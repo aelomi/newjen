@@ -1,13 +1,14 @@
 //! Spawns and owns one `claude` CLI process speaking the stream-json protocol.
 //!
 //! Two background threads read the process's output and turn it into [`SessionEvent`]s on an
-//! `async_channel`, which the UI can await (or a test can poll). Writing to the process
-//! (prompts, approval answers, interrupts) happens on the caller's thread through
-//! [`Session`]'s methods.
+//! `async_channel`, which the UI can await (or a test can poll). A third thread writes to the
+//! process: [`Session`]'s methods (prompts, approval answers, interrupts) only put a finished
+//! line on a queue and return. So a stalled `claude` that stops reading its stdin can never
+//! freeze the caller (the UI thread) or block [`Session::shutdown`].
 //!
 //! Why threads and not an async runtime: there is exactly one process per conversation and its
-//! output is line-based, so two plain threads are the simplest thing that works, and `core`
-//! stays independent of any UI framework's executor.
+//! input and output are line-based, so plain threads are the simplest thing that works, and
+//! `core` stays independent of any UI framework's executor.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -15,7 +16,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -164,9 +165,11 @@ pub enum SessionEvent {
 /// A running `claude` process. Dropping it shuts the process down.
 pub struct Session {
     pid: u32,
-    /// The process's stdin. `None` after shutdown. The CLI must keep stdin open for the whole
-    /// session: when it closes, the CLI rejects pending approvals and exits.
-    stdin: Mutex<Option<ChildStdin>>,
+    /// Lines waiting to be written to the process's stdin by the writer thread. Closing this
+    /// queue makes the writer thread finish and drop stdin, which closes the pipe. The CLI
+    /// needs stdin open for the whole session (when it closes, the CLI rejects pending
+    /// approvals and exits), so it is closed only by `shutdown`.
+    to_stdin: Sender<String>,
     /// Set by the first `shutdown` call so later calls return at once. Shared with the stdout
     /// thread, which reports it in `Exited { requested }`.
     shutting_down: Arc<AtomicBool>,
@@ -210,6 +213,7 @@ impl Session {
         let stdout = child.stdout.take().context("child has no stdout")?;
         let stderr = child.stderr.take().context("child has no stderr")?;
 
+        let to_stdin = spawn_stdin_writer(stdin);
         let (sender, receiver) = async_channel::unbounded();
         let exited = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -226,7 +230,7 @@ impl Session {
 
         let session = Session {
             pid,
-            stdin: Mutex::new(Some(stdin)),
+            to_stdin,
             shutting_down,
             exited,
             next_request_number: AtomicU64::new(1),
@@ -253,17 +257,20 @@ impl Session {
 
     /// Stops the process: closes stdin, sends SIGTERM to its process group, and SIGKILL if it
     /// is still alive after a short grace period. Safe to call more than once; later calls
-    /// return immediately. Takes at most about 150 ms, inside GPUI's quit budget.
+    /// return immediately. Takes at most about 150 ms, inside GPUI's quit budget, and never
+    /// waits for the writer thread (which may be stuck writing to a claude that stopped
+    /// reading; the SIGKILL below unsticks it).
     pub fn shutdown(&self) {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Dropping stdin closes the pipe.
-        drop(self.lock_stdin().take());
+        // Closing the queue never blocks. The writer thread then drops stdin, which closes the
+        // pipe, as soon as it is not in the middle of a write.
+        self.to_stdin.close();
         if self.exited.load(Ordering::SeqCst) {
             // claude was reaped earlier, so its pid (which is also the group id) may already
-            // belong to an unrelated process; signalling the group now could hit that. The
-            // trade-off: tools a crashed claude left running in its group are not killed here.
+            // belong to an unrelated process; signalling the group now could hit that. Tools a
+            // crashed claude left in its group were already sent SIGTERM by the reader thread.
             return;
         }
         let group = self.pid as libc::pid_t;
@@ -289,29 +296,18 @@ impl Session {
         self.pid
     }
 
-    /// Serializes `message` with a JSON encoder and writes it as one line. The CLI exits on a
-    /// line that is not valid JSON, so lines are never built by hand.
+    /// Serializes `message` with a JSON encoder and queues it as one line for the writer
+    /// thread. The CLI exits on a line that is not valid JSON, so lines are never built by hand.
     ///
-    /// The write blocks the calling thread until claude has read the bytes. That is instant in
-    /// practice because the CLI reads stdin continuously.
+    /// Returns at once. Fails if the session was shut down or claude stopped accepting input
+    /// (the writer thread closes the queue when a write fails).
     fn write_line(&self, message: &Value) -> Result<()> {
         let mut line = serde_json::to_string(message)?;
         line.push('\n');
-        let mut stdin = self.lock_stdin();
-        let pipe = stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("the claude session has been shut down"))?;
-        pipe.write_all(line.as_bytes())
-            .context("could not write to claude")?;
-        pipe.flush().context("could not write to claude")?;
-        Ok(())
-    }
-
-    fn lock_stdin(&self) -> std::sync::MutexGuard<'_, Option<ChildStdin>> {
-        // A poisoned lock only means another thread panicked mid-write; the pipe is still usable.
-        self.stdin
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        // The queue is unbounded, so the only possible error is "closed".
+        self.to_stdin
+            .try_send(line)
+            .map_err(|_| anyhow!("the claude session has ended (shut down, or claude exited)"))
     }
 }
 
@@ -319,6 +315,25 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Writes queued lines to claude's stdin, in order, until the queue is closed (by `shutdown`)
+/// or a write fails (claude is gone). Then it drops stdin, which closes the pipe.
+fn spawn_stdin_writer(mut stdin: ChildStdin) -> Sender<String> {
+    let (sender, receiver) = async_channel::unbounded::<String>();
+    thread::spawn(move || {
+        // `recv_blocking` still hands out lines queued before the close, then returns an error.
+        while let Ok(line) = receiver.recv_blocking() {
+            if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
+                // Closing the queue makes later `send_prompt`/`answer` calls report an error
+                // instead of silently queueing lines nobody will write.
+                receiver.close();
+                break;
+            }
+        }
+        drop(stdin);
+    });
+    sender
 }
 
 /// Reads stdout line by line until EOF, then reaps the process and sends `Exited` last.
@@ -342,6 +357,16 @@ fn spawn_stdout_reader(
         let code = child.wait().ok().and_then(|status| status.code());
         // Read after the process is gone: true only if shutdown started before it ended.
         let requested = shutting_down.load(Ordering::SeqCst);
+        if !requested {
+            // claude ended on its own (often a crash). Stop the tools it started, which share
+            // its process group, so they don't run on unattended. Safe even though claude is
+            // already reaped: a group id is not handed out again while any process is still
+            // in that group, and if the group is already empty this just fails with ESRCH.
+            // The only risk is the pid being reused as a new group leader in the moment since
+            // `wait()` returned, which is vanishingly unlikely.
+            // SAFETY: killpg only sends a signal.
+            unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGTERM) };
+        }
         // Unregister before setting `exited`: once `exited` is set, `shutdown` returns early
         // and skips its own unregister, and the app may quit right after.
         orphans::unregister(child.id());

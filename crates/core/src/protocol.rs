@@ -552,8 +552,9 @@ impl PermissionRequest {
 pub enum PermissionAnswer {
     /// Run this one call.
     AllowOnce,
-    /// Run it, and auto-approve identical calls for the rest of this session (nothing is
-    /// written to the project's settings).
+    /// Run it, and auto-approve similar calls for the rest of this session: the rule the CLI
+    /// suggests (e.g. this Bash command), or every file edit for Write/Edit. Nothing is
+    /// written to the project's settings. See `session_permissions`.
     AllowForSession,
     /// Don't run it; Claude is told and carries on.
     Deny,
@@ -589,10 +590,10 @@ pub fn permission_response(request: &PermissionRequest, answer: PermissionAnswer
         PermissionAnswer::AllowOnce => allow(request),
         PermissionAnswer::AllowForSession => {
             let mut decision = allow(request);
-            let rules = session_rules(&request.suggestions);
-            // Without an `addRules` suggestion there is nothing to remember: allow once.
-            if !rules.is_empty() {
-                decision["updatedPermissions"] = Value::Array(rules);
+            // An empty list means we found nothing safe to remember: this is then allow-once.
+            let permissions = session_permissions(request);
+            if !permissions.is_empty() {
+                decision["updatedPermissions"] = Value::Array(permissions);
             }
             decision
         }
@@ -615,10 +616,21 @@ fn allow(request: &PermissionRequest) -> Value {
     json!({ "behavior": "allow", "updatedInput": request.input })
 }
 
-/// Keeps only the `addRules` suggestions and changes their destination to `session`, so the
-/// rule lasts until the CLI exits and is never written into the project's settings files.
-fn session_rules(suggestions: &[Value]) -> Vec<Value> {
-    suggestions
+/// What to send as `updatedPermissions` for "Allow for this session", in order of preference.
+/// Everything returned has `destination: "session"`, so it lasts until the CLI exits and is
+/// never written into a settings file (the CLI's own suggestions usually say `localSettings`).
+///
+/// 1. The CLI's `addRules` suggestions (e.g. Bash `touch a.txt`).
+/// 2. Else its `setMode` `acceptEdits` suggestion for the session. Write and Edit suggest only
+///    this; verified live, the next Write is then auto-approved. Any other mode (for example
+///    `bypassPermissions`) is never forwarded.
+/// 3. Else a rule we build ourselves. Some calls come with no suggestions at all (seen live
+///    for Bash `echo $(date) > when.txt`). For Bash the rule names the exact command, so only
+///    identical calls are approved, never "any Bash command". Other tools get a whole-tool
+///    rule. Both were verified live to auto-approve the next call.
+fn session_permissions(request: &PermissionRequest) -> Vec<Value> {
+    let rules: Vec<Value> = request
+        .suggestions
         .iter()
         .filter(|suggestion| suggestion.get("type").and_then(Value::as_str) == Some("addRules"))
         .map(|suggestion| {
@@ -626,7 +638,40 @@ fn session_rules(suggestions: &[Value]) -> Vec<Value> {
             rule["destination"] = Value::String("session".to_string());
             rule
         })
-        .collect()
+        .collect();
+    if !rules.is_empty() {
+        return rules;
+    }
+
+    let modes: Vec<Value> = request
+        .suggestions
+        .iter()
+        .filter(|suggestion| {
+            suggestion.get("type").and_then(Value::as_str) == Some("setMode")
+                && suggestion.get("mode").and_then(Value::as_str) == Some("acceptEdits")
+                && suggestion.get("destination").and_then(Value::as_str) == Some("session")
+        })
+        .cloned()
+        .collect();
+    if !modes.is_empty() {
+        return modes;
+    }
+
+    let rule = if request.tool_name == "Bash" {
+        match request.input.get("command").and_then(Value::as_str) {
+            Some(command) => json!({ "toolName": "Bash", "ruleContent": command }),
+            // A Bash call without a command string: nothing safe to name, so allow once.
+            None => return Vec::new(),
+        }
+    } else {
+        json!({ "toolName": request.tool_name })
+    };
+    vec![json!({
+        "type": "addRules",
+        "rules": [rule],
+        "behavior": "allow",
+        "destination": "session",
+    })]
 }
 
 /// Asks the CLI to stop the current turn. `request_id` is any id we choose; the CLI echoes it
@@ -750,12 +795,56 @@ mod tests {
         assert_eq!(permissions[0]["destination"], "session");
     }
 
+    /// The `updatedPermissions` an AllowForSession reply carries (`Null` if none).
+    fn session_permissions_sent(request: &PermissionRequest) -> Value {
+        permission_response(request, PermissionAnswer::AllowForSession)["response"]["response"]
+            ["updatedPermissions"]
+            .clone()
+    }
+
     #[test]
-    fn allow_for_session_without_rules_is_allow_once() {
-        let reply = permission_response(&bash_request(vec![]), PermissionAnswer::AllowForSession);
+    fn allow_for_session_falls_back_to_the_session_accept_edits_mode() {
+        // What the CLI suggests for Write and Edit (recorded live).
+        let mut request = bash_request(vec![
+            json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"}),
+            json!({"type": "setMode", "mode": "bypassPermissions", "destination": "session"}),
+            json!({"type": "setMode", "mode": "acceptEdits", "destination": "localSettings"}),
+        ]);
+        request.tool_name = "Write".to_string();
         assert_eq!(
-            reply,
-            permission_response(&bash_request(vec![]), PermissionAnswer::AllowOnce)
+            session_permissions_sent(&request),
+            json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}])
+        );
+    }
+
+    #[test]
+    fn allow_for_session_without_suggestions_names_the_exact_bash_command() {
+        assert_eq!(
+            session_permissions_sent(&bash_request(vec![])),
+            json!([{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "touch a.txt"}],
+                    "behavior": "allow", "destination": "session"}])
+        );
+    }
+
+    #[test]
+    fn allow_for_session_without_suggestions_allows_another_tool_by_name() {
+        let mut request = bash_request(vec![]);
+        request.tool_name = "WebSearch".to_string();
+        request.input = json!({"query": "x"});
+        assert_eq!(
+            session_permissions_sent(&request),
+            json!([{"type": "addRules", "rules": [{"toolName": "WebSearch"}],
+                    "behavior": "allow", "destination": "session"}])
+        );
+    }
+
+    #[test]
+    fn allow_for_session_for_bash_without_a_command_is_allow_once() {
+        let mut request = bash_request(vec![]);
+        request.input = json!({});
+        assert_eq!(
+            permission_response(&request, PermissionAnswer::AllowForSession),
+            permission_response(&request, PermissionAnswer::AllowOnce)
         );
     }
 

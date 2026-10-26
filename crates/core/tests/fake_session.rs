@@ -193,6 +193,88 @@ fn shutdown_kills_the_process_group_within_200ms() {
     assert!(started.elapsed() < Duration::from_millis(20));
 }
 
+#[test]
+fn shutdown_is_quick_even_when_claude_never_reads_stdin() {
+    // A stand-in that never reads stdin. A prompt far bigger than the pipe buffer (64 KB on
+    // macOS) fills the pipe, so writing it blocks until the process dies. That must happen on
+    // the writer thread: neither `send_prompt` nor `shutdown` may wait for it.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("deaf-claude");
+    let mut file = std::fs::File::create(&script).unwrap();
+    writeln!(file, "#!/bin/sh").unwrap();
+    writeln!(file, r#"echo '{{"type":"system","subtype":"ready"}}'"#).unwrap();
+    writeln!(file, "exec sleep 60").unwrap();
+    drop(file);
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut config = SessionConfig::new(dir.path());
+    config.program = script;
+    let (session, events) = Session::spawn(config).unwrap();
+    assert!(matches!(
+        common::next_event(&events, TIMEOUT),
+        SessionEvent::Line(Incoming::System(_))
+    ));
+
+    // 1 MB. Before the writer thread existed, this call blocked forever. The limit is loose
+    // because encoding 1 MB of JSON in a debug build alone takes a few tens of milliseconds.
+    let huge_prompt = "x".repeat(1024 * 1024);
+    let started = Instant::now();
+    session.send_prompt(&huge_prompt).unwrap();
+    session.send_prompt("and another").unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(500),
+        "send_prompt took {took:?}"
+    );
+
+    let started = Instant::now();
+    session.shutdown();
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(200), "shutdown took {took:?}");
+
+    let requested = loop {
+        if let SessionEvent::Exited { requested, .. } = common::next_event(&events, TIMEOUT) {
+            break requested;
+        }
+    };
+    assert!(requested);
+    assert!(session.send_prompt("too late").is_err());
+}
+
+#[test]
+fn unexpected_exit_stops_the_tools_claude_started() {
+    // A stand-in that starts a background tool and then exits on its own, like a crash. The
+    // tool shares claude's process group and must not outlive it.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("crashing-claude");
+    let mut file = std::fs::File::create(&script).unwrap();
+    writeln!(file, "#!/bin/sh").unwrap();
+    writeln!(file, "sleep 60 >/dev/null 2>&1 &").unwrap();
+    writeln!(file, r#"echo "{{\"type\":\"system\",\"subtype\":\"$!\"}}""#).unwrap();
+    writeln!(file, "exit 7").unwrap();
+    drop(file);
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut config = SessionConfig::new(dir.path());
+    config.program = script;
+    let (_session, events) = Session::spawn(config).unwrap();
+    let tool_pid: u32 = match common::next_event(&events, TIMEOUT) {
+        SessionEvent::Line(Incoming::System(message)) => message.subtype.parse().unwrap(),
+        other => panic!("unexpected event {other:?}"),
+    };
+    let (code, requested) = loop {
+        if let SessionEvent::Exited { code, requested } = common::next_event(&events, TIMEOUT) {
+            break (code, requested);
+        }
+    };
+    assert_eq!(code, Some(7));
+    assert!(!requested);
+    assert!(
+        wait_until_dead(tool_pid, Duration::from_secs(2)),
+        "the crashed claude's tool survived"
+    );
+}
+
 /// The pid of a child of `parent`, using `pgrep -P`.
 fn find_child_of(parent: u32) -> Option<u32> {
     let output = std::process::Command::new("pgrep")

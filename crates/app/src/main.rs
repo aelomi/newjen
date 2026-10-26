@@ -32,6 +32,13 @@ fn main() {
 
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let project = project_dir(home.as_deref());
+    // Check before opening a window: a missing folder would otherwise surface later as a
+    // confusing "could not start Claude" error.
+    if let Err(problem) = check_project(&project) {
+        eprintln!("newjen: {problem}");
+        eprintln!("usage: newjen [project-dir]");
+        std::process::exit(2);
+    }
     let project_label = SharedString::from(format::tilde(&project, home.as_deref()));
 
     gpui_platform::application()
@@ -129,6 +136,17 @@ fn project_dir(home: Option<&Path>) -> PathBuf {
     chosen.canonicalize().unwrap_or(chosen)
 }
 
+/// The project must be an existing folder, since Claude runs inside it.
+fn check_project(project: &Path) -> Result<(), String> {
+    if project.is_dir() {
+        Ok(())
+    } else if project.exists() {
+        Err(format!("{} is not a folder.", project.display()))
+    } else {
+        Err(format!("{} does not exist.", project.display()))
+    }
+}
+
 fn open_window(project: PathBuf, project_label: SharedString, cx: &mut App) -> anyhow::Result<()> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -158,4 +176,25 @@ fn open_window(project: PathBuf, project_label: SharedString, cx: &mut App) -> a
         view
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_project_accepts_only_existing_folders() {
+        let dir = std::env::temp_dir();
+        assert_eq!(check_project(&dir), Ok(()));
+
+        let missing = dir.join("newjen-no-such-folder-for-tests");
+        let error = check_project(&missing).unwrap_err();
+        assert!(error.ends_with("does not exist."), "{error}");
+
+        let file = dir.join(format!("newjen-check-project-{}.txt", std::process::id()));
+        std::fs::write(&file, "not a folder").unwrap();
+        let error = check_project(&file).unwrap_err();
+        std::fs::remove_file(&file).unwrap();
+        assert!(error.ends_with("is not a folder."), "{error}");
+    }
 }

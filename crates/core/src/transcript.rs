@@ -470,6 +470,11 @@ impl Transcript {
             self.push_turn_end(result.duration_ms, cost_usd, true);
             self.status = Status::Stopped;
         } else if result.is_error {
+            if is_missing_conversation(result) {
+                // `--resume` named a session the CLI does not have. Forget it, so the next
+                // restart starts a fresh session instead of failing the same way forever.
+                self.session_id = None;
+            }
             self.close_unfinished_tools("The turn ended before this finished.");
             let detail = api_error_text
                 .filter(|text| !text.is_empty())
@@ -609,6 +614,14 @@ impl Transcript {
         self.next_id += 1;
         id
     }
+}
+
+/// True when a failed result says the `--resume` session does not exist, e.g.
+/// `"No conversation found with session ID: …"` (seen live in `errors`).
+fn is_missing_conversation(result: &ResultMessage) -> bool {
+    let says_so = |text: &str| text.contains("No conversation found");
+    result.error_lines().iter().any(|line| says_so(line))
+        || result.result.as_deref().is_some_and(says_so)
 }
 
 /// A friendlier tool name: MCP tools arrive as `mcp__<server>__<tool>` and become

@@ -392,6 +392,62 @@ fn error_bad_resume() {
 }
 
 #[test]
+fn bad_resume_forgets_the_session_id_so_a_retry_starts_fresh() {
+    // Without this, every restart would `--resume` the same missing session and fail again.
+    let mut transcript = Transcript::new();
+    feed(
+        &mut transcript,
+        serde_json::json!({"type": "system", "subtype": "init", "session_id": "gone-session"}),
+    );
+    assert_eq!(transcript.session_id(), Some("gone-session"));
+    for line in common::load("error_bad_resume") {
+        if line.out {
+            feed(&mut transcript, line.msg);
+        }
+    }
+    assert_eq!(transcript.status(), Status::Failed);
+    assert_eq!(transcript.session_id(), None);
+
+    // The fresh session that follows reports its own id as usual.
+    feed(
+        &mut transcript,
+        serde_json::json!({"type": "system", "subtype": "init", "session_id": "new-session"}),
+    );
+    assert_eq!(transcript.session_id(), Some("new-session"));
+}
+
+#[test]
+fn other_errors_keep_the_session_id() {
+    let mut transcript = replay("error_bad_model").end;
+    assert_eq!(transcript.status(), Status::Failed);
+    assert!(transcript.session_id().is_some());
+    feed(&mut transcript, success_result());
+    assert!(transcript.session_id().is_some());
+}
+
+#[test]
+fn write_allowed_for_the_session_runs_the_second_write_without_asking() {
+    // Recorded live: "Allow for this session" on the first Write (sent as the session
+    // `acceptEdits` mode), after which the CLI ran the second Write without asking.
+    let replay = replay("write_allow_session");
+    assert!(replay.saw_pending_approval);
+    let approvals = common::load("write_allow_session")
+        .iter()
+        .filter(|line| line.out && line.msg["type"] == "control_request")
+        .count();
+    assert_eq!(approvals, 1);
+    assert_eq!(
+        tools(&replay.end),
+        [
+            ("Write".to_string(), ToolState::Done),
+            ("Write".to_string(), ToolState::Done)
+        ]
+    );
+    assert!(replay.end.pending_approval().is_none());
+    assert_eq!(replay.end.status(), Status::Done);
+}
+
+#[test]
 fn initialize_adds_no_items() {
     let mut transcript = Transcript::new();
     for line in common::load("initialize") {

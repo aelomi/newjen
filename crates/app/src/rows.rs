@@ -33,7 +33,9 @@ pub type OnRestart = Rc<dyn Fn(&mut Window, &mut App)>;
 /// `is_last` says whether this is the conversation's last item. Only that one can still be
 /// streaming: core keeps every reply of the turn `live` until the turn ends, but a reply
 /// followed by something else is finished, so it must not show a typing caret.
-pub fn item(item: &Item, is_last: bool, on_restart: &OnRestart, cx: &mut App) -> AnyElement {
+///
+/// `retry` is the "Try again" action for an error row, given only where `can_retry` allows it.
+pub fn item(item: &Item, is_last: bool, retry: Option<&OnRestart>, cx: &mut App) -> AnyElement {
     match item {
         Item::User { text, .. } => MessageBubble::new(Role::User)
             .child(text.clone())
@@ -95,21 +97,30 @@ pub fn item(item: &Item, is_last: bool, on_restart: &OnRestart, cx: &mut App) ->
         ),
         Item::Error {
             id, title, detail, ..
-        } => error(("error", *id).into(), title, detail, on_restart),
+        } => error(("error", *id).into(), title, detail, retry),
     }
 }
 
 /// An error that happened in the app rather than in Claude (for example `claude` could not be
-/// started). Drawn like a transcript error.
-pub fn error(id: ElementId, title: &str, detail: &str, on_restart: &OnRestart) -> AnyElement {
-    let restart = on_restart.clone();
+/// started). Drawn like a transcript error. With no `retry`, Ely draws no "Try again" button.
+pub fn error(id: ElementId, title: &str, detail: &str, retry: Option<&OnRestart>) -> AnyElement {
+    let mut message = ErrorMessage::new(id, SharedString::from(title.to_string()))
+        .detail(SharedString::from(detail.to_string()));
+    if let Some(restart) = retry.cloned() {
+        message = message.on_retry(move |window, cx| restart(window, cx));
+    }
     MessageBubble::new(Role::Error)
-        .child(
-            ErrorMessage::new(id, SharedString::from(title.to_string()))
-                .detail(SharedString::from(detail.to_string()))
-                .on_retry(move |window, cx| restart(window, cx)),
-        )
+        .child(message)
         .into_any_element()
+}
+
+/// Whether an error row gets a "Try again" button. Restarting kills the running `claude`, so
+/// only the newest error (the last row) offers it, and only while no turn is running: an old
+/// error's button clicked mid-turn would throw that turn away. The app's own notice is the
+/// exception: it says Newjen could not write to `claude` at all, so the running turn can
+/// neither be answered nor stopped, and restarting is the only way on.
+pub fn can_retry(is_last_row: bool, is_notice: bool, busy: bool) -> bool {
+    is_last_row && (is_notice || !busy)
 }
 
 /// The quiet line under a finished turn: "✓ Done in 4.2s · $0.0041".
@@ -148,5 +159,17 @@ mod tests {
         assert_eq!(step_state(ToolState::Done), StepState::Done);
         assert_eq!(step_state(ToolState::Denied), StepState::Failed);
         assert_eq!(step_state(ToolState::Failed), StepState::Failed);
+    }
+
+    #[test]
+    fn only_the_newest_error_can_retry_and_not_mid_turn() {
+        assert!(can_retry(true, false, false));
+        // An older error, further up the conversation.
+        assert!(!can_retry(false, false, false));
+        // The newest error, but a new turn is already running.
+        assert!(!can_retry(true, false, true));
+        // Newjen's own notice: the pipe to claude is broken, so restarting is the way out.
+        assert!(can_retry(true, true, true));
+        assert!(!can_retry(false, true, false));
     }
 }

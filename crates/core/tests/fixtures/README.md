@@ -9,6 +9,12 @@ Real recordings of the Claude Code CLI's stream-json protocol, used by the `core
   so only they contain `stream_event` lines. `resume` and `error_bad_resume` used `--resume`,
   `error_bad_model` used an unknown `--model`, and `error_not_logged_in` used `--bare` with
   no API key.
+- **`write_allow_session`** (claude 2.1.310, 2026-10-26, same flags, fresh empty project):
+  "Allow for this session" on a Write. The CLI's only suggestion for Write is
+  `{"type":"setMode","mode":"acceptEdits","destination":"session"}`; we answered allow with
+  that as `updatedPermissions`, and the CLI ran the second Write without asking. No settings
+  file appeared in the project. Its SessionStart `hook_response` output was blanked (it came
+  from user-installed plugins).
 - **Line format:** one JSON object per line, `{"dir": "out" | "in", "msg": {...}}`.
   `out` is a line the CLI printed on stdout; `in` is a line we wrote to its stdin, in the
   order it happened. In `probe_malformed_stdin.jsonl` the `in` line is

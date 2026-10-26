@@ -1,45 +1,65 @@
 //! The orphan registry kills `claude` processes whose Newjen owner is gone, and nothing else.
+//! A process is recognised by its pid *and* its start time, never by its name, so `claude`
+//! installs that run under `node` or `bun` are cleaned up too (these tests use plain `sleep`).
 
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use newjen_core::orphans;
 
 /// A pid that cannot belong to a running process (above macOS's pid limit of 99998).
-const DEAD_OWNER_PID: &str = "999999";
+const DEAD_OWNER_PID: u32 = 999_999;
 
-/// A `claude` symlink to `/bin/sleep`, so the registry's "is this claude?" check passes.
-fn fake_claude_link(dir: &std::path::Path) -> std::path::PathBuf {
-    let link = dir.join("claude");
-    if !link.exists() {
-        std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
-    }
-    link
-}
-
-/// Starts `sleep 60` under the name `claude`, in its own process group like a real session.
-/// It is a child of this test process, so it is *not* an orphan.
-fn spawn_fake_claude(dir: &std::path::Path) -> Child {
-    Command::new(fake_claude_link(dir))
+/// Starts `sleep 60` in its own process group like a real session. It is a child of this test
+/// process, so it is *not* an orphan.
+fn spawn_child() -> Child {
+    Command::new("/bin/sleep")
         .arg("60")
         .process_group(0)
         .spawn()
-        .expect("spawn sleep as claude")
+        .expect("spawn sleep")
 }
 
-/// Starts `sleep 60` under the name `claude` as a real orphan: a shell starts it in the
-/// background and exits, so launchd (pid 1) becomes its parent, as after a Newjen crash.
-fn spawn_orphaned_fake_claude(dir: &std::path::Path) -> u32 {
+/// Starts `sleep 60` as a real orphan: a shell starts it in the background and exits, so
+/// launchd (pid 1) becomes its parent, as after a Newjen crash.
+fn spawn_orphan() -> u32 {
     let output = Command::new("/bin/sh")
-        .args(["-c", r#""$0" 60 >/dev/null 2>&1 & echo $!"#])
-        .arg(fake_claude_link(dir))
+        .args(["-c", "/bin/sleep 60 >/dev/null 2>&1 & echo $!"])
         .output()
         .expect("start orphan");
-    String::from_utf8_lossy(&output.stdout)
+    let pid = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
-        .expect("orphan pid")
+        .expect("orphan pid");
+    // Give launchd a moment to adopt it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while parent_of(pid) != Some(1) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pid
+}
+
+fn parent_of(pid: u32) -> Option<u32> {
+    let output = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Writes a registry record by hand: `<owner pid> <owner start> <child start>`.
+fn write_record(dir: &Path, child_pid: u32, owner_pid: u32, owner_start: u64, child_start: u64) {
+    std::fs::write(
+        dir.join(child_pid.to_string()),
+        format!("{owner_pid} {owner_start} {child_start}"),
+    )
+    .unwrap();
+}
+
+fn start_of(pid: u32) -> u64 {
+    orphans::start_time(pid).expect("process start time")
 }
 
 /// True if a process with this pid exists (a zombie counts).
@@ -60,20 +80,26 @@ fn dies_within(pid: u32, timeout: Duration) -> bool {
     false
 }
 
+fn kill_orphan(pid: u32) {
+    // SAFETY: only sends a signal to a process this test started.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+}
+
 #[test]
 fn reap_kills_orphans_of_dead_owners_and_spares_live_ones() {
-    let bin_dir = tempfile::tempdir().unwrap();
     let registry = tempfile::tempdir().unwrap();
 
-    let orphan = spawn_orphaned_fake_claude(bin_dir.path());
-    let mut owned = spawn_fake_claude(bin_dir.path());
+    // Not named `claude`: the name does not matter, only pid + start time.
+    let orphan = spawn_orphan();
+    let mut owned = spawn_child();
 
     // The orphan's owner is a pid that is not running.
-    std::fs::write(registry.path().join(orphan.to_string()), DEAD_OWNER_PID).unwrap();
+    write_record(registry.path(), orphan, DEAD_OWNER_PID, 1, start_of(orphan));
     // The other one is owned by this (live) test process.
     orphans::register_in(registry.path(), owned.id()).unwrap();
-    // A corrupt record is cleaned up.
+    // A corrupt record, and one in the old pid-only format, are removed without killing.
     std::fs::write(registry.path().join("not-a-pid"), "x").unwrap();
+    std::fs::write(registry.path().join("12345"), DEAD_OWNER_PID.to_string()).unwrap();
 
     let killed = orphans::reap_in(registry.path());
 
@@ -84,6 +110,7 @@ fn reap_kills_orphans_of_dead_owners_and_spares_live_ones() {
     );
     assert!(!registry.path().join(orphan.to_string()).exists());
     assert!(!registry.path().join("not-a-pid").exists());
+    assert!(!registry.path().join("12345").exists());
 
     // The live owner's process is untouched and still registered.
     assert!(
@@ -99,49 +126,70 @@ fn reap_kills_orphans_of_dead_owners_and_spares_live_ones() {
 }
 
 #[test]
-fn reap_never_kills_a_process_that_is_not_claude() {
+fn reap_treats_a_reused_owner_pid_as_a_dead_owner() {
+    // The owner pid is running (it is this test), but it started at another time than the
+    // record says: the pid was reused, so the real owner is gone and the orphan is reaped.
     let registry = tempfile::tempdir().unwrap();
-    let mut other = Command::new("/bin/sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    std::fs::write(registry.path().join(other.id().to_string()), DEAD_OWNER_PID).unwrap();
-
-    assert!(orphans::reap_in(registry.path()).is_empty());
-    assert!(
-        other.try_wait().unwrap().is_none(),
-        "a non-claude process was killed"
+    let orphan = spawn_orphan();
+    let me = std::process::id();
+    write_record(
+        registry.path(),
+        orphan,
+        me,
+        start_of(me) - 1,
+        start_of(orphan),
     );
-    // The stale record is still removed.
-    assert!(!registry.path().join(other.id().to_string()).exists());
 
-    other.kill().unwrap();
-    other.wait().unwrap();
+    assert_eq!(orphans::reap_in(registry.path()), [orphan]);
+    assert!(dies_within(orphan, Duration::from_secs(2)));
 }
 
 #[test]
-fn reap_spares_a_claude_that_still_has_a_parent() {
-    // A stale record whose pid now belongs to someone else's `claude` (for example one running
-    // in a terminal): the name matches, but it is not an orphan, so it must survive.
-    let bin_dir = tempfile::tempdir().unwrap();
+fn reap_never_kills_a_process_that_reused_the_child_pid() {
+    // The record's pid is now a different process (other start time): leave it alone.
     let registry = tempfile::tempdir().unwrap();
-    let mut not_ours = spawn_fake_claude(bin_dir.path());
-    std::fs::write(
-        registry.path().join(not_ours.id().to_string()),
+    let stranger = spawn_orphan();
+    write_record(
+        registry.path(),
+        stranger,
         DEAD_OWNER_PID,
-    )
-    .unwrap();
+        1,
+        start_of(stranger) - 1,
+    );
 
     assert!(orphans::reap_in(registry.path()).is_empty());
     assert!(
-        not_ours.try_wait().unwrap().is_none(),
-        "a claude with a live parent was killed"
+        is_alive(stranger),
+        "a process that reused the pid was killed"
     );
-    assert!(!registry.path().join(not_ours.id().to_string()).exists());
+    // The stale record is still removed.
+    assert!(!registry.path().join(stranger.to_string()).exists());
+    kill_orphan(stranger);
+}
 
-    not_ours.kill().unwrap();
-    not_ours.wait().unwrap();
+#[test]
+fn reap_spares_a_child_that_still_has_a_parent() {
+    // Pid and start time match, but the process has a live parent, so it is not an orphan
+    // (for example it was handed to another process). It must survive.
+    let registry = tempfile::tempdir().unwrap();
+    let mut not_orphan = spawn_child();
+    write_record(
+        registry.path(),
+        not_orphan.id(),
+        DEAD_OWNER_PID,
+        1,
+        start_of(not_orphan.id()),
+    );
+
+    assert!(orphans::reap_in(registry.path()).is_empty());
+    assert!(
+        not_orphan.try_wait().unwrap().is_none(),
+        "a process with a live parent was killed"
+    );
+    assert!(!registry.path().join(not_orphan.id().to_string()).exists());
+
+    not_orphan.kill().unwrap();
+    not_orphan.wait().unwrap();
 }
 
 #[test]

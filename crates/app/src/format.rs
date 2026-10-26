@@ -142,7 +142,7 @@ pub fn cap_ends(text: &str, head: usize, tail: usize, max_line_chars: usize) -> 
 }
 
 /// `line` cut to `max_chars` by replacing its middle with " … ".
-fn middle(line: &str, max_chars: usize) -> String {
+pub fn middle(line: &str, max_chars: usize) -> String {
     let chars: Vec<char> = line.chars().collect();
     if chars.len() <= max_chars {
         return line.to_string();
@@ -154,6 +154,131 @@ fn middle(line: &str, max_chars: usize) -> String {
     short.push_str(" … ");
     short.extend(&chars[chars.len() - back..]);
     short
+}
+
+/// How many columns `ch` takes in a monospace font: CJK characters and emoji are drawn twice
+/// as wide as Latin letters.
+fn columns(ch: char) -> usize {
+    match u32::from(ch) {
+        0x1100..=0x115F
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// Whether GPUI keeps `ch` attached to the characters around it when it wraps text (a copy of
+/// GPUI's private `LineWrapper::is_word_char`). Anything else, such as `/` in a path, is a
+/// place a line may break.
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(ch, '\u{00C0}'..='\u{024F}' | '\u{0400}'..='\u{04FF}')
+        || matches!(ch, '\u{1E00}'..='\u{1EFF}' | '\u{0300}'..='\u{036F}')
+        || matches!(ch, '\u{0980}'..='\u{09FF}')
+        // Punctuation that stays with its word, like `a-b`, `I'm` or `plz!`.
+        || "-_.'’‘$%@#^~,=:;!)]}\"”»…⋯".contains(ch)
+        || matches!(ch, '\u{202F}' | '\u{00A0}' | '\u{2011}')
+}
+
+/// How many rows `line` takes when GPUI wraps it at `cols` monospace columns. This follows
+/// GPUI's own rule (`LineLayout::compute_wrap_boundaries`): a row may break before a word
+/// that follows a space, or before any character that is not part of a word (like `/`); when
+/// a row overflows it breaks at the last such place, or right there if it has none.
+pub fn wrapped_rows(line: &str, cols: usize) -> usize {
+    let cols = cols.max(1);
+    let mut rows = 1;
+    // Columns are counted from the start of the line. `row_start` is where the current row
+    // begins and `x` where the current character begins.
+    let mut row_start = 0;
+    let mut x = 0;
+    let mut break_at: Option<usize> = None;
+    let mut seen_text = false;
+    let mut prev = '\0';
+    for ch in line.chars() {
+        let can_break_here = if is_word_char(ch) {
+            prev == ' ' && seen_text
+        } else {
+            ch != ' ' && seen_text
+        };
+        if can_break_here {
+            break_at = Some(x);
+        }
+        if ch != ' ' {
+            seen_text = true;
+        }
+        let end = x + columns(ch);
+        if end - row_start > cols && x > row_start {
+            row_start = break_at.take().unwrap_or(x);
+            rows += 1;
+        }
+        prev = ch;
+        x = end;
+    }
+    rows
+}
+
+/// Total rows of every line of `text` at `cols` columns.
+pub fn text_rows(text: &str, cols: usize) -> usize {
+    text.lines().map(|line| wrapped_rows(line, cols)).sum()
+}
+
+/// Shortens `text` so it wraps to at most `max_rows` rows at `cols` columns. Long lines are
+/// cut in their middle (to two rows each, then one); if there are still too many lines, the
+/// middle lines become "… N more lines …", keeping a little more of the end than the start
+/// (the last line of a shell command is often the one that does the work).
+pub fn fit_rows(text: &str, cols: usize, max_rows: usize) -> String {
+    let cols = cols.max(8);
+    let max_rows = max_rows.max(1);
+    if text_rows(text, cols) <= max_rows {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let two_rows: Vec<String> = lines.iter().map(|line| fit_line(line, cols, 2)).collect();
+    if two_rows
+        .iter()
+        .map(|line| wrapped_rows(line, cols))
+        .sum::<usize>()
+        <= max_rows
+    {
+        return two_rows.join("\n");
+    }
+    let one_row: Vec<String> = lines.iter().map(|line| fit_line(line, cols, 1)).collect();
+    if one_row.len() <= max_rows {
+        return one_row.join("\n");
+    }
+    // One row is kept for the "… N more lines …" marker.
+    let head = (max_rows - 1) / 2;
+    let tail = max_rows - 1 - head;
+    let hidden = one_row.len() - head - tail;
+    let mut kept: Vec<String> = one_row[..head].to_vec();
+    kept.push(format!("… {hidden} more lines …"));
+    kept.extend_from_slice(&one_row[one_row.len() - tail..]);
+    kept.join("\n")
+}
+
+/// `line` cut in its middle until it wraps to at most `max_rows` rows at `cols` columns.
+fn fit_line(line: &str, cols: usize, max_rows: usize) -> String {
+    if wrapped_rows(line, cols) <= max_rows {
+        return line.to_string();
+    }
+    // Start from a full budget of characters and trim until it wraps short enough (word
+    // breaks and wide characters can make a cut line need an extra row). A cut line of three
+    // characters (" … ") always fits, so this ends.
+    let step = (cols / 8).max(1);
+    let mut keep = (cols * max_rows).min(line.chars().count());
+    loop {
+        let short = middle(line, keep);
+        if keep <= 3 || wrapped_rows(&short, cols) <= max_rows {
+            return short;
+        }
+        keep = keep.saturating_sub(step).max(3);
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +361,46 @@ mod tests {
         // Cutting a single line would hide nothing, so it is shown.
         assert_eq!(cap_ends("1\n2\n3\n4", 2, 1, 100), "1\n2\n3\n4");
         assert_eq!(cap_ends("abcdefghij", 2, 2, 7), "ab … ij");
+    }
+
+    #[test]
+    fn wrapped_rows_breaks_between_words() {
+        assert_eq!(wrapped_rows("", 10), 1);
+        assert_eq!(wrapped_rows("0123456789", 10), 1);
+        assert_eq!(wrapped_rows("0123456789a", 10), 2);
+        // "aaaa bbbb" fits; "cccc" moves to the next row instead of splitting.
+        assert_eq!(wrapped_rows("aaaa bbbb cccc", 10), 2);
+        // A word wider than a row is split inside.
+        assert_eq!(wrapped_rows("a 0123456789012345678901", 10), 4);
+        // A path breaks before a `/`, which can waste room: 39 characters need three rows
+        // of 20, not two.
+        let path = format!("{}/{}", "a".repeat(15), "b".repeat(23));
+        assert_eq!(wrapped_rows(&path, 20), 3);
+        // CJK characters take two columns each.
+        assert_eq!(wrapped_rows("日本語日本語", 10), 2);
+    }
+
+    #[test]
+    fn fit_rows_keeps_long_text_inside_its_rows_and_keeps_the_end() {
+        // 20 lines of 200 characters: 60 rows at 77 columns, far over a 15-row budget.
+        let text = (1..=20)
+            .map(|n| format!("line{n:02} {}", "x".repeat(193)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fitted = fit_rows(&text, 77, 15);
+        assert!(text_rows(&fitted, 77) <= 15, "{fitted}");
+        let lines: Vec<&str> = fitted.lines().collect();
+        assert!(lines[0].starts_with("line01 "));
+        assert!(lines.last().unwrap().starts_with("line20 "));
+        assert!(fitted.contains("… 6 more lines …"), "{fitted}");
+
+        // One huge line keeps both ends.
+        let long = format!("start {} end", "y".repeat(5_000));
+        let fitted = fit_rows(&long, 40, 3);
+        assert!(text_rows(&fitted, 40) <= 3);
+        assert!(fitted.starts_with("start ") && fitted.ends_with(" end"));
+
+        // Text that already fits is untouched.
+        assert_eq!(fit_rows("a\nb", 40, 2), "a\nb");
     }
 }

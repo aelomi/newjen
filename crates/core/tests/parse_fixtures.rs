@@ -2,7 +2,9 @@
 
 mod common;
 
-use newjen_core::protocol::{ContentBlock, Incoming, StreamEvent};
+use newjen_core::protocol::{
+    ContentBlock, Incoming, PermissionAnswer, StreamEvent, permission_response,
+};
 
 #[test]
 fn every_out_line_of_every_fixture_parses_into_a_known_variant() {
@@ -83,4 +85,31 @@ fn permission_request_fields_are_decoded() {
     );
     assert!(request.description.is_some());
     assert_eq!(request.suggestions.len(), 3);
+}
+
+#[test]
+fn allow_for_session_reply_matches_the_live_verified_write_answer() {
+    // `write_allow_session` records the answer that was verified live to auto-approve the
+    // next Write. Our encoder must produce exactly that `updatedPermissions`.
+    let lines = common::load("write_allow_session");
+    let request_line = lines
+        .iter()
+        .find(|line| line.out && line.msg["type"] == "control_request")
+        .expect("a control_request");
+    let Incoming::PermissionRequest(request) = Incoming::from_value(request_line.msg.clone())
+    else {
+        panic!("expected a permission request");
+    };
+    assert_eq!(request.tool_name, "Write");
+    let recorded = lines
+        .iter()
+        .find(|line| !line.out && line.msg["type"] == "control_response")
+        .expect("the recorded answer");
+
+    let ours = permission_response(&request, PermissionAnswer::AllowForSession);
+    assert_eq!(ours, recorded.msg);
+    assert_eq!(
+        ours["response"]["response"]["updatedPermissions"],
+        serde_json::json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}])
+    );
 }

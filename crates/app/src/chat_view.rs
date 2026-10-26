@@ -9,7 +9,8 @@
 //!
 //! Every change ends with `cx.notify()`, which asks GPUI to call `render` again.
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -21,20 +22,20 @@ use ely_gpui_component::layout::{h_stack, v_stack};
 use ely_gpui_component::motion;
 use ely_gpui_component::primitives::FocusScope;
 use ely_gpui_component::shell::TitleBar;
-use ely_gpui_component::theme::{ActiveTheme, Elevation, Radius, TextSize};
+use ely_gpui_component::theme::{ActiveTheme, ControlSize, Elevation, Radius, TextSize};
 use ely_gpui_component::typography::{Caption, Kbd, Title};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription, Task, Window,
-    div, prelude::*, px,
+    IntoElement, KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
+    Task, Window, div, font, prelude::*, px,
 };
 use newjen_core::{
     Item, PermissionAnswer, Session, SessionConfig, SessionEvent, Status, ToolState, Transcript,
 };
 
-use crate::approval;
-use crate::format::short_path;
-use crate::keys::{self, AllowOnce, Deny, Stop};
+use crate::approval::{self, Room};
+use crate::format::{fit_rows, short_path, text_rows};
+use crate::keys::{self, ApprovalKey, Stop};
 use crate::rows::{self, OnRestart};
 
 /// The conversation column is capped at this width and centered, as in the mocks.
@@ -44,9 +45,33 @@ const COLUMN_WIDTH: Pixels = px(720.0);
 const DOCK_RISE: f32 = 6.0;
 
 /// ⌘↵ and Esc are ignored for this long after a new approval appears, and for this long after
-/// each ignored press. Without it a double-tap, or a held key repeating, could answer the next
-/// queued request before its dock is even visible. Mouse clicks are not affected.
+/// each ignored press. Without it a quick double-tap could answer the next queued request
+/// before its dock is even visible. (A held key is handled separately: its repeats never
+/// answer anything, see `keys::approval_key`.) Mouse clicks are not affected.
 const KEY_ANSWER_DELAY: Duration = Duration::from_millis(300);
+
+// Sizes used to work out how much of an approval's detail fits above the dock's buttons (see
+// `dock_room`). Ely's PermissionPrompt has no height limit, so without this a long command at
+// the smallest window size (640x480) pushes Allow and Deny below the window's edge.
+/// Left and right padding around the bottom column (`px_4`).
+const PAGE_PADDING: f32 = 32.0;
+/// Space above and below the dock (`pt_2` + `pb_4`).
+const BOTTOM_PADDING: f32 = 24.0;
+/// The prompt's border (1 px each side) and padding (`p_4`), plus the detail box's side
+/// padding (`px_2`) or the title's icon and gap, whichever is wider.
+const DETAIL_INSET: f32 = 2.0 + 32.0 + 22.0;
+/// The prompt's border and padding, its two gaps (`gap_3`) and the detail box's own padding
+/// (`py_1p5`), top to bottom. The button row and the text rows are added on top.
+const PROMPT_CHROME: f32 = 2.0 + 32.0 + 24.0 + 12.0;
+/// Height kept for the conversation above the dock, so you still see what Claude is doing.
+const CONVERSATION_RESERVE: f32 = 80.0;
+/// GPUI's default line height: the golden ratio times the font size.
+const LINE_HEIGHT: f32 = 1.618;
+/// The title wraps to at most this many rows (a deep file path is cut in its middle).
+const TITLE_ROWS: usize = 2;
+/// The detail never takes more rows than this, nor fewer (the conversation shrinks instead).
+const DETAIL_ROWS_MAX: usize = 9;
+const DETAIL_ROWS_MIN: usize = 3;
 
 /// Rough room the title bar keeps for the centered "Newjen" title and the traffic lights, and
 /// the width of one small mono character, used to decide how much of the project path fits.
@@ -75,10 +100,9 @@ pub struct ChatView {
     field: Entity<TextInput>,
     /// The placeholder currently set on the field, to avoid resetting it every event.
     placeholder: SharedString,
-    /// Focus target while the field is disabled for an approval, so ⌘↵ and Esc reach us.
+    /// Focus target while an approval is pending (the dock replaces the composer, so the field
+    /// is not on screen), so ⌘↵ and Esc reach us.
     root: FocusHandle,
-    /// True while the field is disabled because an approval is pending.
-    field_locked: bool,
     /// The approval the dock is showing, to notice when a new one takes its place.
     dock_request: Option<String>,
     /// Keyboard answers (⌘↵, Esc) are ignored until this moment; see `KEY_ANSWER_DELAY`.
@@ -118,7 +142,6 @@ impl ChatView {
             field,
             placeholder,
             root: cx.focus_handle(),
-            field_locked: false,
             dock_request: None,
             keys_ready_at: None,
             _subscriptions: vec![on_quit],
@@ -165,17 +188,7 @@ impl ChatView {
                     }
                 }));
             }
-            Err(error) => {
-                self.notice = Some(Notice {
-                    title: "Could not start Claude Code".to_string(),
-                    detail: format!(
-                        "{error:#}.\n\nInstall Claude Code and run `claude` once in a terminal to \
-                         log in, then try again. Newjen looked for `{}` (set NEWJEN_CLAUDE to \
-                         use another path).",
-                        program.display()
-                    ),
-                });
-            }
+            Err(error) => self.notice = Some(spawn_notice(&error, &program)),
         }
     }
 
@@ -186,8 +199,9 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Keeps the text field in step with the conversation: disabled (and focus on the root)
-    /// while an approval is pending, and a placeholder that fits the moment.
+    /// Keeps focus and the text field in step with the conversation: focus on the root while
+    /// an approval is pending (so ⌘↵ and Esc reach `on_key_down`), back in the field
+    /// afterwards, and a placeholder that fits the moment.
     fn sync_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let front = self
             .transcript
@@ -196,20 +210,18 @@ impl ChatView {
         if front != self.dock_request {
             // A new request is on the dock: give the user a moment to see it.
             self.keys_ready_at = front.as_ref().map(|_| Instant::now() + KEY_ANSWER_DELAY);
+            match (&self.dock_request, &front) {
+                // The dock appears in place of the composer.
+                (None, Some(_)) => window.focus(&self.root, cx),
+                // The last approval was answered: the composer is back.
+                (Some(_), None) => {
+                    let handle = self.field_focus(cx);
+                    window.focus(&handle, cx);
+                }
+                // One request replaced by the next, or nothing to nothing: focus stays.
+                _ => {}
+            }
             self.dock_request = front;
-        }
-        let pending = self.dock_request.is_some();
-        if pending && !self.field_locked {
-            self.field_locked = true;
-            self.field
-                .update(cx, |field, cx| field.set_disabled(true, cx));
-            window.focus(&self.root, cx);
-        } else if !pending && self.field_locked {
-            self.field_locked = false;
-            self.field
-                .update(cx, |field, cx| field.set_disabled(false, cx));
-            let handle = self.field_focus(cx);
-            window.focus(&handle, cx);
         }
 
         let placeholder = SharedString::from(match self.transcript.status() {
@@ -241,6 +253,8 @@ impl ChatView {
         };
         match session.send_prompt(&text) {
             Ok(()) => {
+                // Writing worked, so an older "could not reach Claude" notice is out of date.
+                self.notice = None;
                 self.transcript.push_user(&text);
                 // Ely's composer leaves clearing the field to its owner.
                 self.field.update(cx, |field, cx| field.set_text("", cx));
@@ -311,7 +325,8 @@ impl ChatView {
         self.notice = None;
         // The old process's own exit event will never arrive (its pump is dropped below), so
         // end its turn here as a requested stop would. Otherwise a restart pressed mid-turn
-        // (old error cards keep their button) leaves the view stuck in Working.
+        // (the app's notice keeps its button then, see `rows::can_retry`) leaves the view
+        // stuck in Working.
         if self.session.is_some() {
             self.transcript.apply(&SessionEvent::Exited {
                 code: None,
@@ -325,7 +340,8 @@ impl ChatView {
     }
 
     /// Whether a keyboard answer may go through now. A press that comes too soon is ignored
-    /// and pushes the moment back, so holding the key down never answers anything.
+    /// and pushes the moment back, so tapping quickly never answers a request you have not
+    /// seen yet.
     fn keys_ready(&mut self) -> bool {
         let now = Instant::now();
         match self.keys_ready_at {
@@ -337,15 +353,27 @@ impl ChatView {
         }
     }
 
-    fn on_allow_once(&mut self, _: &AllowOnce, window: &mut Window, cx: &mut Context<Self>) {
-        if self.keys_ready() {
-            self.answer(None, PermissionAnswer::AllowOnce, window, cx);
+    /// ⌘↵ (allow once) and Esc (deny) while an approval is pending. GPUI calls this for every
+    /// key press inside the view, before the focused element sees it (the "capture" phase).
+    /// With no approval pending it leaves every key alone, so Esc still reaches the text field
+    /// (where it may be cancelling a half-typed IME character).
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript.pending_approval().is_none() {
+            return;
         }
-    }
-
-    fn on_deny(&mut self, _: &Deny, window: &mut Window, cx: &mut Context<Self>) {
-        if self.keys_ready() {
-            self.answer(None, PermissionAnswer::Deny, window, cx);
+        let Some(key) = keys::approval_key(event) else {
+            return;
+        };
+        // An approval key while the dock is up is ours, even when it is ignored below.
+        cx.stop_propagation();
+        match key {
+            // Held down: macOS is repeating the key. Only a fresh press answers.
+            ApprovalKey::Repeat => {}
+            ApprovalKey::Answer(answer) => {
+                if self.keys_ready() {
+                    self.answer(None, answer, window, cx);
+                }
+            }
         }
     }
 
@@ -370,11 +398,15 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let on_restart = self.restart_callback(cx);
+        let busy = self.is_busy();
         let items = self.transcript.items();
+        let row_count = items.len() + usize::from(self.notice.is_some());
+        let is_notice = ix >= items.len();
+        let retry = rows::can_retry(ix + 1 == row_count, is_notice, busy).then_some(&on_restart);
         let row = if let Some(item) = items.get(ix) {
-            rows::item(item, ix + 1 == items.len(), &on_restart, cx)
+            rows::item(item, ix + 1 == items.len(), retry, cx)
         } else if let Some(notice) = &self.notice {
-            rows::error("notice".into(), &notice.title, &notice.detail, &on_restart)
+            rows::error("notice".into(), &notice.title, &notice.detail, retry)
         } else {
             div().into_any_element()
         };
@@ -452,8 +484,43 @@ impl ChatView {
         ))
     }
 
+    /// How much of an approval fits in the dock at the current window size. Returns the title
+    /// cut to `TITLE_ROWS` and the room left for the detail: columns from the dock's width and
+    /// the mono font's character width, rows from the window height minus the title bar, the
+    /// dock's padding, buttons and title, and a strip of conversation.
+    fn dock_room(&self, title: &str, window: &Window, cx: &App) -> (String, Room) {
+        let theme = cx.theme();
+        let rem = window.rem_size();
+        // Ely's prompt draws its text at the small size, the detail in the mono font.
+        let font_size = theme.text_size(TextSize::Sm).to_pixels(rem);
+        let text_system = window.text_system();
+        let mono = text_system.resolve_font(&font(theme.mono_family.clone()));
+        let char_width = text_system
+            .advance(mono, font_size, '0')
+            .map(|size| f32::from(size.width))
+            .unwrap_or(f32::from(font_size) * 0.6)
+            .max(1.0);
+        let viewport = window.viewport_size();
+        let dock_width = (f32::from(viewport.width) - PAGE_PADDING).min(f32::from(COLUMN_WIDTH));
+        // One column spare: real wrapping is a little less tidy than the estimate.
+        let cols = ((dock_width - DETAIL_INSET) / char_width).max(0.0) as usize;
+        let cols = cols.saturating_sub(1);
+
+        let title = fit_rows(title, cols, TITLE_ROWS);
+        let line_height = f32::from(font_size) * LINE_HEIGHT;
+        let used = f32::from(theme.titlebar_height().to_pixels(rem))
+            + BOTTOM_PADDING
+            + PROMPT_CHROME
+            + f32::from(theme.control_height(ControlSize::Md).to_pixels(rem))
+            + text_rows(&title, cols) as f32 * line_height
+            + CONVERSATION_RESERVE;
+        let free = (f32::from(viewport.height) - used).max(0.0);
+        let rows = ((free / line_height) as usize).clamp(DETAIL_ROWS_MIN, DETAIL_ROWS_MAX);
+        (title, Room { cols, rows })
+    }
+
     /// The approval dock, shown instead of the composer while Claude waits for an answer.
-    fn render_dock(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_dock(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let request = self.transcript.pending_approval()?;
         let mut title = approval::title(request, Some(&self.project));
         // Say when more approvals are queued behind this one (each tool waiting for an answer
@@ -475,7 +542,8 @@ impl ChatView {
         if waiting > 1 {
             title.push_str(&format!(" (1 of {waiting})"));
         }
-        let detail = approval::detail(request, Some(&self.project));
+        let (title, room) = self.dock_room(&title, window, cx);
+        let detail = approval::detail(request, Some(&self.project), room);
         let request_id = SharedString::from(request.request_id.clone());
         let view = cx.entity();
         let answered_id = request_id.clone();
@@ -550,7 +618,7 @@ impl Render for ChatView {
         } else {
             self.render_messages(cx).into_any_element()
         };
-        let bottom = match self.render_dock(cx) {
+        let bottom = match self.render_dock(window, cx) {
             Some(dock) => dock,
             None => self.render_composer(cx),
         };
@@ -560,8 +628,7 @@ impl Render for ChatView {
         div()
             .key_context(keys::CONTEXT)
             .size_full()
-            .on_action(cx.listener(Self::on_allow_once))
-            .on_action(cx.listener(Self::on_deny))
+            .capture_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::on_stop))
             .child(
                 FocusScope::new(&self.root)
@@ -586,5 +653,61 @@ impl Render for ChatView {
                             .child(div().w_full().max_w(COLUMN_WIDTH).child(bottom)),
                     ),
             )
+    }
+}
+
+/// The error row shown when `claude` could not be started, worded by what went wrong.
+fn spawn_notice(error: &anyhow::Error, program: &Path) -> Notice {
+    let program = program.display();
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .map(io::Error::kind);
+    let detail = match kind {
+        // The project folder is checked at startup, so this is the program (unless the folder
+        // was deleted since).
+        Some(io::ErrorKind::NotFound) => format!(
+            "Newjen could not find `{program}`. Install Claude Code and run `claude` once in a \
+             terminal to log in, then try again. Set NEWJEN_CLAUDE to use another path."
+        ),
+        Some(io::ErrorKind::PermissionDenied) => format!(
+            "`{program}` is not allowed to run ({error:#}). Check that it is an executable \
+             file, then try again."
+        ),
+        _ => format!("{error:#}.\n\nCheck that `{program}` runs in a terminal, then try again."),
+    };
+    Notice {
+        title: "Could not start Claude Code".to_string(),
+        detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(kind: io::ErrorKind) -> anyhow::Error {
+        // The same shape `Session::spawn` returns: the OS error with context around it.
+        anyhow::Error::new(io::Error::from(kind)).context("could not start `claude` in /work")
+    }
+
+    #[test]
+    fn spawn_notice_names_the_actual_problem() {
+        let program = Path::new("/opt/bin/claude");
+        let missing = spawn_notice(&failed(io::ErrorKind::NotFound), program);
+        assert!(missing.detail.contains("could not find `/opt/bin/claude`"));
+        assert!(missing.detail.contains("Install Claude Code"));
+
+        let denied = spawn_notice(&failed(io::ErrorKind::PermissionDenied), program);
+        assert!(denied.detail.contains("not allowed to run"));
+        assert!(!denied.detail.contains("Install Claude Code"));
+
+        let other = spawn_notice(&failed(io::ErrorKind::OutOfMemory), program);
+        assert!(
+            other
+                .detail
+                .starts_with("could not start `claude` in /work")
+        );
+        assert!(!other.detail.contains("Install Claude Code"));
     }
 }
