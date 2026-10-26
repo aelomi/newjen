@@ -40,6 +40,9 @@ pub enum Incoming {
     ControlRequest(ControlRequest),
     /// `type: "control_response"`: the CLI's answer to one of our control requests.
     ControlResponse(ControlResponse),
+    /// `type: "control_cancel_request"`: the CLI withdraws a control request it sent earlier
+    /// (for example an approval it no longer needs). Holds that request's id.
+    ControlCancelRequest { request_id: String },
     /// `type: "rate_limit_event"`: usage-limit info. Kept raw; Newjen does not use it yet.
     RateLimit(Value),
     /// `type: "result"`: the end of a turn.
@@ -69,6 +72,12 @@ impl Incoming {
             "stream_event" => parse_as(&value).map(Incoming::StreamEvent),
             "control_request" => parse_control_request(&value),
             "control_response" => parse_as(&value).map(Incoming::ControlResponse),
+            // Shape from the Python Agent SDK (`query.py`, `control_cancel_request`).
+            "control_cancel_request" => value.get("request_id").and_then(Value::as_str).map(|id| {
+                Incoming::ControlCancelRequest {
+                    request_id: id.to_string(),
+                }
+            }),
             "rate_limit_event" => Some(Incoming::RateLimit(value.clone())),
             "result" => parse_as(&value).map(Incoming::Result),
             _ => None,
@@ -523,6 +532,9 @@ pub struct PermissionRequest {
     /// `permission_suggestions` from the CLI, e.g. an `addRules` entry that would allow this
     /// command from now on. Used for "Allow for this session".
     pub suggestions: Vec<Value>,
+    /// The file or folder the call would touch, when the CLI names one (e.g. the file a
+    /// `touch` creates). Lets the UI point out paths outside the project.
+    pub blocked_path: Option<String>,
 }
 
 impl PermissionRequest {
@@ -543,6 +555,7 @@ impl PermissionRequest {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default(),
+            blocked_path: text("blocked_path"),
         })
     }
 }
@@ -617,11 +630,55 @@ fn allow(request: &PermissionRequest) -> Value {
     json!({ "behavior": "allow", "updatedInput": request.input })
 }
 
+/// What "Always allow" would remember for a request. The UI can show this *before* the click,
+/// e.g. "Always allow → remembers `touch a.txt` for this session".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionScope {
+    /// The rules that would be remembered until claude exits, as readable text: a rule's
+    /// content (a Bash command such as `npm test *`), or `server · tool` for one MCP tool.
+    Remembers(Vec<String>),
+    /// "Always allow" would act as allow once, for this reason.
+    OnceOnly(OnceReason),
+}
+
+/// Why "Always allow" falls back to allow once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnceReason {
+    /// A file edit (Write, Edit, MultiEdit, NotebookEdit). Every safe-looking rule for edits
+    /// turned out too broad or useless (verified live; see `session_permissions`).
+    Edit,
+    /// The CLI offered no narrow rule, and there is no exact Bash command to name.
+    NoSafeRule,
+}
+
+/// Tools that change files. "Always allow" never remembers anything for them.
+const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// What "Always allow" would remember for `request`. Built from the same rules that
+/// [`permission_response`] sends, so the label can never promise more than the answer does.
+pub fn session_scope(request: &PermissionRequest) -> SessionScope {
+    if EDIT_TOOLS.contains(&request.tool_name.as_str()) {
+        return SessionScope::OnceOnly(OnceReason::Edit);
+    }
+    let permissions = session_permissions(request);
+    if permissions.is_empty() {
+        return SessionScope::OnceOnly(OnceReason::NoSafeRule);
+    }
+    let texts = permissions
+        .iter()
+        .filter_map(|permission| permission.get("rules").and_then(Value::as_array))
+        .flatten()
+        .map(rule_text)
+        .collect();
+    SessionScope::Remembers(texts)
+}
+
 /// True if answering `request` with [`PermissionAnswer::AllowForSession`] really makes the
 /// CLI remember the approval. False means it is sent as a plain allow-once, so the UI can tell
-/// the user that the next similar call will ask again.
+/// the user that the next similar call will ask again. Same as checking
+/// [`session_scope`] for `Remembers`.
 pub fn allows_for_session(request: &PermissionRequest) -> bool {
-    !session_permissions(request).is_empty()
+    matches!(session_scope(request), SessionScope::Remembers(_))
 }
 
 /// What to send as `updatedPermissions` for "Allow for this session". Everything returned has
@@ -629,12 +686,14 @@ pub fn allows_for_session(request: &PermissionRequest) -> bool {
 /// settings file (the CLI's own suggestions usually say `localSettings`). An empty list means
 /// "nothing safe to remember": the answer is then a plain allow-once.
 ///
-/// 1. The CLI's `addRules` suggestions (e.g. Bash `touch a.txt`).
-/// 2. Else, for Bash, a rule naming the exact command, so only identical calls are approved.
+/// 1. Nothing for file edits (see [`EDIT_TOOLS`]).
+/// 2. The CLI's `addRules` suggestions that are narrow (see [`is_narrow_suggestion`]), e.g.
+///    Bash `touch a.txt`. Other suggestions are dropped.
+/// 3. Else, for Bash, a rule naming the exact command, so only identical calls are approved.
 ///    Some calls come with no suggestions at all (seen live for `echo $(date) > when.txt`).
 ///    Skipped if the command contains `*`: in a Bash rule `*` is a wildcard, so the rule would
 ///    also approve other commands.
-/// 3. Else nothing. Verified live with claude 2.1.310, the other options are too broad:
+/// 4. Else nothing. Verified live with claude 2.1.310, the other options are too broad:
 ///    - The `setMode` `acceptEdits` suggestion (what Write and Edit offer) also auto-approves
 ///      file-changing Bash commands such as `rm` and `mkdir` for the rest of the session.
 ///    - A whole-tool rule such as `{"toolName": "Write"}` also approved a Write outside the
@@ -642,10 +701,13 @@ pub fn allows_for_session(request: &PermissionRequest) -> bool {
 ///    - An exact-file Write rule did not match a later write to the same file, so it is
 ///      useless.
 fn session_permissions(request: &PermissionRequest) -> Vec<Value> {
+    if EDIT_TOOLS.contains(&request.tool_name.as_str()) {
+        return Vec::new();
+    }
     let rules: Vec<Value> = request
         .suggestions
         .iter()
-        .filter(|suggestion| suggestion.get("type").and_then(Value::as_str) == Some("addRules"))
+        .filter(|suggestion| is_narrow_suggestion(suggestion))
         .map(|suggestion| {
             let mut rule = suggestion.clone();
             rule["destination"] = Value::String("session".to_string());
@@ -675,6 +737,59 @@ fn session_permissions(request: &PermissionRequest) -> Vec<Value> {
     })]
 }
 
+/// True for an `addRules` allow suggestion whose every rule is narrow: it has a `ruleContent`
+/// (such as one Bash command), or it names exactly one MCP tool (`mcp__server__tool`). A bare
+/// rule such as `{"toolName": "WebSearch"}` would allow the whole tool, so a suggestion with
+/// one of those is dropped.
+fn is_narrow_suggestion(suggestion: &Value) -> bool {
+    let text = |name: &str| suggestion.get(name).and_then(Value::as_str);
+    if text("type") != Some("addRules") || text("behavior") != Some("allow") {
+        return false;
+    }
+    let Some(rules) = suggestion.get("rules").and_then(Value::as_array) else {
+        return false;
+    };
+    !rules.is_empty()
+        && rules.iter().all(|rule| {
+            let has_content = rule
+                .get("ruleContent")
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.trim().is_empty());
+            has_content || bare_mcp_tool(rule).is_some()
+        })
+}
+
+/// For a rule with no content that names one MCP tool, that tool's name.
+fn bare_mcp_tool(rule: &Value) -> Option<&str> {
+    let tool = rule.get("toolName").and_then(Value::as_str)?;
+    // `mcp__server` alone would allow every tool of that server: require `mcp__server__tool`.
+    let (server, name) = tool.strip_prefix("mcp__")?.split_once("__")?;
+    (!server.is_empty() && !name.is_empty()).then_some(tool)
+}
+
+/// The readable text of one forwarded rule: its content, or the MCP tool's display name.
+fn rule_text(rule: &Value) -> String {
+    match rule.get("ruleContent").and_then(Value::as_str) {
+        Some(content) if !content.trim().is_empty() => content.to_string(),
+        _ => crate::transcript::display_name(bare_mcp_tool(rule).unwrap_or_default()),
+    }
+}
+
+/// The error reply to a control request Newjen does not handle, so the CLI never waits for an
+/// answer that will not come. The shape is the Agent SDK's `ControlErrorResponse`
+/// (`{subtype: "error", request_id, error}`, Python SDK `types.py`; `query.py` sends it the
+/// same way when a request handler fails).
+pub fn control_error_response(request_id: &str, error: &str) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "error",
+            "request_id": request_id,
+            "error": error,
+        },
+    })
+}
+
 /// Asks the CLI to stop the current turn. `request_id` is any id we choose; the CLI echoes it
 /// in its `control_response`.
 pub fn interrupt_request(request_id: &str) -> Value {
@@ -698,6 +813,7 @@ mod tests {
             input: json!({ "command": "touch a.txt" }),
             description: None,
             suggestions,
+            blocked_path: None,
         }
     }
 
@@ -862,6 +978,110 @@ mod tests {
             assert!(session_answer_is_allow_once(&request));
             assert!(!allows_for_session(&request));
         }
+    }
+
+    /// A request for `tool_name` with one synthetic suggestion.
+    fn request_with(tool_name: &str, suggestion: Value) -> PermissionRequest {
+        let mut request = bash_request(vec![suggestion]);
+        request.tool_name = tool_name.to_string();
+        request.input = json!({"query": "x"});
+        request
+    }
+
+    #[test]
+    fn a_bare_whole_tool_suggestion_is_allow_once() {
+        let request = request_with(
+            "WebSearch",
+            json!({"type": "addRules", "rules": [{"toolName": "WebSearch"}],
+                   "behavior": "allow", "destination": "localSettings"}),
+        );
+        assert!(session_answer_is_allow_once(&request));
+        assert_eq!(
+            session_scope(&request),
+            SessionScope::OnceOnly(OnceReason::NoSafeRule)
+        );
+    }
+
+    #[test]
+    fn a_bare_rule_for_one_mcp_tool_is_forwarded() {
+        let request = request_with(
+            "mcp__x__y",
+            json!({"type": "addRules", "rules": [{"toolName": "mcp__x__y"}],
+                   "behavior": "allow", "destination": "localSettings"}),
+        );
+        assert_eq!(
+            session_permissions_sent(&request),
+            json!([{"type": "addRules", "rules": [{"toolName": "mcp__x__y"}],
+                    "behavior": "allow", "destination": "session"}])
+        );
+        assert_eq!(
+            session_scope(&request),
+            SessionScope::Remembers(vec!["x · y".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_suggestion_with_one_bare_non_mcp_rule_is_dropped() {
+        let request = request_with(
+            "WebFetch",
+            json!({"type": "addRules", "rules": [
+                       {"toolName": "WebFetch", "ruleContent": "domain:example.com"},
+                       {"toolName": "WebSearch"}],
+                   "behavior": "allow", "destination": "localSettings"}),
+        );
+        assert!(session_answer_is_allow_once(&request));
+        assert!(!allows_for_session(&request));
+    }
+
+    #[test]
+    fn scope_names_the_remembered_rule_before_the_click() {
+        let request = bash_request(vec![json!({"type": "addRules", "rules": [
+            {"toolName": "Bash", "ruleContent": "npm test *"}],
+            "behavior": "allow", "destination": "localSettings"})]);
+        assert_eq!(
+            session_scope(&request),
+            SessionScope::Remembers(vec!["npm test *".to_string()])
+        );
+        assert!(allows_for_session(&request));
+    }
+
+    #[test]
+    fn edits_are_once_only_even_with_a_narrow_suggestion() {
+        let mut request = request_with(
+            "Edit",
+            json!({"type": "addRules", "rules": [{"toolName": "Edit", "ruleContent": "a.txt"}],
+                   "behavior": "allow", "destination": "localSettings"}),
+        );
+        request.input = json!({"file_path": "/tmp/project/a.txt"});
+        assert_eq!(
+            session_scope(&request),
+            SessionScope::OnceOnly(OnceReason::Edit)
+        );
+        assert!(session_answer_is_allow_once(&request));
+    }
+
+    #[test]
+    fn control_error_response_shape() {
+        assert_eq!(
+            control_error_response("r1", "nope"),
+            json!({"type": "control_response", "response": {
+                "subtype": "error", "request_id": "r1", "error": "nope"}})
+        );
+    }
+
+    #[test]
+    fn control_cancel_request_is_parsed() {
+        assert_eq!(
+            Incoming::parse(r#"{"type":"control_cancel_request","request_id":"r9"}"#),
+            Incoming::ControlCancelRequest {
+                request_id: "r9".to_string()
+            }
+        );
+        // Without an id there is nothing to cancel.
+        assert!(matches!(
+            Incoming::parse(r#"{"type":"control_cancel_request"}"#),
+            Incoming::Unknown(_)
+        ));
     }
 
     #[test]

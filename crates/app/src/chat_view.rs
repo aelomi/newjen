@@ -31,7 +31,7 @@ use gpui::{
 };
 use newjen_core::{
     Item, PermissionAnswer, PermissionRequest, Session, SessionConfig, SessionEvent, Status,
-    ToolState, Transcript, allows_for_session,
+    ToolState, Transcript, allows_for_session, session_scope,
 };
 
 use crate::approval::{self, Room};
@@ -64,6 +64,9 @@ const DETAIL_INSET: f32 = 2.0 + 32.0 + 22.0;
 /// The prompt's border and padding, its two gaps (`gap_3`) and the detail box's own padding
 /// (`py_1p5`), top to bottom. The button row and the text rows are added on top.
 const PROMPT_CHROME: f32 = 2.0 + 32.0 + 24.0 + 12.0;
+/// The scope row under the dock ("Always allow remembers …"): one line plus the gap above it
+/// (`gap_2`).
+const SCOPE_GAP: f32 = 8.0;
 /// Height kept for the conversation above the dock, so you still see what Claude is doing.
 const CONVERSATION_RESERVE: f32 = 80.0;
 /// GPUI's default line height: the golden ratio times the font size.
@@ -294,11 +297,14 @@ impl ChatView {
     }
 
     /// Answers the pending approval. `request_id` is the request the button belonged to; a
-    /// stale click (that request was already answered) does nothing.
+    /// stale click (that request was already answered) does nothing. `shortened` says the dock
+    /// had to cut the command to fit, so "Always allow" is sent as allow once (see
+    /// `sent_answer`).
     fn answer(
         &mut self,
         request_id: Option<&str>,
-        answer: PermissionAnswer,
+        choice: PermissionAnswer,
+        shortened: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -308,16 +314,19 @@ impl ChatView {
         if request_id.is_some_and(|id| id != request.request_id) {
             return;
         }
+        let answer = sent_answer(choice, shortened);
         // Resolve first: a second click or key press now finds nothing to answer.
         self.transcript
             .resolve_approval(&request.request_id, answer);
         if let Some(session) = &self.session {
             let sent = session.answer(&request, answer);
-            // Core sends "Always allow" as a plain allow-once when it can't make Claude
-            // remember it. Say so quietly, because the next similar call will ask again.
+            // "Always allow" went out as a plain allow-once (core can't make Claude remember
+            // it, or the command was cut). The scope row said so before the click; say it
+            // again quietly, because the next similar call will ask again.
             self.notice =
                 notice_after(sent, "Could not send your answer to Claude").or_else(|| {
-                    always_fell_back(&request, answer).then(|| Notice::quiet(ALLOWED_ONCE_NOTE))
+                    always_fell_back(&request, choice, shortened)
+                        .then(|| Notice::quiet(ALLOWED_ONCE_NOTE))
                 });
         }
         self.sync_field(window, cx);
@@ -327,7 +336,7 @@ impl ChatView {
     /// ⌘. or the stop button: deny-and-stop a pending approval, otherwise interrupt the turn.
     fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.transcript.pending_approval().is_some() {
-            self.answer(None, PermissionAnswer::DenyAndStop, window, cx);
+            self.answer(None, PermissionAnswer::DenyAndStop, false, window, cx);
             return;
         }
         if !self.is_busy() {
@@ -390,7 +399,7 @@ impl ChatView {
             ApprovalKey::Repeat => {}
             ApprovalKey::Answer(answer) => {
                 if self.keys_ready() {
-                    self.answer(None, answer, window, cx);
+                    self.answer(None, answer, false, window, cx);
                 }
             }
         }
@@ -509,7 +518,7 @@ impl ChatView {
     /// How much of an approval fits in the dock at the current window size. Returns the title
     /// cut to `TITLE_ROWS` and the room left for the detail: columns from the dock's width and
     /// the mono font's character width, rows from the window height minus the title bar, the
-    /// dock's padding, buttons and title, and a strip of conversation.
+    /// dock's padding, buttons and title, the scope row under it, and a strip of conversation.
     fn dock_room(&self, title: &str, window: &Window, cx: &App) -> (String, Room) {
         let theme = cx.theme();
         let rem = window.rem_size();
@@ -535,6 +544,8 @@ impl ChatView {
             + PROMPT_CHROME
             + f32::from(theme.control_height(ControlSize::Md).to_pixels(rem))
             + text_rows(&title, cols) as f32 * line_height
+            + SCOPE_GAP
+            + line_height
             + CONVERSATION_RESERVE;
         let free = (f32::from(viewport.height) - used).max(0.0);
         let rows = ((free / line_height) as usize).clamp(DETAIL_ROWS_MIN, DETAIL_ROWS_MAX);
@@ -566,6 +577,8 @@ impl ChatView {
         }
         let (title, room) = self.dock_room(&title, window, cx);
         let detail = approval::detail(request, Some(&self.project), room);
+        let shortened = detail.shortened;
+        let scope = approval::scope_row(&session_scope(request), shortened, room.cols);
         let request_id = SharedString::from(request.request_id.clone());
         let view = cx.entity();
         let answered_id = request_id.clone();
@@ -579,20 +592,26 @@ impl ChatView {
                     Permission::Deny => PermissionAnswer::Deny,
                 };
                 view.update(cx, |view, cx| {
-                    view.answer(Some(answered_id.as_ref()), answer, window, cx)
+                    view.answer(Some(answered_id.as_ref()), answer, shortened, window, cx)
                 });
             },
         )
-        .detail(detail);
+        .detail(detail.text);
 
         let theme = cx.theme();
         // Ely's prompt draws its own surface, border and 8 px corners; this adds the floating
         // shadow on the same shape.
-        let dock = div()
-            .relative()
+        let card = div()
             .rounded(theme.radius(Radius::Lg))
             .shadow(theme.elevation(Elevation::Floating))
             .child(prompt);
+        // Ely's prompt has no slot between its detail and its buttons, so the scope row sits
+        // just under the card. `dock_room` counts it, so the buttons stay on screen.
+        let dock = v_stack()
+            .relative()
+            .gap_2()
+            .child(card)
+            .child(rows::scope(&scope, cx));
         // Enters once per request: fade in while rising 6 px, 120 ms, ease-out. Ely shortens
         // it to 1 ms when its theme's `reduced_motion` flag is set; note that nothing sets that
         // flag from macOS's Reduce Motion setting yet, so today it always plays.
@@ -717,10 +736,24 @@ fn notice_after(sent: anyhow::Result<()>, failed: &str) -> Option<Notice> {
     ))
 }
 
-/// True when the user picked "Always allow" but core sends it as a plain allow-once, because
-/// it can't make the CLI remember this kind of call (`newjen_core::allows_for_session`).
-fn always_fell_back(request: &PermissionRequest, answer: PermissionAnswer) -> bool {
-    answer == PermissionAnswer::AllowForSession && !allows_for_session(request)
+/// What to send for the user's `choice`. When the dock cut the command to fit (`shortened`),
+/// "Always allow" is sent as allow once: nothing is remembered that the user could not read.
+fn sent_answer(choice: PermissionAnswer, shortened: bool) -> PermissionAnswer {
+    match choice {
+        PermissionAnswer::AllowForSession if shortened => PermissionAnswer::AllowOnce,
+        other => other,
+    }
+}
+
+/// True when the user picked "Always allow" but it acts as a plain allow-once: the command was
+/// cut to fit, or core can't make the CLI remember this kind of call
+/// (`newjen_core::allows_for_session`).
+fn always_fell_back(
+    request: &PermissionRequest,
+    choice: PermissionAnswer,
+    shortened: bool,
+) -> bool {
+    choice == PermissionAnswer::AllowForSession && (shortened || !allows_for_session(request))
 }
 
 /// Whether row `ix` gets a "Try again" button. Rows are the transcript's `item_count` items,
@@ -746,6 +779,7 @@ mod tests {
             input,
             description: None,
             suggestions: Vec::new(),
+            blocked_path: None,
         }
     }
 
@@ -755,12 +789,60 @@ mod tests {
             "Write",
             json!({"file_path": "/work/a.txt", "content": "hi"}),
         );
-        assert!(always_fell_back(&write, PermissionAnswer::AllowForSession));
+        assert!(always_fell_back(
+            &write,
+            PermissionAnswer::AllowForSession,
+            false
+        ));
         // Allow once is exactly what the user asked for: nothing to say.
-        assert!(!always_fell_back(&write, PermissionAnswer::AllowOnce));
+        assert!(!always_fell_back(
+            &write,
+            PermissionAnswer::AllowOnce,
+            false
+        ));
         // An exact Bash command is remembered for the session, so no note.
         let bash = request("Bash", json!({"command": "ls -la"}));
-        assert!(!always_fell_back(&bash, PermissionAnswer::AllowForSession));
+        assert!(!always_fell_back(
+            &bash,
+            PermissionAnswer::AllowForSession,
+            false
+        ));
+    }
+
+    #[test]
+    fn always_allow_on_a_shortened_command_is_sent_as_allow_once() {
+        let bash = request("Bash", json!({"command": "ls -la"}));
+        let always = PermissionAnswer::AllowForSession;
+        assert_eq!(sent_answer(always, true), PermissionAnswer::AllowOnce);
+        assert!(always_fell_back(&bash, always, true));
+        // Shown in full: remembered as asked.
+        assert_eq!(sent_answer(always, false), always);
+        // Other answers are never changed.
+        assert_eq!(
+            sent_answer(PermissionAnswer::Deny, true),
+            PermissionAnswer::Deny
+        );
+    }
+
+    #[test]
+    fn an_interrupt_timeout_leaves_the_composer_usable_with_try_again() {
+        let mut transcript = Transcript::new();
+        transcript.push_user("hello");
+        transcript.apply(&SessionEvent::InterruptTimedOut);
+        // The session shuts claude down right after; that must not change the outcome.
+        transcript.apply(&SessionEvent::Exited {
+            code: None,
+            requested: true,
+        });
+        let busy = is_busy(transcript.status());
+        assert!(!busy, "the composer must not stay on \"Working\"");
+        let items = transcript.items();
+        let last = items.len() - 1;
+        assert!(matches!(
+            &items[last],
+            Item::Error { title, .. } if title == "Claude didn't stop, so Newjen ended the session"
+        ));
+        assert!(offers_retry(last, items.len(), None, busy));
     }
 
     #[test]

@@ -85,6 +85,10 @@ fn permission_request_fields_are_decoded() {
     );
     assert!(request.description.is_some());
     assert_eq!(request.suggestions.len(), 3);
+    assert_eq!(
+        request.blocked_path.as_deref(),
+        Some("/tmp/project/newjen_probe.txt")
+    );
 }
 
 #[test]

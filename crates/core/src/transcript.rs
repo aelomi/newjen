@@ -241,6 +241,7 @@ impl Transcript {
                 }
             }
             SessionEvent::WriteFailed(detail) => self.apply_write_failed(detail),
+            SessionEvent::InterruptTimedOut => self.apply_interrupt_timed_out(),
             SessionEvent::Exited { code, requested } => self.apply_exit(*code, *requested),
         }
     }
@@ -261,6 +262,23 @@ impl Transcript {
         self.status = Status::Failed;
     }
 
+    /// claude ignored a stop request, so the session ended the process. Failed (not Stopped),
+    /// so the UI offers "Try again", which resumes the conversation in a fresh claude.
+    fn apply_interrupt_timed_out(&mut self) {
+        if self.status == Status::Failed {
+            return; // One error is enough (see `apply_write_failed`).
+        }
+        self.finish_turn();
+        self.close_unfinished_tools("Stopped");
+        self.push_error(
+            "Claude didn't stop, so Newjen ended the session",
+            "Claude did not confirm the stop request in time. Try again to continue the \
+             conversation."
+                .to_string(),
+        );
+        self.status = Status::Failed;
+    }
+
     fn apply_incoming(&mut self, incoming: &Incoming) {
         match incoming {
             Incoming::System(message) => self.apply_system(message),
@@ -269,6 +287,7 @@ impl Transcript {
             Incoming::User(message) => self.apply_user(message),
             Incoming::PermissionRequest(request) => self.apply_permission_request(request),
             Incoming::Result(result) => self.apply_result(result),
+            Incoming::ControlCancelRequest { request_id } => self.apply_cancel(request_id),
             // Hooks, rate limits, answers to our own requests and unknown lines change nothing.
             Incoming::ControlRequest(_)
             | Incoming::ControlResponse(_)
@@ -466,6 +485,28 @@ impl Transcript {
         }
         self.pending.push_back(request.clone());
         self.status = Status::Waiting;
+    }
+
+    /// The CLI withdrew an approval request: it no longer waits for the answer, so drop the
+    /// request from the queue and close its tool card.
+    fn apply_cancel(&mut self, request_id: &str) {
+        let Some(position) = self
+            .pending
+            .iter()
+            .position(|request| request.request_id == request_id)
+        else {
+            return; // Already answered, or not an approval.
+        };
+        let request = self.pending.remove(position).expect("position is valid");
+        let tool_use_id = request.tool_use_id.unwrap_or(request.request_id);
+        if let Some(Item::Tool { state, output, .. }) = self.find_tool_mut(&tool_use_id) {
+            *state = ToolState::Failed;
+            *output = Some("Cancelled by Claude".to_string());
+        }
+        self.tool_started.remove(&tool_use_id);
+        if self.pending.is_empty() && self.status == Status::Waiting {
+            self.status = Status::Working;
+        }
     }
 
     fn apply_result(&mut self, result: &ResultMessage) {

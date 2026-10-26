@@ -653,3 +653,54 @@ fn stop_during_thinking_leaves_the_previous_reply_alone() {
         Some(Item::Assistant { interrupted: false, text, .. }) if text == "First reply"
     ));
 }
+
+#[test]
+fn a_cancelled_approval_is_dropped_and_its_tool_fails() {
+    let mut transcript = Transcript::new();
+    transcript.push_user("go");
+    feed(
+        &mut transcript,
+        serde_json::json!({"type": "control_request", "request_id": "r1", "request": {
+            "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t1",
+            "input": {"command": "ls"}}}),
+    );
+    assert_eq!(transcript.status(), Status::Waiting);
+    feed(
+        &mut transcript,
+        serde_json::json!({"type": "control_cancel_request", "request_id": "r1"}),
+    );
+    assert!(transcript.pending_approval().is_none());
+    assert_eq!(transcript.status(), Status::Working);
+    assert!(matches!(
+        &transcript.items()[1],
+        Item::Tool { state: ToolState::Failed, output: Some(output), .. }
+            if output == "Cancelled by Claude"
+    ));
+}
+
+#[test]
+fn an_interrupt_timeout_fails_the_turn_with_one_error() {
+    let mut transcript = Transcript::new();
+    transcript.push_user("go");
+    feed(
+        &mut transcript,
+        serde_json::json!({"type": "assistant", "message": {"id": "m1", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "sleep 99"}}]}}),
+    );
+    transcript.apply(&SessionEvent::InterruptTimedOut);
+    // The shutdown that follows must not change the outcome.
+    transcript.apply(&SessionEvent::Exited {
+        code: None,
+        requested: true,
+    });
+    assert_eq!(transcript.status(), Status::Failed);
+    assert_eq!(
+        tools(&transcript),
+        [("Bash".to_string(), ToolState::Failed)]
+    );
+    let titles: Vec<String> = errors(&transcript)
+        .into_iter()
+        .map(|(title, _)| title)
+        .collect();
+    assert_eq!(titles, ["Claude didn't stop, so Newjen ended the session"]);
+}

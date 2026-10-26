@@ -1878,6 +1878,56 @@
                 },
                 {
                   "type": "frame",
+                  "id": "DafJR",
+                  "name": "Scope",
+                  "width": "fill_container",
+                  "gap": 6,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "OZzqO",
+                      "name": "Icon",
+                      "width": 12,
+                      "height": 12,
+                      "icon": "info",
+                      "library": "lucide",
+                      "fill": "$fg-subtle"
+                    },
+                    {
+                      "type": "text",
+                      "id": "wyFeB",
+                      "name": "Lead",
+                      "fill": "$fg-subtle",
+                      "content": "Always allow remembers",
+                      "fontFamily": "$font",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "oHH64",
+                      "name": "Rule",
+                      "fill": "$fg-muted",
+                      "content": "touch notes.md",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "gwHIz",
+                      "name": "Tail",
+                      "fill": "$fg-subtle",
+                      "content": "for this session",
+                      "fontFamily": "$font",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
                   "id": "Q81WNs",
                   "name": "Actions",
                   "width": "fill_container",
@@ -4078,6 +4128,150 @@
           "fontFamily": "$font",
           "fontSize": 13,
           "fontWeight": "normal"
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "S18nle",
+      "x": 8580,
+      "y": 1720,
+      "name": "Dock scope variants",
+      "theme": {
+        "mode": "dark"
+      },
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "layout": "vertical",
+      "gap": 24,
+      "padding": 32,
+      "children": [
+        {
+          "type": "frame",
+          "id": "a88ju",
+          "name": "Variant",
+          "gap": 6,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "icon",
+              "id": "TethE",
+              "name": "Icon",
+              "width": 12,
+              "height": 12,
+              "icon": "info",
+              "library": "lucide",
+              "fill": "$fg-subtle"
+            },
+            {
+              "type": "text",
+              "id": "ZschE",
+              "name": "Lead",
+              "fill": "$fg-subtle",
+              "content": "Always allow remembers",
+              "fontFamily": "$font",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "pixde",
+              "name": "Rule",
+              "fill": "$fg-muted",
+              "content": "npm test *",
+              "fontFamily": "$mono",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "PAWcK",
+              "name": "Tail",
+              "fill": "$fg-subtle",
+              "content": "for this session (any arguments)",
+              "fontFamily": "$font",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "QrKpg",
+          "name": "Variant",
+          "gap": 6,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "icon",
+              "id": "R4IBv",
+              "name": "Icon",
+              "width": 12,
+              "height": 12,
+              "icon": "info",
+              "library": "lucide",
+              "fill": "$fg-subtle"
+            },
+            {
+              "type": "text",
+              "id": "FwBWV",
+              "name": "Lead",
+              "fill": "$fg-subtle",
+              "content": "Always allow works once here —",
+              "fontFamily": "$font",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "U1NVX",
+              "name": "Rule",
+              "fill": "$fg-muted",
+              "content": "no safe rule for edits",
+              "fontFamily": "$font",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "mjlz2",
+          "name": "Variant",
+          "gap": 6,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "icon",
+              "id": "xm8AL",
+              "name": "Icon",
+              "width": 12,
+              "height": 12,
+              "icon": "info",
+              "library": "lucide",
+              "fill": "$fg-subtle"
+            },
+            {
+              "type": "text",
+              "id": "FU3DS",
+              "name": "Lead",
+              "fill": "$fg-subtle",
+              "content": "Always allow works once here —",
+              "fontFamily": "$font",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "gtyF8",
+              "name": "Rule",
+              "fill": "$fg-muted",
+              "content": "the command was shortened to fit",
+              "fontFamily": "$font",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            }
+          ]
         }
       ]
     }

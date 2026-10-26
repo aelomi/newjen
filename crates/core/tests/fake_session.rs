@@ -165,7 +165,7 @@ fn shutdown_kills_the_process_group_within_200ms() {
         SessionEvent::Line(Incoming::System(message)) => assert_eq!(message.subtype, "ready"),
         other => panic!("unexpected event {other:?}"),
     }
-    let grandchild_pid = find_child_of(session.pid()).expect("the script's sleep");
+    let grandchild_pid = find_sleep_child_of(session.pid()).expect("the script's sleep");
     let pid = session.pid();
 
     let started = Instant::now();
@@ -393,16 +393,223 @@ fn crash_is_reported_even_when_a_tool_keeps_stdout_open() {
     );
 }
 
-/// The pid of a child of `parent`, using `pgrep -P`.
-fn find_child_of(parent: u32) -> Option<u32> {
+/// The pid of a `sleep` child of `parent`, using `pgrep -P`. (claude's other child is the
+/// owner-pipe watcher, a shell.)
+fn find_sleep_child_of(parent: u32) -> Option<u32> {
+    pgrep(&["-P", &parent.to_string(), "-x", "sleep"])
+        .first()
+        .copied()
+}
+
+/// The pids `pgrep` prints for `args`.
+fn pgrep(args: &[&str]) -> Vec<u32> {
     let output = std::process::Command::new("pgrep")
-        .args(["-P", &parent.to_string()])
+        .args(args)
         .output()
-        .ok()?;
+        .expect("run pgrep");
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// The processes in claude's process group: claude, its tools, and the watcher.
+fn group_members(pid: u32) -> Vec<u32> {
+    pgrep(&["-g", &pid.to_string()])
+}
+
+/// Waits for the next event that is not a stdout or stderr line.
+fn next_lifecycle_event(events: &async_channel::Receiver<SessionEvent>) -> SessionEvent {
+    loop {
+        match common::next_event(events, TIMEOUT) {
+            SessionEvent::Line(_) | SessionEvent::Stderr(_) => {}
+            other => return other,
+        }
+    }
+}
+
+#[test]
+fn unsupported_control_requests_get_an_error_reply() {
+    // A stand-in that sends a control request Newjen does not handle, then prints the line it
+    // gets back on stderr.
+    let dir = tempfile::tempdir().unwrap();
+    let config = script_config(
+        dir.path(),
+        "hooked-claude",
+        &[
+            r#"echo '{"type":"control_request","request_id":"hook_1","request":{"subtype":"hook_callback","callback_id":"c1"}}'"#,
+            "read line",
+            r#"printf '%s\n' "$line" >&2"#,
+            "exec sleep 60",
+        ],
+    );
+    let (session, events) = Session::spawn(config).unwrap();
+    let reply = loop {
+        if let SessionEvent::Stderr(line) = common::next_event(&events, TIMEOUT) {
+            break line;
+        }
+    };
+    let reply: serde_json::Value = serde_json::from_str(&reply).expect("the reply is JSON");
+    assert_eq!(
+        reply,
+        serde_json::json!({"type": "control_response", "response": {
+            "subtype": "error", "request_id": "hook_1",
+            "error": "Newjen does not support hook_callback yet"}})
+    );
+    session.shutdown();
+}
+
+#[test]
+fn claude_and_its_tools_die_when_newjen_dies() {
+    // Everything here ignores SIGTERM, so only the watcher's SIGKILL (2 s after its SIGTERM)
+    // can end it. Nothing in Newjen signals the group: the session is still "running".
+    let dir = tempfile::tempdir().unwrap();
+    let config = script_config(
+        dir.path(),
+        "stubborn-claude",
+        &[
+            "trap '' TERM",
+            "sleep 60 &",
+            r#"echo "{\"type\":\"system\",\"subtype\":\"$!\"}""#,
+            "wait",
+        ],
+    );
+    let (session, events) = Session::spawn(config).unwrap();
+    let tool_pid: u32 = match common::next_event(&events, TIMEOUT) {
+        SessionEvent::Line(Incoming::System(message)) => message.subtype.parse().unwrap(),
+        other => panic!("unexpected event {other:?}"),
+    };
+    let pid = session.pid();
+
+    session.simulate_owner_death();
+    assert!(
+        wait_until_dead(tool_pid, Duration::from_secs(4)),
+        "the tool survived its owner"
+    );
+    // claude is reaped by the waiter thread once it is killed.
+    assert!(
+        wait_until_dead(pid, Duration::from_secs(1)),
+        "claude survived"
+    );
+    let SessionEvent::Exited { requested, .. } = next_lifecycle_event(&events) else {
+        panic!("expected Exited");
+    };
+    assert!(!requested, "Newjen did not ask for this exit");
+}
+
+#[test]
+fn no_watcher_is_left_after_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = script_config(
+        dir.path(),
+        "idle-claude",
+        &[
+            r#"echo '{"type":"system","subtype":"ready"}'"#,
+            "exec sleep 60",
+        ],
+    );
+    let (session, events) = Session::spawn(config).unwrap();
+    assert!(matches!(
+        common::next_event(&events, TIMEOUT),
+        SessionEvent::Line(Incoming::System(_))
+    ));
+    let pid = session.pid();
+    assert_eq!(
+        group_members(pid).len(),
+        2,
+        "expected claude and its watcher in the group"
+    );
+
+    session.shutdown();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !group_members(pid).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        group_members(pid),
+        Vec::<u32>::new(),
+        "something outlived shutdown"
+    );
+}
+
+/// A stand-in that prints one line and then never reads stdin, so it never answers anything.
+fn deaf_config(dir: &std::path::Path) -> SessionConfig {
+    let mut config = script_config(
+        dir,
+        "deaf-claude",
+        &[
+            r#"echo '{"type":"system","subtype":"ready"}'"#,
+            "exec sleep 60",
+        ],
+    );
+    config.interrupt_ack_timeout = Duration::from_millis(200);
+    config
+}
+
+#[test]
+fn an_unanswered_interrupt_ends_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (session, events) = Session::spawn(deaf_config(dir.path())).unwrap();
+    let mut transcript = Transcript::new();
+    transcript.apply(&common::next_event(&events, TIMEOUT));
+    session.send_prompt("hello").unwrap();
+    transcript.push_user("hello");
+
+    session.interrupt().unwrap();
+    let timed_out = next_lifecycle_event(&events);
+    assert_eq!(timed_out, SessionEvent::InterruptTimedOut);
+    transcript.apply(&timed_out);
+    let exited = next_lifecycle_event(&events);
+    assert!(
+        matches!(
+            exited,
+            SessionEvent::Exited {
+                requested: true,
+                ..
+            }
+        ),
+        "{exited:?}"
+    );
+    transcript.apply(&exited);
+    assert!(wait_until_dead(session.pid(), Duration::from_secs(1)));
+
+    assert_eq!(transcript.status(), Status::Failed);
+    assert!(transcript.items().iter().any(|item| matches!(
+        item,
+        Item::Error { title, .. } if title == "Claude didn't stop, so Newjen ended the session"
+    )));
+}
+
+#[test]
+fn an_answered_interrupt_keeps_the_session() {
+    // Answers the first interrupt (Newjen numbers them from 1), then idles.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = script_config(
+        dir.path(),
+        "polite-claude",
+        &[
+            r#"echo '{"type":"system","subtype":"ready"}'"#,
+            "read line",
+            r#"echo '{"type":"control_response","response":{"subtype":"success","request_id":"newjen_interrupt_1","response":{}}}'"#,
+            "exec sleep 60",
+        ],
+    );
+    config.interrupt_ack_timeout = Duration::from_millis(500);
+    let (session, events) = Session::spawn(config).unwrap();
+    // Start the clock only once the stand-in runs, so a slow start can't look like silence.
+    assert!(matches!(
+        common::next_event(&events, TIMEOUT),
+        SessionEvent::Line(Incoming::System(_))
+    ));
+    session.interrupt().unwrap();
+    let event = common::next_event(&events, TIMEOUT);
+    assert!(
+        matches!(event, SessionEvent::Line(Incoming::ControlResponse(_))),
+        "{event:?}"
+    );
+    // Well past the deadline: nothing more happens, and claude is still running.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(events.try_recv().is_err(), "no event expected");
+    assert!(is_alive(session.pid()));
+    session.shutdown();
 }

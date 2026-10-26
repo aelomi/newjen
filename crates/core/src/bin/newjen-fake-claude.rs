@@ -6,8 +6,8 @@
 //! - The fixture path comes from the `NEWJEN_FAKE_FIXTURE` environment variable.
 //! - `out` lines are printed to stdout, one JSON object per line, like the real CLI.
 //! - For each `in` line it reads one line from stdin and checks it is valid JSON with the same
-//!   `type` (and, for a `control_response`, the same `request_id` and `behavior`). On a
-//!   mismatch it prints why to stderr and exits with code 3.
+//!   `type` (and, for a `control_response`, the same `subtype`, `request_id` and `behavior`).
+//!   On a mismatch it prints why to stderr and exits with code 3.
 //! - When the fixture is fully replayed it exits 0. (The real CLI would instead wait for stdin
 //!   to close.) If stdin closes early, it exits 0 too, like the real CLI.
 //!
@@ -94,7 +94,11 @@ fn check_input(expected: &Value, received: &str) -> Result<(), String> {
         ));
     }
     if expected["type"] == "control_response" {
-        for pointer in ["/response/request_id", "/response/response/behavior"] {
+        for pointer in [
+            "/response/subtype",
+            "/response/request_id",
+            "/response/response/behavior",
+        ] {
             if received.pointer(pointer) != expected.pointer(pointer) {
                 return Err(format!(
                     "{pointer}: expected {:?}, got {:?}",

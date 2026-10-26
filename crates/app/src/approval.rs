@@ -2,13 +2,13 @@
 //!
 //! Pure functions of the request, so they are unit-tested without a window.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use newjen_core::PermissionRequest;
 use newjen_core::transcript::{display_name, summarize};
+use newjen_core::{OnceReason, PermissionRequest, SessionScope};
 use serde_json::Value;
 
-use crate::format::{cap, fit_rows};
+use crate::format::{cap, fit_rows, middle, short_path};
 
 /// How many lines of detail the dock shows at most before it cuts the rest (for tools other
 /// than Bash, whose arguments are one line of JSON or a file path).
@@ -42,38 +42,142 @@ pub fn title(request: &PermissionRequest, cwd: Option<&Path>) -> String {
     format!("Allow Claude to use {}?", tool_label(request))
 }
 
+/// The dock's detail text, and whether what will run had to be cut to fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detail {
+    pub text: String,
+    /// The command or arguments were shortened, so the user cannot see all of what "Always
+    /// allow" would remember. The dock then treats "Always allow" as allow once.
+    pub shortened: bool,
+}
+
 /// What will run: `$ <command>` for Bash (with Claude's stated purpose under it as a `#`
 /// comment), the file for edits, otherwise the arguments as compact JSON. Cut to `room`, so a
 /// huge command cannot push the buttons off screen. A long command keeps its first and last
 /// lines with the middle cut, so the end of the command (often the part that actually runs
-/// things) is always visible before you approve it.
-pub fn detail(request: &PermissionRequest, cwd: Option<&Path>, room: Room) -> String {
-    if request.tool_name == "Bash"
+/// things) is always visible before you approve it. A last row warns when the call touches a
+/// path outside the project (`cwd`).
+pub fn detail(request: &PermissionRequest, cwd: Option<&Path>, room: Room) -> Detail {
+    // The warning gets its row first: it matters more than the purpose.
+    let outside = outside_line(request, cwd, room.cols);
+    let rows = room
+        .rows
+        .saturating_sub(usize::from(outside.is_some()))
+        .max(1);
+    let (mut text, shortened) = if request.tool_name == "Bash"
         && let Some(command) = request.input.get("command").and_then(Value::as_str)
     {
         // The purpose gets one row, unless the room is so small the command needs it.
-        let purpose = purpose(request).filter(|_| room.rows >= 3);
-        let command_rows = room.rows - usize::from(purpose.is_some());
-        let mut text = fit_rows(&format!("$ {command}"), room.cols, command_rows);
+        let purpose = purpose(request).filter(|_| rows >= 3);
+        let command_rows = rows - usize::from(purpose.is_some());
+        let full = format!("$ {command}");
+        let mut text = fit_rows(&full, room.cols, command_rows);
+        // Only the command counts as shortened: the purpose is Claude's comment, not what runs.
+        let shortened = text != full;
         if let Some(purpose) = purpose {
             text.push('\n');
             text.push_str(&fit_rows(&format!("# {purpose}"), room.cols, 1));
         }
-        return text;
-    }
-    let specific = if EDIT_TOOLS.contains(&request.tool_name.as_str()) {
-        Some(summarize(&request.tool_name, &request.input, cwd)).filter(|file| !file.is_empty())
+        (text, shortened)
     } else {
-        None
+        let specific = if EDIT_TOOLS.contains(&request.tool_name.as_str()) {
+            Some(summarize(&request.tool_name, &request.input, cwd)).filter(|file| !file.is_empty())
+        } else {
+            None
+        };
+        // Anything else (or a request missing the expected field): the raw arguments.
+        let full =
+            specific.unwrap_or_else(|| serde_json::to_string(&request.input).unwrap_or_default());
+        let text = fit_rows(&cap(&full, DETAIL_LINES, DETAIL_CHARS), room.cols, rows);
+        let shortened = text != full;
+        (text, shortened)
     };
-    // Anything else (or a request missing the expected field): the raw arguments.
-    let text =
-        specific.unwrap_or_else(|| serde_json::to_string(&request.input).unwrap_or_default());
-    fit_rows(
-        &cap(&text, DETAIL_LINES, DETAIL_CHARS),
-        room.cols,
-        room.rows,
-    )
+    if let Some(outside) = outside {
+        text.push('\n');
+        text.push_str(&outside);
+    }
+    Detail { text, shortened }
+}
+
+/// "Outside the project: <path>" when the CLI says the call touches a path outside `project`,
+/// cut in its middle to one row of `cols`.
+fn outside_line(
+    request: &PermissionRequest,
+    project: Option<&Path>,
+    cols: usize,
+) -> Option<String> {
+    let path = request.blocked_path.as_deref()?;
+    if !outside_project(path, project?) {
+        return None;
+    }
+    const LABEL: &str = "Outside the project: ";
+    let room = cols.saturating_sub(LABEL.len()).max(12);
+    Some(format!("{LABEL}{}", short_path(path, room)))
+}
+
+/// Whether `path` (absolute, or relative to the project) lies outside `project`. Symlinks are
+/// resolved first: the project folder is stored resolved (`/tmp/x` is `/private/tmp/x` on
+/// macOS), while the CLI reports paths as written, so a plain prefix check would call every
+/// file in a `/tmp` project "outside".
+fn outside_project(path: &str, project: &Path) -> bool {
+    // `join` with an absolute path gives that path unchanged. Both sides are resolved, so a
+    // `..` cannot make an outside path look inside.
+    !resolve(&project.join(path)).starts_with(resolve(project))
+}
+
+/// `path` with symlinks (and `..`) resolved as far as it exists. The file itself often does
+/// not exist yet (a `touch` asks before it creates the file), so the missing end is kept as
+/// written.
+fn resolve(path: &Path) -> PathBuf {
+    for existing in path.ancestors() {
+        if let Ok(real) = existing.canonicalize() {
+            let rest = path.strip_prefix(existing).unwrap_or(Path::new(""));
+            return real.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// The quiet row under the dock that says what "Always allow" will do, before the click:
+/// `before`, then `code` in the mono font (the rule that is remembered), then `after`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeRow {
+    pub before: String,
+    pub code: Option<String>,
+    pub after: String,
+}
+
+/// The scope row for `scope` (from `newjen_core::session_scope`). `shortened` is
+/// [`Detail::shortened`]: then "Always allow" is sent as allow once. The remembered rule is
+/// cut in its middle so the row stays one line at about `cols` columns of the detail's text.
+pub fn scope_row(scope: &SessionScope, shortened: bool, cols: usize) -> ScopeRow {
+    let once = |why: &str| ScopeRow {
+        before: format!("Always allow works once here{why}"),
+        code: None,
+        after: String::new(),
+    };
+    match scope {
+        SessionScope::OnceOnly(OnceReason::Edit) => once(" — no safe rule for edits"),
+        SessionScope::OnceOnly(OnceReason::NoSafeRule) => once(""),
+        SessionScope::Remembers(_) if shortened => once(" — the command was shortened to fit"),
+        SessionScope::Remembers(rules) => {
+            // In a rule, `*` matches anything, so say that in words.
+            let wildcard = rules.iter().any(|rule| rule.contains('*'));
+            let after = if wildcard {
+                " (any arguments) for this session"
+            } else {
+                " for this session"
+            };
+            const BEFORE: &str = "Always allow remembers ";
+            let room = cols.saturating_sub(BEFORE.len() + after.len()).max(12);
+            ScopeRow {
+                before: BEFORE.to_string(),
+                // One line: a multi-line command's line breaks are shown as ↵.
+                code: Some(middle(&rules.join(", ").replace('\n', " ↵ "), room)),
+                after: after.to_string(),
+            }
+        }
+    }
 }
 
 /// Claude's one-line reason for a call, e.g. "List files in the current directory": the CLI's
@@ -115,6 +219,7 @@ mod tests {
             input,
             description: None,
             suggestions: Vec::new(),
+            blocked_path: None,
         }
     }
 
@@ -122,12 +227,12 @@ mod tests {
     fn bash_shows_the_command() {
         let ask = request("Bash", json!({"command": "ls -la", "description": "List"}));
         assert_eq!(title(&ask, None), "Allow Bash to run this command?");
-        assert_eq!(detail(&ask, None, ROOMY), "$ ls -la\n# List");
+        assert_eq!(detail(&ask, None, ROOMY).text, "$ ls -la\n# List");
 
         let mut described = request("Bash", json!({"command": "touch a.txt"}));
         described.description = Some("Create an empty file".to_string());
         assert_eq!(
-            detail(&described, None, ROOMY),
+            detail(&described, None, ROOMY).text,
             "$ touch a.txt\n# Create an empty file"
         );
     }
@@ -137,14 +242,14 @@ mod tests {
         let cwd = Path::new("/work/app");
         let ask = request("Edit", json!({"file_path": "/work/app/src/main.rs"}));
         assert_eq!(title(&ask, Some(cwd)), "Allow Claude to edit src/main.rs?");
-        assert_eq!(detail(&ask, Some(cwd), ROOMY), "src/main.rs");
+        assert_eq!(detail(&ask, Some(cwd), ROOMY).text, "src/main.rs");
     }
 
     #[test]
     fn other_tools_show_compact_json() {
         let ask = request("mcp__linear__search", json!({"label": "billing"}));
         assert_eq!(title(&ask, None), "Allow Claude to use linear · search?");
-        assert_eq!(detail(&ask, None, ROOMY), r#"{"label":"billing"}"#);
+        assert_eq!(detail(&ask, None, ROOMY).text, r#"{"label":"billing"}"#);
 
         // The same name as the tool's card, even when the CLI calls it something else.
         let mut named = request("WebFetch", json!({"url": "https://example.com"}));
@@ -160,7 +265,7 @@ mod tests {
             .join("\n");
         let ask = request("Bash", json!({ "command": command }));
         assert_eq!(
-            detail(&ask, None, ROOMY),
+            detail(&ask, None, ROOMY).text,
             "$ echo 1\necho 2\necho 3\n… 13 more lines …\necho 17\necho 18\necho 19\necho 20"
         );
     }
@@ -176,10 +281,96 @@ mod tests {
         let mut ask = request("Bash", json!({ "command": command }));
         ask.description = Some("Rebuild everything from scratch, slowly".to_string());
         let room = Room { cols: 75, rows: 6 };
-        let shown = detail(&ask, None, room);
+        let shown = detail(&ask, None, room).text;
         assert!(text_rows(&shown, room.cols) <= room.rows, "{shown}");
         assert!(shown.starts_with("$ echo line 1 "), "{shown}");
         // The line that does the damage and the purpose stay visible.
         assert!(shown.contains("\nrm -rf build\n# Rebuild"), "{shown}");
+    }
+
+    #[test]
+    fn a_shortened_command_is_flagged_so_always_allow_acts_once() {
+        let ask = request("Bash", json!({"command": "touch notes.md"}));
+        assert!(!detail(&ask, None, ROOMY).shortened);
+        let long = (1..=40)
+            .map(|n| format!("echo {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cut = detail(&request("Bash", json!({ "command": long })), None, ROOMY);
+        assert!(cut.shortened, "{}", cut.text);
+        // A long purpose is cut too, but it is only Claude's comment: not shortened.
+        let mut chatty = request("Bash", json!({"command": "ls"}));
+        chatty.description = Some("word ".repeat(400));
+        assert!(!detail(&chatty, None, Room { cols: 40, rows: 3 }).shortened);
+
+        let scope = SessionScope::Remembers(vec!["touch notes.md".to_string()]);
+        assert_eq!(
+            scope_row(&scope, true, 80).before,
+            "Always allow works once here — the command was shortened to fit"
+        );
+    }
+
+    #[test]
+    fn the_scope_row_says_what_always_allow_remembers() {
+        let text = |row: ScopeRow| {
+            let code = row.code.map(|code| format!("`{code}`")).unwrap_or_default();
+            format!("{}{code}{}", row.before, row.after)
+        };
+        let exact = SessionScope::Remembers(vec!["touch notes.md".to_string()]);
+        assert_eq!(
+            text(scope_row(&exact, false, 80)),
+            "Always allow remembers `touch notes.md` for this session"
+        );
+        let wildcard = SessionScope::Remembers(vec!["npm test *".to_string()]);
+        assert_eq!(
+            text(scope_row(&wildcard, false, 80)),
+            "Always allow remembers `npm test *` (any arguments) for this session"
+        );
+        assert_eq!(
+            text(scope_row(
+                &SessionScope::OnceOnly(OnceReason::Edit),
+                false,
+                80
+            )),
+            "Always allow works once here — no safe rule for edits"
+        );
+        assert_eq!(
+            text(scope_row(
+                &SessionScope::OnceOnly(OnceReason::NoSafeRule),
+                false,
+                80
+            )),
+            "Always allow works once here"
+        );
+        // A long rule is cut in its middle to keep the row to one line.
+        let long = SessionScope::Remembers(vec![format!("echo {}done", "x".repeat(200))]);
+        let row = scope_row(&long, false, 80);
+        let code = row.code.expect("a rule");
+        assert!(
+            code.starts_with("echo x") && code.ends_with("done"),
+            "{code}"
+        );
+        assert!(code.chars().count() < 80, "{code}");
+    }
+
+    #[test]
+    fn a_path_outside_the_project_gets_its_own_row() {
+        // A project under a symlinked folder, stored resolved as `main.rs` does it: macOS's
+        // temp folder is `/var/...`, really `/private/var/...`.
+        let raw = std::env::temp_dir().join(format!("newjen-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&raw).expect("temp project");
+        let project = raw.canonicalize().expect("resolved project");
+        let mut ask = request("Bash", json!({"command": "touch new.txt"}));
+
+        // Inside, written through the symlink, and not created yet: no row.
+        ask.blocked_path = Some(raw.join("new.txt").display().to_string());
+        assert_eq!(detail(&ask, Some(&project), ROOMY).text, "$ touch new.txt");
+
+        ask.blocked_path = Some("/elsewhere/notes/new.txt".to_string());
+        assert_eq!(
+            detail(&ask, Some(&project), ROOMY).text,
+            "$ touch new.txt\nOutside the project: /elsewhere/notes/new.txt"
+        );
+        let _ = std::fs::remove_dir_all(&raw);
     }
 }

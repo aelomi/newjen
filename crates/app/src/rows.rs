@@ -7,11 +7,15 @@ use ely_gpui_component::agent::ToolCallCard;
 use ely_gpui_component::chat::{ErrorMessage, MessageBubble, Role, StepState, StreamingMarkdown};
 use ely_gpui_component::layout::h_stack;
 use ely_gpui_component::primitives::{Icon, IconName};
-use ely_gpui_component::theme::{ActiveTheme, IconSize};
+use ely_gpui_component::theme::{ActiveTheme, IconSize, TextSize};
 use ely_gpui_component::typography::Caption;
-use gpui::{AnyElement, App, ElementId, IntoElement, ParentElement, SharedString, Styled, Window};
+use gpui::{
+    AnyElement, App, ElementId, IntoElement, ParentElement, SharedString, Styled, Window, div,
+    prelude::*,
+};
 use newjen_core::{Item, ToolState};
 
+use crate::approval::ScopeRow;
 use crate::format::{cap, cap_ends, turn_caption};
 
 /// Tool output and arguments longer than this are cut (Ely's code block folds after 14 lines
@@ -136,6 +140,39 @@ fn turn_end(caption: String, stopped: bool, cx: &mut App) -> AnyElement {
 /// A quiet line of information from the app (not an error), such as "Allowed once — …".
 pub fn note(text: &str, cx: &mut App) -> AnyElement {
     caption_row(IconName::Info, text.to_string(), cx)
+}
+
+/// The quiet line under the approval dock saying what "Always allow" does, with the remembered
+/// rule in the mono font. Kept to one line (the rule is already cut to fit, see
+/// `approval::scope_row`), because the dock counts it as exactly one row.
+pub fn scope(row: &ScopeRow, cx: &mut App) -> AnyElement {
+    let theme = cx.theme();
+    let color = theme.colors.fg_subtle;
+    // The gaps stand in for the spaces around the rule, so they are trimmed off the words.
+    let words = h_stack()
+        .gap_1()
+        .min_w_0()
+        .child(Caption::new(row.before.trim_end().to_string()).text_color(color))
+        .children(row.code.clone().map(|code| {
+            div()
+                .min_w_0()
+                .font_family(theme.mono_family.clone())
+                .text_size(theme.text_size(TextSize::Xs))
+                .text_color(theme.colors.fg_muted)
+                .text_ellipsis_middle()
+                .child(code)
+        }))
+        .when(!row.after.is_empty(), |line| {
+            line.child(Caption::new(row.after.trim_start().to_string()).text_color(color))
+        });
+    h_stack()
+        .gap_1p5()
+        .px_1()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .child(Icon::new(IconName::Info).size(IconSize::Xs).color(color))
+        .child(words)
+        .into_any_element()
 }
 
 /// A small icon and a caption, both in the subtle text color.

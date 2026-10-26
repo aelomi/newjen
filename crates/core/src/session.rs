@@ -10,14 +10,18 @@
 //! Why threads and not an async runtime: there is exactly one process per conversation and its
 //! input and output are line-based, so plain threads are the simplest thing that works, and
 //! `core` stays independent of any UI framework's executor.
+//!
+//! claude is started through a tiny shell launcher (see [`LAUNCHER`]) that also starts a
+//! watcher, so claude and its tools die as soon as Newjen dies, even after a crash.
 
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, PipeWriter, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,6 +63,34 @@ const CRASH_GRACE_PERIOD: Duration = Duration::from_millis(150);
 /// group could keep a pipe open forever.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long [`Session::interrupt`] waits for claude to confirm a stop request (or end the turn)
+/// before it ends the session. Synara also uses 10 s.
+pub const INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The shell script that starts claude: `/bin/sh -c LAUNCHER sh <claude> <args…>`.
+///
+/// It starts a background *watcher*, then `exec`s claude, so claude keeps the shell's pid (and
+/// `Session::pid` and the orphan registry still name claude). The watcher waits on fd 3, the
+/// read end of a pipe whose write end only Newjen holds. When Newjen dies, even by a crash or
+/// SIGKILL, the OS closes that write end, `read` returns, and the watcher stops claude's whole
+/// process group: SIGTERM, then SIGKILL 2 s later. Without it, the orphan registry would only
+/// clean up at the next launch. (T3 Code does the same.)
+///
+/// - `trap '' TERM`: the watcher survives its own SIGTERM to the group, so it can follow up
+///   with SIGKILL. Because it stays in the group until then, the group id cannot be handed to
+///   another process while it waits.
+/// - `</dev/null >/dev/null 2>&1`: the watcher must not hold claude's pipes, or our stdout
+///   reader would not see EOF and a failed write to claude's stdin would go unnoticed.
+/// - `3<&-`: claude itself does not inherit fd 3.
+///
+/// Newjen closes the write end whenever the session ends, and its SIGKILL to the group also
+/// kills the watcher, so no watcher outlives a session.
+const LAUNCHER: &str = "(trap '' TERM; read _ <&3; kill -TERM 0; sleep 2; kill -KILL 0) \
+                        </dev/null >/dev/null 2>&1 & exec \"$@\" 3<&-";
+
+/// The fd number the watcher reads (see [`LAUNCHER`]).
+const WATCH_FD: libc::c_int = 3;
+
 /// How to start the CLI.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
@@ -72,6 +104,9 @@ pub struct SessionConfig {
     pub extra_args: Vec<String>,
     /// Extra environment variables for the child. Mostly for tests (to drive the fake CLI).
     pub env: Vec<(String, String)>,
+    /// How long an interrupt may go unanswered before the session is ended. Defaults to
+    /// [`INTERRUPT_ACK_TIMEOUT`]; tests use a shorter one.
+    pub interrupt_ack_timeout: Duration,
 }
 
 impl SessionConfig {
@@ -83,6 +118,7 @@ impl SessionConfig {
             resume: None,
             extra_args: Vec::new(),
             env: Vec::new(),
+            interrupt_ack_timeout: INTERRUPT_ACK_TIMEOUT,
         }
     }
 
@@ -154,6 +190,9 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Something that happened in the CLI process.
+// `Line` is much bigger than the other variants. That is fine: each event is built once and
+// moved through the channel once, and boxing it would make every `match` on a line clumsier.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionEvent {
     /// One decoded stdout line.
@@ -164,6 +203,10 @@ pub enum SessionEvent {
     /// it never arrived. Holds the OS error text. Never sent after [`Session::shutdown`], and
     /// it can arrive just before or just after the `Exited` of a crashed claude.
     WriteFailed(String),
+    /// claude did not confirm an interrupt within the deadline (see
+    /// [`SessionConfig::interrupt_ack_timeout`]), so the session was shut down. Sent just
+    /// before the `Exited` of that shutdown.
+    InterruptTimedOut,
     /// The process ended. `code` is `None` if it was killed by a signal. `requested` is true
     /// when [`Session::shutdown`] (or dropping the `Session`) was called before it ended, so
     /// the exit was expected rather than a crash.
@@ -176,6 +219,16 @@ pub enum SessionEvent {
 
 /// A running `claude` process. Dropping it shuts the process down.
 pub struct Session {
+    control: Arc<Control>,
+    /// Counter for the ids of our own control requests (interrupts).
+    next_request_number: AtomicU64,
+    interrupt_ack_timeout: Duration,
+}
+
+/// The parts of a session that its background threads need too: to stop the process, to
+/// answer control requests, and to track an unanswered interrupt. Shared through an `Arc` (a
+/// reference-counted pointer: several owners, one object, freed when the last one is gone).
+struct Control {
     pid: u32,
     /// Lines waiting to be written to the process's stdin by the writer thread. Closing this
     /// queue makes the writer thread finish and drop stdin, which closes the pipe. The CLI
@@ -183,22 +236,50 @@ pub struct Session {
     /// approvals and exits), so it is closed only by `shutdown`, when claude has exited, or
     /// when a write fails. After that, `send_prompt`, `answer` and `interrupt` return an error.
     to_stdin: Sender<String>,
-    /// Set by the first `shutdown` call so later calls return at once. Shared with the waiter
+    /// Set by the first `shutdown` call so later calls return at once. Read by the waiter
     /// thread, which reports it in `Exited { requested }`, and the writer thread, which then
     /// stays quiet about failed writes.
     shutting_down: Arc<AtomicBool>,
     /// Set by the waiter thread once the process has exited, been reaped and (after a crash)
     /// the tools it left behind were stopped.
-    exited: Arc<AtomicBool>,
-    /// Counter for the ids of our own control requests (interrupts).
-    next_request_number: AtomicU64,
+    exited: AtomicBool,
+    /// Newjen's end of the pipe the watcher waits on (see [`LAUNCHER`]). Dropping it tells the
+    /// watcher to stop claude, so it is dropped only when the session ends.
+    owner_pipe: Mutex<Option<PipeWriter>>,
+    /// The id of an interrupt claude has not confirmed yet.
+    pending_interrupt: Mutex<Option<String>>,
+    /// Set when an interrupt went unanswered and the session was shut down because of it.
+    interrupt_timed_out: AtomicBool,
 }
 
 impl Session {
     /// Starts the CLI. Returns the session and the channel its events arrive on.
     pub fn spawn(config: SessionConfig) -> Result<(Session, Receiver<SessionEvent>)> {
-        let mut command = Command::new(&config.program);
+        let could_not_start = || {
+            format!(
+                "could not start `{}` in {}",
+                config.program.display(),
+                config.cwd.display()
+            )
+        };
+        // The shell would only report a missing claude after it started (as exit code 127),
+        // so check first and keep a clear error.
+        check_program(&config).with_context(could_not_start)?;
+
+        // The owner pipe (see `LAUNCHER`). std opens both ends with close-on-exec.
+        let (watch_read, watch_write) = std::io::pipe().context("could not create a pipe")?;
+        // SAFETY: fcntl on a file descriptor we own; it only sets a flag. Close-on-exec on our
+        // end means claude and its tools never inherit it (std already sets it; this makes the
+        // requirement explicit).
+        unsafe { libc::fcntl(watch_write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        let read_fd = watch_read.as_raw_fd();
+
+        let mut command = Command::new("/bin/sh");
         command
+            .arg("-c")
+            .arg(LAUNCHER)
+            .arg("sh") // `$0` inside the script
+            .arg(&config.program)
             .args(config.args())
             .current_dir(&config.cwd)
             .stdin(Stdio::piped())
@@ -206,6 +287,23 @@ impl Session {
             .stderr(Stdio::piped())
             // A new process group, so `killpg` also reaches the tools claude starts.
             .process_group(0);
+        // SAFETY: this runs in the child between fork and exec, where only async-signal-safe
+        // calls are allowed; `dup2`, `fcntl` and reading errno are. It puts the pipe's read end
+        // on fd 3 for the watcher. The copy `dup2` makes does not have close-on-exec; if the
+        // read end already is fd 3, clear the flag instead.
+        unsafe {
+            command.pre_exec(move || {
+                let result = if read_fd == WATCH_FD {
+                    libc::fcntl(WATCH_FD, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(read_fd, WATCH_FD)
+                };
+                if result == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         for name in NESTED_SESSION_ENV_VARS {
             command.env_remove(name);
         }
@@ -213,13 +311,9 @@ impl Session {
             command.env(OsString::from(name), OsString::from(value));
         }
 
-        let mut child = command.spawn().with_context(|| {
-            format!(
-                "could not start `{}` in {}",
-                config.program.display(),
-                config.cwd.display()
-            )
-        })?;
+        let mut child = command.spawn().with_context(could_not_start)?;
+        // Only the watcher needs the read end.
+        drop(watch_read);
         let pid = child.id();
         // Best effort: if this fails, the only loss is orphan cleanup after a crash.
         let _ = orphans::register(pid);
@@ -229,27 +323,26 @@ impl Session {
         let stderr = child.stderr.take().context("child has no stderr")?;
 
         let (sender, receiver) = async_channel::unbounded();
-        let exited = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
 
         let to_stdin = spawn_stdin_writer(stdin, sender.clone(), shutting_down.clone());
-        let stdout_done = spawn_stdout_reader(stdout, sender.clone());
-        let stderr_done = spawn_stderr_reader(stderr, sender.clone());
-        spawn_waiter(
-            child,
-            sender,
-            to_stdin.clone(),
-            [stdout_done, stderr_done],
-            exited.clone(),
-            shutting_down.clone(),
-        );
-
-        let session = Session {
+        let control = Arc::new(Control {
             pid,
             to_stdin,
             shutting_down,
-            exited,
+            exited: AtomicBool::new(false),
+            owner_pipe: Mutex::new(Some(watch_write)),
+            pending_interrupt: Mutex::new(None),
+            interrupt_timed_out: AtomicBool::new(false),
+        });
+        let stdout_done = spawn_stdout_reader(stdout, sender.clone(), control.clone());
+        let stderr_done = spawn_stderr_reader(stderr, sender.clone());
+        spawn_waiter(child, sender, [stdout_done, stderr_done], control.clone());
+
+        let session = Session {
+            control,
             next_request_number: AtomicU64::new(1),
+            interrupt_ack_timeout: config.interrupt_ack_timeout,
         };
         Ok((session, receiver))
     }
@@ -265,10 +358,26 @@ impl Session {
     }
 
     /// Asks the CLI to stop the current turn. The turn then ends with a "stopped" result.
+    ///
+    /// If claude neither confirms the request nor ends the turn within
+    /// [`SessionConfig::interrupt_ack_timeout`], the session is shut down and
+    /// [`SessionEvent::InterruptTimedOut`] is sent, so a stuck claude can always be stopped.
     pub fn interrupt(&self) -> Result<()> {
         let number = self.next_request_number.fetch_add(1, Ordering::SeqCst);
         let request_id = format!("newjen_interrupt_{number}");
-        self.write_line(&protocol::interrupt_request(&request_id))
+        // Remember it before sending, so even a very quick answer finds it.
+        *lock(&self.control.pending_interrupt) = Some(request_id.clone());
+        if let Err(error) = self.write_line(&protocol::interrupt_request(&request_id)) {
+            lock(&self.control.pending_interrupt).take();
+            return Err(error);
+        }
+        let control = self.control.clone();
+        let timeout = self.interrupt_ack_timeout;
+        thread::spawn(move || {
+            thread::sleep(timeout);
+            control.expire_interrupt(&request_id);
+        });
+        Ok(())
     }
 
     /// Stops the process: closes stdin, sends SIGTERM to its process group, and SIGKILL if it
@@ -277,12 +386,44 @@ impl Session {
     /// waits for the writer thread (which may be stuck writing to a claude that stopped
     /// reading; the SIGKILL below unsticks it).
     pub fn shutdown(&self) {
+        self.control.shutdown();
+    }
+
+    /// The process id. Also the process group id, since the child leads its own group.
+    pub fn pid(&self) -> u32 {
+        self.control.pid
+    }
+
+    /// TEST SUPPORT ONLY: closes Newjen's end of the owner pipe and nothing else, as if Newjen
+    /// had died. The watcher should then stop claude and its tools on its own.
+    #[doc(hidden)]
+    pub fn simulate_owner_death(&self) {
+        self.control.close_owner_pipe();
+    }
+
+    /// Serializes `message` and queues it for the writer thread (see [`queue_line`]).
+    fn write_line(&self, message: &Value) -> Result<()> {
+        queue_line(&self.control.to_stdin, message)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl Control {
+    /// See [`Session::shutdown`].
+    fn shutdown(&self) {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
         // Closing the queue never blocks. The writer thread then drops stdin, which closes the
         // pipe, as soon as it is not in the middle of a write.
         self.to_stdin.close();
+        // The session is over, so the watcher may go (the SIGKILL below also stops it).
+        self.close_owner_pipe();
         if self.exited.load(Ordering::SeqCst) {
             // claude was reaped earlier, so its pid (which is also the group id) may already
             // belong to an unrelated process; signalling the group now could hit that. Tools a
@@ -299,7 +440,8 @@ impl Session {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        // Even if claude itself exited, tools it started may still be running in its group.
+        // Even if claude itself exited, tools it started (and the watcher, which ignores
+        // SIGTERM) may still be running in its group.
         // SAFETY: as above.
         unsafe { libc::killpg(group, libc::SIGKILL) };
         // The process is gone now. Unregister here too (not only in the waiter thread), because
@@ -307,29 +449,101 @@ impl Session {
         orphans::unregister(self.pid);
     }
 
-    /// The process id. Also the process group id, since the child leads its own group.
-    pub fn pid(&self) -> u32 {
-        self.pid
+    /// Drops Newjen's end of the owner pipe, which makes the watcher stop claude's group.
+    fn close_owner_pipe(&self) {
+        lock(&self.owner_pipe).take();
     }
 
-    /// Serializes `message` with a JSON encoder and queues it as one line for the writer
-    /// thread. The CLI exits on a line that is not valid JSON, so lines are never built by hand.
-    ///
-    /// Returns at once. Fails if the session was shut down, claude exited, or an earlier write
-    /// failed (each of these closes the queue).
-    fn write_line(&self, message: &Value) -> Result<()> {
-        let mut line = serde_json::to_string(message)?;
-        line.push('\n');
-        // The queue is unbounded, so the only possible error is "closed".
-        self.to_stdin
-            .try_send(line)
-            .map_err(|_| anyhow!("the claude session has ended (shut down, or claude exited)"))
+    /// Called by an interrupt's timer when its deadline has passed. If claude still has not
+    /// answered that interrupt, ends the session; the waiter thread then reports
+    /// `InterruptTimedOut` just before `Exited`.
+    fn expire_interrupt(&self, request_id: &str) {
+        let unanswered = lock(&self.pending_interrupt).as_deref() == Some(request_id);
+        let ended = self.shutting_down.load(Ordering::SeqCst) || self.exited.load(Ordering::SeqCst);
+        if unanswered && !ended {
+            // Set before shutting down, so the waiter sees it when claude's exit wakes it.
+            self.interrupt_timed_out.store(true, Ordering::SeqCst);
+            self.shutdown();
+        }
+    }
+
+    /// Handles the stdout lines the session itself must react to, before they go to the UI.
+    fn note_incoming(&self, incoming: &Incoming) {
+        match incoming {
+            // A control request Newjen does not handle (a valid `can_use_tool` became
+            // `PermissionRequest` instead). The CLI would wait for an answer forever, so say no.
+            Incoming::ControlRequest(request) => {
+                let error = match request.subtype() {
+                    "can_use_tool" => "Newjen could not read this approval request".to_string(),
+                    subtype => format!("Newjen does not support {subtype} yet"),
+                };
+                let reply = protocol::control_error_response(&request.request_id, &error);
+                // A closed queue means the session is ending; nobody waits for the reply then.
+                let _ = queue_line(&self.to_stdin, &reply);
+            }
+            // claude confirmed our interrupt.
+            Incoming::ControlResponse(response) => {
+                let mut pending = lock(&self.pending_interrupt);
+                if pending.is_some() && pending.as_deref() == response.request_id() {
+                    *pending = None;
+                }
+            }
+            // The turn ended, so there is nothing left to stop.
+            Incoming::Result(_) => {
+                lock(&self.pending_interrupt).take();
+            }
+            _ => {}
+        }
     }
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.shutdown();
+/// Locks a mutex. A mutex is "poisoned" if a thread panicked while holding it; the data here
+/// (an `Option`) is still valid then, so carry on instead of panicking too.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Serializes `message` with a JSON encoder and queues it as one line for the writer thread.
+/// The CLI exits on a line that is not valid JSON, so lines are never built by hand.
+///
+/// Returns at once. Fails if the session was shut down, claude exited, or an earlier write
+/// failed (each of these closes the queue).
+fn queue_line(to_stdin: &Sender<String>, message: &Value) -> Result<()> {
+    let mut line = serde_json::to_string(message)?;
+    line.push('\n');
+    // The queue is unbounded, so the only possible error is "closed".
+    to_stdin
+        .try_send(line)
+        .map_err(|_| anyhow!("the claude session has ended (shut down, or claude exited)"))
+}
+
+/// Checks that `config.program` can be started, looking for it the way the shell's `exec`
+/// will: a path is taken relative to `config.cwd`, a bare name is searched on `PATH` (the
+/// child's, if `config.env` sets one).
+fn check_program(config: &SessionConfig) -> Result<()> {
+    let program = &config.program;
+    let found = if program.components().count() > 1 {
+        is_executable(&config.cwd.join(program))
+    } else {
+        let path = config
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| OsString::from(value))
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_default();
+        std::env::split_paths(&path).any(|dir| is_executable(&dir.join(program)))
+    };
+    if found {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "`{}` was not found or is not executable",
+            program.display()
+        ))
     }
 }
 
@@ -368,6 +582,7 @@ fn spawn_stdin_writer(
 fn spawn_stdout_reader(
     stdout: impl Read + Send + 'static,
     sender: Sender<SessionEvent>,
+    control: Arc<Control>,
 ) -> mpsc::Receiver<()> {
     let (done_sender, done) = mpsc::channel();
     thread::spawn(move || {
@@ -375,9 +590,11 @@ fn spawn_stdout_reader(
             if line.trim().is_empty() {
                 return;
             }
+            let incoming = Incoming::parse(line);
+            control.note_incoming(&incoming);
             // If nobody is listening any more, keep draining so the child never blocks on a
             // full pipe.
-            let _ = sender.send_blocking(SessionEvent::Line(Incoming::parse(line)));
+            let _ = sender.send_blocking(SessionEvent::Line(incoming));
         });
         let _ = done_sender.send(());
     });
@@ -391,16 +608,17 @@ fn spawn_stdout_reader(
 fn spawn_waiter(
     mut child: Child,
     sender: Sender<SessionEvent>,
-    to_stdin: Sender<String>,
     readers_done: [mpsc::Receiver<()>; 2],
-    exited: Arc<AtomicBool>,
-    shutting_down: Arc<AtomicBool>,
+    control: Arc<Control>,
 ) {
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|status| status.code());
         let pid = child.id();
         // Read after the process is gone: true only if shutdown started before it ended.
-        let requested = shutting_down.load(Ordering::SeqCst);
+        let requested = control.shutting_down.load(Ordering::SeqCst);
+        // The session is over, so the watcher may go. (Its SIGTERM is harmless; the SIGKILL
+        // from `shutdown` or `stop_leftover_tools` removes the watcher itself.)
+        control.close_owner_pipe();
         // claude is reaped, so the orphan registry has nothing left to clean up. Unregister
         // before setting `exited`: once `exited` is set, `shutdown` returns early and skips its
         // own unregister, and the app may quit right after.
@@ -411,15 +629,18 @@ fn spawn_waiter(
         // Nobody reads stdin any more: make `send_prompt`, `answer` and `interrupt` fail at
         // once instead of queueing lines into a dead pipe. Done before `Exited` is sent, so a
         // caller that has seen `Exited` can rely on it.
-        to_stdin.close();
+        control.to_stdin.close();
         // Set only after the cleanup above. Until then a `shutdown` call (say, the app
         // quitting) still signals the group itself, so a stubborn tool cannot outlive the app.
-        exited.store(true, Ordering::SeqCst);
+        control.exited.store(true, Ordering::SeqCst);
         // Let the last stdout and stderr lines arrive before `Exited`, but don't hang if a
         // leftover process keeps a pipe open.
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         for done in readers_done {
             let _ = done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        if control.interrupt_timed_out.load(Ordering::SeqCst) {
+            let _ = sender.send_blocking(SessionEvent::InterruptTimedOut);
         }
         let _ = sender.send_blocking(SessionEvent::Exited { code, requested });
     });
@@ -427,7 +648,7 @@ fn spawn_waiter(
 
 /// claude ended on its own (often a crash). Stops the tools it started, which share its process
 /// group, so they don't run on unattended: SIGTERM, up to [`CRASH_GRACE_PERIOD`] for them to
-/// exit, then SIGKILL for any that ignored it.
+/// exit, then SIGKILL for any that ignored it (including the watcher, which ignores SIGTERM).
 ///
 /// Safe even though claude is already reaped: a group id is not handed out again while any
 /// process is still in that group, and if the group is already empty the signals just fail

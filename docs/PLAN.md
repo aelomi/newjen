@@ -69,6 +69,18 @@ crates/
    - **Agent-managed:** the harness never writes to version control in the copy, and reads only with `--ignore-working-copy`. Landing fetches whatever bookmarks the agent created.
 4. **Close:** `rift remove <copy path>`, then `jj git remote remove <thread>` in the main repo, and later `rift gc`.
 
+## Approvals and agent lifecycle
+
+Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zeron, Paseo, Synara, Zed, Vibe Kanban, Claude Squad and Cursor ([memo](research/approvals-and-lifecycle.md)).
+
+- **Grants live only in the session.** "Always allow" never writes to settings files (each Rift copy would get its own), and it remembers only what it can name exactly: CLI `addRules` suggestions whose rules all carry `ruleContent` (or a single MCP tool), or an exact Bash command without `*`. Everything else, including edits, is allowed once. The dock says which, before the click.
+- **Deny and stop are separate.** Esc denies and Claude carries on; ⌘. denies and ends the turn.
+- **Claude dies with Newjen.** A watcher kills claude's process group as soon as Newjen exits, and the pid registry reaps anything left at the next launch.
+- **Later slices:**
+  - Slice 2: deny with feedback (typed text becomes the deny message); a list of session grants with revoke, which no other ADE has (verify how to carry grants across `--resume` first); allocate `--session-id` before spawning; show approvals left pending by a crash as expired.
+  - Slice 4: a real diff before approving an edit; a diff too large to show means allow once.
+  - Slice 5: one approvals inbox across threads, notifications only when Newjen is in the background, a Dock badge for threads waiting on you, an idle reaper that never stops a thread with a pending approval, and asking before quitting with turns running.
+
 ## Known gotchas
 
 - **Copied absolute paths.** Python virtual environments and some build caches embed absolute paths. Use Rift `postcreate` hooks to rebuild them.
