@@ -1641,6 +1641,2445 @@
           ]
         }
       ]
+    },
+    {
+      "type": "frame",
+      "id": "f17yUW",
+      "x": 0,
+      "y": 960,
+      "name": "Final · Components",
+      "theme": {
+        "mode": "dark"
+      },
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "layout": "vertical",
+      "gap": 28,
+      "padding": 40,
+      "children": [
+        {
+          "type": "text",
+          "id": "EOLeV",
+          "name": "Caption",
+          "fill": "$fg-subtle",
+          "content": "Slice 1 components — sizes follow Ely (13px body, 1.6 leading, 12px radius bubbles/composer)",
+          "fontFamily": "$font",
+          "fontSize": 12,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "YEe8N",
+          "name": "Row",
+          "gap": 40,
+          "children": [
+            {
+              "type": "frame",
+              "id": "K4tZ3x",
+              "name": "Tool step",
+              "reusable": true,
+              "width": 560,
+              "fill": "$sunken",
+              "cornerRadius": 8,
+              "layout": "vertical",
+              "gap": 6,
+              "padding": [
+                8,
+                10
+              ],
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "N5NYC",
+                  "name": "Head",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "pZfWK",
+                      "name": "Mark",
+                      "width": 14,
+                      "height": 14,
+                      "icon": "circle-check",
+                      "library": "lucide",
+                      "fill": "$success"
+                    },
+                    {
+                      "type": "text",
+                      "id": "I5WFkd",
+                      "name": "Tool",
+                      "fill": "$fg",
+                      "content": "Bash",
+                      "fontFamily": "$font",
+                      "fontSize": 12,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "text",
+                      "id": "IusEe",
+                      "name": "Arg",
+                      "fill": "$fg-muted",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "ls -la",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "wbk6i",
+                      "name": "State",
+                      "fill": "$fg-subtle",
+                      "content": "0.2s",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "FgQ0H",
+                  "name": "Output",
+                  "width": "fill_container",
+                  "padding": [
+                    0,
+                    0,
+                    0,
+                    22
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "vtmRs",
+                      "name": "Out",
+                      "fill": "$fg-subtle",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "total 16\ndrwxr-xr-x  4 user  staff  128 Oct 26 21:50 .\n-rw-r--r--  1 user  staff   12 Oct 26 21:50 hello.txt",
+                      "lineHeight": 1.5,
+                      "fontFamily": "$mono",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "J0WgQ",
+              "name": "Approval dock",
+              "reusable": true,
+              "width": 720,
+              "fill": "$surface",
+              "cornerRadius": 12,
+              "stroke": "#FFFFFF14",
+              "strokeWidth": 1,
+              "effect": {
+                "type": "shadow",
+                "shadowType": "outer",
+                "color": "#00000066",
+                "offset": {
+                  "x": 0,
+                  "y": 8
+                },
+                "blur": 28
+              },
+              "layout": "vertical",
+              "gap": 12,
+              "padding": 16,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "DC1VH",
+                  "name": "Header",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "hDhOg",
+                      "name": "Icon",
+                      "width": 16,
+                      "height": 16,
+                      "icon": "shield-alert",
+                      "library": "lucide",
+                      "fill": "$warning"
+                    },
+                    {
+                      "type": "text",
+                      "id": "x4ysPo",
+                      "name": "Title",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "Allow Bash to run this command?",
+                      "fontFamily": "$font",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "text",
+                      "id": "R4hGl",
+                      "name": "Tool",
+                      "fill": "$fg-subtle",
+                      "content": "Bash",
+                      "fontFamily": "$mono",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "pN3xd",
+                  "name": "Input",
+                  "width": "fill_container",
+                  "fill": "$sunken",
+                  "cornerRadius": 8,
+                  "layout": "vertical",
+                  "gap": 4,
+                  "padding": [
+                    10,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "v6lL98",
+                      "name": "Cmd",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "$ touch notes.md",
+                      "lineHeight": 1.5,
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "I5kOs",
+                      "name": "Desc",
+                      "fill": "$fg-subtle",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "Create an empty notes.md",
+                      "fontFamily": "$font",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "Q81WNs",
+                  "name": "Actions",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "jSDS0",
+                      "name": "Cwd",
+                      "fill": "$fg-subtle",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "in ~/Newjen",
+                      "fontFamily": "$mono",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "yWd5O",
+                      "name": "Deny",
+                      "fill": "#00000000",
+                      "cornerRadius": 6,
+                      "stroke": "#00000000",
+                      "strokeWidth": 1,
+                      "gap": 8,
+                      "padding": [
+                        7,
+                        12
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "HRU2q",
+                          "name": "Label",
+                          "fill": "$fg",
+                          "content": "Deny",
+                          "fontFamily": "$font",
+                          "fontSize": 13,
+                          "fontWeight": "500"
+                        },
+                        {
+                          "type": "text",
+                          "id": "n5XIVJ",
+                          "name": "Kbd",
+                          "opacity": 0.7,
+                          "fill": "$fg-subtle",
+                          "content": "esc",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "SeNsQ",
+                      "name": "Always allow",
+                      "fill": "$hover",
+                      "cornerRadius": 6,
+                      "gap": 8,
+                      "padding": [
+                        7,
+                        12
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "hqp1O",
+                          "name": "Label",
+                          "fill": "$fg",
+                          "content": "Always allow",
+                          "fontFamily": "$font",
+                          "fontSize": 13,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "ssiZi",
+                      "name": "Allow",
+                      "fill": "$accent",
+                      "cornerRadius": 6,
+                      "gap": 8,
+                      "padding": [
+                        7,
+                        12
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "zdkct",
+                          "name": "Label",
+                          "fill": "$on-accent",
+                          "content": "Allow once",
+                          "fontFamily": "$font",
+                          "fontSize": 13,
+                          "fontWeight": "500"
+                        },
+                        {
+                          "type": "text",
+                          "id": "DymTC",
+                          "name": "Kbd",
+                          "opacity": 0.7,
+                          "fill": "$on-accent",
+                          "content": "⌘↵",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "JaUIT",
+              "name": "Col",
+              "layout": "vertical",
+              "gap": 24,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "WBhlj",
+                  "name": "Composer",
+                  "reusable": true,
+                  "width": 720,
+                  "fill": "$surface",
+                  "cornerRadius": 12,
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 10,
+                  "padding": [
+                    12,
+                    14
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "ZkHfg",
+                      "name": "Text",
+                      "fill": "$fg-disabled",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "Ask Claude to work on ~/Newjen…",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "L9DZL",
+                      "name": "Footer",
+                      "width": "fill_container",
+                      "gap": 8,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "L6HncB",
+                          "name": "Hint",
+                          "fill": "$fg-subtle",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "↵ send · ⇧↵ new line",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "eRKrN",
+                          "name": "Button",
+                          "width": 28,
+                          "height": 28,
+                          "fill": "$accent",
+                          "cornerRadius": 14,
+                          "justifyContent": "center",
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "icon",
+                              "id": "qoQIl",
+                              "name": "Icon",
+                              "width": 14,
+                              "height": 14,
+                              "icon": "arrow-up",
+                              "library": "lucide",
+                              "fill": "$on-accent"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "hspXi",
+                  "name": "Status pill",
+                  "reusable": true,
+                  "fill": "$hover",
+                  "cornerRadius": 10,
+                  "gap": 6,
+                  "padding": [
+                    3,
+                    9
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "FZ7D5",
+                      "name": "Dot",
+                      "fill": "$fg-subtle",
+                      "width": 6,
+                      "height": 6
+                    },
+                    {
+                      "type": "text",
+                      "id": "EPAWC",
+                      "name": "Label",
+                      "fill": "$fg-muted",
+                      "content": "Idle",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "500"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "d33VbP",
+                  "name": "User message",
+                  "reusable": true,
+                  "width": 720,
+                  "justifyContent": "end",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "VMcve",
+                      "name": "Bubble",
+                      "fill": "$hover",
+                      "cornerRadius": 12,
+                      "layout": "vertical",
+                      "padding": [
+                        10,
+                        16
+                      ],
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "ky97F",
+                          "name": "Text",
+                          "fill": "$fg",
+                          "content": "Look at the files in this folder and tell me how many there are.",
+                          "lineHeight": 1.6,
+                          "fontFamily": "$font",
+                          "fontSize": 13,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "PkaqP",
+      "x": 2220,
+      "y": 960,
+      "name": "1 · Empty",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1000,
+      "height": 700,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "Y1iDBt",
+          "name": "Title bar",
+          "width": "fill_container",
+          "height": 38,
+          "padding": [
+            0,
+            14
+          ],
+          "justifyContent": "space_between",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "eyYj8",
+              "name": "Traffic lights",
+              "width": 160,
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "jjL8Q",
+                  "name": "Light",
+                  "fill": "#FF5F57",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "b02XNt",
+                  "name": "Light",
+                  "fill": "#FEBC2E",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "w6z88P",
+                  "name": "Light",
+                  "fill": "#28C840",
+                  "width": 12,
+                  "height": 12
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "qDijz",
+              "name": "Title",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "PeKzo",
+                  "name": "App",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "vAZEo",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "RX6tj",
+              "name": "Right",
+              "width": 160,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "cNm3s",
+                  "type": "ref",
+                  "ref": "hspXi",
+                  "name": "Status pill",
+                  "fill": "$hover",
+                  "descendants": {
+                    "FZ7D5": {
+                      "fill": "$fg-subtle"
+                    },
+                    "EPAWC": {
+                      "content": "Idle",
+                      "fill": "$fg-muted"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "oXhYu",
+          "name": "Transcript",
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            20,
+            0
+          ],
+          "justifyContent": "center",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "rueup",
+              "name": "Column",
+              "width": 720,
+              "layout": "vertical",
+              "gap": 18,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "UZvNa",
+                  "name": "Welcome",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 6,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Y38Zya",
+                      "name": "Heading",
+                      "fill": "$fg",
+                      "content": "What should Claude work on?",
+                      "fontFamily": "$font",
+                      "fontSize": 20,
+                      "fontWeight": "600",
+                      "letterSpacing": -0.3
+                    },
+                    {
+                      "type": "text",
+                      "id": "hgL9C",
+                      "name": "Sub",
+                      "fill": "$fg-muted",
+                      "content": "Claude Code runs in ~/Newjen. You approve each tool call before it runs.",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "gpaKP",
+          "name": "Bottom",
+          "width": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            0,
+            0,
+            16,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "Cqccv",
+              "type": "ref",
+              "ref": "WBhlj",
+              "name": "Composer",
+              "stroke": "$focus",
+              "descendants": {
+                "ZkHfg": {
+                  "content": "Ask Claude to work on ~/Newjen…",
+                  "fill": "$fg-disabled"
+                },
+                "L6HncB": {
+                  "content": "↵ send · ⇧↵ new line"
+                },
+                "eRKrN": {
+                  "opacity": 0.35
+                },
+                "qoQIl": {
+                  "icon": "arrow-up"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "HCadq",
+      "x": 3280,
+      "y": 960,
+      "name": "2 · Streaming",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1000,
+      "height": 700,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "Gh4Qi",
+          "name": "Title bar",
+          "width": "fill_container",
+          "height": 38,
+          "padding": [
+            0,
+            14
+          ],
+          "justifyContent": "space_between",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "a7bsS",
+              "name": "Traffic lights",
+              "width": 160,
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "xeKJb",
+                  "name": "Light",
+                  "fill": "#FF5F57",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "XsCRF",
+                  "name": "Light",
+                  "fill": "#FEBC2E",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "DeiGa",
+                  "name": "Light",
+                  "fill": "#28C840",
+                  "width": 12,
+                  "height": 12
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "T3eDF",
+              "name": "Title",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "pCm6P",
+                  "name": "App",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "tKInf",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Y0wny",
+              "name": "Right",
+              "width": 160,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "J0u9Sn",
+                  "type": "ref",
+                  "ref": "hspXi",
+                  "name": "Status pill",
+                  "fill": "$hover",
+                  "descendants": {
+                    "FZ7D5": {
+                      "fill": "$focus"
+                    },
+                    "EPAWC": {
+                      "content": "Working",
+                      "fill": "$fg-muted"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "KRkcQ",
+          "name": "Transcript",
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            20,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "il31a",
+              "name": "Column",
+              "width": 720,
+              "layout": "vertical",
+              "gap": 18,
+              "children": [
+                {
+                  "id": "hIC5U",
+                  "type": "ref",
+                  "ref": "d33VbP",
+                  "name": "User message",
+                  "width": "fill_container",
+                  "descendants": {
+                    "ky97F": {
+                      "content": "Look at the files in this folder and tell me how many there are."
+                    }
+                  }
+                },
+                {
+                  "type": "frame",
+                  "id": "NECJn",
+                  "name": "Streaming line",
+                  "width": "fill_container",
+                  "gap": 2,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "TrMQ2",
+                      "name": "Text",
+                      "fill": "$fg",
+                      "content": "I'll list the directory to count the",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "rectangle",
+                      "cornerRadius": 1,
+                      "id": "KMbYg",
+                      "name": "Caret",
+                      "fill": "$fg-muted",
+                      "width": 7,
+                      "height": 15
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "nNcOM",
+          "name": "Bottom",
+          "width": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            0,
+            0,
+            16,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "GdkxM",
+              "type": "ref",
+              "ref": "WBhlj",
+              "name": "Composer",
+              "stroke": "$border-strong",
+              "descendants": {
+                "ZkHfg": {
+                  "content": "Claude is working…",
+                  "fill": "$fg-disabled"
+                },
+                "L6HncB": {
+                  "content": "⌘. stop"
+                },
+                "eRKrN": {
+                  "opacity": 1
+                },
+                "qoQIl": {
+                  "icon": "square"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "UoAVL",
+      "x": 4340,
+      "y": 960,
+      "name": "3 · Needs approval",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1000,
+      "height": 700,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "kxcfN",
+          "name": "Title bar",
+          "width": "fill_container",
+          "height": 38,
+          "padding": [
+            0,
+            14
+          ],
+          "justifyContent": "space_between",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "Tj37m",
+              "name": "Traffic lights",
+              "width": 160,
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "B1oPKr",
+                  "name": "Light",
+                  "fill": "#FF5F57",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "uSVA3",
+                  "name": "Light",
+                  "fill": "#FEBC2E",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "FDzBy",
+                  "name": "Light",
+                  "fill": "#28C840",
+                  "width": 12,
+                  "height": 12
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "PNHFm",
+              "name": "Title",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "lNa23",
+                  "name": "App",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "B2KOqY",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "qdYP3",
+              "name": "Right",
+              "width": 160,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "Yh3Se",
+                  "type": "ref",
+                  "ref": "hspXi",
+                  "name": "Status pill",
+                  "fill": "$warning-subtle",
+                  "descendants": {
+                    "FZ7D5": {
+                      "fill": "$warning"
+                    },
+                    "EPAWC": {
+                      "content": "Needs approval",
+                      "fill": "$warning"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "Gtm9g",
+          "name": "Transcript",
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            20,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "gcDSq",
+              "name": "Column",
+              "width": 720,
+              "layout": "vertical",
+              "gap": 18,
+              "children": [
+                {
+                  "id": "sb1XF",
+                  "type": "ref",
+                  "ref": "d33VbP",
+                  "name": "User message",
+                  "width": "fill_container",
+                  "descendants": {
+                    "ky97F": {
+                      "content": "Create an empty notes.md in this folder."
+                    }
+                  }
+                },
+                {
+                  "type": "text",
+                  "id": "Wts79",
+                  "name": "Assistant text",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "I'll create the file with touch.",
+                  "lineHeight": 1.6,
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "id": "pyLPe",
+                  "type": "ref",
+                  "ref": "K4tZ3x",
+                  "name": "Tool step",
+                  "width": "fill_container",
+                  "fill": "#00000000",
+                  "stroke": "$warning",
+                  "strokeWidth": 1,
+                  "descendants": {
+                    "pZfWK": {
+                      "icon": "circle-pause",
+                      "fill": "$warning"
+                    },
+                    "IusEe": {
+                      "content": "touch notes.md"
+                    },
+                    "wbk6i": {
+                      "content": "waiting for you",
+                      "fill": "$warning"
+                    },
+                    "FgQ0H": {
+                      "enabled": false
+                    },
+                    "vtmRs": {
+                      "content": ""
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "W8iQm",
+          "name": "Bottom",
+          "width": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            0,
+            0,
+            16,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "RsE5Y",
+              "type": "ref",
+              "ref": "J0WgQ",
+              "name": "Approval dock"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "MEqww",
+      "x": 5400,
+      "y": 960,
+      "name": "4 · Turn done",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1000,
+      "height": 700,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "ptaEI",
+          "name": "Title bar",
+          "width": "fill_container",
+          "height": 38,
+          "padding": [
+            0,
+            14
+          ],
+          "justifyContent": "space_between",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "NAXhj",
+              "name": "Traffic lights",
+              "width": 160,
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "xHMtQ",
+                  "name": "Light",
+                  "fill": "#FF5F57",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "SGEQY",
+                  "name": "Light",
+                  "fill": "#FEBC2E",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "cW2Gu",
+                  "name": "Light",
+                  "fill": "#28C840",
+                  "width": 12,
+                  "height": 12
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "PQM2x",
+              "name": "Title",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "wi2sR",
+                  "name": "App",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "V1Gxbk",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "n0uREA",
+              "name": "Right",
+              "width": 160,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "K9jL1N",
+                  "type": "ref",
+                  "ref": "hspXi",
+                  "name": "Status pill",
+                  "fill": "$hover",
+                  "descendants": {
+                    "FZ7D5": {
+                      "fill": "$fg-subtle"
+                    },
+                    "EPAWC": {
+                      "content": "Idle",
+                      "fill": "$fg-muted"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "c58NOk",
+          "name": "Transcript",
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            20,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "M3o98G",
+              "name": "Column",
+              "width": 720,
+              "layout": "vertical",
+              "gap": 18,
+              "children": [
+                {
+                  "id": "bl5T7",
+                  "type": "ref",
+                  "ref": "d33VbP",
+                  "name": "User message",
+                  "width": "fill_container",
+                  "descendants": {
+                    "ky97F": {
+                      "content": "Look at the files in this folder and tell me how many there are."
+                    }
+                  }
+                },
+                {
+                  "type": "text",
+                  "id": "AvkbD",
+                  "name": "Assistant text",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "I'll list the directory contents to count the files.",
+                  "lineHeight": 1.6,
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "id": "orYuP",
+                  "type": "ref",
+                  "ref": "K4tZ3x",
+                  "name": "Tool step",
+                  "width": "fill_container",
+                  "descendants": {
+                    "pZfWK": {
+                      "icon": "circle-check",
+                      "fill": "$success"
+                    },
+                    "I5WFkd": {
+                      "content": "Bash"
+                    },
+                    "IusEe": {
+                      "content": "ls -la",
+                      "fill": "$fg-muted"
+                    },
+                    "wbk6i": {
+                      "content": "0.1s",
+                      "fill": "$fg-subtle"
+                    },
+                    "FgQ0H": {
+                      "enabled": true
+                    },
+                    "vtmRs": {
+                      "content": "total 16\ndrwxr-xr-x  4 user  staff  128 Oct 26 21:50 .\ndrwxr-xr-x  9 user  staff  288 Oct 26 21:41 ..\n-rw-r--r--  1 user  staff   12 Oct 26 21:50 hello.txt\n-rw-r--r--  1 user  staff  418 Oct 26 21:50 notes.md"
+                    }
+                  }
+                },
+                {
+                  "type": "text",
+                  "id": "NeoMU",
+                  "name": "Assistant text",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "There are 2 files here: hello.txt and notes.md. (The listing also shows . and .., which are the folder itself and its parent.)",
+                  "lineHeight": 1.6,
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "TMT1w",
+                  "name": "Turn footer",
+                  "gap": 6,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "qnrkP",
+                      "name": "Icon",
+                      "width": 12,
+                      "height": 12,
+                      "icon": "check",
+                      "library": "lucide",
+                      "fill": "$fg-subtle"
+                    },
+                    {
+                      "type": "text",
+                      "id": "q4neBY",
+                      "name": "Meta",
+                      "fill": "$fg-subtle",
+                      "content": "Done in 4.2s · $0.0041",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "wcsH8",
+          "name": "Bottom",
+          "width": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            0,
+            0,
+            16,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "j8adco",
+              "type": "ref",
+              "ref": "WBhlj",
+              "name": "Composer",
+              "stroke": "$border-strong",
+              "descendants": {
+                "ZkHfg": {
+                  "content": "Reply to Claude…",
+                  "fill": "$fg-disabled"
+                },
+                "L6HncB": {
+                  "content": "↵ send · ⇧↵ new line"
+                },
+                "eRKrN": {
+                  "opacity": 0.35
+                },
+                "qoQIl": {
+                  "icon": "arrow-up"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "lLXL0",
+      "x": 6460,
+      "y": 960,
+      "name": "5 · Denied, then error",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1000,
+      "height": 700,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "X70T5",
+          "name": "Title bar",
+          "width": "fill_container",
+          "height": 38,
+          "padding": [
+            0,
+            14
+          ],
+          "justifyContent": "space_between",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "Yg13n",
+              "name": "Traffic lights",
+              "width": 160,
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "zpzz6",
+                  "name": "Light",
+                  "fill": "#FF5F57",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "ObFyO",
+                  "name": "Light",
+                  "fill": "#FEBC2E",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "SFIru",
+                  "name": "Light",
+                  "fill": "#28C840",
+                  "width": 12,
+                  "height": 12
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "yPnqs",
+              "name": "Title",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "AS0a0",
+                  "name": "App",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "jyi7A",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "DV9X7",
+              "name": "Right",
+              "width": 160,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "YfScF",
+                  "type": "ref",
+                  "ref": "hspXi",
+                  "name": "Status pill",
+                  "fill": "$danger-subtle",
+                  "descendants": {
+                    "FZ7D5": {
+                      "fill": "$danger"
+                    },
+                    "EPAWC": {
+                      "content": "Stopped",
+                      "fill": "$danger"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "zIWKb",
+          "name": "Transcript",
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            20,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "mkUly",
+              "name": "Column",
+              "width": 720,
+              "layout": "vertical",
+              "gap": 18,
+              "children": [
+                {
+                  "id": "KwMGv",
+                  "type": "ref",
+                  "ref": "d33VbP",
+                  "name": "User message",
+                  "width": "fill_container",
+                  "descendants": {
+                    "ky97F": {
+                      "content": "Look at the files in this folder and tell me how many there are."
+                    }
+                  }
+                },
+                {
+                  "type": "text",
+                  "id": "pTq4x",
+                  "name": "Assistant text",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "I'll list the directory contents to count the files.",
+                  "lineHeight": 1.6,
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "id": "nzpXM",
+                  "type": "ref",
+                  "ref": "K4tZ3x",
+                  "name": "Tool step",
+                  "width": "fill_container",
+                  "descendants": {
+                    "pZfWK": {
+                      "icon": "circle-x",
+                      "fill": "$fg-subtle"
+                    },
+                    "I5WFkd": {
+                      "content": "Bash"
+                    },
+                    "IusEe": {
+                      "content": "ls -la",
+                      "fill": "$fg-subtle"
+                    },
+                    "wbk6i": {
+                      "content": "denied",
+                      "fill": "$fg-subtle"
+                    },
+                    "FgQ0H": {
+                      "enabled": false
+                    },
+                    "vtmRs": {
+                      "content": ""
+                    }
+                  }
+                },
+                {
+                  "type": "text",
+                  "id": "d6n1OA",
+                  "name": "Assistant text",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Understood — I won't run that. I can't count the files without listing them; tell me another way you'd like me to check.",
+                  "lineHeight": 1.6,
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "bsUWt",
+                  "name": "Error",
+                  "width": "fill_container",
+                  "fill": "$danger-subtle",
+                  "cornerRadius": 8,
+                  "gap": 12,
+                  "padding": [
+                    12,
+                    14
+                  ],
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "gvfEh",
+                      "name": "Icon",
+                      "width": 16,
+                      "height": 16,
+                      "icon": "octagon-alert",
+                      "library": "lucide",
+                      "fill": "$danger"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "ypIpX",
+                      "name": "Text",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 4,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "WRj03",
+                          "name": "Title",
+                          "fill": "$fg",
+                          "content": "Claude stopped unexpectedly",
+                          "fontFamily": "$font",
+                          "fontSize": 13,
+                          "fontWeight": "600"
+                        },
+                        {
+                          "type": "text",
+                          "id": "sV1X3",
+                          "name": "Body",
+                          "fill": "$fg-muted",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "The claude process exited with code 1: “Invalid API key · Please run /login”. Run claude in a terminal to sign in, then restart the session.",
+                          "lineHeight": 1.5,
+                          "fontFamily": "$font",
+                          "fontSize": 13,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "tjmi1",
+                      "name": "Restart",
+                      "fill": "$surface",
+                      "cornerRadius": 6,
+                      "stroke": "$border-strong",
+                      "strokeWidth": 1,
+                      "padding": [
+                        6,
+                        12
+                      ],
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "Rn7bQ",
+                          "name": "Label",
+                          "fill": "$fg",
+                          "content": "Restart",
+                          "fontFamily": "$font",
+                          "fontSize": 13,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "F6lAaS",
+          "name": "Bottom",
+          "width": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            0,
+            0,
+            16,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "WSNUV",
+              "type": "ref",
+              "ref": "WBhlj",
+              "name": "Composer",
+              "stroke": "$border-strong",
+              "descendants": {
+                "ZkHfg": {
+                  "content": "Reply to Claude…",
+                  "fill": "$fg-disabled"
+                },
+                "L6HncB": {
+                  "content": "↵ send · ⇧↵ new line"
+                },
+                "eRKrN": {
+                  "opacity": 0.35
+                },
+                "qoQIl": {
+                  "icon": "arrow-up"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "r8IIsT",
+      "x": 7520,
+      "y": 960,
+      "name": "6 · Needs approval (light)",
+      "theme": {
+        "mode": "light"
+      },
+      "clip": true,
+      "width": 1000,
+      "height": 700,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "xGXtY",
+          "name": "Title bar",
+          "width": "fill_container",
+          "height": 38,
+          "padding": [
+            0,
+            14
+          ],
+          "justifyContent": "space_between",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "j4lf0",
+              "name": "Traffic lights",
+              "width": 160,
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "s7SuN",
+                  "name": "Light",
+                  "fill": "#FF5F57",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "qr23I",
+                  "name": "Light",
+                  "fill": "#FEBC2E",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "lVCYp",
+                  "name": "Light",
+                  "fill": "#28C840",
+                  "width": 12,
+                  "height": 12
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "ErZWO",
+              "name": "Title",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "u1N8Kx",
+                  "name": "App",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "EOuzE",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "GoBgF",
+              "name": "Right",
+              "width": 160,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "hV9yl",
+                  "type": "ref",
+                  "ref": "hspXi",
+                  "name": "Status pill",
+                  "fill": "$warning-subtle",
+                  "descendants": {
+                    "FZ7D5": {
+                      "fill": "$warning"
+                    },
+                    "EPAWC": {
+                      "content": "Needs approval",
+                      "fill": "$warning"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "LQ4SR",
+          "name": "Transcript",
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            20,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "DifCx",
+              "name": "Column",
+              "width": 720,
+              "layout": "vertical",
+              "gap": 18,
+              "children": [
+                {
+                  "id": "l5rBY",
+                  "type": "ref",
+                  "ref": "d33VbP",
+                  "name": "User message",
+                  "width": "fill_container",
+                  "descendants": {
+                    "ky97F": {
+                      "content": "Create an empty notes.md in this folder."
+                    }
+                  }
+                },
+                {
+                  "type": "text",
+                  "id": "jHgiE",
+                  "name": "Assistant text",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "I'll create the file with touch.",
+                  "lineHeight": 1.6,
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "id": "iBg9K",
+                  "type": "ref",
+                  "ref": "K4tZ3x",
+                  "name": "Tool step",
+                  "width": "fill_container",
+                  "fill": "#00000000",
+                  "stroke": "$warning",
+                  "strokeWidth": 1,
+                  "descendants": {
+                    "pZfWK": {
+                      "icon": "circle-pause",
+                      "fill": "$warning"
+                    },
+                    "IusEe": {
+                      "content": "touch notes.md"
+                    },
+                    "wbk6i": {
+                      "content": "waiting for you",
+                      "fill": "$warning"
+                    },
+                    "FgQ0H": {
+                      "enabled": false
+                    },
+                    "vtmRs": {
+                      "content": ""
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "LpSVc",
+          "name": "Bottom",
+          "width": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            0,
+            0,
+            16,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "vTmdS",
+              "type": "ref",
+              "ref": "J0WgQ",
+              "name": "Approval dock"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "tvatd",
+      "x": 8580,
+      "y": 960,
+      "name": "7 · Worst case (break-ui)",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1000,
+      "height": 700,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "to7hU",
+          "name": "Title bar",
+          "width": "fill_container",
+          "height": 38,
+          "padding": [
+            0,
+            14
+          ],
+          "justifyContent": "space_between",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "CypGE",
+              "name": "Traffic lights",
+              "width": 160,
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "Ply1Z",
+                  "name": "Light",
+                  "fill": "#FF5F57",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "MAJru",
+                  "name": "Light",
+                  "fill": "#FEBC2E",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "ellipse",
+                  "id": "j28jF",
+                  "name": "Light",
+                  "fill": "#28C840",
+                  "width": 12,
+                  "height": 12
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "bWBxO",
+              "name": "Title",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "hNNHN",
+                  "name": "App",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "wSZ6h",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "ORtT2",
+              "name": "Right",
+              "width": 160,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "XWt2v",
+                  "type": "ref",
+                  "ref": "hspXi",
+                  "name": "Status pill",
+                  "fill": "$warning-subtle",
+                  "descendants": {
+                    "FZ7D5": {
+                      "fill": "$warning"
+                    },
+                    "EPAWC": {
+                      "content": "Needs approval",
+                      "fill": "$warning"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "P7hGe",
+          "name": "Transcript",
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            20,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "XKxsD",
+              "name": "Column",
+              "width": 720,
+              "layout": "vertical",
+              "gap": 18,
+              "children": [
+                {
+                  "id": "A5Lx6",
+                  "type": "ref",
+                  "ref": "d33VbP",
+                  "name": "User message",
+                  "width": "fill_container",
+                  "descendants": {
+                    "VMcve": {
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "fn4fD",
+                          "name": "Text",
+                          "fill": "$fg",
+                          "textGrowth": "fixed-width",
+                          "width": 528,
+                          "content": "Fix the import in /Users/aleksandra.wisniewska-kowalczyk/Projects/northwind-industries-holdings/packages/billing-reconciliation-service/src/handlers/stripeWebhookIdempotencyMiddleware.ts and run the tests — 你好, also check the 👩🏽‍💻 emoji parser",
+                          "lineHeight": 1.6,
+                          "fontFamily": "$font",
+                          "fontSize": 13,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "text",
+                  "id": "k5e5t",
+                  "name": "Assistant text",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Looking at the middleware first.",
+                  "lineHeight": 1.6,
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "id": "nYAZX",
+                  "type": "ref",
+                  "ref": "K4tZ3x",
+                  "name": "Tool step",
+                  "width": "fill_container",
+                  "descendants": {
+                    "I5WFkd": {
+                      "content": "northwind-linear · search_issues_by_label"
+                    },
+                    "IusEe": {
+                      "content": "{\"label\":\"billing\",\"limit\":50}"
+                    },
+                    "wbk6i": {
+                      "content": "1.8s"
+                    },
+                    "vtmRs": {
+                      "content": "[{\"id\":\"BIL-1284\",\"title\":\"Stripe webhook retried 3× creates duplicate invoice\"},\n {\"id\":\"BIL-1290\",\"title\":\"Idempotency key collides across workspaces\"},\n {\"id\":\"BIL-1301\",\"title\":\"…\"}\n+ 2,981 more lines"
+                    }
+                  }
+                },
+                {
+                  "id": "AcPHX",
+                  "type": "ref",
+                  "ref": "K4tZ3x",
+                  "name": "Tool step pending",
+                  "width": "fill_container",
+                  "fill": "#00000000",
+                  "stroke": "$warning",
+                  "strokeWidth": 1,
+                  "descendants": {
+                    "pZfWK": {
+                      "icon": "circle-pause",
+                      "fill": "$warning"
+                    },
+                    "IusEe": {
+                      "content": "cd packages/billing-reconciliation-service && pnpm vitest run src/handlers/stripeWe…"
+                    },
+                    "wbk6i": {
+                      "content": "waiting for you",
+                      "fill": "$warning"
+                    },
+                    "FgQ0H": {
+                      "enabled": false
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "i4b3p5",
+          "name": "Bottom",
+          "width": "fill_container",
+          "layout": "vertical",
+          "padding": [
+            0,
+            0,
+            16,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "f3RmLM",
+              "type": "ref",
+              "ref": "J0WgQ",
+              "name": "Approval dock",
+              "descendants": {
+                "v6lL98": {
+                  "content": "$ cd packages/billing-reconciliation-service && \\\n    pnpm vitest run src/handlers/stripeWebhookIdempotencyMiddleware.test.ts \\\n    --reporter=verbose 2>&1 | tail -n 200"
+                },
+                "I5kOs": {
+                  "content": "Run the idempotency middleware tests and show the last 200 lines of output"
+                },
+                "jSDS0": {
+                  "content": "in ~/Projects/northwind-in…/billing-reconciliation-service"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "KxM2C",
+      "x": 9640,
+      "y": 960,
+      "name": "Decisions",
+      "theme": {
+        "mode": "dark"
+      },
+      "width": 520,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "gap": 10,
+      "padding": 28,
+      "children": [
+        {
+          "type": "text",
+          "id": "KZAKS",
+          "fill": "$fg",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "Slice 1 — decisions",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 16,
+          "fontWeight": "600"
+        },
+        {
+          "type": "text",
+          "id": "X5Fw7",
+          "fill": "$fg-muted",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "• Direction: single pane (A) with the approval docked over the composer (B). Sidebar waits for slice 2 (threads).",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "EiCeM",
+          "fill": "$fg-muted",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "• Approval is the primary action and uses Ely’s PermissionPrompt (Deny · Always allow · Allow once) docked where the composer sits. “Always allow” adds a session-only rule from Claude’s permission_suggestions (verified: nothing is written to the project). The step row in the transcript carries the outcome afterwards.",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "O3ENhm",
+          "fill": "$fg-muted",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "• Keyboard: ⌘↵ allow, esc deny, ↵ send, ⇧↵ newline, ⌘. stop. Keyboard-initiated changes never animate.",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "y8dMT0",
+          "fill": "$fg-muted",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "• Step row: one line; the argument end-truncates (the full input is in the dock). Output clamps to 4 lines + “N more lines”.",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "nnYE7",
+          "fill": "$fg-muted",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "• MCP tool names render as “server · tool”. Paths in metadata middle-truncate. A missing Bash description omits the line.",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "Xf97V",
+          "fill": "$fg-muted",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "• Turn footer shows duration and cost from the result message. Errors render inline with a Restart action; the pill says Stopped.",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "oZ7UN",
+          "fill": "$fg-muted",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "• Sizes follow Ely: 13px body at 1.6 leading, 720px reading column, 12px radius bubbles/composer, Ely palette in light and dark.",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "IUujH",
+          "fill": "$fg-muted",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "• Break-ui: emoji need the system emoji fallback in GPUI (Pen shows a box). Dock input caps at ~8 lines, then scrolls.",
+          "lineHeight": 1.55,
+          "fontFamily": "$font",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        }
+      ]
     }
   ],
   "themes": {
