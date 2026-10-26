@@ -93,7 +93,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 
 ## Build order (one vertical slice first)
 
-1. **Slice:** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in Ely chat, with approve/deny working. One thread, no Rift, no jj.
+1. **Slice (done 2026-10-27):** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in Ely chat, with approve/deny working. One thread, no Rift, no jj.
 2. Threads list, SQLite persistence, resume.
 3. One Rift copy per thread, with postcreate hooks.
 4. jj snapshots, diff view (`ely-git`), and both landing modes.
@@ -106,4 +106,4 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 
 ## Open questions
 
-- None blocking. Next: build slice 1.
+- None blocking. Slice 1 is built (2026-10-27). Next: slice 2, thread list, SQLite persistence and resume.
