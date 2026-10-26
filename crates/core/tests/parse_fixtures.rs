@@ -3,7 +3,7 @@
 mod common;
 
 use newjen_core::protocol::{
-    ContentBlock, Incoming, PermissionAnswer, StreamEvent, permission_response,
+    ContentBlock, Incoming, PermissionAnswer, StreamEvent, allows_for_session, permission_response,
 };
 
 #[test]
@@ -88,9 +88,10 @@ fn permission_request_fields_are_decoded() {
 }
 
 #[test]
-fn allow_for_session_reply_matches_the_live_verified_write_answer() {
-    // `write_allow_session` records the answer that was verified live to auto-approve the
-    // next Write. Our encoder must produce exactly that `updatedPermissions`.
+fn allow_for_session_on_a_write_is_now_plain_allow_once() {
+    // `write_allow_session` records the old answer: the session `acceptEdits` mode, which the
+    // CLI offers for Write. Verified live, that mode also auto-approves `rm` and `mkdir`
+    // through Bash, so we no longer send it. The same request now gets a plain allow-once.
     let lines = common::load("write_allow_session");
     let request_line = lines
         .iter()
@@ -107,9 +108,13 @@ fn allow_for_session_reply_matches_the_live_verified_write_answer() {
         .expect("the recorded answer");
 
     let ours = permission_response(&request, PermissionAnswer::AllowForSession);
-    assert_eq!(ours, recorded.msg);
     assert_eq!(
-        ours["response"]["response"]["updatedPermissions"],
-        serde_json::json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}])
+        ours,
+        permission_response(&request, PermissionAnswer::AllowOnce)
     );
+    assert_ne!(
+        ours, recorded.msg,
+        "the recording holds the old setMode answer"
+    );
+    assert!(!allows_for_session(&request));
 }

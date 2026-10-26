@@ -125,12 +125,22 @@ pub fn can_retry(is_last_row: bool, is_notice: bool, busy: bool) -> bool {
 
 /// The quiet line under a finished turn: "✓ Done in 4.2s · $0.0041".
 fn turn_end(caption: String, stopped: bool, cx: &mut App) -> AnyElement {
-    let color = cx.theme().colors.fg_subtle;
     let icon = if stopped {
         IconName::Square
     } else {
         IconName::Check
     };
+    caption_row(icon, caption, cx)
+}
+
+/// A quiet line of information from the app (not an error), such as "Allowed once — …".
+pub fn note(text: &str, cx: &mut App) -> AnyElement {
+    caption_row(IconName::Info, text.to_string(), cx)
+}
+
+/// A small icon and a caption, both in the subtle text color.
+fn caption_row(icon: IconName, caption: String, cx: &mut App) -> AnyElement {
+    let color = cx.theme().colors.fg_subtle;
     h_stack()
         .gap_1p5()
         .child(Icon::new(icon).size(IconSize::Xs).color(color))

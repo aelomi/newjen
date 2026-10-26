@@ -275,6 +275,124 @@ fn unexpected_exit_stops_the_tools_claude_started() {
     );
 }
 
+/// Writes an executable shell script into `dir` and returns a config that runs it as claude.
+fn script_config(dir: &std::path::Path, name: &str, lines: &[&str]) -> SessionConfig {
+    let script = dir.join(name);
+    let mut file = std::fs::File::create(&script).unwrap();
+    writeln!(file, "#!/bin/sh").unwrap();
+    for line in lines {
+        writeln!(file, "{line}").unwrap();
+    }
+    drop(file);
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = SessionConfig::new(dir);
+    config.program = script;
+    config
+}
+
+#[test]
+fn writes_fail_at_once_after_claude_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = script_config(dir.path(), "quitting-claude", &["exit 0"]);
+    let (session, events) = Session::spawn(config).unwrap();
+    loop {
+        if let SessionEvent::Exited { requested, .. } = common::next_event(&events, TIMEOUT) {
+            assert!(!requested);
+            break;
+        }
+    }
+    // The queue is closed before `Exited` is sent, so nothing is queued into a dead pipe.
+    assert!(session.send_prompt("hello").is_err());
+    assert!(session.interrupt().is_err());
+}
+
+#[test]
+fn a_failed_write_is_reported_as_one_error() {
+    // A stand-in that closes its stdin but keeps running, so our write fails with a broken
+    // pipe while claude is still alive.
+    let dir = tempfile::tempdir().unwrap();
+    let config = script_config(
+        dir.path(),
+        "deaf-claude",
+        &[
+            "exec 0<&-",
+            r#"echo '{"type":"system","subtype":"ready"}'"#,
+            "exec sleep 60",
+        ],
+    );
+    let (session, events) = Session::spawn(config).unwrap();
+    let mut transcript = Transcript::new();
+    transcript.apply(&common::next_event(&events, TIMEOUT));
+
+    session.send_prompt("hello").unwrap();
+    transcript.push_user("hello");
+    loop {
+        let event = common::next_event(&events, TIMEOUT);
+        transcript.apply(&event);
+        match event {
+            SessionEvent::WriteFailed(_) => break,
+            SessionEvent::Exited { .. } => panic!("exited before reporting the failed write"),
+            _ => {}
+        }
+    }
+    assert!(session.send_prompt("again").is_err());
+
+    session.shutdown();
+    loop {
+        let event = common::next_event(&events, TIMEOUT);
+        transcript.apply(&event);
+        if matches!(event, SessionEvent::Exited { .. }) {
+            break;
+        }
+    }
+    let errors: Vec<&str> = transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            Item::Error { title, .. } => Some(title.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors, ["Could not reach Claude"]);
+    assert_eq!(transcript.status(), Status::Failed);
+}
+
+#[test]
+fn crash_is_reported_even_when_a_tool_keeps_stdout_open() {
+    // The tool inherits claude's stdout and ignores SIGTERM, so stdout never reaches EOF on
+    // its own. `Exited` must still arrive, and the tool must be killed (SIGTERM, then SIGKILL).
+    let dir = tempfile::tempdir().unwrap();
+    let config = script_config(
+        dir.path(),
+        "crashing-claude",
+        &[
+            "trap '' TERM",
+            "sleep 60 &",
+            r#"echo "{\"type\":\"system\",\"subtype\":\"$!\"}""#,
+            "exit 7",
+        ],
+    );
+    let (_session, events) = Session::spawn(config).unwrap();
+    let tool_pid: u32 = match common::next_event(&events, TIMEOUT) {
+        SessionEvent::Line(Incoming::System(message)) => message.subtype.parse().unwrap(),
+        other => panic!("unexpected event {other:?}"),
+    };
+    // Far below the tool's 60 s: before this fix, `Exited` waited for stdout to close.
+    let (code, requested) = loop {
+        if let SessionEvent::Exited { code, requested } =
+            common::next_event(&events, Duration::from_secs(3))
+        {
+            break (code, requested);
+        }
+    };
+    assert_eq!(code, Some(7));
+    assert!(!requested);
+    assert!(
+        wait_until_dead(tool_pid, Duration::from_secs(1)),
+        "the tool holding stdout survived"
+    );
+}
+
 /// The pid of a child of `parent`, using `pgrep -P`.
 fn find_child_of(parent: u32) -> Option<u32> {
     let output = std::process::Command::new("pgrep")

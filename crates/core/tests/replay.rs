@@ -426,9 +426,13 @@ fn other_errors_keep_the_session_id() {
 }
 
 #[test]
-fn write_allowed_for_the_session_runs_the_second_write_without_asking() {
-    // Recorded live: "Allow for this session" on the first Write (sent as the session
-    // `acceptEdits` mode), after which the CLI ran the second Write without asking.
+fn write_allow_session_recording_replays_both_writes() {
+    // Recorded live with the OLD "Allow for this session" answer for Write (the session
+    // `acceptEdits` mode), after which the CLI ran the second Write without asking. Newjen no
+    // longer sends that mode (it also auto-approves `rm` and `mkdir`; see
+    // `parse_fixtures::allow_for_session_on_a_write_is_now_plain_allow_once`), so a second
+    // Write would now ask again. The recording still checks that the transcript settles an
+    // approved call and a call the CLI ran without asking.
     let replay = replay("write_allow_session");
     assert!(replay.saw_pending_approval);
     let approvals = common::load("write_allow_session")
@@ -552,6 +556,28 @@ fn exit_after_a_failed_turn_adds_no_second_error() {
         requested: false,
     });
     assert_eq!(errors(&transcript).len(), 1);
+}
+
+#[test]
+fn a_failed_write_and_a_crash_show_one_error_in_either_order() {
+    let crash = SessionEvent::Exited {
+        code: Some(1),
+        requested: false,
+    };
+    let write_failed = SessionEvent::WriteFailed("Broken pipe (os error 32)".to_string());
+    for (first, second, title) in [
+        (&crash, &write_failed, "Claude exited"),
+        (&write_failed, &crash, "Could not reach Claude"),
+    ] {
+        let mut transcript = Transcript::new();
+        transcript.push_user("hi");
+        transcript.apply(first);
+        transcript.apply(second);
+        let errors = errors(&transcript);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, title);
+        assert_eq!(transcript.status(), Status::Failed);
+    }
 }
 
 /// Feeds one raw stdout line to the transcript.

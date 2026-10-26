@@ -1,10 +1,11 @@
 //! Spawns and owns one `claude` CLI process speaking the stream-json protocol.
 //!
 //! Two background threads read the process's output and turn it into [`SessionEvent`]s on an
-//! `async_channel`, which the UI can await (or a test can poll). A third thread writes to the
-//! process: [`Session`]'s methods (prompts, approval answers, interrupts) only put a finished
-//! line on a queue and return. So a stalled `claude` that stops reading its stdin can never
-//! freeze the caller (the UI thread) or block [`Session::shutdown`].
+//! `async_channel`, which the UI can await (or a test can poll). A third thread waits for the
+//! process to end, cleans up after it and sends the final `Exited` event. A fourth writes to
+//! the process: [`Session`]'s methods (prompts, approval answers, interrupts) only put a
+//! finished line on a queue and return. So a stalled `claude` that stops reading its stdin can
+//! never freeze the caller (the UI thread) or block [`Session::shutdown`].
 //!
 //! Why threads and not an async runtime: there is exactly one process per conversation and its
 //! input and output are line-based, so plain threads are the simplest thing that works, and
@@ -49,8 +50,14 @@ const NESTED_SESSION_ENV_VARS: &[&str] = &[
 /// gives the whole app about 200 ms to quit.
 const GRACE_PERIOD: Duration = Duration::from_millis(140);
 
-/// How long the stdout thread waits for the stderr thread to drain after the process exits.
-const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// When claude exits on its own (a crash), how long the tools it left running get after
+/// SIGTERM before they are sent SIGKILL.
+const CRASH_GRACE_PERIOD: Duration = Duration::from_millis(150);
+
+/// After the process exits, how long to wait for the stdout and stderr threads to read the
+/// last lines before `Exited` is sent anyway. Bounded, because a leftover process outside the
+/// group could keep a pipe open forever.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How to start the CLI.
 #[derive(Debug, Clone, PartialEq)]
@@ -153,12 +160,17 @@ pub enum SessionEvent {
     Line(Incoming),
     /// One stderr line (warnings, crash output). Useful in error messages.
     Stderr(String),
+    /// Writing a prompt or answer to claude's stdin failed (claude closed it or is gone), so
+    /// it never arrived. Holds the OS error text. Never sent after [`Session::shutdown`], and
+    /// it can arrive just before or just after the `Exited` of a crashed claude.
+    WriteFailed(String),
     /// The process ended. `code` is `None` if it was killed by a signal. `requested` is true
     /// when [`Session::shutdown`] (or dropping the `Session`) was called before it ended, so
     /// the exit was expected rather than a crash.
     ///
-    /// The last stdout-derived event. A few `Stderr` lines can still follow it if a leftover
-    /// grandchild keeps stderr open.
+    /// Normally the last event. It waits (briefly) for stdout and stderr to reach the end, so
+    /// only a leftover process outside claude's group that keeps a pipe open, or a
+    /// `WriteFailed`, can follow it.
     Exited { code: Option<i32>, requested: bool },
 }
 
@@ -168,12 +180,15 @@ pub struct Session {
     /// Lines waiting to be written to the process's stdin by the writer thread. Closing this
     /// queue makes the writer thread finish and drop stdin, which closes the pipe. The CLI
     /// needs stdin open for the whole session (when it closes, the CLI rejects pending
-    /// approvals and exits), so it is closed only by `shutdown`.
+    /// approvals and exits), so it is closed only by `shutdown`, when claude has exited, or
+    /// when a write fails. After that, `send_prompt`, `answer` and `interrupt` return an error.
     to_stdin: Sender<String>,
-    /// Set by the first `shutdown` call so later calls return at once. Shared with the stdout
-    /// thread, which reports it in `Exited { requested }`.
+    /// Set by the first `shutdown` call so later calls return at once. Shared with the waiter
+    /// thread, which reports it in `Exited { requested }`, and the writer thread, which then
+    /// stays quiet about failed writes.
     shutting_down: Arc<AtomicBool>,
-    /// Set by the reader thread once the process has exited and been reaped.
+    /// Set by the waiter thread once the process has exited, been reaped and (after a crash)
+    /// the tools it left behind were stopped.
     exited: Arc<AtomicBool>,
     /// Counter for the ids of our own control requests (interrupts).
     next_request_number: AtomicU64,
@@ -213,17 +228,18 @@ impl Session {
         let stdout = child.stdout.take().context("child has no stdout")?;
         let stderr = child.stderr.take().context("child has no stderr")?;
 
-        let to_stdin = spawn_stdin_writer(stdin);
         let (sender, receiver) = async_channel::unbounded();
         let exited = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
 
+        let to_stdin = spawn_stdin_writer(stdin, sender.clone(), shutting_down.clone());
+        let stdout_done = spawn_stdout_reader(stdout, sender.clone());
         let stderr_done = spawn_stderr_reader(stderr, sender.clone());
-        spawn_stdout_reader(
+        spawn_waiter(
             child,
-            stdout,
             sender,
-            stderr_done,
+            to_stdin.clone(),
+            [stdout_done, stderr_done],
             exited.clone(),
             shutting_down.clone(),
         );
@@ -270,7 +286,7 @@ impl Session {
         if self.exited.load(Ordering::SeqCst) {
             // claude was reaped earlier, so its pid (which is also the group id) may already
             // belong to an unrelated process; signalling the group now could hit that. Tools a
-            // crashed claude left in its group were already sent SIGTERM by the reader thread.
+            // crashed claude left in its group were already stopped by the waiter thread.
             return;
         }
         let group = self.pid as libc::pid_t;
@@ -286,7 +302,7 @@ impl Session {
         // Even if claude itself exited, tools it started may still be running in its group.
         // SAFETY: as above.
         unsafe { libc::killpg(group, libc::SIGKILL) };
-        // The process is gone now. Unregister here too (not only in the reader thread), because
+        // The process is gone now. Unregister here too (not only in the waiter thread), because
         // the app may exit right after this call, before that thread gets to run.
         orphans::unregister(self.pid);
     }
@@ -299,8 +315,8 @@ impl Session {
     /// Serializes `message` with a JSON encoder and queues it as one line for the writer
     /// thread. The CLI exits on a line that is not valid JSON, so lines are never built by hand.
     ///
-    /// Returns at once. Fails if the session was shut down or claude stopped accepting input
-    /// (the writer thread closes the queue when a write fails).
+    /// Returns at once. Fails if the session was shut down, claude exited, or an earlier write
+    /// failed (each of these closes the queue).
     fn write_line(&self, message: &Value) -> Result<()> {
         let mut line = serde_json::to_string(message)?;
         line.push('\n');
@@ -317,17 +333,29 @@ impl Drop for Session {
     }
 }
 
-/// Writes queued lines to claude's stdin, in order, until the queue is closed (by `shutdown`)
-/// or a write fails (claude is gone). Then it drops stdin, which closes the pipe.
-fn spawn_stdin_writer(mut stdin: ChildStdin) -> Sender<String> {
+/// Writes queued lines to claude's stdin, in order, until the queue is closed (by `shutdown`
+/// or when claude exits) or a write fails. Then it drops stdin, which closes the pipe.
+fn spawn_stdin_writer(
+    mut stdin: ChildStdin,
+    events: Sender<SessionEvent>,
+    shutting_down: Arc<AtomicBool>,
+) -> Sender<String> {
     let (sender, receiver) = async_channel::unbounded::<String>();
     thread::spawn(move || {
         // `recv_blocking` still hands out lines queued before the close, then returns an error.
         while let Ok(line) = receiver.recv_blocking() {
-            if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
+            let written = stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush());
+            if let Err(error) = written {
                 // Closing the queue makes later `send_prompt`/`answer` calls report an error
                 // instead of silently queueing lines nobody will write.
                 receiver.close();
+                // Tell the UI, so a lost prompt or answer never fails silently. After
+                // `shutdown` a failed write is expected (we killed claude), so stay quiet.
+                if !shutting_down.load(Ordering::SeqCst) {
+                    let _ = events.send_blocking(SessionEvent::WriteFailed(error.to_string()));
+                }
                 break;
             }
         }
@@ -336,15 +364,12 @@ fn spawn_stdin_writer(mut stdin: ChildStdin) -> Sender<String> {
     sender
 }
 
-/// Reads stdout line by line until EOF, then reaps the process and sends `Exited` last.
+/// Reads stdout line by line until EOF. Signals the returned channel at EOF.
 fn spawn_stdout_reader(
-    mut child: Child,
     stdout: impl Read + Send + 'static,
     sender: Sender<SessionEvent>,
-    stderr_done: mpsc::Receiver<()>,
-    exited: Arc<AtomicBool>,
-    shutting_down: Arc<AtomicBool>,
-) {
+) -> mpsc::Receiver<()> {
+    let (done_sender, done) = mpsc::channel();
     thread::spawn(move || {
         for_each_line(stdout, |line| {
             if line.trim().is_empty() {
@@ -354,28 +379,73 @@ fn spawn_stdout_reader(
             // full pipe.
             let _ = sender.send_blocking(SessionEvent::Line(Incoming::parse(line)));
         });
+        let _ = done_sender.send(());
+    });
+    done
+}
+
+/// Waits for claude to exit, cleans up, and sends `Exited` last.
+///
+/// This does not wait for stdout to close first: a tool claude started can inherit stdout and
+/// keep it open long after claude itself is gone, and a crash must still be reported.
+fn spawn_waiter(
+    mut child: Child,
+    sender: Sender<SessionEvent>,
+    to_stdin: Sender<String>,
+    readers_done: [mpsc::Receiver<()>; 2],
+    exited: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
         let code = child.wait().ok().and_then(|status| status.code());
+        let pid = child.id();
         // Read after the process is gone: true only if shutdown started before it ended.
         let requested = shutting_down.load(Ordering::SeqCst);
+        // claude is reaped, so the orphan registry has nothing left to clean up. Unregister
+        // before setting `exited`: once `exited` is set, `shutdown` returns early and skips its
+        // own unregister, and the app may quit right after.
+        orphans::unregister(pid);
         if !requested {
-            // claude ended on its own (often a crash). Stop the tools it started, which share
-            // its process group, so they don't run on unattended. Safe even though claude is
-            // already reaped: a group id is not handed out again while any process is still
-            // in that group, and if the group is already empty this just fails with ESRCH.
-            // The only risk is the pid being reused as a new group leader in the moment since
-            // `wait()` returned, which is vanishingly unlikely.
-            // SAFETY: killpg only sends a signal.
-            unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGTERM) };
+            stop_leftover_tools(pid);
         }
-        // Unregister before setting `exited`: once `exited` is set, `shutdown` returns early
-        // and skips its own unregister, and the app may quit right after.
-        orphans::unregister(child.id());
+        // Nobody reads stdin any more: make `send_prompt`, `answer` and `interrupt` fail at
+        // once instead of queueing lines into a dead pipe. Done before `Exited` is sent, so a
+        // caller that has seen `Exited` can rely on it.
+        to_stdin.close();
+        // Set only after the cleanup above. Until then a `shutdown` call (say, the app
+        // quitting) still signals the group itself, so a stubborn tool cannot outlive the app.
         exited.store(true, Ordering::SeqCst);
-        // Let the last stderr lines arrive before `Exited`, but don't hang if a leftover
-        // grandchild keeps stderr open.
-        let _ = stderr_done.recv_timeout(STDERR_DRAIN_TIMEOUT);
+        // Let the last stdout and stderr lines arrive before `Exited`, but don't hang if a
+        // leftover process keeps a pipe open.
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        for done in readers_done {
+            let _ = done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
         let _ = sender.send_blocking(SessionEvent::Exited { code, requested });
     });
+}
+
+/// claude ended on its own (often a crash). Stops the tools it started, which share its process
+/// group, so they don't run on unattended: SIGTERM, up to [`CRASH_GRACE_PERIOD`] for them to
+/// exit, then SIGKILL for any that ignored it.
+///
+/// Safe even though claude is already reaped: a group id is not handed out again while any
+/// process is still in that group, and if the group is already empty the signals just fail
+/// with ESRCH. The only risk is the pid being reused as a new group leader in the moment since
+/// `wait()` returned, which is vanishingly unlikely.
+fn stop_leftover_tools(pid: u32) {
+    let group = pid as libc::pid_t;
+    // SAFETY (all three calls): killpg only sends a signal.
+    unsafe { libc::killpg(group, libc::SIGTERM) };
+    let deadline = Instant::now() + CRASH_GRACE_PERIOD;
+    while Instant::now() < deadline {
+        // Signal 0 sends nothing; it fails once no process is left in the group.
+        if unsafe { libc::killpg(group, 0) } != 0 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    unsafe { libc::killpg(group, libc::SIGKILL) };
 }
 
 /// Forwards stderr lines. Signals `done` at EOF.

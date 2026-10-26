@@ -240,8 +240,25 @@ impl Transcript {
                     self.stderr_tail.pop_front();
                 }
             }
+            SessionEvent::WriteFailed(detail) => self.apply_write_failed(detail),
             SessionEvent::Exited { code, requested } => self.apply_exit(*code, *requested),
         }
+    }
+
+    /// A prompt or answer could not be written to claude, so the turn can't go on.
+    fn apply_write_failed(&mut self, detail: &str) {
+        // Already failed (usually a "Claude exited" error for the same crash): one error is
+        // enough. If this one comes first, `apply_exit` skips its own error the same way.
+        if self.status == Status::Failed {
+            return;
+        }
+        self.finish_turn();
+        self.close_unfinished_tools("Claude could not be reached.");
+        self.push_error(
+            "Could not reach Claude",
+            format!("Newjen could not send the message to the claude process: {detail}"),
+        );
+        self.status = Status::Failed;
     }
 
     fn apply_incoming(&mut self, incoming: &Incoming) {

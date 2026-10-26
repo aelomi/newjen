@@ -30,7 +30,8 @@ use gpui::{
     Task, Window, div, font, prelude::*, px,
 };
 use newjen_core::{
-    Item, PermissionAnswer, Session, SessionConfig, SessionEvent, Status, ToolState, Transcript,
+    Item, PermissionAnswer, PermissionRequest, Session, SessionConfig, SessionEvent, Status,
+    ToolState, Transcript, allows_for_session,
 };
 
 use crate::approval::{self, Room};
@@ -79,10 +80,35 @@ const TITLE_WIDTH: f32 = 60.0;
 const TITLE_BAR_INSET: f32 = 100.0;
 const PATH_CHAR_WIDTH: f32 = 7.0;
 
-/// A problem in the app itself (not reported by Claude), shown as an error row at the end.
+/// Shown when "Always allow" could only allow once (see `always_fell_back`).
+const ALLOWED_ONCE_NOTE: &str = "Allowed once — Always allow isn't available for this request yet.";
+
+/// A message from the app itself (not reported by Claude), shown as the last row. It is cleared
+/// by the next prompt, answer or stop that reaches Claude.
 struct Notice {
     title: String,
     detail: String,
+    /// Just information, not a problem: drawn as a quiet caption (only `title` is shown) and
+    /// never offers "Try again", which would restart Claude and lose the running turn.
+    quiet: bool,
+}
+
+impl Notice {
+    fn error(title: &str, detail: String) -> Notice {
+        Notice {
+            title: title.to_string(),
+            detail,
+            quiet: false,
+        }
+    }
+
+    fn quiet(text: &str) -> Notice {
+        Notice {
+            title: text.to_string(),
+            detail: String::new(),
+            quiet: true,
+        }
+    }
 }
 
 pub struct ChatView {
@@ -239,7 +265,7 @@ impl ChatView {
     }
 
     fn is_busy(&self) -> bool {
-        matches!(self.transcript.status(), Status::Working | Status::Waiting)
+        is_busy(self.transcript.status())
     }
 
     /// Sends the composer's text as a prompt (Enter or the send button).
@@ -259,12 +285,9 @@ impl ChatView {
                 // Ely's composer leaves clearing the field to its owner.
                 self.field.update(cx, |field, cx| field.set_text("", cx));
             }
-            Err(error) => {
-                self.notice = Some(Notice {
-                    title: "Could not reach Claude".to_string(),
-                    detail: format!("{error:#}. Try again to restart the session."),
-                });
-            }
+            // Nothing was sent: the text stays in the field (so nothing typed is lost) and the
+            // conversation stays as it was, not "Working", so the composer remains usable.
+            Err(error) => self.notice = notice_after(Err(error), "Could not reach Claude"),
         }
         self.sync_field(window, cx);
         cx.notify();
@@ -288,13 +311,14 @@ impl ChatView {
         // Resolve first: a second click or key press now finds nothing to answer.
         self.transcript
             .resolve_approval(&request.request_id, answer);
-        if let Some(session) = &self.session
-            && let Err(error) = session.answer(&request, answer)
-        {
-            self.notice = Some(Notice {
-                title: "Could not send your answer to Claude".to_string(),
-                detail: format!("{error:#}. Try again to restart the session."),
-            });
+        if let Some(session) = &self.session {
+            let sent = session.answer(&request, answer);
+            // Core sends "Always allow" as a plain allow-once when it can't make Claude
+            // remember it. Say so quietly, because the next similar call will ask again.
+            self.notice =
+                notice_after(sent, "Could not send your answer to Claude").or_else(|| {
+                    always_fell_back(&request, answer).then(|| Notice::quiet(ALLOWED_ONCE_NOTE))
+                });
         }
         self.sync_field(window, cx);
         cx.notify();
@@ -309,13 +333,8 @@ impl ChatView {
         if !self.is_busy() {
             return;
         }
-        if let Some(session) = &self.session
-            && let Err(error) = session.interrupt()
-        {
-            self.notice = Some(Notice {
-                title: "Could not stop Claude".to_string(),
-                detail: format!("{error:#}. Try again to restart the session."),
-            });
+        if let Some(session) = &self.session {
+            self.notice = notice_after(session.interrupt(), "Could not stop Claude");
             cx.notify();
         }
     }
@@ -400,13 +419,16 @@ impl ChatView {
         let on_restart = self.restart_callback(cx);
         let busy = self.is_busy();
         let items = self.transcript.items();
-        let row_count = items.len() + usize::from(self.notice.is_some());
-        let is_notice = ix >= items.len();
-        let retry = rows::can_retry(ix + 1 == row_count, is_notice, busy).then_some(&on_restart);
+        let retry =
+            offers_retry(ix, items.len(), self.notice.as_ref(), busy).then_some(&on_restart);
         let row = if let Some(item) = items.get(ix) {
             rows::item(item, ix + 1 == items.len(), retry, cx)
         } else if let Some(notice) = &self.notice {
-            rows::error("notice".into(), &notice.title, &notice.detail, retry)
+            if notice.quiet {
+                rows::note(&notice.title, cx)
+            } else {
+                rows::error("notice".into(), &notice.title, &notice.detail, retry)
+            }
         } else {
             div().into_any_element()
         };
@@ -676,15 +698,113 @@ fn spawn_notice(error: &anyhow::Error, program: &Path) -> Notice {
         ),
         _ => format!("{error:#}.\n\nCheck that `{program}` runs in a terminal, then try again."),
     };
-    Notice {
-        title: "Could not start Claude Code".to_string(),
-        detail,
-    }
+    Notice::error("Could not start Claude Code", detail)
+}
+
+/// While Claude is working or waiting on an approval, the composer shows the stop button and
+/// sending is blocked. Any other status (including Failed) leaves the composer usable.
+fn is_busy(status: Status) -> bool {
+    matches!(status, Status::Working | Status::Waiting)
+}
+
+/// The notice after writing a prompt, answer or stop to Claude. If it was sent, none: an older
+/// notice (say, an earlier failed write) is now out of date. If not, an error titled `failed`.
+fn notice_after(sent: anyhow::Result<()>, failed: &str) -> Option<Notice> {
+    let error = sent.err()?;
+    Some(Notice::error(
+        failed,
+        format!("{error:#}. Try again to restart the session."),
+    ))
+}
+
+/// True when the user picked "Always allow" but core sends it as a plain allow-once, because
+/// it can't make the CLI remember this kind of call (`newjen_core::allows_for_session`).
+fn always_fell_back(request: &PermissionRequest, answer: PermissionAnswer) -> bool {
+    answer == PermissionAnswer::AllowForSession && !allows_for_session(request)
+}
+
+/// Whether row `ix` gets a "Try again" button. Rows are the transcript's `item_count` items,
+/// then the notice if there is one. A quiet notice never retries and is skipped when finding
+/// the last row, so the newest error above it keeps its button.
+fn offers_retry(ix: usize, item_count: usize, notice: Option<&Notice>, busy: bool) -> bool {
+    let error_notice = notice.is_some_and(|notice| !notice.quiet);
+    let row_count = item_count + usize::from(error_notice);
+    ix < row_count && rows::can_retry(ix + 1 == row_count, ix >= item_count, busy)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+
+    fn request(tool_name: &str, input: Value) -> PermissionRequest {
+        PermissionRequest {
+            request_id: "req-1".to_string(),
+            tool_use_id: Some("toolu_1".to_string()),
+            tool_name: tool_name.to_string(),
+            display_name: tool_name.to_string(),
+            input,
+            description: None,
+            suggestions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn always_allow_says_allowed_once_when_core_cannot_remember_it() {
+        let write = request(
+            "Write",
+            json!({"file_path": "/work/a.txt", "content": "hi"}),
+        );
+        assert!(always_fell_back(&write, PermissionAnswer::AllowForSession));
+        // Allow once is exactly what the user asked for: nothing to say.
+        assert!(!always_fell_back(&write, PermissionAnswer::AllowOnce));
+        // An exact Bash command is remembered for the session, so no note.
+        let bash = request("Bash", json!({"command": "ls -la"}));
+        assert!(!always_fell_back(&bash, PermissionAnswer::AllowForSession));
+    }
+
+    #[test]
+    fn a_quiet_notice_never_retries_and_keeps_the_newest_errors_button() {
+        let note = Notice::quiet(ALLOWED_ONCE_NOTE);
+        // Two transcript items, the second an error; the turn has ended (not busy).
+        assert!(offers_retry(1, 2, Some(&note), false));
+        assert!(!offers_retry(2, 2, Some(&note), false));
+        // Mid-turn the quiet note still never offers a restart.
+        assert!(!offers_retry(2, 2, Some(&note), true));
+        // An error notice is the last row and keeps its button, even mid-turn.
+        let error = Notice::error("Could not reach Claude", String::new());
+        assert!(offers_retry(2, 2, Some(&error), true));
+        assert!(!offers_retry(1, 2, Some(&error), false));
+    }
+
+    #[test]
+    fn a_sent_answer_or_stop_clears_the_notice() {
+        assert!(notice_after(Ok(()), "Could not stop Claude").is_none());
+        let failed = notice_after(
+            Err(anyhow::anyhow!("claude has exited")),
+            "Could not stop Claude",
+        )
+        .expect("a failed write leaves a notice");
+        assert_eq!(failed.title, "Could not stop Claude");
+        assert!(failed.detail.starts_with("claude has exited. Try again"));
+        assert!(!failed.quiet);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_composer_usable_with_try_again() {
+        let mut transcript = Transcript::new();
+        transcript.push_user("hello");
+        assert!(is_busy(transcript.status()));
+        transcript.apply(&SessionEvent::WriteFailed(
+            "Broken pipe (os error 32)".to_string(),
+        ));
+        let busy = is_busy(transcript.status());
+        assert!(!busy, "the composer must not stay on \"Working\"");
+        let items = transcript.items();
+        let last = items.len() - 1;
+        assert!(matches!(items[last], Item::Error { .. }));
+        assert!(offers_retry(last, items.len(), None, busy));
+    }
 
     fn failed(kind: io::ErrorKind) -> anyhow::Error {
         // The same shape `Session::spawn` returns: the OS error with context around it.
