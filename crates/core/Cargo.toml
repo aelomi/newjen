@@ -1,0 +1,30 @@
+[package]
+name = "newjen-core"
+description = "Newjen's UI-free core: Claude Code sessions, protocol types and conversation state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "newjen_core"
+path = "src/lib.rs"
+
+# Test support only: a stand-in for the `claude` CLI that replays a recorded fixture.
+# Integration tests run it through `Session` so they need no network and no Claude login.
+[[bin]]
+name = "newjen-fake-claude"
+path = "src/bin/newjen-fake-claude.rs"
+test = false
+doc = false
+
+# `core` must never depend on GPUI or Ely, so the UI layer can be replaced.
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

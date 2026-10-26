@@ -1,0 +1,23 @@
+# The Newjen Cargo workspace. Think of it like an npm/pnpm workspace: one lockfile,
+# several crates (packages) that build together.
+[workspace]
+resolver = "3"
+members = ["crates/core"]
+
+# Settings every crate inherits with `x.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+# Every dependency is pinned to an exact version (`=x.y.z`) so builds are reproducible.
+# Crates opt in with `name.workspace = true`. These versions match what GPUI and Ely already
+# pull in, so the whole workspace shares one copy of each and builds offline.
+[workspace.dependencies]
+anyhow = "=1.0.104"
+async-channel = "=2.5.0"
+libc = "=0.2.191"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tempfile = "=3.27.0"
