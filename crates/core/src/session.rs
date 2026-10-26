@@ -11,7 +11,7 @@
 //! input and output are line-based, so plain threads are the simplest thing that works, and
 //! `core` stays independent of any UI framework's executor.
 //!
-//! claude is started through a tiny shell launcher (see [`LAUNCHER`]) that also starts a
+//! claude is started through a tiny shell launcher (see `LAUNCHER`) that also starts a
 //! watcher, so claude and its tools die as soon as Newjen dies, even after a crash.
 
 use std::ffi::OsString;
@@ -88,7 +88,7 @@ pub const INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const LAUNCHER: &str = "(trap '' TERM; read _ <&3; kill -TERM 0; sleep 2; kill -KILL 0) \
                         </dev/null >/dev/null 2>&1 & exec \"$@\" 3<&-";
 
-/// The fd number the watcher reads (see [`LAUNCHER`]).
+/// The fd number the watcher reads (see `LAUNCHER`).
 const WATCH_FD: libc::c_int = 3;
 
 /// How to start the CLI.
@@ -243,7 +243,7 @@ struct Control {
     /// Set by the waiter thread once the process has exited, been reaped and (after a crash)
     /// the tools it left behind were stopped.
     exited: AtomicBool,
-    /// Newjen's end of the pipe the watcher waits on (see [`LAUNCHER`]). Dropping it tells the
+    /// Newjen's end of the pipe the watcher waits on (see `LAUNCHER`). Dropping it tells the
     /// watcher to stop claude, so it is dropped only when the session ends.
     owner_pipe: Mutex<Option<PipeWriter>>,
     /// The id of an interrupt claude has not confirmed yet.

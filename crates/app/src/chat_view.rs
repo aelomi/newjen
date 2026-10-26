@@ -30,8 +30,8 @@ use gpui::{
     Task, Window, div, font, prelude::*, px,
 };
 use newjen_core::{
-    Item, PermissionAnswer, PermissionRequest, Session, SessionConfig, SessionEvent, Status,
-    ToolState, Transcript, allows_for_session, session_scope,
+    Item, PermissionAnswer, Session, SessionConfig, SessionEvent, Status, ToolState, Transcript,
+    session_scope,
 };
 
 use crate::approval::{self, Room};
@@ -83,17 +83,11 @@ const TITLE_WIDTH: f32 = 60.0;
 const TITLE_BAR_INSET: f32 = 100.0;
 const PATH_CHAR_WIDTH: f32 = 7.0;
 
-/// Shown when "Always allow" could only allow once (see `always_fell_back`).
-const ALLOWED_ONCE_NOTE: &str = "Allowed once — Always allow isn't available for this request yet.";
-
 /// A message from the app itself (not reported by Claude), shown as the last row. It is cleared
 /// by the next prompt, answer or stop that reaches Claude.
 struct Notice {
     title: String,
     detail: String,
-    /// Just information, not a problem: drawn as a quiet caption (only `title` is shown) and
-    /// never offers "Try again", which would restart Claude and lose the running turn.
-    quiet: bool,
 }
 
 impl Notice {
@@ -101,15 +95,6 @@ impl Notice {
         Notice {
             title: title.to_string(),
             detail,
-            quiet: false,
-        }
-    }
-
-    fn quiet(text: &str) -> Notice {
-        Notice {
-            title: text.to_string(),
-            detail: String::new(),
-            quiet: true,
         }
     }
 }
@@ -134,6 +119,10 @@ pub struct ChatView {
     root: FocusHandle,
     /// The approval the dock is showing, to notice when a new one takes its place.
     dock_request: Option<String>,
+    /// That approval's path outside the project, if any (`approval::outside_path`). Worked out
+    /// once when the request reaches the dock, because it reads the disk and `render` runs on
+    /// every streamed frame.
+    dock_outside: Option<String>,
     /// Keyboard answers (⌘↵, Esc) are ignored until this moment; see `KEY_ANSWER_DELAY`.
     keys_ready_at: Option<Instant>,
     _subscriptions: Vec<Subscription>,
@@ -172,6 +161,7 @@ impl ChatView {
             placeholder,
             root: cx.focus_handle(),
             dock_request: None,
+            dock_outside: None,
             keys_ready_at: None,
             _subscriptions: vec![on_quit],
         };
@@ -251,6 +241,10 @@ impl ChatView {
                 _ => {}
             }
             self.dock_request = front;
+            self.dock_outside = self
+                .transcript
+                .pending_approval()
+                .and_then(|request| approval::outside_path(request, &self.project));
         }
 
         let placeholder = SharedString::from(match self.transcript.status() {
@@ -297,14 +291,14 @@ impl ChatView {
     }
 
     /// Answers the pending approval. `request_id` is the request the button belonged to; a
-    /// stale click (that request was already answered) does nothing. `shortened` says the dock
-    /// had to cut the command to fit, so "Always allow" is sent as allow once (see
-    /// `sent_answer`).
+    /// stale click (that request was already answered) does nothing. `rule_cut` says the dock
+    /// could not show the remembered rule in full (`ScopeRow::once`), so "Always allow" is sent
+    /// as allow once (see `sent_answer`).
     fn answer(
         &mut self,
         request_id: Option<&str>,
         choice: PermissionAnswer,
-        shortened: bool,
+        rule_cut: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -314,20 +308,15 @@ impl ChatView {
         if request_id.is_some_and(|id| id != request.request_id) {
             return;
         }
-        let answer = sent_answer(choice, shortened);
+        let answer = sent_answer(choice, rule_cut);
         // Resolve first: a second click or key press now finds nothing to answer.
         self.transcript
             .resolve_approval(&request.request_id, answer);
         if let Some(session) = &self.session {
+            // No note after the click when "Always allow" acts once: the scope row under the
+            // dock already said so before the click.
             let sent = session.answer(&request, answer);
-            // "Always allow" went out as a plain allow-once (core can't make Claude remember
-            // it, or the command was cut). The scope row said so before the click; say it
-            // again quietly, because the next similar call will ask again.
-            self.notice =
-                notice_after(sent, "Could not send your answer to Claude").or_else(|| {
-                    always_fell_back(&request, choice, shortened)
-                        .then(|| Notice::quiet(ALLOWED_ONCE_NOTE))
-                });
+            self.notice = notice_after(sent, "Could not send your answer to Claude");
         }
         self.sync_field(window, cx);
         cx.notify();
@@ -433,11 +422,7 @@ impl ChatView {
         let row = if let Some(item) = items.get(ix) {
             rows::item(item, ix + 1 == items.len(), retry, cx)
         } else if let Some(notice) = &self.notice {
-            if notice.quiet {
-                rows::note(&notice.title, cx)
-            } else {
-                rows::error("notice".into(), &notice.title, &notice.detail, retry)
-            }
+            rows::error("notice".into(), &notice.title, &notice.detail, retry)
         } else {
             div().into_any_element()
         };
@@ -576,9 +561,20 @@ impl ChatView {
             title.push_str(&format!(" (1 of {waiting})"));
         }
         let (title, room) = self.dock_room(&title, window, cx);
-        let detail = approval::detail(request, Some(&self.project), room);
-        let shortened = detail.shortened;
-        let scope = approval::scope_row(&session_scope(request), shortened, room.cols);
+        // `sync_field` keeps `dock_outside` in step with the dock's request.
+        let detail = approval::detail(
+            request,
+            Some(&self.project),
+            self.dock_outside.as_deref(),
+            room,
+        );
+        let scope = approval::scope_row(
+            &session_scope(request),
+            request,
+            detail.shortened,
+            room.cols,
+        );
+        let rule_cut = scope.once;
         let request_id = SharedString::from(request.request_id.clone());
         let view = cx.entity();
         let answered_id = request_id.clone();
@@ -592,7 +588,7 @@ impl ChatView {
                     Permission::Deny => PermissionAnswer::Deny,
                 };
                 view.update(cx, |view, cx| {
-                    view.answer(Some(answered_id.as_ref()), answer, shortened, window, cx)
+                    view.answer(Some(answered_id.as_ref()), answer, rule_cut, window, cx)
                 });
             },
         )
@@ -736,85 +732,31 @@ fn notice_after(sent: anyhow::Result<()>, failed: &str) -> Option<Notice> {
     ))
 }
 
-/// What to send for the user's `choice`. When the dock cut the command to fit (`shortened`),
-/// "Always allow" is sent as allow once: nothing is remembered that the user could not read.
-fn sent_answer(choice: PermissionAnswer, shortened: bool) -> PermissionAnswer {
+/// What to send for the user's `choice`. When the dock could not show the remembered rule in
+/// full (`rule_cut`), "Always allow" is sent as allow once: nothing is remembered that the user
+/// could not read.
+fn sent_answer(choice: PermissionAnswer, rule_cut: bool) -> PermissionAnswer {
     match choice {
-        PermissionAnswer::AllowForSession if shortened => PermissionAnswer::AllowOnce,
+        PermissionAnswer::AllowForSession if rule_cut => PermissionAnswer::AllowOnce,
         other => other,
     }
 }
 
-/// True when the user picked "Always allow" but it acts as a plain allow-once: the command was
-/// cut to fit, or core can't make the CLI remember this kind of call
-/// (`newjen_core::allows_for_session`).
-fn always_fell_back(
-    request: &PermissionRequest,
-    choice: PermissionAnswer,
-    shortened: bool,
-) -> bool {
-    choice == PermissionAnswer::AllowForSession && (shortened || !allows_for_session(request))
-}
-
 /// Whether row `ix` gets a "Try again" button. Rows are the transcript's `item_count` items,
-/// then the notice if there is one. A quiet notice never retries and is skipped when finding
-/// the last row, so the newest error above it keeps its button.
+/// then the notice if there is one.
 fn offers_retry(ix: usize, item_count: usize, notice: Option<&Notice>, busy: bool) -> bool {
-    let error_notice = notice.is_some_and(|notice| !notice.quiet);
-    let row_count = item_count + usize::from(error_notice);
+    let row_count = item_count + usize::from(notice.is_some());
     ix < row_count && rows::can_retry(ix + 1 == row_count, ix >= item_count, busy)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
-
-    fn request(tool_name: &str, input: Value) -> PermissionRequest {
-        PermissionRequest {
-            request_id: "req-1".to_string(),
-            tool_use_id: Some("toolu_1".to_string()),
-            tool_name: tool_name.to_string(),
-            display_name: tool_name.to_string(),
-            input,
-            description: None,
-            suggestions: Vec::new(),
-            blocked_path: None,
-        }
-    }
 
     #[test]
-    fn always_allow_says_allowed_once_when_core_cannot_remember_it() {
-        let write = request(
-            "Write",
-            json!({"file_path": "/work/a.txt", "content": "hi"}),
-        );
-        assert!(always_fell_back(
-            &write,
-            PermissionAnswer::AllowForSession,
-            false
-        ));
-        // Allow once is exactly what the user asked for: nothing to say.
-        assert!(!always_fell_back(
-            &write,
-            PermissionAnswer::AllowOnce,
-            false
-        ));
-        // An exact Bash command is remembered for the session, so no note.
-        let bash = request("Bash", json!({"command": "ls -la"}));
-        assert!(!always_fell_back(
-            &bash,
-            PermissionAnswer::AllowForSession,
-            false
-        ));
-    }
-
-    #[test]
-    fn always_allow_on_a_shortened_command_is_sent_as_allow_once() {
-        let bash = request("Bash", json!({"command": "ls -la"}));
+    fn always_allow_on_a_cut_rule_is_sent_as_allow_once() {
         let always = PermissionAnswer::AllowForSession;
         assert_eq!(sent_answer(always, true), PermissionAnswer::AllowOnce);
-        assert!(always_fell_back(&bash, always, true));
         // Shown in full: remembered as asked.
         assert_eq!(sent_answer(always, false), always);
         // Other answers are never changed.
@@ -846,14 +788,8 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_notice_never_retries_and_keeps_the_newest_errors_button() {
-        let note = Notice::quiet(ALLOWED_ONCE_NOTE);
-        // Two transcript items, the second an error; the turn has ended (not busy).
-        assert!(offers_retry(1, 2, Some(&note), false));
-        assert!(!offers_retry(2, 2, Some(&note), false));
-        // Mid-turn the quiet note still never offers a restart.
-        assert!(!offers_retry(2, 2, Some(&note), true));
-        // An error notice is the last row and keeps its button, even mid-turn.
+    fn an_error_notice_is_the_last_row_and_keeps_its_button() {
+        // Two transcript items, then the notice; even mid-turn it keeps "Try again".
         let error = Notice::error("Could not reach Claude", String::new());
         assert!(offers_retry(2, 2, Some(&error), true));
         assert!(!offers_retry(1, 2, Some(&error), false));
@@ -869,7 +805,6 @@ mod tests {
         .expect("a failed write leaves a notice");
         assert_eq!(failed.title, "Could not stop Claude");
         assert!(failed.detail.starts_with("claude has exited. Try again"));
-        assert!(!failed.quiet);
     }
 
     #[test]

@@ -568,7 +568,7 @@ pub enum PermissionAnswer {
     /// Run it, and auto-approve similar calls for the rest of this session: the rule the CLI
     /// suggests, or this exact Bash command. Nothing is written to the project's settings.
     /// When there is no safe rule to remember (for example Write and Edit), this is the same
-    /// as `AllowOnce`; [`allows_for_session`] tells the UI which case it is.
+    /// as `AllowOnce`; [`session_scope`] tells the UI which case it is, before the click.
     AllowForSession,
     /// Don't run it; Claude is told and carries on.
     Deny,
@@ -674,9 +674,8 @@ pub fn session_scope(request: &PermissionRequest) -> SessionScope {
 }
 
 /// True if answering `request` with [`PermissionAnswer::AllowForSession`] really makes the
-/// CLI remember the approval. False means it is sent as a plain allow-once, so the UI can tell
-/// the user that the next similar call will ask again. Same as checking
-/// [`session_scope`] for `Remembers`.
+/// CLI remember the approval. False means it is sent as a plain allow-once. A shorthand for
+/// checking [`session_scope`] for `Remembers`; the app shows `session_scope` itself.
 pub fn allows_for_session(request: &PermissionRequest) -> bool {
     matches!(session_scope(request), SessionScope::Remembers(_))
 }
@@ -707,7 +706,7 @@ fn session_permissions(request: &PermissionRequest) -> Vec<Value> {
     let rules: Vec<Value> = request
         .suggestions
         .iter()
-        .filter(|suggestion| is_narrow_suggestion(suggestion))
+        .filter(|suggestion| is_narrow_suggestion(suggestion, &request.tool_name))
         .map(|suggestion| {
             let mut rule = suggestion.clone();
             rule["destination"] = Value::String("session".to_string());
@@ -737,11 +736,13 @@ fn session_permissions(request: &PermissionRequest) -> Vec<Value> {
     })]
 }
 
-/// True for an `addRules` allow suggestion whose every rule is narrow: it has a `ruleContent`
-/// (such as one Bash command), or it names exactly one MCP tool (`mcp__server__tool`). A bare
+/// True for an `addRules` allow suggestion whose every rule is narrow: it is for the tool being
+/// asked about (`tool_name`), that tool is not a file edit, and the rule has a `ruleContent`
+/// (such as one Bash command) or names exactly one MCP tool (`mcp__server__tool`). A bare
 /// rule such as `{"toolName": "WebSearch"}` would allow the whole tool, so a suggestion with
-/// one of those is dropped.
-fn is_narrow_suggestion(suggestion: &Value) -> bool {
+/// one of those is dropped. So is one that sneaks in a rule for another tool (say an `Edit`
+/// rule on a Bash request): the dock only shows this call, so it must not approve others.
+fn is_narrow_suggestion(suggestion: &Value, tool_name: &str) -> bool {
     let text = |name: &str| suggestion.get(name).and_then(Value::as_str);
     if text("type") != Some("addRules") || text("behavior") != Some("allow") {
         return false;
@@ -751,6 +752,11 @@ fn is_narrow_suggestion(suggestion: &Value) -> bool {
     };
     !rules.is_empty()
         && rules.iter().all(|rule| {
+            let tool = rule.get("toolName").and_then(Value::as_str);
+            // Edits are never remembered (see `session_permissions`), whatever tool asked.
+            if tool != Some(tool_name) || tool.is_some_and(|tool| EDIT_TOOLS.contains(&tool)) {
+                return false;
+            }
             let has_content = rule
                 .get("ruleContent")
                 .and_then(Value::as_str)
@@ -1043,6 +1049,27 @@ mod tests {
             SessionScope::Remembers(vec!["npm test *".to_string()])
         );
         assert!(allows_for_session(&request));
+    }
+
+    #[test]
+    fn a_rule_for_another_tool_or_an_edit_tool_is_never_forwarded() {
+        // A Bash request whose suggestion would also allow editing any file: dropped, so
+        // "Always allow" falls back to the exact Bash command alone.
+        let request = bash_request(vec![json!({"type": "addRules", "rules": [
+            {"toolName": "Edit", "ruleContent": "//abs/**"}],
+            "behavior": "allow", "destination": "localSettings"})]);
+        assert_eq!(
+            session_permissions_sent(&request),
+            json!([{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "touch a.txt"}],
+                    "behavior": "allow", "destination": "session"}])
+        );
+        // An MCP rule must name the very tool that asked, not a sibling.
+        let request = request_with(
+            "mcp__x__y",
+            json!({"type": "addRules", "rules": [{"toolName": "mcp__x__z"}],
+                   "behavior": "allow", "destination": "localSettings"}),
+        );
+        assert!(session_answer_is_allow_once(&request));
     }
 
     #[test]

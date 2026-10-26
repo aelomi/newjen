@@ -42,12 +42,13 @@ pub fn title(request: &PermissionRequest, cwd: Option<&Path>) -> String {
     format!("Allow Claude to use {}?", tool_label(request))
 }
 
-/// The dock's detail text, and whether what will run had to be cut to fit.
+/// The dock's detail text, and whether the Bash command had to be cut to fit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detail {
     pub text: String,
-    /// The command or arguments were shortened, so the user cannot see all of what "Always
-    /// allow" would remember. The dock then treats "Always allow" as allow once.
+    /// The Bash command was shortened. Only matters when "Always allow" remembers that exact
+    /// command (see [`scope_row`]); other tools' arguments are cut freely, because their rule
+    /// does not depend on them.
     pub shortened: bool,
 }
 
@@ -55,11 +56,16 @@ pub struct Detail {
 /// comment), the file for edits, otherwise the arguments as compact JSON. Cut to `room`, so a
 /// huge command cannot push the buttons off screen. A long command keeps its first and last
 /// lines with the middle cut, so the end of the command (often the part that actually runs
-/// things) is always visible before you approve it. A last row warns when the call touches a
-/// path outside the project (`cwd`).
-pub fn detail(request: &PermissionRequest, cwd: Option<&Path>, room: Room) -> Detail {
+/// things) is always visible before you approve it. A last row warns about `outside`, the path
+/// from [`outside_path`] (passed in, so drawing a frame never touches the disk).
+pub fn detail(
+    request: &PermissionRequest,
+    cwd: Option<&Path>,
+    outside: Option<&str>,
+    room: Room,
+) -> Detail {
     // The warning gets its row first: it matters more than the purpose.
-    let outside = outside_line(request, cwd, room.cols);
+    let outside = outside.map(|path| outside_line(path, room.cols));
     let rows = room
         .rows
         .saturating_sub(usize::from(outside.is_some()))
@@ -88,9 +94,9 @@ pub fn detail(request: &PermissionRequest, cwd: Option<&Path>, room: Room) -> De
         // Anything else (or a request missing the expected field): the raw arguments.
         let full =
             specific.unwrap_or_else(|| serde_json::to_string(&request.input).unwrap_or_default());
+        // Not a command: whether this was cut never decides what "Always allow" remembers.
         let text = fit_rows(&cap(&full, DETAIL_LINES, DETAIL_CHARS), room.cols, rows);
-        let shortened = text != full;
-        (text, shortened)
+        (text, false)
     };
     if let Some(outside) = outside {
         text.push('\n');
@@ -99,20 +105,18 @@ pub fn detail(request: &PermissionRequest, cwd: Option<&Path>, room: Room) -> De
     Detail { text, shortened }
 }
 
-/// "Outside the project: <path>" when the CLI says the call touches a path outside `project`,
-/// cut in its middle to one row of `cols`.
-fn outside_line(
-    request: &PermissionRequest,
-    project: Option<&Path>,
-    cols: usize,
-) -> Option<String> {
+/// The path the CLI says this call touches, if it lies outside `project`. This reads the disk
+/// (to resolve symlinks), so the chat view calls it once per request, not on every frame.
+pub fn outside_path(request: &PermissionRequest, project: &Path) -> Option<String> {
     let path = request.blocked_path.as_deref()?;
-    if !outside_project(path, project?) {
-        return None;
-    }
+    outside_project(path, project).then(|| path.to_string())
+}
+
+/// "Outside the project: <path>", cut in its middle to one row of `cols`.
+fn outside_line(path: &str, cols: usize) -> String {
     const LABEL: &str = "Outside the project: ";
     let room = cols.saturating_sub(LABEL.len()).max(12);
-    Some(format!("{LABEL}{}", short_path(path, room)))
+    format!("{LABEL}{}", short_path(path, room))
 }
 
 /// Whether `path` (absolute, or relative to the project) lies outside `project`. Symlinks are
@@ -145,38 +149,65 @@ pub struct ScopeRow {
     pub before: String,
     pub code: Option<String>,
     pub after: String,
+    /// The remembered rule could not be shown in full, so "Always allow" must be sent as
+    /// allow once: nothing is remembered that the user could not read.
+    pub once: bool,
 }
 
-/// The scope row for `scope` (from `newjen_core::session_scope`). `shortened` is
-/// [`Detail::shortened`]: then "Always allow" is sent as allow once. The remembered rule is
-/// cut in its middle so the row stays one line at about `cols` columns of the detail's text.
-pub fn scope_row(scope: &SessionScope, shortened: bool, cols: usize) -> ScopeRow {
-    let once = |why: &str| ScopeRow {
+/// The scope row for `request`'s `scope` (from `newjen_core::session_scope`).
+/// `command_shortened` is [`Detail::shortened`]. The remembered rule is cut in its middle so
+/// the row stays one line at about `cols` columns of the detail's text.
+pub fn scope_row(
+    scope: &SessionScope,
+    request: &PermissionRequest,
+    command_shortened: bool,
+    cols: usize,
+) -> ScopeRow {
+    // `cut`: the answer itself must be downgraded here (core already sends allow once for the
+    // `OnceOnly` cases, so they need no help).
+    let once = |why: &str, cut: bool| ScopeRow {
         before: format!("Always allow works once here{why}"),
         code: None,
         after: String::new(),
+        once: cut,
     };
-    match scope {
-        SessionScope::OnceOnly(OnceReason::Edit) => once(" — no safe rule for edits"),
-        SessionScope::OnceOnly(OnceReason::NoSafeRule) => once(""),
-        SessionScope::Remembers(_) if shortened => once(" — the command was shortened to fit"),
-        SessionScope::Remembers(rules) => {
-            // In a rule, `*` matches anything, so say that in words.
-            let wildcard = rules.iter().any(|rule| rule.contains('*'));
-            let after = if wildcard {
-                " (any arguments) for this session"
-            } else {
-                " for this session"
-            };
-            const BEFORE: &str = "Always allow remembers ";
-            let room = cols.saturating_sub(BEFORE.len() + after.len()).max(12);
-            ScopeRow {
-                before: BEFORE.to_string(),
-                // One line: a multi-line command's line breaks are shown as ↵.
-                code: Some(middle(&rules.join(", ").replace('\n', " ↵ "), room)),
-                after: after.to_string(),
-            }
+    let rules = match scope {
+        SessionScope::OnceOnly(OnceReason::Edit) => {
+            return once(" — no safe rule for edits", false);
         }
+        SessionScope::OnceOnly(OnceReason::NoSafeRule) => return once("", false),
+        SessionScope::Remembers(rules) => rules,
+    };
+    // In a rule, `*` matches more than this one call, so say that in words. For Bash it stands
+    // for any arguments; for other tools it is a path or domain pattern.
+    let after = match rules.iter().any(|rule| rule.contains('*')) {
+        true if request.tool_name == "Bash" => " (any arguments) for this session",
+        true => " (a pattern) for this session",
+        false => " for this session",
+    };
+    const BEFORE: &str = "Always allow remembers ";
+    let room = cols.saturating_sub(BEFORE.len() + after.len()).max(12);
+    // One line: a multi-line command's line breaks are shown as ↵.
+    let full = rules.join(", ").replace('\n', " ↵ ");
+    let code = middle(&full, room);
+    // Where can the user read the whole rule? When it is exactly the Bash command, the detail
+    // above shows it (this row only repeats it, cut), so what counts is whether the detail cut
+    // it. Any other rule (a CLI suggestion such as `npm test *` or `domain:example.com`) is
+    // shown only here, so what counts is whether this row cut it.
+    let command = request.input.get("command").and_then(Value::as_str);
+    let rule_is_command = request.tool_name == "Bash"
+        && command.is_some_and(|command| rules.len() == 1 && rules[0] == command);
+    if rule_is_command && command_shortened {
+        return once(" — the command was shortened to fit", true);
+    }
+    if !rule_is_command && code != full {
+        return once(" — the rule was shortened to fit", true);
+    }
+    ScopeRow {
+        before: BEFORE.to_string(),
+        code: Some(code),
+        after: after.to_string(),
+        once: false,
     }
 }
 
@@ -227,12 +258,12 @@ mod tests {
     fn bash_shows_the_command() {
         let ask = request("Bash", json!({"command": "ls -la", "description": "List"}));
         assert_eq!(title(&ask, None), "Allow Bash to run this command?");
-        assert_eq!(detail(&ask, None, ROOMY).text, "$ ls -la\n# List");
+        assert_eq!(detail(&ask, None, None, ROOMY).text, "$ ls -la\n# List");
 
         let mut described = request("Bash", json!({"command": "touch a.txt"}));
         described.description = Some("Create an empty file".to_string());
         assert_eq!(
-            detail(&described, None, ROOMY).text,
+            detail(&described, None, None, ROOMY).text,
             "$ touch a.txt\n# Create an empty file"
         );
     }
@@ -242,14 +273,17 @@ mod tests {
         let cwd = Path::new("/work/app");
         let ask = request("Edit", json!({"file_path": "/work/app/src/main.rs"}));
         assert_eq!(title(&ask, Some(cwd)), "Allow Claude to edit src/main.rs?");
-        assert_eq!(detail(&ask, Some(cwd), ROOMY).text, "src/main.rs");
+        assert_eq!(detail(&ask, Some(cwd), None, ROOMY).text, "src/main.rs");
     }
 
     #[test]
     fn other_tools_show_compact_json() {
         let ask = request("mcp__linear__search", json!({"label": "billing"}));
         assert_eq!(title(&ask, None), "Allow Claude to use linear · search?");
-        assert_eq!(detail(&ask, None, ROOMY).text, r#"{"label":"billing"}"#);
+        assert_eq!(
+            detail(&ask, None, None, ROOMY).text,
+            r#"{"label":"billing"}"#
+        );
 
         // The same name as the tool's card, even when the CLI calls it something else.
         let mut named = request("WebFetch", json!({"url": "https://example.com"}));
@@ -265,7 +299,7 @@ mod tests {
             .join("\n");
         let ask = request("Bash", json!({ "command": command }));
         assert_eq!(
-            detail(&ask, None, ROOMY).text,
+            detail(&ask, None, None, ROOMY).text,
             "$ echo 1\necho 2\necho 3\n… 13 more lines …\necho 17\necho 18\necho 19\necho 20"
         );
     }
@@ -281,7 +315,7 @@ mod tests {
         let mut ask = request("Bash", json!({ "command": command }));
         ask.description = Some("Rebuild everything from scratch, slowly".to_string());
         let room = Room { cols: 75, rows: 6 };
-        let shown = detail(&ask, None, room).text;
+        let shown = detail(&ask, None, None, room).text;
         assert!(text_rows(&shown, room.cols) <= room.rows, "{shown}");
         assert!(shown.starts_with("$ echo line 1 "), "{shown}");
         // The line that does the damage and the purpose stay visible.
@@ -291,23 +325,61 @@ mod tests {
     #[test]
     fn a_shortened_command_is_flagged_so_always_allow_acts_once() {
         let ask = request("Bash", json!({"command": "touch notes.md"}));
-        assert!(!detail(&ask, None, ROOMY).shortened);
+        assert!(!detail(&ask, None, None, ROOMY).shortened);
         let long = (1..=40)
             .map(|n| format!("echo {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let cut = detail(&request("Bash", json!({ "command": long })), None, ROOMY);
+        let cut = detail(
+            &request("Bash", json!({ "command": long })),
+            None,
+            None,
+            ROOMY,
+        );
         assert!(cut.shortened, "{}", cut.text);
         // A long purpose is cut too, but it is only Claude's comment: not shortened.
         let mut chatty = request("Bash", json!({"command": "ls"}));
         chatty.description = Some("word ".repeat(400));
-        assert!(!detail(&chatty, None, Room { cols: 40, rows: 3 }).shortened);
+        assert!(!detail(&chatty, None, None, Room { cols: 40, rows: 3 }).shortened);
 
+        let ask = request("Bash", json!({"command": "touch notes.md"}));
         let scope = SessionScope::Remembers(vec!["touch notes.md".to_string()]);
+        let row = scope_row(&scope, &ask, true, 80);
         assert_eq!(
-            scope_row(&scope, true, 80).before,
+            row.before,
             "Always allow works once here — the command was shortened to fit"
         );
+        assert!(row.once);
+    }
+
+    #[test]
+    fn cut_arguments_do_not_matter_when_the_rule_does_not_use_them() {
+        // An MCP call with huge arguments: the detail is cut, but the rule is just the tool.
+        let ask = request("mcp__x__y", json!({"text": "word ".repeat(400)}));
+        let shown = detail(&ask, None, None, Room { cols: 40, rows: 3 });
+        assert!(!shown.shortened, "{}", shown.text);
+        let scope = SessionScope::Remembers(vec!["x · y".to_string()]);
+        let row = scope_row(&scope, &ask, shown.shortened, 80);
+        assert!(!row.once);
+        assert_eq!(row.code.as_deref(), Some("x · y"));
+
+        // A CLI rule too long for its row is cut there, the only place it is shown.
+        let fetch = request("WebFetch", json!({"url": "https://example.com"}));
+        let long = SessionScope::Remembers(vec![format!("domain:{}.com", "a".repeat(200))]);
+        let row = scope_row(&long, &fetch, false, 80);
+        assert_eq!(
+            row.before,
+            "Always allow works once here — the rule was shortened to fit"
+        );
+        assert!(row.once);
+
+        // A CLI rule for Bash that is not the command itself: also judged by this row.
+        let npm = request(
+            "Bash",
+            json!({"command": format!("npm test {}", "x".repeat(300))}),
+        );
+        let short_rule = SessionScope::Remembers(vec!["npm test *".to_string()]);
+        assert!(!scope_row(&short_rule, &npm, true, 80).once);
     }
 
     #[test]
@@ -316,19 +388,29 @@ mod tests {
             let code = row.code.map(|code| format!("`{code}`")).unwrap_or_default();
             format!("{}{code}{}", row.before, row.after)
         };
+        let bash = |command: &str| request("Bash", json!({ "command": command }));
+        let touch = bash("touch notes.md");
         let exact = SessionScope::Remembers(vec!["touch notes.md".to_string()]);
         assert_eq!(
-            text(scope_row(&exact, false, 80)),
+            text(scope_row(&exact, &touch, false, 80)),
             "Always allow remembers `touch notes.md` for this session"
         );
         let wildcard = SessionScope::Remembers(vec!["npm test *".to_string()]);
         assert_eq!(
-            text(scope_row(&wildcard, false, 80)),
+            text(scope_row(&wildcard, &bash("npm test --watch"), false, 80)),
             "Always allow remembers `npm test *` (any arguments) for this session"
+        );
+        // Outside Bash, `*` is a path or domain pattern, not "any arguments".
+        let domains = SessionScope::Remembers(vec!["domain:*.example.com".to_string()]);
+        let fetch = request("WebFetch", json!({"url": "https://docs.example.com"}));
+        assert_eq!(
+            text(scope_row(&domains, &fetch, false, 80)),
+            "Always allow remembers `domain:*.example.com` (a pattern) for this session"
         );
         assert_eq!(
             text(scope_row(
                 &SessionScope::OnceOnly(OnceReason::Edit),
+                &touch,
                 false,
                 80
             )),
@@ -337,14 +419,18 @@ mod tests {
         assert_eq!(
             text(scope_row(
                 &SessionScope::OnceOnly(OnceReason::NoSafeRule),
+                &touch,
                 false,
                 80
             )),
             "Always allow works once here"
         );
-        // A long rule is cut in its middle to keep the row to one line.
-        let long = SessionScope::Remembers(vec![format!("echo {}done", "x".repeat(200))]);
-        let row = scope_row(&long, false, 80);
+        // A long command is cut in its middle to keep the row to one line; the detail above
+        // shows it in full, so "Always allow" still remembers it.
+        let command = format!("echo {}done", "x".repeat(200));
+        let long = SessionScope::Remembers(vec![command.clone()]);
+        let row = scope_row(&long, &bash(&command), false, 80);
+        assert!(!row.once);
         let code = row.code.expect("a rule");
         assert!(
             code.starts_with("echo x") && code.ends_with("done"),
@@ -364,12 +450,19 @@ mod tests {
 
         // Inside, written through the symlink, and not created yet: no row.
         ask.blocked_path = Some(raw.join("new.txt").display().to_string());
-        assert_eq!(detail(&ask, Some(&project), ROOMY).text, "$ touch new.txt");
+        assert_eq!(outside_path(&ask, &project), None);
 
         ask.blocked_path = Some("/elsewhere/notes/new.txt".to_string());
+        let outside = outside_path(&ask, &project);
+        assert_eq!(outside.as_deref(), Some("/elsewhere/notes/new.txt"));
+        // `detail` itself only formats the path it is given: no disk access while drawing.
         assert_eq!(
-            detail(&ask, Some(&project), ROOMY).text,
+            detail(&ask, Some(&project), outside.as_deref(), ROOMY).text,
             "$ touch new.txt\nOutside the project: /elsewhere/notes/new.txt"
+        );
+        assert_eq!(
+            detail(&ask, Some(&project), None, ROOMY).text,
+            "$ touch new.txt"
         );
         let _ = std::fs::remove_dir_all(&raw);
     }

@@ -137,11 +137,6 @@ fn turn_end(caption: String, stopped: bool, cx: &mut App) -> AnyElement {
     caption_row(icon, caption, cx)
 }
 
-/// A quiet line of information from the app (not an error), such as "Allowed once — …".
-pub fn note(text: &str, cx: &mut App) -> AnyElement {
-    caption_row(IconName::Info, text.to_string(), cx)
-}
-
 /// The quiet line under the approval dock saying what "Always allow" does, with the remembered
 /// rule in the mono font. Kept to one line (the rule is already cut to fit, see
 /// `approval::scope_row`), because the dock counts it as exactly one row.
