@@ -218,6 +218,13 @@ impl Transcript {
         if let Some(Item::Tool { state, .. }) = self.find_tool_mut(&tool_use_id) {
             *state = new_state;
         }
+        // A tool's time should be how long it ran, not how long the user took to answer:
+        // restart its clock when allowed, and drop it when denied (it never runs).
+        if answer.is_deny() {
+            self.tool_started.remove(&tool_use_id);
+        } else {
+            self.tool_started.insert(tool_use_id, Instant::now());
+        }
         if self.pending.is_empty() && self.status == Status::Waiting {
             self.status = Status::Working;
         }

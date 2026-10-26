@@ -217,6 +217,12 @@ fn tool_deny() {
         tools(&transcript),
         [("Bash".to_string(), ToolState::Denied)]
     );
+    // A denied call never ran, so it has no duration (the wait for the user doesn't count).
+    let denied_took = transcript.items().iter().find_map(|item| match item {
+        Item::Tool { took, .. } => Some(*took),
+        _ => None,
+    });
+    assert_eq!(denied_took, Some(None));
     assert_eq!(transcript.status(), Status::Done);
     assert!(assistant_texts(&transcript)[0].starts_with("The command didn't run"));
 }

@@ -2,7 +2,7 @@
 # several crates (packages) that build together.
 [workspace]
 resolver = "3"
-members = ["crates/core"]
+members = ["crates/core", "crates/app"]
 
 # Settings every crate inherits with `x.workspace = true`.
 [workspace.package]
@@ -21,3 +21,9 @@ libc = "=0.2.191"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 tempfile = "=3.27.0"
+
+# UI (crates/app only; `core` must never use these).
+ely-gpui-component = "=0.1.1"
+gpui = { package = "gpui-pre", version = "=0.3.10" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }
+newjen-core = { path = "crates/core" }
