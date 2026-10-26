@@ -1,0 +1,23 @@
+# GitCafe Actions (GitHub Actions syntax). Runs on a self-hosted macOS runner,
+# because Newjen is macOS-only and GitCafe-hosted runners are not available yet.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Skipped until the Cargo workspace exists.
+      - name: Build
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo build --workspace --locked
+
+      - name: Test
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo test --workspace --locked
