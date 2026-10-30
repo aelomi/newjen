@@ -147,3 +147,57 @@ fn live_thread_starts_with_session_id_then_resumes_from_its_folder() {
         "the resumed conversation remembers: {last_reply:?}"
     );
 }
+
+#[test]
+#[ignore = "uses the real claude CLI and your login"]
+fn live_background_task_turn_marks_an_off_screen_thread_unread() {
+    use newjen_core::store::Store;
+    use newjen_core::thread::Thread;
+
+    let home = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).unwrap();
+    let project = store.open_project(project_dir.path()).unwrap();
+    let mut base = SessionConfig::new(project_dir.path());
+    base.extra_args = vec![
+        "--model".into(),
+        "haiku".into(),
+        "--strict-mcp-config".into(),
+    ];
+    let mut thread = Thread::new_draft(store, &project, base);
+    thread.set_active(true);
+    thread
+        .send(
+            "Use the Bash tool with run_in_background set to true to run exactly: sleep 6 && \
+             echo finished -- then reply with just: started",
+        )
+        .unwrap();
+    let events = thread.events();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut turns_ended = 0;
+    while turns_ended < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "{:#?}",
+            thread.transcript().items()
+        );
+        let Ok(event) = events.try_recv() else {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        let was_busy = thread.status().is_busy();
+        thread.apply(event);
+        if was_busy && !thread.status().is_busy() {
+            turns_ended += 1;
+            eprintln!(
+                "turn {turns_ended} ended: status {:?}, background {}",
+                thread.status(),
+                thread.background_tasks().len()
+            );
+            if turns_ended == 1 {
+                thread.set_active(false);
+            }
+        }
+    }
+    assert!(thread.is_unread(), "{:#?}", thread.transcript().items());
+}
