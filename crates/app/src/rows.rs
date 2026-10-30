@@ -16,7 +16,7 @@ use gpui::{
 };
 use newjen_core::transcript::{
     BACKGROUND_STOPPED_NOTE, EXPIRED_NOTE, FRESH_START_NOTE, STOPPED_ON_QUIT,
-    STOPPED_ON_QUIT_DETAIL, STOPPED_TOOL_NOTE, UNREADABLE_NOTE,
+    STOPPED_ON_QUIT_DETAIL, STOPPED_TOOL_NOTE, STOPPED_UNSENT_DETAIL, UNREADABLE_NOTE,
 };
 use newjen_core::{Item, ToolState};
 
@@ -182,6 +182,15 @@ pub fn continue_label(resends: bool) -> &'static str {
     if resends { "Send again" } else { "Continue" }
 }
 
+/// The notice's second line: what Continue or Send again will do.
+pub fn stopped_detail(resends: bool) -> &'static str {
+    if resends {
+        STOPPED_UNSENT_DETAIL
+    } else {
+        STOPPED_ON_QUIT_DETAIL
+    }
+}
+
 /// The notice a thread gets when Newjen quit during its turn (screen 9): "Stopped when Newjen
 /// quit / Nothing runs until you continue.", with Continue when `resume` is given.
 fn stopped_notice(id: u64, resume: Option<(&OnRestart, &'static str)>, cx: &App) -> AnyElement {
@@ -202,7 +211,9 @@ fn stopped_notice(id: u64, resume: Option<(&OnRestart, &'static str)>, cx: &App)
             div()
                 .text_size(theme.text_size(TextSize::Sm))
                 .text_color(colors.fg_subtle)
-                .child(STOPPED_ON_QUIT_DETAIL),
+                .child(stopped_detail(
+                    resume.is_some_and(|(_, label)| label == continue_label(true)),
+                )),
         );
     h_stack()
         .gap_2p5()
@@ -476,6 +487,8 @@ mod tests {
     fn continue_says_send_again_when_it_resends_the_message() {
         assert_eq!(continue_label(false), "Continue");
         assert_eq!(continue_label(true), "Send again");
+        assert_eq!(stopped_detail(false), STOPPED_ON_QUIT_DETAIL);
+        assert_eq!(stopped_detail(true), STOPPED_UNSENT_DETAIL);
     }
 
     #[test]

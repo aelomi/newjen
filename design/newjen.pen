@@ -7891,6 +7891,458 @@
           ]
         }
       ]
+    },
+    {
+      "type": "frame",
+      "id": "uJU31",
+      "x": 1320,
+      "y": 1478,
+      "name": "9b · Send again, revoke with a background command",
+      "theme": {
+        "mode": "dark"
+      },
+      "width": 760,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "layout": "vertical",
+      "gap": 24,
+      "padding": 32,
+      "children": [
+        {
+          "type": "text",
+          "id": "xFbAL",
+          "name": "Caption",
+          "fill": "$fg-subtle",
+          "content": "Quit before Claude started the turn: Continue becomes Send again and resends your message.",
+          "fontFamily": "$font",
+          "fontSize": 12,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "C29i7G",
+          "name": "Stopped notice",
+          "width": "fill_container",
+          "fill": "$surface",
+          "cornerRadius": 8,
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "gap": 10,
+          "padding": [
+            10,
+            12
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "icon",
+              "id": "SQkGk",
+              "name": "Icon",
+              "width": 14,
+              "height": 14,
+              "icon": "circle-pause",
+              "library": "lucide",
+              "fill": "$fg-muted"
+            },
+            {
+              "type": "frame",
+              "id": "DibFu",
+              "name": "Text",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 2,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "f4qtS",
+                  "name": "Title",
+                  "fill": "$fg",
+                  "content": "Stopped when Newjen quit",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "500"
+                },
+                {
+                  "type": "text",
+                  "id": "a83QHV",
+                  "name": "Detail",
+                  "fill": "$fg-subtle",
+                  "content": "Claude never got your last message. Nothing runs until you send it again.",
+                  "fontFamily": "$font",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "o97hj",
+              "name": "Continue",
+              "fill": "$surface",
+              "cornerRadius": 6,
+              "stroke": "$border-strong",
+              "strokeWidth": 1,
+              "padding": [
+                6,
+                12
+              ],
+              "children": [
+                {
+                  "type": "text",
+                  "id": "A1Fcpj",
+                  "name": "Label",
+                  "fill": "$fg",
+                  "content": "Send again",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "500"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "hCBvh",
+          "name": "Caption 2",
+          "fill": "$fg-subtle",
+          "content": "Revoking while a background command runs: the footer says it stops too.",
+          "fontFamily": "$font",
+          "fontSize": 12,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "iTFFj",
+          "name": "Allowed rules popover",
+          "theme": {
+            "mode": "dark"
+          },
+          "width": 330,
+          "fill": "$overlay",
+          "cornerRadius": 10,
+          "stroke": "$border-strong",
+          "strokeWidth": 1,
+          "effect": {
+            "type": "shadow",
+            "shadowType": "outer",
+            "color": "#00000066",
+            "offset": {
+              "x": 0,
+              "y": 8
+            },
+            "blur": 24
+          },
+          "layout": "vertical",
+          "gap": 2,
+          "padding": 6,
+          "children": [
+            {
+              "type": "frame",
+              "id": "ab7ed",
+              "name": "Header",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 2,
+              "padding": [
+                6,
+                8,
+                8,
+                8
+              ],
+              "children": [
+                {
+                  "type": "text",
+                  "id": "N233gJ",
+                  "name": "Title",
+                  "fill": "$fg",
+                  "content": "Always allowed in this thread",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "gK9oM",
+                  "name": "Sub",
+                  "fill": "$fg-subtle",
+                  "content": "Claude runs these without asking, until you revoke them.",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Dh3WV",
+              "name": "Rule touch one.txt",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 8,
+              "padding": [
+                7,
+                8
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "V3uE8",
+                  "name": "Tool",
+                  "fill": "$fg-muted",
+                  "content": "Bash",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "500"
+                },
+                {
+                  "type": "frame",
+                  "id": "Bn2i5",
+                  "name": "Text",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 1,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "uGDvb",
+                      "name": "Rule",
+                      "fill": "$fg",
+                      "content": "touch one.txt",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "s6ND4r",
+                      "name": "Note",
+                      "fill": "$fg-subtle",
+                      "content": "exact command",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "eVYRj",
+                  "name": "Revoke",
+                  "cornerRadius": 6,
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "padding": [
+                    3,
+                    9
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "xFlx8",
+                      "name": "Label",
+                      "fill": "$fg",
+                      "content": "Revoke",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "500"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "NLKM7",
+              "name": "Rule git add:*",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 8,
+              "padding": [
+                7,
+                8
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "j9KWN",
+                  "name": "Tool",
+                  "fill": "$fg-muted",
+                  "content": "Bash",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "500"
+                },
+                {
+                  "type": "frame",
+                  "id": "US2g2",
+                  "name": "Text",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 1,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "GRieN",
+                      "name": "Rule",
+                      "fill": "$fg",
+                      "content": "git add:*",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "d5RCb",
+                      "name": "Note",
+                      "fill": "$fg-subtle",
+                      "content": "git add with any arguments",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "YcAph",
+                  "name": "Revoke",
+                  "cornerRadius": 6,
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "padding": [
+                    3,
+                    9
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "PsRlq",
+                      "name": "Label",
+                      "fill": "$fg",
+                      "content": "Revoke",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "500"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "yaq0c",
+              "name": "Rule pencil · get_style",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 8,
+              "padding": [
+                7,
+                8
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "U5ZJNt",
+                  "name": "Tool",
+                  "fill": "$fg-muted",
+                  "content": "MCP",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "500"
+                },
+                {
+                  "type": "frame",
+                  "id": "qVsWu",
+                  "name": "Text",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 1,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "AYHIU",
+                      "name": "Rule",
+                      "fill": "$fg",
+                      "content": "pencil · get_style",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "xvsUs",
+                      "name": "Note",
+                      "fill": "$fg-subtle",
+                      "content": "this tool only",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "D3htj",
+                  "name": "Revoke",
+                  "cornerRadius": 6,
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "padding": [
+                    3,
+                    9
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "rKQWC",
+                      "name": "Label",
+                      "fill": "$fg",
+                      "content": "Revoke",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "500"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "DjF5K",
+              "name": "Footer",
+              "width": "fill_container",
+              "stroke": "$border",
+              "strokeWidth": {
+                "top": 1
+              },
+              "padding": [
+                8,
+                8,
+                6,
+                8
+              ],
+              "children": [
+                {
+                  "type": "text",
+                  "id": "vDTwq",
+                  "name": "Note",
+                  "fill": "$fg-subtle",
+                  "content": "A revoke takes effect before your next message. It also stops the command running in the background.",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        }
+      ]
     }
   ],
   "themes": {

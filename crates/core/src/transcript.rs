@@ -38,6 +38,8 @@ pub const ITEM_SCHEMA_VERSION: u32 = 1;
 pub const STOPPED_ON_QUIT: &str = "Stopped when Newjen quit";
 /// The line under [`STOPPED_ON_QUIT`], next to its Continue button.
 pub const STOPPED_ON_QUIT_DETAIL: &str = "Nothing runs until you continue.";
+pub const STOPPED_UNSENT_DETAIL: &str =
+    "Claude never got your last message. Nothing runs until you send it again.";
 /// Why an approval left unanswered at quit is [`ToolState::Expired`]. Shown as
 /// "Expired · Newjen quit before you answered".
 pub const EXPIRED_NOTE: &str = "Newjen quit before you answered";
