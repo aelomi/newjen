@@ -136,5 +136,6 @@ jj git push --bookmark master                     # push to GitCafe
 ```
 
 - The remote is `origin`, at `https://git.cafe/ericrasputin/newjen.git`. The default branch is `master`.
+- Commit titles use [Conventional Commits](https://www.conventionalcommits.org): `type(scope): subject`, such as `fix(core): keep stdin open after an interrupt`.
 - Use `cafe` for PRs, issues and CI (`cafe pr`, `cafe ci`). Run `cafe --help` for the full command list.
 - Open pull requests with `cafe pr create`.

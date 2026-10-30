@@ -21,3 +21,11 @@ jobs:
       - name: Test
         if: hashFiles('Cargo.toml') != ''
         run: cargo test --workspace --locked
+
+      - name: Format
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
