@@ -77,8 +77,8 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 - **Deny and stop are separate.** Esc denies and Claude carries on; ⌘. denies and ends the turn.
 - **Claude dies with Newjen.** A watcher kills claude's process group as soon as Newjen exits, and the pid registry reaps anything left at the next launch.
 - **Later slices:**
-  - Slice 2: deny with feedback (typed text becomes the deny message); a list of session grants with revoke, which no other ADE has (verify how to carry grants across `--resume` first); allocate `--session-id` before spawning; show approvals left pending by a crash as expired.
-  - Slice 4: a real diff before approving an edit; a diff too large to show means allow once.
+  - Slice 2: grants kept per thread across resume, with a list and revoke, which no other ADE has; allocate `--session-id` before spawning; show approvals left pending by a crash as expired.
+  - Slice 4: deny with a note (typed text becomes the deny message); a real diff before approving an edit; a diff too large to show means allow once.
   - Slice 5: one approvals inbox across threads, notifications only when Newjen is in the background, a Dock badge for threads waiting on you, an idle reaper that never stops a thread with a pending approval, and asking before quitting with turns running.
 
 ## Known gotchas
@@ -94,7 +94,14 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 ## Build order (one vertical slice first)
 
 1. **Slice (done 2026-10-27):** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in Ely chat, with approve/deny working. One thread, no Rift, no jj.
-2. Threads list, SQLite persistence, resume.
+2. Threads list, SQLite persistence, resume. Decided 2026-10-30 ([memo](research/threads-and-persistence.md)):
+   - **Store:** `~/Library/Application Support/Newjen/newjen.db` (`NEWJEN_HOME` overrides it), WAL, migrations by `user_version`. Tables: projects, threads (with `provider`, the Claude session id and an unread flag), rendered transcript items, and grants. Writes run off the UI thread, at checkpoints only, never per streamed token.
+   - **Resume:** the Claude session id is allocated when the thread is created: `--session-id` until `init` arrives, `--resume` after.
+   - **Relaunch:** approvals left pending show as expired and running work as interrupted. Continuing is manual; nothing restarts on its own.
+   - **Processes:** a thread's `claude` keeps running when you switch away, and stops after 30 minutes idle, never mid-turn or with an approval pending. Quitting stops all of them.
+   - **Grants:** "Always allow" rules are saved per thread and re-applied at every spawn with `--allowedTools`, so the dock says "for this thread". They can be listed and revoked.
+   - **List:** new threads on top, a status per thread (needs approval, working, failed, stopped, unread), titles from the first message (no hidden model calls). ⌘N opens a draft that is saved only once its first message is sent, so empty threads never pile up. The sidebar hides below 760 px of window width (⌘B toggles it) and shows a dot when a hidden thread needs you. Mocks: `design/newjen.pen` screens 8–12.
+   - **Deferred:** deny with a note. The approval dock replaces the composer, so it needs its own text field; it moves to slice 4 with the diff view.
 3. One Rift copy per thread, with postcreate hooks.
 4. jj snapshots, diff view (`ely-git`), and both landing modes.
 5. Parallel threads, notifications (Dock badge), and a terminal panel (`ely-terminal`).
