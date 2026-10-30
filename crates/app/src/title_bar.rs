@@ -42,6 +42,8 @@ const GRANTS_WIDTH: f32 = 306.0;
 /// border (`p_3`), the header (title, the sub line wrapped to two lines, `pt_1p5` + `pb_2`),
 /// the footer (`mt_0p5`, `pt_2`, a line, `pb_1p5`, its border) and the gaps between them.
 const GRANTS_CHROME: f32 = 26.0 + 74.0 + 36.0 + 4.0;
+/// The footer's second line, when it also says a revoke stops the background commands.
+const GRANTS_FOOTER_LINE: f32 = 18.0;
 /// Room kept between the popover and the window's bottom edge (and the small drop it opens
 /// with under the chip).
 const GRANTS_MARGIN: f32 = 16.0;
@@ -71,8 +73,29 @@ pub struct Bar {
 /// tall. The popover hangs from the title bar; Ely does not limit its height, so without this
 /// a long list would run off the bottom of the window with its Revoke buttons. Past this the
 /// rows scroll, and the header and footer stay put.
-pub fn grant_rows_max_height(viewport_height: f32, title_bar_height: f32) -> f32 {
-    (viewport_height - title_bar_height - GRANTS_CHROME - GRANTS_MARGIN).max(GRANT_ROWS_MIN)
+pub fn grant_rows_max_height(
+    viewport_height: f32,
+    title_bar_height: f32,
+    background_tasks: usize,
+) -> f32 {
+    let footer = if background_tasks > 0 {
+        GRANTS_FOOTER_LINE
+    } else {
+        0.0
+    };
+    (viewport_height - title_bar_height - GRANTS_CHROME - footer - GRANTS_MARGIN)
+        .max(GRANT_ROWS_MIN)
+}
+
+/// The popover's footer. A revoke stops claude, and the commands it runs in the background
+/// stop with it, so it says that too while any run.
+pub fn grants_footer(background_tasks: usize) -> String {
+    let when = "A revoke takes effect before your next message.";
+    match background_tasks {
+        0 => when.to_string(),
+        1 => format!("{when} It also stops the command running in the background."),
+        count => format!("{when} It also stops the {count} commands running in the background."),
+    }
 }
 
 /// How many characters of the path fit beside the title in a chat `main_width` pixels wide.
@@ -130,7 +153,7 @@ pub fn render(bar: Bar, on_revoke: OnRevoke, window: &mut Window, cx: &mut App) 
             .gap_1p5()
             .occlude()
             .when(!bar.grants.is_empty(), |right| {
-                right.child(grants_chip(bar.grants, on_revoke, cx))
+                right.child(grants_chip(bar.grants, bar.background_tasks, on_revoke, cx))
             })
             .children(status_pill(bar.status, bar.background_tasks)),
     );
@@ -217,7 +240,12 @@ fn status_pill(status: Status, background_tasks: usize) -> Option<AnyElement> {
 }
 
 /// "🛡 2 allowed": opens the list of the thread's remembered rules.
-fn grants_chip(grants: Vec<Grant>, on_revoke: OnRevoke, cx: &App) -> AnyElement {
+fn grants_chip(
+    grants: Vec<Grant>,
+    background_tasks: usize,
+    on_revoke: OnRevoke,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let colors = theme.colors.clone();
     let label_size = theme.text_size(TextSize::Xs);
@@ -250,13 +278,19 @@ fn grants_chip(grants: Vec<Grant>, on_revoke: OnRevoke, cx: &App) -> AnyElement 
                         .child(label),
                 )
         },
-        move |_close, window, cx| grants_panel(&grants, &on_revoke, window, cx),
+        move |_close, window, cx| grants_panel(&grants, background_tasks, &on_revoke, window, cx),
     )
     .into_any_element()
 }
 
 /// The popover's content (the "Allowed rules popover" frame of the mock).
-fn grants_panel(grants: &[Grant], on_revoke: &OnRevoke, window: &Window, cx: &App) -> AnyElement {
+fn grants_panel(
+    grants: &[Grant],
+    background_tasks: usize,
+    on_revoke: &OnRevoke,
+    window: &Window,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let colors = &theme.colors;
     let small = theme.text_size(TextSize::Xs);
@@ -264,6 +298,7 @@ fn grants_panel(grants: &[Grant], on_revoke: &OnRevoke, window: &Window, cx: &Ap
     let rows_height = grant_rows_max_height(
         f32::from(window.viewport_size().height),
         f32::from(theme.titlebar_height().to_pixels(rem)),
+        background_tasks,
     );
     let header = v_stack()
         .gap_0p5()
@@ -335,7 +370,7 @@ fn grants_panel(grants: &[Grant], on_revoke: &OnRevoke, window: &Window, cx: &Ap
         .border_color(colors.border)
         .text_size(small)
         .text_color(colors.fg_subtle)
-        .child("A revoke takes effect before your next message.");
+        .child(grants_footer(background_tasks));
     // Only the rows scroll (it needs an id to keep its scroll position).
     let rows = v_stack()
         .id("grant-rows")
@@ -473,14 +508,33 @@ mod tests {
     #[test]
     fn a_long_grant_list_scrolls_inside_the_window() {
         // At the smallest window, rows up to the bottom edge, header and footer included.
-        let small = grant_rows_max_height(480.0, 38.0);
+        let small = grant_rows_max_height(480.0, 38.0, 0);
         assert_eq!(small, 480.0 - 38.0 - GRANTS_CHROME - GRANTS_MARGIN);
         assert!(38.0 + GRANTS_CHROME + small + GRANTS_MARGIN <= 480.0);
         // About five 50 px rules fit before the rows scroll at 640×480, a dozen at 760 tall.
         assert!((250.0..300.0).contains(&small), "{small}");
-        assert!(grant_rows_max_height(760.0, 38.0) > 500.0);
+        assert!(grant_rows_max_height(760.0, 38.0, 0) > 500.0);
         // A tiny height still leaves room for a couple of rules.
-        assert_eq!(grant_rows_max_height(100.0, 38.0), GRANT_ROWS_MIN);
+        assert_eq!(grant_rows_max_height(100.0, 38.0, 0), GRANT_ROWS_MIN);
+        // The footer's background note takes a second line.
+        assert_eq!(
+            grant_rows_max_height(480.0, 38.0, 2),
+            small - GRANTS_FOOTER_LINE
+        );
+    }
+
+    #[test]
+    fn a_revoke_says_it_also_stops_background_commands() {
+        let when = "A revoke takes effect before your next message.";
+        assert_eq!(grants_footer(0), when);
+        assert_eq!(
+            grants_footer(1),
+            format!("{when} It also stops the command running in the background.")
+        );
+        assert_eq!(
+            grants_footer(3),
+            format!("{when} It also stops the 3 commands running in the background.")
+        );
     }
 
     #[test]

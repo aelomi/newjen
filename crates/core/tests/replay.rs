@@ -493,6 +493,28 @@ fn every_fixture_replays_without_panicking() {
 }
 
 #[test]
+fn no_fixture_leaves_the_thread_working_after_its_last_result() {
+    // A bare `init` starts a turn (see `starts_turn`), so one after a result would leave the
+    // thread working with nothing running.
+    let mut checked = Vec::new();
+    for name in common::all_fixture_names() {
+        let replay = replay(&name);
+        let Some(after_last) = replay.after_each_result.last() else {
+            continue;
+        };
+        assert!(
+            !after_last.status().is_busy(),
+            "{name}: {:?}",
+            after_last.status()
+        );
+        assert!(!replay.end.status().is_busy(), "{name}");
+        checked.push(name);
+    }
+    assert!(checked.contains(&"resume".to_string()));
+    assert!(checked.contains(&"background_task".to_string()));
+}
+
+#[test]
 fn unexpected_exit_is_an_error_with_stderr() {
     let mut transcript = replay("text_reply").end;
     transcript.apply(&SessionEvent::Stderr("something broke".to_string()));

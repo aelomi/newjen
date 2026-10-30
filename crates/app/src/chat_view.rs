@@ -34,7 +34,7 @@ use gpui::{
     Subscription, Task, UniformListScrollHandle, Window, div, font, prelude::*, px, uniform_list,
 };
 use newjen_core::store::now_ms;
-use newjen_core::thread::{self, CONTINUE_MESSAGE, Quitting, keeps_draft};
+use newjen_core::thread::{self, Quitting, keeps_draft};
 use newjen_core::transcript::display_name;
 use newjen_core::{
     Item, PermissionAnswer, Project, SessionConfig, Status, Store, Thread, ToolState, session_scope,
@@ -575,10 +575,13 @@ impl ChatView {
     }
 
     /// Continue on the "Stopped when Newjen quit" notice: a visible message asking Claude to
-    /// go on. Pressing it is the only way a stopped turn goes on (nothing restarts by itself).
+    /// go on, or the user's last message again if Claude never started its turn
+    /// (`Thread::continue_text`).
+    /// Pressing it is the only way a stopped turn goes on (nothing restarts by itself).
     fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_busy(cx) {
-            self.send_text(CONTINUE_MESSAGE, window, cx);
+            let text = self.thread().read(cx).continue_text();
+            self.send_text(&text, window, cx);
         }
     }
 
@@ -825,8 +828,10 @@ impl ChatView {
         let retry = offers_retry(ix, items.len(), notice, busy).then_some(&on_restart);
         // Only the notice that is the last row gets Continue; an older one (Newjen quit twice)
         // is history.
-        let resume =
-            (ix + 1 == items.len() && !busy && rows::shows_continue(items)).then_some(&on_continue);
+        let resume = (ix + 1 == items.len() && !busy && rows::shows_continue(items)).then_some((
+            &on_continue,
+            rows::continue_label(thread.continue_resends()),
+        ));
         let row = if let Some(item) = items.get(ix) {
             let typing = ix + 1 == items.len() && !whole;
             rows::item(item, typing, retry, resume, cx)

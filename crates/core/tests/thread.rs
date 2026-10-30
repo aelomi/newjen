@@ -9,11 +9,19 @@
 //! - `new_missing` / `resume_missing`: print claude's "No conversation found" result and exit
 //!   1, without reading stdin. claude 2.1.314 checks `--resume` as it starts, before it reads
 //!   a message (checked live), so this also happens with no message at all.
+//! - `resume_missing_other`: like `resume_missing`, but the error names another session id.
 //! - `other_in_use`: print another error that says "already in use" (a busy port) on stderr
 //!   and exit 1, without reading stdin.
 //! - `crash`: read a message, then exit 1 without answering.
+//! - `never_init`: read a message, then hang without ever sending `init`, as a claude still
+//!   starting up would.
+//! - `no_init`: never send `init`, but otherwise run turns as usual.
+//! - `hang_after_init`: read a message, send `init`, then hang without any reply.
+//! - `missing_after_init`: end each turn right after its `init` with the "No conversation
+//!   found" result for this session, and keep running.
 //! - `vanish`: delete the stand-in as it starts, so the next start fails.
 //! - `ask`: ask to approve `touch one.txt` (with the CLI's usual suggestion) before replying.
+//!   With `exit_on_ask` too, exit 1 right after asking.
 //! - `hang`: start the turn (a running `sleep` tool call and a reply being streamed) and never
 //!   finish it.
 //! - `slow_stop`: ignore SIGTERM, as a claude busy with its exit hooks might, so stopping it
@@ -21,6 +29,8 @@
 //! - `background`: run `npm run dev` in the background before replying, as claude 2.1.314
 //!   does (see the `background_task` fixture). The task runs until a `finish_task` file
 //!   appears; then claude reports it finished and starts a turn by itself, with no message.
+//!   With `own_turn_missing`, that turn ends with the "No conversation found" result for this
+//!   session.
 //! - `queued_own_turn`: on reading a message, first run the turn claude starts by itself when
 //!   that task finishes, as if the message arrived just after the task did. That turn's
 //!   result says the message waits for the next turn (`queued_turn_count: 1`).
@@ -33,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use newjen_core::protocol::PermissionAnswer;
-use newjen_core::session::SessionConfig;
+use newjen_core::session::{SessionConfig, SessionEvent};
 use newjen_core::store::{Project, Store};
 use newjen_core::thread::{CONTINUE_MESSAGE, IDLE_TIMEOUT, NEW_THREAD_TITLE, Thread, finish_quit};
 use newjen_core::transcript::{
@@ -68,15 +78,29 @@ if [ -f "$dir/other_in_use" ]; then
   echo "Error: listen EADDRINUSE: address is already in use :::3000" >&2
   exit 1
 fi
+missing='{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: '"$sid"'"]}'
 if [ -f "$dir/${mode}_missing" ]; then
   sleep 0.2
-  printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: '"$sid"'"]}'
+  printf '%s\n' "$missing"
   exit 1
 fi
+if [ -f "$dir/${mode}_missing_other" ]; then
+  sleep 0.2
+  printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: 11111111-0000-4000-8000-000000000000"]}'
+  exit 1
+fi
+send_init() {
+  if [ ! -f "$dir/no_init" ]; then
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
+  fi
+}
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$dir/stdin.log"
   if [ -f "$dir/crash" ]; then
     exit 1
+  fi
+  if [ -f "$dir/never_init" ]; then
+    exec sleep 60
   fi
   if [ -f "$dir/queued_own_turn" ]; then
     printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"b1","run_id":"r1","tool_use_id":"tb","status":"completed","summary":"Background command completed (exit code 0)"}'
@@ -85,7 +109,14 @@ while IFS= read -r line; do
     printf '%s\n' '{"type":"assistant","message":{"id":"mc","content":[{"type":"text","text":"The dev server stopped."}]}}'
     printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"duration_ms":5,"queued_turn_count":1,"origin":{"kind":"task-notification","producer":"session-task","runId":"r1"}}'
   fi
-  printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
+  send_init
+  if [ -f "$dir/hang_after_init" ]; then
+    exec sleep 60
+  fi
+  if [ -f "$dir/missing_after_init" ]; then
+    printf '%s\n' "$missing"
+    continue
+  fi
   if [ -f "$dir/hang" ]; then
     printf '%s\n' '{"type":"assistant","message":{"id":"m0","content":[{"type":"tool_use","id":"t0","name":"Bash","input":{"command":"sleep 60"}}]}}'
     printf '%s\n' '{"type":"stream_event","api_message_id":"m1","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Still going"}}}'
@@ -102,13 +133,20 @@ while IFS= read -r line; do
       printf '%s\n' '{"type":"system","subtype":"task_updated","task_id":"b1","run_id":"r1","patch":{"status":"completed"}}'
       printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"b1","run_id":"r1","tool_use_id":"tb","status":"completed","summary":"Background command completed (exit code 0)"}'
       printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
-      printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
+      send_init
       printf '%s\n' '{"type":"assistant","message":{"id":"mc","content":[{"type":"text","text":"The dev server stopped."}]}}'
-      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"duration_ms":5}'
+      if [ -f "$dir/own_turn_missing" ]; then
+        printf '%s\n' "$missing"
+      else
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"duration_ms":5}'
+      fi
     ) &
   fi
   if [ -f "$dir/ask" ]; then
     printf '%s\n' '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"t1","input":{"command":"touch one.txt"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch one.txt"}],"behavior":"allow","destination":"localSettings"}]}}'
+    if [ -f "$dir/exit_on_ask" ]; then
+      exit 1
+    fi
     IFS= read -r answer
     printf '%s\n' "$answer" >> "$dir/stdin.log"
     printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"","is_error":false}]}}'
@@ -495,19 +533,23 @@ fn a_missing_conversation_starts_fresh_and_resends_the_message_once() {
     // The failed resume read nothing; the fresh start got the message.
     assert_eq!(fixture.messages_received(), ["first", "second"]);
     assert_eq!(thread.status(), Status::Done);
+    // The divider comes before the message that starts the new conversation.
     assert_eq!(
         kinds(&thread),
         [
             "user",
             "assistant",
             "turn_end",
-            "user",
             "fresh_start",
+            "user",
             "assistant",
             "turn_end"
         ]
     );
+    assert_eq!(user_texts(&thread), ["first", "second"]);
     assert!(errors(&thread).is_empty());
+    let reloaded = fixture.reload(thread.id());
+    assert_eq!(reloaded.transcript().items(), thread.transcript().items());
 
     // The new conversation is saved, so the next launch resumes it.
     assert!(fixture.store.flush(FLUSH));
@@ -580,6 +622,96 @@ fn a_missing_conversation_twice_shows_one_error() {
             .count(),
         1
     );
+}
+
+#[test]
+fn a_missing_conversation_error_after_init_is_shown_and_nothing_is_resent() {
+    let fixture = Fixture::new();
+    fixture.switch("missing_after_init", true);
+    let mut thread = fixture.draft();
+    thread.send("hello").unwrap();
+    finish_turn(&mut thread);
+    settle(&mut thread);
+
+    let spawns = fixture.spawns();
+    assert_eq!(spawns.len(), 1, "no new claude");
+    assert_eq!(flag(&spawns[0], "--session-id"), Some(thread.session_id()));
+    assert_eq!(fixture.messages_received(), ["hello"], "nothing resent");
+    assert!(thread.session_started());
+    assert_eq!(thread.status(), Status::Failed);
+    assert!(errors(&thread)[0].1.contains("No conversation found"));
+    assert!(!kinds(&thread).contains(&"fresh_start"));
+}
+
+/// A started thread whose next turn leaves `npm run dev` running, and whose turn claude starts
+/// by itself when it finishes ends with "No conversation found" for this conversation. With
+/// `init` false the stand-in never sends `system/init`.
+fn missing_conversation_in_claudes_own_turn(fixture: &Fixture, init: bool) -> Thread {
+    let mut thread = started_thread(fixture);
+    fixture.switch("no_init", !init);
+    fixture.switch("background", true);
+    fixture.switch("own_turn_missing", true);
+    thread.send("Start the dev server").unwrap();
+    finish_turn(&mut thread);
+    fixture.switch("background", false);
+    assert_eq!(thread.status(), Status::Done);
+    let before = kinds(&thread).len();
+
+    fixture.switch("finish_task", true);
+    pump_until(&mut thread, "claude's own turn to end", |thread| {
+        kinds(thread).len() > before + 1 && !thread.status().is_busy()
+    });
+    settle(&mut thread);
+    assert_eq!(fixture.spawns().len(), 2, "no new claude");
+    assert_eq!(
+        fixture.messages_received(),
+        ["first", "Start the dev server"],
+        "nothing resent"
+    );
+    assert_eq!(user_texts(&thread), ["first", "Start the dev server"]);
+    thread
+}
+
+#[test]
+fn a_missing_conversation_error_in_claudes_own_turn_is_shown_and_nothing_is_resent() {
+    let fixture = Fixture::new();
+    let thread = missing_conversation_in_claudes_own_turn(&fixture, true);
+    assert_eq!(
+        flag(&fixture.spawns()[1], "--resume"),
+        Some(thread.session_id())
+    );
+    assert!(thread.session_started());
+    assert_eq!(thread.status(), Status::Failed);
+    assert!(!kinds(&thread).contains(&"fresh_start"));
+}
+
+#[test]
+fn a_finished_turns_message_is_never_resent_even_without_init() {
+    let fixture = Fixture::new();
+    missing_conversation_in_claudes_own_turn(&fixture, false);
+}
+
+#[test]
+fn a_missing_conversation_error_for_another_id_is_shown_as_it_is() {
+    let fixture = Fixture::new();
+    let mut thread = started_thread(&fixture);
+    let session = thread.session_id().to_string();
+    fixture.switch("resume_missing_other", true);
+    thread.send("second").unwrap();
+    finish_turn(&mut thread);
+    settle(&mut thread);
+
+    assert_eq!(fixture.spawns().len(), 2, "no repair");
+    assert_eq!(fixture.messages_received(), ["first"]);
+    assert_eq!(thread.session_id(), session);
+    assert!(thread.session_started());
+    assert_eq!(thread.status(), Status::Failed);
+    assert!(
+        errors(&thread)[0]
+            .1
+            .contains("11111111-0000-4000-8000-000000000000")
+    );
+    assert!(!kinds(&thread).contains(&"fresh_start"));
 }
 
 #[test]
@@ -821,6 +953,8 @@ fn a_thread_left_waiting_by_a_crash_is_stopped_with_its_approval_expired() {
 
     // Continue is an ordinary message, sent to the resumed conversation.
     fixture.switch("ask", false);
+    assert!(!relaunched.continue_resends());
+    assert_eq!(relaunched.continue_text(), CONTINUE_MESSAGE);
     relaunched.send(CONTINUE_MESSAGE).unwrap();
     finish_turn(&mut relaunched);
     let spawns = fixture.spawns();
@@ -984,6 +1118,7 @@ fn try_again_when_the_conversation_is_gone_switches_to_a_new_one() {
         errors(&thread)
     );
     assert_eq!(kinds(&thread).last(), Some(&"fresh_start"));
+    assert_eq!(thread.status(), Status::Stopped, "usable, not failed");
     settle(&mut thread);
     assert_eq!(fixture.spawns().len(), 3, "nothing was resent or retried");
 
@@ -1640,4 +1775,146 @@ fn try_again_says_it_stopped_the_background_task() {
     let relaunched = fixture.reload(thread.id());
     assert_eq!(relaunched.transcript().items(), thread.transcript().items());
     assert!(!kinds(&relaunched).contains(&"stopped"));
+}
+
+#[test]
+fn continuing_a_thread_quit_before_claude_started_sends_the_message_again() {
+    let fixture = Fixture::new();
+    fixture.switch("never_init", true);
+    let mut thread = fixture.draft();
+    thread.send("Fix the login bug").unwrap();
+    fixture.wait_for_messages(1);
+    thread.shutdown_for_quit();
+    let mut relaunched = fixture.reload(thread.id());
+    drop(thread);
+    assert_eq!(kinds(&relaunched), ["user", "stopped"]);
+    assert!(!relaunched.session_started());
+
+    // Claude never started the conversation, so "Continue where you left off." would mean
+    // nothing to it: Continue sends the message again instead.
+    fixture.switch("never_init", false);
+    assert!(relaunched.continue_resends());
+    let text = relaunched.continue_text();
+    assert_eq!(text, "Fix the login bug");
+    relaunched.send(&text).unwrap();
+    finish_turn(&mut relaunched);
+    let spawns = fixture.spawns();
+    assert_eq!(spawns.len(), 2);
+    assert_eq!(
+        flag(&spawns[1], "--session-id"),
+        Some(relaunched.session_id())
+    );
+    assert_eq!(
+        fixture.messages_received(),
+        ["Fix the login bug", "Fix the login bug"]
+    );
+    assert_eq!(relaunched.status(), Status::Done);
+}
+
+#[test]
+fn continuing_a_started_thread_quit_before_claude_started_the_turn_sends_the_message_again() {
+    let fixture = Fixture::new();
+    let mut thread = started_thread(&fixture);
+    fixture.switch("never_init", true);
+    thread.send("second").unwrap();
+    fixture.wait_for_messages(2);
+    thread.shutdown_for_quit();
+    let mut relaunched = fixture.reload(thread.id());
+    drop(thread);
+    assert_eq!(
+        kinds(&relaunched),
+        ["user", "assistant", "turn_end", "user", "stopped"]
+    );
+    assert!(relaunched.session_started());
+    assert!(relaunched.continue_resends());
+
+    fixture.switch("never_init", false);
+    let text = relaunched.continue_text();
+    assert_eq!(text, "second");
+    relaunched.send(&text).unwrap();
+    finish_turn(&mut relaunched);
+    let spawns = fixture.spawns();
+    assert_eq!(spawns.len(), 3);
+    assert_eq!(flag(&spawns[2], "--resume"), Some(relaunched.session_id()));
+    assert_eq!(fixture.messages_received(), ["first", "second", "second"]);
+    assert_eq!(relaunched.status(), Status::Done);
+    assert!(!relaunched.continue_resends());
+}
+
+#[test]
+fn after_a_crash_continue_resends_only_a_message_whose_turn_never_started() {
+    let fixture = Fixture::new();
+    let mut thread = started_thread(&fixture);
+    fixture.switch("never_init", true);
+    thread.send("second").unwrap();
+    fixture.wait_for_messages(2);
+    // Newjen is killed here: only what was saved at the last checkpoint (the message).
+    let mut relaunched = fixture.reload(thread.id());
+    drop(thread);
+    assert_eq!(
+        kinds(&relaunched),
+        ["user", "assistant", "turn_end", "user", "stopped"]
+    );
+    assert_eq!(relaunched.continue_text(), "second");
+
+    // This time claude starts the turn (`init`) before the kill, so it has the message.
+    fixture.switch("never_init", false);
+    fixture.switch("hang_after_init", true);
+    relaunched.send("third").unwrap();
+    pump_until(&mut relaunched, "the turn to start", |thread| {
+        !thread.continue_resends()
+    });
+    let again = fixture.reload(relaunched.id());
+    drop(relaunched);
+    assert_eq!(kinds(&again).last(), Some(&"stopped"));
+    assert!(!again.continue_resends());
+    assert_eq!(again.continue_text(), CONTINUE_MESSAGE);
+}
+
+#[test]
+fn archiving_mid_turn_saves_the_thread_as_stopped() {
+    let fixture = Fixture::new();
+    fixture.switch("hang", true);
+    let mut thread = fixture.draft();
+    thread.send("go").unwrap();
+    pump_until(&mut thread, "the turn to start", |thread| {
+        kinds(thread) == ["user", "tool", "assistant"]
+    });
+    thread.archive();
+    assert!(!thread.has_session());
+    assert_eq!(thread.status(), Status::Stopped);
+    assert!(fixture.store.flush(FLUSH));
+    let row = fixture.store.thread(thread.id()).unwrap().unwrap();
+    assert_eq!(row.status, Status::Stopped);
+}
+
+#[test]
+fn always_allow_that_never_reaches_claude_saves_no_grant() {
+    let fixture = Fixture::new();
+    fixture.switch("ask", true);
+    fixture.switch("exit_on_ask", true);
+    let mut thread = fixture.draft();
+    send_and_wait_for_approval(&mut thread, "make a file");
+    // claude exits right after asking. Its exit is not passed on yet, so the approval is still
+    // on screen when the user answers it.
+    let events = thread.events();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut exited = false;
+    while !exited {
+        match events.try_recv() {
+            Ok(event) => exited = matches!(event.event(), SessionEvent::Exited { .. }),
+            Err(_) => {
+                assert!(Instant::now() < deadline, "timed out waiting for the exit");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    assert!(
+        thread
+            .answer(None, PermissionAnswer::AllowForSession)
+            .is_err()
+    );
+    assert!(thread.grants().is_empty());
+    assert!(fixture.store.flush(FLUSH));
+    assert!(fixture.store.grants(thread.id()).unwrap().is_empty());
 }

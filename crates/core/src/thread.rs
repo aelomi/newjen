@@ -15,12 +15,13 @@
 //! `--resume <id>` after that. Two failures are repaired once per user message by starting
 //! claude again and resending that message (see [`Thread::apply`]):
 //! - "Session ID … is already in use" (the conversation exists after all): resume it.
-//! - "No conversation found" (Claude no longer has it): start a new one with a new id, after
-//!   a quiet row saying so. The earlier messages stay on screen. This also happens after
-//!   "Try again", which has no message to resend: the next message starts the new one.
+//! - "No conversation found" for this id (Claude no longer has it): start a new one with a new
+//!   id, after a quiet row saying so. The earlier messages stay on screen. This also happens
+//!   after "Try again", which has no message to resend: the next message starts the new one.
 //!
-//! A repair applies only while claude is starting (before its first `system/init`); a Stop
-//! pressed in that window ends the turn at once instead (see [`Thread::stop`]).
+//! A repair applies only while claude is starting (before its first `system/init`), and resends
+//! a message only while its turn runs; a Stop pressed in that window ends the turn at once
+//! instead (see [`Thread::stop`]).
 //!
 //! **Saving.** A thread is a *draft* until its first message is sent; drafts are never saved.
 //! After that, the row and the changed transcript rows are saved at checkpoints only (a
@@ -46,7 +47,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
-use crate::protocol::{BackgroundTask, Incoming, PermissionAnswer, session_rules};
+use crate::protocol::{BackgroundTask, Incoming, PermissionAnswer, ResultMessage, session_rules};
 use crate::session::{Conversation, Session, SessionConfig, SessionEvent};
 use crate::store::{Grant, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow, now_ms};
 use crate::transcript::{Item, Status, Transcript};
@@ -65,7 +66,8 @@ pub const TITLE_MAX_CHARS: usize = 50;
 /// (`--resume`). T3 Code and Codex also use 30 minutes.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// What the Continue button on a "Stopped when Newjen quit" notice sends, as a visible message.
+/// What the Continue button on a "Stopped when Newjen quit" notice sends, as a visible message,
+/// when claude got the user's last message (see [`Thread::continue_text`]).
 pub const CONTINUE_MESSAGE: &str = "Continue where you left off.";
 
 /// True if `line` is what claude prints on stderr (and then exits 1) when `--session-id`
@@ -74,6 +76,26 @@ pub const CONTINUE_MESSAGE: &str = "Continue where you left off.";
 /// in use" (a busy port, say) is shown as it is.
 fn is_session_in_use(line: &str, session_id: &str) -> bool {
     line.contains(&format!("Session ID {session_id} is already in use"))
+}
+
+/// True if `result` is claude's "No conversation found" error for `session_id`. A message that
+/// names another session id does not count.
+fn is_missing_conversation(result: &ResultMessage, session_id: &str) -> bool {
+    const NAMED: &str = "No conversation found with session ID:";
+    let names_another = |text: &String| {
+        text.split_once(NAMED).is_some_and(|(_, rest)| {
+            rest.split_whitespace()
+                .next()
+                .map(|id| id.trim_end_matches('.'))
+                != Some(session_id)
+        })
+    };
+    result.is_missing_conversation()
+        && !result
+            .error_lines()
+            .iter()
+            .chain(result.result.as_ref())
+            .any(names_another)
 }
 
 /// One event from one of the thread's `claude` processes. Pass it to [`Thread::apply`].
@@ -153,6 +175,7 @@ struct RowState {
 #[derive(Debug, Default)]
 struct Recovery {
     /// The user's last message, resent once if claude must be started again to receive it.
+    /// Dropped when its turn ends.
     message: Option<String>,
     /// The current process printed the "already in use" line. Held back from the transcript
     /// until it is clear whether the repair works.
@@ -373,6 +396,21 @@ impl Thread {
         config
     }
 
+    /// What Continue on the "Stopped when Newjen quit" notice sends: the user's last message
+    /// again if claude never started its turn (`Transcript::unconfirmed_message`), otherwise
+    /// [`CONTINUE_MESSAGE`].
+    pub fn continue_text(&self) -> String {
+        self.transcript
+            .unconfirmed_message()
+            .unwrap_or(CONTINUE_MESSAGE)
+            .to_string()
+    }
+
+    /// True if Continue sends the user's last message again (see [`Thread::continue_text`]).
+    pub fn continue_resends(&self) -> bool {
+        self.transcript.unconfirmed_message().is_some()
+    }
+
     // -----------------------------------------------------------------------------------------
     // What the app does
     // -----------------------------------------------------------------------------------------
@@ -435,7 +473,7 @@ impl Thread {
             Some(session) => session.answer(&request, answer),
             None => Err(anyhow!("the claude session has ended")),
         };
-        if answer == PermissionAnswer::AllowForSession {
+        if sent.is_ok() && answer == PermissionAnswer::AllowForSession {
             let now = now_ms();
             for rule in session_rules(&request) {
                 self.add_grant(Grant {
@@ -550,6 +588,12 @@ impl Thread {
 
     /// Hides the thread from the list and stops its `claude`. Its rows stay in the store.
     pub fn archive(&mut self) {
+        if self.session.is_some() {
+            self.transcript.apply(&SessionEvent::Exited {
+                code: None,
+                requested: true,
+            });
+        }
         self.end_session();
         self.save();
         if !self.draft {
@@ -623,30 +667,25 @@ impl Thread {
             // gone, so switch to a new one now; otherwise every later start would fail the same
             // way.
             SessionEvent::Line(Incoming::Result(result))
-                if result.is_missing_conversation()
-                    && self.session_started
-                    && !self.recovery.started_fresh =>
+                if self.session_started
+                    && !self.session_initialized
+                    && !self.recovery.started_fresh
+                    && is_missing_conversation(result, &self.session_id) =>
             {
                 self.recovery.started_fresh = true;
                 self.session_id = new_id();
                 self.session_started = false;
                 match self.recovery.message.as_deref() {
-                    // "Continue where you left off." means nothing to a new conversation, so
-                    // it is not resent: the turn ends, and the user's next message starts
-                    // the new conversation.
-                    Some(CONTINUE_MESSAGE) => {
-                        self.end_turn_as_stopped();
-                        self.transcript.push_fresh_start();
-                        self.save();
-                    }
-                    Some(_) => {
-                        self.transcript.push_fresh_start();
+                    Some(message) if message != CONTINUE_MESSAGE => {
+                        self.transcript.insert_fresh_start_before_last_message();
                         self.start_again();
                     }
-                    None => {
-                        // Nothing to resend: the next message starts the new conversation.
+                    // "Continue where you left off." means nothing to a new conversation, and
+                    // "Try again" has nothing to resend: the turn ends, and the user's next
+                    // message starts the new conversation.
+                    _ => {
+                        self.end_turn_as_stopped();
                         self.transcript.push_fresh_start();
-                        self.end_session();
                         self.save();
                     }
                 }
@@ -802,12 +841,14 @@ impl Thread {
     }
 
     /// What happens whenever a turn ends, however it ended: the unread rule, the turn's clock,
-    /// and a stop that was waiting for the turn to end (see [`Thread::revoke`]).
+    /// the message a repair would resend, and a stop that was waiting for the turn to end (see
+    /// [`Thread::revoke`]).
     fn after_turn_ended(&mut self) {
         if becomes_unread(self.active, true, false) {
             self.set_unread(true);
         }
         self.turn_started = None;
+        self.recovery.message = None;
         if self.stop_after_turn {
             self.end_session();
         }
@@ -1070,6 +1111,27 @@ mod tests {
             "Error: listen EADDRINUSE: address is already in use :::3000",
             id
         ));
+    }
+
+    #[test]
+    fn only_a_missing_conversation_error_for_this_id_counts() {
+        let id = "3f1e1c2a-0000-4000-8000-0000000000ab";
+        let result = |is_error: bool, error: &str| ResultMessage {
+            is_error,
+            errors: Some(vec![serde_json::json!(error)]),
+            ..ResultMessage::default()
+        };
+        let named = |id: &str| format!("No conversation found with session ID: {id}");
+        assert!(is_missing_conversation(&result(true, &named(id)), id));
+        assert!(is_missing_conversation(
+            &result(true, "No conversation found"),
+            id
+        ));
+        assert!(!is_missing_conversation(
+            &result(true, &named("11111111-0000-4000-8000-000000000000")),
+            id
+        ));
+        assert!(!is_missing_conversation(&result(false, &named(id)), id));
     }
 
     #[test]

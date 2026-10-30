@@ -130,6 +130,11 @@ pub enum Item {
     User {
         id: u64,
         text: String,
+        /// Sent, but claude has not started its turn yet (no `system/init`), so claude may never
+        /// have received it. Saved, so a relaunch knows too (see
+        /// [`Transcript::unconfirmed_message`]).
+        #[serde(default, skip_serializing_if = "is_false")]
+        unconfirmed: bool,
     },
     Assistant {
         id: u64,
@@ -171,14 +176,10 @@ pub enum Item {
     /// Newjen quit (or crashed) while the thread was working or waiting, so the turn was
     /// stopped. Shown as [`STOPPED_ON_QUIT`] / [`STOPPED_ON_QUIT_DETAIL`] with a Continue
     /// button. Added by [`Transcript::normalize_after_relaunch`].
-    Stopped {
-        id: u64,
-    },
+    Stopped { id: u64 },
     /// Claude no longer had the earlier conversation, so a new one starts here. The rows above
     /// stay visible but Claude does not remember them. Shown as [`FRESH_START_NOTE`].
-    FreshStart {
-        id: u64,
-    },
+    FreshStart { id: u64 },
     /// A saved row this version of Newjen cannot read (written by a newer or older version).
     /// Shown as a quiet [`UNREADABLE_NOTE`] row. Keeps the saved row as it was, so saving the
     /// thread again never destroys it.
@@ -426,14 +427,68 @@ impl Transcript {
         self.push(Item::User {
             id,
             text: text.to_string(),
+            unconfirmed: true,
         });
         self.status = Status::Working;
     }
 
+    /// The user's last message, if claude never started its turn (see `Item::User`).
+    pub fn unconfirmed_message(&self) -> Option<&str> {
+        self.items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::User {
+                    text, unconfirmed, ..
+                } => Some(unconfirmed.then_some(text.as_str())),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    /// A turn started (`system/init`), so claude has the user's last message.
+    fn confirm_last_message(&mut self) {
+        let Some(position) = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::User { .. }))
+        else {
+            return;
+        };
+        if let Item::User { unconfirmed, .. } = &mut self.items[position]
+            && *unconfirmed
+        {
+            *unconfirmed = false;
+            self.touch(position);
+        }
+    }
+
     /// Adds the quiet row saying the conversation starts over here (see [`Item::FreshStart`]).
+    /// A failure before it was the old conversation's, so the thread is Stopped, not Failed.
     pub fn push_fresh_start(&mut self) {
         let id = self.new_id();
         self.push(Item::FreshStart { id });
+        if self.status == Status::Failed {
+            self.status = Status::Stopped;
+        }
+    }
+
+    /// Adds the fresh-start row just before the user's last message, the one that starts the
+    /// new conversation. Its id is a new one, so ids are unique but no longer in row order.
+    pub fn insert_fresh_start_before_last_message(&mut self) {
+        let Some(position) = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::User { .. }))
+        else {
+            return self.push_fresh_start();
+        };
+        let id = self.new_id();
+        self.items.insert(position, Item::FreshStart { id });
+        for at in self.open_text.values_mut().filter(|at| **at >= position) {
+            *at += 1;
+        }
+        self.touch(position);
     }
 
     /// Ends the turn with an error the app found itself (for example claude could not be
@@ -626,6 +681,7 @@ impl Transcript {
         if message.subtype != "init" {
             return;
         }
+        self.confirm_last_message();
         if let Some(session_id) = &message.session_id {
             self.session_id = Some(session_id.clone());
         }
@@ -1072,6 +1128,9 @@ impl Transcript {
 /// Lines that only come while a turn runs: its `init`, and the main conversation's replies.
 /// One between turns means claude started a turn by itself, as it does when a background task
 /// finishes: no user message, just `init` and a reply. It is a turn like any other.
+///
+/// Assumes claude sends `init` only to start a turn, never at spawn or after a result (true in
+/// every fixture; checked in `tests/replay.rs`).
 fn starts_turn(incoming: &Incoming) -> bool {
     match incoming {
         Incoming::System(message) => message.subtype == "init",
@@ -1198,6 +1257,7 @@ mod tests {
             Item::User {
                 id: 1,
                 text: "hi \"there\"\n🦀".to_string(),
+                unconfirmed: true,
             },
             Item::Assistant {
                 id: 2,
@@ -1261,6 +1321,27 @@ mod tests {
     }
 
     #[test]
+    fn a_message_is_unconfirmed_until_its_turn_starts() {
+        // A message saved before the flag existed counts as received.
+        let old = Item::from_saved(ITEM_SCHEMA_VERSION, r#"{"type":"user","id":1,"text":"a"}"#);
+        let mut transcript = Transcript::from_saved("/tmp/p", vec![old], Status::Stopped);
+        assert_eq!(transcript.unconfirmed_message(), None);
+
+        transcript.push_user("b");
+        assert_eq!(transcript.unconfirmed_message(), Some("b"));
+        transcript.mark_saved();
+        let init = Incoming::parse(r#"{"type":"system","subtype":"init","session_id":"s"}"#);
+        transcript.apply(&SessionEvent::Line(init));
+        assert_eq!(transcript.unconfirmed_message(), None);
+        assert_eq!(
+            transcript.dirty_from(),
+            Some(1),
+            "saved at the init checkpoint"
+        );
+        assert!(!transcript.items()[1].to_saved().1.contains("unconfirmed"));
+    }
+
+    #[test]
     fn rows_that_cannot_be_read_become_placeholders_and_are_kept_as_they_were() {
         let rows = [
             (1, "{not json"),
@@ -1280,7 +1361,8 @@ mod tests {
             item,
             Item::User {
                 id: 3,
-                text: "hi".to_string()
+                text: "hi".to_string(),
+                unconfirmed: false,
             }
         );
     }
@@ -1291,6 +1373,7 @@ mod tests {
             Item::User {
                 id: 4,
                 text: "a".to_string(),
+                unconfirmed: false,
             },
             Item::from_saved(1, "broken"),
             // A repeated id (a damaged file) gets a new one.

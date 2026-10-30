@@ -90,6 +90,10 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 - **Orphan processes.** Kill `claude` children on crash or quit, using process groups and a cleanup check at startup.
 - **No sandbox.** Rift copies isolate files, not permissions. Agents still have full access to your Mac.
 - **Ely is early.** Its README says it is 0.x and written by agents ("no crate is stable"). Pin exact versions and commit `Cargo.lock`.
+- **The "already in use" repair is timing-bound.** It needs claude's stderr line to arrive within the 500 ms drain after claude exits; a later line shows as a plain "Claude exited" error instead.
+- **⌘{ and ⌘} assume a US layout.** On layouts that type braces another way, previous/next thread may not fire.
+- **Reduce Motion is polled every second.** Listening for NSWorkspace's accessibility display options notification would apply it at once.
+- **Two Newjen instances on one project aren't prevented.** Both would drive the same threads and store; Codex and T3 Code hold a lock, and Newjen should too.
 
 ## Build order (one vertical slice first)
 

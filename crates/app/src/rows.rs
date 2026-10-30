@@ -47,13 +47,13 @@ pub type OnRestart = Rc<dyn Fn(&mut Window, &mut App)>;
 /// first frame after its thread comes on screen (see `live_reply`).
 ///
 /// `retry` is the "Try again" action for an error row, given only where `can_retry` allows it.
-/// `resume` is the Continue action for the "Stopped when Newjen quit" notice, given only where
-/// `shows_continue` allows it.
+/// `resume` is the Continue action for the "Stopped when Newjen quit" notice and its label (see
+/// `continue_label`), given only where `shows_continue` allows it.
 pub fn item(
     item: &Item,
     typing: bool,
     retry: Option<&OnRestart>,
-    resume: Option<&OnRestart>,
+    resume: Option<(&OnRestart, &'static str)>,
     cx: &App,
 ) -> AnyElement {
     match item {
@@ -176,9 +176,15 @@ pub fn shows_continue(items: &[Item]) -> bool {
     matches!(items.last(), Some(Item::Stopped { .. }))
 }
 
+/// The label of that Continue button: "Send again" when it sends the user's last message
+/// again because Claude never started its turn (`Thread::continue_resends`).
+pub fn continue_label(resends: bool) -> &'static str {
+    if resends { "Send again" } else { "Continue" }
+}
+
 /// The notice a thread gets when Newjen quit during its turn (screen 9): "Stopped when Newjen
 /// quit / Nothing runs until you continue.", with Continue when `resume` is given.
-fn stopped_notice(id: u64, resume: Option<&OnRestart>, cx: &App) -> AnyElement {
+fn stopped_notice(id: u64, resume: Option<(&OnRestart, &'static str)>, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let colors = &theme.colors;
     let text = v_stack()
@@ -212,8 +218,9 @@ fn stopped_notice(id: u64, resume: Option<&OnRestart>, cx: &App) -> AnyElement {
                 .color(colors.fg_muted),
         )
         .child(text)
-        .children(resume.cloned().map(|resume| {
-            Button::new(("continue", id), "Continue")
+        .children(resume.map(|(resume, label)| {
+            let resume = resume.clone();
+            Button::new(("continue", id), label)
                 .variant(ButtonVariant::Secondary)
                 .on_click(move |_, window, cx| resume(window, cx))
         }))
@@ -242,8 +249,8 @@ pub enum QuietIcon {
 /// How a call in `state` with `output` is drawn (see "Rendering decisions" in the slice 2
 /// spec): an approval Newjen quit before you answered is "Expired · Newjen quit before you
 /// answered"; a call that was running then is "Stopped when Newjen quit", and a command left
-/// running in the background when Newjen stopped its claude is "Stopped when Claude
-/// restarted". Everything else is Ely's card.
+/// running in the background when Newjen stopped its claude is "Stopped with Claude".
+/// Everything else is Ely's card.
 pub fn tool_look(state: ToolState, output: Option<&str>) -> ToolLook {
     match state {
         ToolState::Expired => ToolLook::Quiet {
@@ -449,6 +456,7 @@ mod tests {
         let user = Item::User {
             id: 1,
             text: "hi".to_string(),
+            unconfirmed: false,
         };
         let stopped = Item::Stopped { id: 2 };
         assert!(shows_continue(&[user.clone(), stopped.clone()]));
@@ -456,11 +464,18 @@ mod tests {
         let continued = Item::User {
             id: 3,
             text: newjen_core::thread::CONTINUE_MESSAGE.to_string(),
+            unconfirmed: true,
         };
         assert!(!shows_continue(&[stopped.clone(), continued]));
         assert!(!shows_continue(&[stopped, Item::FreshStart { id: 3 }]));
         assert!(!shows_continue(&[user]));
         assert!(!shows_continue(&[]));
+    }
+
+    #[test]
+    fn continue_says_send_again_when_it_resends_the_message() {
+        assert_eq!(continue_label(false), "Continue");
+        assert_eq!(continue_label(true), "Send again");
     }
 
     #[test]
@@ -474,6 +489,7 @@ mod tests {
         let user = Item::User {
             id: 1,
             text: "hi".to_string(),
+            unconfirmed: false,
         };
         assert_eq!(live_reply(&[user.clone(), reply(2, true)]), Some(2));
         // Finished, or followed by another row: nothing is typing.
