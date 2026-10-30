@@ -54,6 +54,7 @@ pub fn item(
     typing: bool,
     retry: Option<&OnRestart>,
     resume: Option<(&OnRestart, &'static str)>,
+    resends: bool,
     cx: &App,
 ) -> AnyElement {
     match item {
@@ -122,7 +123,7 @@ pub fn item(
         Item::Error {
             id, title, detail, ..
         } => error(("error", *id).into(), title, detail, retry),
-        Item::Stopped { id } => stopped_notice(*id, resume, cx),
+        Item::Stopped { id } => stopped_notice(*id, resume, resends, cx),
         Item::FreshStart { .. } => fresh_start(cx),
         Item::Unreadable { .. } => caption_row(IconName::Info, UNREADABLE_NOTE.to_string(), cx),
     }
@@ -178,6 +179,20 @@ pub fn shows_continue(items: &[Item]) -> bool {
 
 /// The label of that Continue button: "Send again" when it sends the user's last message
 /// again because Claude never started its turn (`Thread::continue_resends`).
+/// Whether the Stopped notice at `ix` is about a message Claude never got: the user's last
+/// message before it is still unconfirmed. Stays true after Send again, so the notice keeps
+/// saying what happened.
+pub fn stopped_resends(items: &[Item], ix: usize) -> bool {
+    items[..ix.min(items.len())]
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            Item::User { unconfirmed, .. } => Some(*unconfirmed),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 pub fn continue_label(resends: bool) -> &'static str {
     if resends { "Send again" } else { "Continue" }
 }
@@ -193,7 +208,12 @@ pub fn stopped_detail(resends: bool) -> &'static str {
 
 /// The notice a thread gets when Newjen quit during its turn (screen 9): "Stopped when Newjen
 /// quit / Nothing runs until you continue.", with Continue when `resume` is given.
-fn stopped_notice(id: u64, resume: Option<(&OnRestart, &'static str)>, cx: &App) -> AnyElement {
+fn stopped_notice(
+    id: u64,
+    resume: Option<(&OnRestart, &'static str)>,
+    resends: bool,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let colors = &theme.colors;
     let text = v_stack()
@@ -211,9 +231,7 @@ fn stopped_notice(id: u64, resume: Option<(&OnRestart, &'static str)>, cx: &App)
             div()
                 .text_size(theme.text_size(TextSize::Sm))
                 .text_color(colors.fg_subtle)
-                .child(stopped_detail(
-                    resume.is_some_and(|(_, label)| label == continue_label(true)),
-                )),
+                .child(stopped_detail(resends)),
         );
     h_stack()
         .gap_2p5()
@@ -489,6 +507,14 @@ mod tests {
         assert_eq!(continue_label(true), "Send again");
         assert_eq!(stopped_detail(false), STOPPED_ON_QUIT_DETAIL);
         assert_eq!(stopped_detail(true), STOPPED_UNSENT_DETAIL);
+        let user = |unconfirmed| Item::User {
+            id: 1,
+            text: "a".into(),
+            unconfirmed,
+        };
+        let items = [user(true), Item::Stopped { id: 2 }, user(false)];
+        assert!(stopped_resends(&items, 1), "still says so after Send again");
+        assert!(!stopped_resends(&[user(false), Item::Stopped { id: 2 }], 1));
     }
 
     #[test]

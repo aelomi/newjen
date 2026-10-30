@@ -834,7 +834,14 @@ impl ChatView {
         ));
         let row = if let Some(item) = items.get(ix) {
             let typing = ix + 1 == items.len() && !whole;
-            rows::item(item, typing, retry, resume, cx)
+            rows::item(
+                item,
+                typing,
+                retry,
+                resume,
+                rows::stopped_resends(items, ix),
+                cx,
+            )
         } else if let Some(notice) = notice {
             rows::error("notice".into(), &notice.title, &notice.detail, retry)
         } else {

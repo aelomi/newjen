@@ -98,7 +98,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 ## Build order (one vertical slice first)
 
 1. **Slice (done 2026-10-27):** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in Ely chat, with approve/deny working. One thread, no Rift, no jj.
-2. Threads list, SQLite persistence, resume. Decided 2026-10-30 ([memo](research/threads-and-persistence.md)):
+2. **Done 2026-10-31.** Threads list, SQLite persistence, resume. Decided 2026-10-30 ([memo](research/threads-and-persistence.md)):
    - **Store:** `~/Library/Application Support/Newjen/newjen.db` (`NEWJEN_HOME` overrides it), WAL, migrations by `user_version`. Tables: projects, threads (with `provider`, the Claude session id and an unread flag), rendered transcript items, and grants. Writes run off the UI thread, at checkpoints only, never per streamed token.
    - **Resume:** the Claude session id is allocated when the thread is created: `--session-id` until `init` arrives, `--resume` after. Each thread stores its own working folder and always spawns from it, so slice 3 only has to set it to a Rift copy.
    - **Relaunch:** approvals left pending show as expired and running work as interrupted. Continuing is manual; nothing restarts on its own.
@@ -127,4 +127,4 @@ Dark only. Light mode waits until users ask for it (decided 2026-10-30).
 
 ## Open questions
 
-- None blocking. Slice 1 is built (2026-10-27). Next: slice 2, thread list, SQLite persistence and resume. The threads table stores a provider from the start, so Codex threads fit in later.
+- None blocking. Slices 1 and 2 are built (2026-10-27, 2026-10-31). Next: adopt pstack (replacing tstack), then slice 3, Rift copies chosen per thread.

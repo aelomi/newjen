@@ -465,6 +465,22 @@ impl Transcript {
         }
     }
 
+    fn unconfirm_last_message(&mut self) {
+        let Some(position) = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::User { .. }))
+        else {
+            return;
+        };
+        if let Item::User { unconfirmed, .. } = &mut self.items[position]
+            && !*unconfirmed
+        {
+            *unconfirmed = true;
+            self.touch(position);
+        }
+    }
+
     /// Adds the quiet row saying the conversation starts over here (see [`Item::FreshStart`]).
     /// A failure before it was the old conversation's, so the thread is Stopped, not Failed.
     pub fn push_fresh_start(&mut self) {
@@ -943,6 +959,8 @@ impl Transcript {
         // The user's message arrived while claude ran a turn of its own; it runs next.
         if !result.was_stopped() && result.another_turn_follows() {
             self.status = Status::Working;
+            // The init that just ended confirmed the queued message too early.
+            self.unconfirm_last_message();
         }
     }
 
@@ -1805,6 +1823,11 @@ mod tests {
             Status::Working,
             "the message runs next"
         );
+        assert_eq!(
+            transcript.unconfirmed_message(),
+            Some("What next?"),
+            "claude's own init did not start the queued message's turn"
+        );
         assert!(matches!(
             transcript.items().last(),
             Some(Item::TurnEnd { .. })
@@ -1817,6 +1840,7 @@ mod tests {
         transcript.apply(&line(json!({"type": "result", "subtype": "success",
             "is_error": false, "queued_turn_count": 0})));
         assert_eq!(transcript.status(), Status::Done);
+        assert_eq!(transcript.unconfirmed_message(), None);
 
         // A stop ends the turn even with a message queued; claude starts that one by itself.
         transcript.push_user("And then?");
