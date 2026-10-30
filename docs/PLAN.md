@@ -3,7 +3,7 @@
 Newjen is a macOS-only agent development environment: run many isolated Claude Code agents in parallel from a fast native app.
 
 - **Location:** `~/Newjen`, with remote `https://git.cafe/ericrasputin/newjen` (GitCafe, public, default branch `master`).
-- **Audience:** personal for now, with plans to open it to contributors later. Keep the repo contributor-ready: pick an open-source license early, keep a clear README and CLAUDE.md, and avoid personal paths or secrets in code. Code signing and auto-updates come later.
+- **Audience:** personal for now, with plans to open it to contributors later. Keep the repo contributor-ready: pick an open-source license early, keep a clear README and CONTRIBUTING.md, and avoid personal paths or secrets in code. Code signing and auto-updates come later.
 
 ## v1 goal
 
@@ -114,7 +114,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 
 ## Subscription safety
 
-Users run Newjen on their own Claude and ChatGPT subscriptions, so it must never put their accounts at risk. Newjen spawns only the user's own installed, unmodified CLIs; it never reads or stores credentials, never calls model APIs itself, never offers its own login and never retries around usage limits. It never disguises the CLI. Like T3 Code, it adds no Claude app label; Codex gets the `clientInfo` it requires. Switching a thread's provider with a context handoff, as T3 Code does, is planned for after the MVP. The rules and their sources are in [the memo](research/providers-and-subscriptions.md#2-subscription-safety) and in `CLAUDE.md`.
+Users run Newjen on their own Claude and ChatGPT subscriptions, so it must never put their accounts at risk. Newjen spawns only the user's own installed, unmodified CLIs; it never reads or stores credentials, never calls model APIs itself, never offers its own login and never retries around usage limits. It never disguises the CLI. Like T3 Code, it adds no Claude app label; Codex gets the `clientInfo` it requires. Switching a thread's provider with a context handoff, as T3 Code does, is planned for after the MVP. The rules and their sources are in [the memo](research/providers-and-subscriptions.md#2-subscription-safety) and in `CONTRIBUTING.md`.
 
 ## Appearance
 
@@ -127,4 +127,4 @@ Dark only. Light mode waits until users ask for it (decided 2026-10-30).
 
 ## Open questions
 
-- None blocking. Slices 1 and 2 are built (2026-10-27, 2026-10-31). Next: adopt pstack (replacing tstack), then slice 3, Rift copies chosen per thread.
+- None blocking. Slices 1 and 2 are built (2026-10-27, 2026-10-31). Next: replace Ely with GPUI Kit (decided 2026-10-31), then slice 3, Rift copies chosen per thread.

@@ -1,0 +1,140 @@
+# Contributing to Newjen
+
+Newjen is a native macOS agent development environment (ADE). It runs many Claude Code agents in parallel, each in the project or in its own copy of it, from a fast, low-memory GPUI app.
+
+The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](docs/PLAN.md). Read it before making architectural changes. Research behind the bigger decisions is in [`docs/research/`](docs/research/).
+
+## Ground rules
+
+- **Never commit secrets, tokens or personal absolute paths.**
+- **Pin every dependency to an exact version** (`=x.y.z`) and commit `Cargo.lock`.
+- **macOS only.** Don't add Linux or Windows code paths.
+- **`core` never depends on the UI libraries**, so the UI layer can be replaced.
+- **Follow the settled decisions below.** Raise a concern once, with evidence, rather than working around one.
+
+## Settled decisions
+
+| Area | Decision |
+|---|---|
+| Platform | **macOS only**. Don't add Linux or Windows code paths. |
+| Language | Rust, in a Cargo workspace. Toolchain 1.98+. |
+| UI | GPUI via `gpui = { package = "gpui-pre", version = "=0.3.10" }` and `gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }`. |
+| Components | **Ely**: `ely-gpui-component = "=0.1.1"`, a plain crates.io dependency. **Do not fork or vendor it.** If an Ely bug blocks work, use a temporary `[patch.crates-io]` entry and report the bug upstream. |
+| Agents | Claude Code CLI over stream-json now; Codex CLI (`codex app-server`) after the MVP slices. Newjen detects which CLIs are installed and uses one provider per thread. API-key providers and ACP agents come later. |
+| Isolation | **Rift** copy-on-write copies, **opt-in per thread**: by default a thread works in the project folder, and you choose a Rift copy when you want one. When chosen, it must be seamless. No git worktrees for now. |
+| Version control | **jj (Jujutsu)**, colocated with git. |
+| Hosting | **GitCafe** (`git.cafe`, CLI `cafe`). **Never use GitHub or the `gh` CLI for this repo.** |
+| Storage | SQLite for app state. Claude keeps its own transcripts; resume with `--resume <session-id>`. |
+| CI | GitCafe Actions, workflow in `.github/workflows/ci.yml` (GitCafe reads GitHub Actions syntax from that folder). Runs on a self-hosted macOS runner. |
+
+
+## Layout
+
+```
+crates/
+  core/   # package `newjen-core`. No UI: Claude sessions, protocol, transcript state, SQLite store. Tested headlessly.
+  app/    # package `app`, binary `newjen`. The GPUI shell. Renders core state and sends user intents to core.
+design/   # newjen.pen: pen.dev mocks of every UI state. Mock UI changes here first.
+docs/     # PLAN.md and research memos.
+```
+
+Later slices add Rift and jj to `core`, and maybe a `cli/` crate that drives `core` from the terminal.
+
+## Build order
+
+Build one vertical slice first, and don't start wrappers for later steps before it works end to end.
+
+1. `cargo run` opens a window. You type a prompt, Claude replies over stream-json, and the reply renders in Ely chat. Approve and deny work. One thread; no Rift, no jj. **Done (2026-10-27).**
+2. Thread list, SQLite persistence, resume. **Done (2026-10-31).**
+3. Rift copies, chosen per thread (the default stays the project folder).
+4. jj snapshots, diff view (Ely `git` components), and both landing modes (see the plan).
+5. Parallel threads, Dock badge notifications, and a terminal panel (Ely `terminal`).
+
+## Verified facts (tested on macOS)
+
+### Claude Code stream-json
+
+```
+claude -p --verbose --input-format stream-json --output-format stream-json \
+       --permission-prompt-tool stdio --permission-mode default \
+       --include-partial-messages [--resume <id>]
+```
+
+Checked against claude 2.1.310. `crates/core/tests/fixtures/` holds sanitized recordings of each case below.
+
+- **Sending input:** write one JSON object per line to stdin: `{"type":"user","message":{"role":"user","content":"..."}}`. Always produce the line with a JSON encoder: a line that isn't JSON kills the CLI. **Keep stdin open** for the whole session.
+- **Closing stdin** makes the CLI exit about a second later, after it finishes the current turn. A pending approval is then rejected with an `AbortError` tool_result, and the model may keep going without the tool.
+- **Approval requests** arrive on stdout as `{"type":"control_request","request_id":…,"request":{"subtype":"can_use_tool","tool_name":…,"input":…,"tool_use_id":…,"permission_suggestions":[…]}}`. Read-only commands such as `ls` are approved automatically and never ask, so test approvals with a command that writes, such as `touch`.
+- **Answering an approval:** reply on stdin with `{"type":"control_response","response":{"subtype":"success","request_id":…,"response":{"behavior":"allow","updatedInput":<input>}}}`. No MCP server is needed.
+  - **Deny** with `"behavior":"deny","message":"…"`. The `message` is required; without it the model retries the tool. Add `"interrupt":true` to also end the turn.
+  - **Allow for the session:** add `"updatedPermissions"` with the request's `addRules` suggestions, their `destination` changed to `"session"`. Later identical calls are approved without asking, and nothing is written to the project.
+  - **Rules that grant more than they look like:** a session `setMode` `acceptEdits` (the CLI's suggestion for Write/Edit) also approves shell commands such as `rm` and `mkdir`. A whole-tool rule such as `{"toolName":"Write"}` approves writes outside the project. A `*` inside a Bash rule's `ruleContent` is a wildcard. So "Always allow" forwards an `addRules` suggestion only when every rule names the requesting tool (never an edit tool) and carries `ruleContent`, or names exactly one `mcp__server__tool`; otherwise it remembers an exact Bash command without `*`, or allows once. The dock shows which before the click (`session_scope` in `crates/core/src/protocol.rs`).
+- **Stop a turn** with `{"type":"control_request","request_id":"<any id>","request":{"subtype":"interrupt"}}`.
+- **Other events:** stdout also carries `system` (hooks, and `init` at the start of every turn, not at spawn), `assistant` (one line per finished content block, so several lines share a `message.id`), `stream_event` (token deltas, with `--include-partial-messages`), `user` (`tool_result`), `rate_limit_event` and `result` (end of turn). Background tasks (Bash `run_in_background`, claude 2.1.314) outlive their turn: `system/background_tasks_changed` carries the full list (`[]` when none), and when one finishes claude starts a turn by itself (`init`, reply, `result`) with no user message. A `result` with `queued_turn_count` > 0 means a user message sent meanwhile is still queued and its turn follows (from the CLI's schema text; not recorded).
+- **Errors:** branch on `result.is_error`, not `subtype`. A missing login or bad model comes back as `subtype:"success"` with `is_error:true`. `total_cost_usd` is a running total across turns and `--resume`; per-turn cost is in `model_usage_since_last_result`.
+- **Environment:** when Newjen runs inside a Claude Code terminal, nested-session variables (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID` and others) leak into the child. `crates/core/src/session.rs` strips them and keeps the user's own config variables.
+- **Tests:** record real sessions as fixture files and replay them in `core` tests.
+
+### Rift + jj
+
+- **Use `rift create --copy-all`.** Without it, Rift skips gitignored files (`node_modules`, `target/`), which defeats the purpose.
+- **Run `jj new` in a fresh copy before the agent starts.** Otherwise the copy and the main repo share a jj change, and fetching it back creates a divergent change.
+- **Don't let the main repo and the copy share a working-copy change at all.** In the main repo, describe `@` if it has edits and run `jj new` *before* `rift create`, then `jj new` again in both the main repo and the copy. Found on 2026-10-31 with an APFS clone standing in for Rift; confirm with real Rift in slice 3.
+- **Land work** by running `jj git remote add <thread> <copy-path>` and then `jj git fetch --remote <thread>` in the main repo.
+- **Expect a harmless warning:** jj prints "repo appears to have been copied" the first time it runs in a copy.
+- **Remove copies by path:** `rift remove <copy-path>` (not the name), then `rift gc`.
+- **UI reads of jj must pass `--ignore-working-copy`.** Without it, each read snapshots an agent's half-written files.
+- **jj does not run git hooks.** Run any checks they would have done from the harness.
+
+## Subscription safety
+
+Users run Newjen on their own Claude and ChatGPT subscriptions. **Never do anything that could get their accounts banned.** What got other harnesses banned in 2026 was copying subscription tokens and calling the API while pretending to be Claude Code. Sources and dates are in [`docs/research/providers-and-subscriptions.md`](docs/research/providers-and-subscriptions.md); re-check its two policy links whenever the supported CLI versions change.
+
+- **Only spawn the user's own installed, unmodified `claude` or `codex`**, and let it handle sign-in. If they aren't logged in, tell them to run `claude` or `codex login` in their own terminal.
+- **Never touch credentials.** Don't read the Keychain, `~/.claude/.credentials.json` or `~/.codex/auth.json`; don't use `CLAUDE_CODE_OAUTH_TOKEN` or `claude setup-token`; don't build a login screen or proxy sign-in.
+- **Never call model APIs directly**, and never fake the entrypoint, headers or system prompt.
+- **Don't disguise or relabel the CLI.** `claude -p` already reports itself to Anthropic as a non-interactive (`sdk-cli`) session, so don't change that. Like T3 Code, Newjen doesn't set `CLAUDE_AGENT_SDK_CLIENT_APP` and strips any inherited value. Codex requires `clientInfo`; send the name `newjen`.
+- **Respect usage limits.** Every turn starts from a user action. Never auto-retry, auto-resume at a limit reset, or auto-continue a turn. Stop on a rejected rate limit and show when it resets.
+- **Say which account pays.** Show the account and plan from the CLI's own report (`claude auth status --json`, Codex `account/read`), and warn when `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` will bill the API instead.
+- **No "Claude Code" in Newjen's name or UI labels.** Prose such as the README may say it "runs Claude Code".
+
+## GPUI and Ely: don't guess APIs
+
+Models often invent GPUI APIs because there is little public documentation and the API changes between versions. Before writing UI code:
+
+- **Read the real Ely and GPUI source.** After the first `cargo build`, it's in `~/.cargo/registry/src/*/ely-gpui-component-0.1.1/`, `~/.cargo/registry/src/*/gpui-pre-0.3.10/` and the other `ely-*` and `gpui-pre-*` folders.
+- **Ely's guidance:**
+  - Its README and docs: https://elygpui.com
+  - Its source repository: https://github.com/ELY-Open-Source/Ely-GPUI-Components (read only)
+- **Ely setup:** call `ely_gpui_component::init(cx)` and pass `Assets` to `gpui_platform::application().with_assets(...)`. Without the `font-kit` feature, no text renders on macOS.
+- **Match existing patterns.** Use Ely components rather than building custom widgets when Ely has one.
+
+## UI work
+
+Mock a change in `design/newjen.pen` with [pen.dev](https://pen.dev) first, including its states (empty, running, needs approval, error, worst-case data), then build to match.
+
+## Commands
+
+```sh
+cargo run -p app [-- <project dir>]   # launch the app (once crates/app exists)
+cargo test --workspace                # all tests; no network or Claude login needed
+cargo test -p newjen-core -- --ignored   # live test against the real claude CLI (uses your login)
+cargo build --release                 # optimized build
+```
+
+The first build takes about 1–2 minutes and creates a `target/` folder of several GB. Later builds are incremental.
+
+## Version control
+
+Use **jj**, not raw git, for commits in this repo:
+
+```sh
+jj describe -m "message"                         # describe the current change
+jj new                                            # start the next change
+jj bookmark set master -r @-                      # move master to the finished change
+jj git push --bookmark master                     # push to GitCafe
+```
+
+- The remote is `origin`, at `https://git.cafe/ericrasputin/newjen.git`. The default branch is `master`.
+- Use `cafe` for PRs, issues and CI (`cafe pr`, `cafe ci`). Run `cafe --help` for the full command list.
+- Open pull requests with `cafe pr create`.

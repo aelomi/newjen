@@ -75,7 +75,7 @@ Newjen's approach is the path both providers allow: spawn the user's own logged-
 
 ### Newjen rules
 
-These are copied into `CLAUDE.md` as standing rules.
+These are copied into `CONTRIBUTING.md` as standing rules.
 
 **Do:**
 - Spawn only the user's installed, unmodified `claude` and `codex`, and let them handle sign-in.

@@ -3,7 +3,7 @@
 Real recordings of the Claude Code CLI's stream-json protocol, used by the `core` tests
 (parsing, transcript replay, and the `newjen-fake-claude` test binary).
 
-- **Recorded with:** claude 2.1.310 on 2026-10-26, using the CLAUDE.md spawn command plus
+- **Recorded with:** claude 2.1.310 on 2026-10-26, using the spawn command in CONTRIBUTING.md plus
   `--model haiku --strict-mcp-config` (small, cheap, and no personal MCP connectors).
   Only `partial`, `partial_tool_allow`, `interrupt` and `background_task` also used
   `--include-partial-messages`, so only they contain `stream_event` lines. `resume` and

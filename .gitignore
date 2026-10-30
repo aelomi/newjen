@@ -1,3 +1,7 @@
 /target
 .DS_Store
 __pycache__/
+
+# The owner's private agent setup: instructions and skills stay on their Mac.
+/CLAUDE.md
+/.claude/
