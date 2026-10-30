@@ -63,6 +63,8 @@ pub struct Bar {
     /// The thread's "Always allow" rules.
     pub grants: Vec<Grant>,
     pub status: Status,
+    /// How many commands Claude keeps running in the background.
+    pub background_tasks: usize,
 }
 
 /// The most height the grants popover's rows may take in a window `viewport_height` pixels
@@ -130,7 +132,7 @@ pub fn render(bar: Bar, on_revoke: OnRevoke, window: &mut Window, cx: &mut App) 
             .when(!bar.grants.is_empty(), |right| {
                 right.child(grants_chip(bar.grants, on_revoke, cx))
             })
-            .children(status_pill(bar.status)),
+            .children(status_pill(bar.status, bar.background_tasks)),
     );
     drag_region("title-bar", window, cx)
         .flex_none()
@@ -180,17 +182,21 @@ pub enum Pill {
     Agent(AgentState),
     /// A badge with a dot: this word, in this tone.
     Badge(&'static str, Tone),
+    /// A blue badge with a dot: this many commands still run in the background.
+    Background(usize),
 }
 
 /// The pill for a thread's status, worded as the mocks and the thread list word it (screens
-/// 8–11): "Needs approval" in amber, a quiet "Idle" once a turn is done, a quiet "Stopped".
-/// Ely's agent pill stays for working (its spinner shows life) and failed. A thread with no
-/// message yet has none.
-pub fn pill(status: Status) -> Option<Pill> {
+/// 8–11): "Needs approval" in amber, a quiet "Idle" once a turn is done, a quiet "Stopped",
+/// and "Background task running" instead of those (and of failed) while a command Claude
+/// started still runs. Ely's agent pill stays for working (its spinner shows life) and failed.
+/// A thread with no message yet has none.
+pub fn pill(status: Status, background_tasks: usize) -> Option<Pill> {
     Some(match status {
         Status::Working => Pill::Agent(AgentState::Working),
-        Status::Failed => Pill::Agent(AgentState::Failed),
         Status::Waiting => Pill::Badge(sidebar::NEEDS_APPROVAL, Tone::Warning),
+        _ if background_tasks > 0 => Pill::Background(background_tasks),
+        Status::Failed => Pill::Agent(AgentState::Failed),
         // The turn's own "Done in 4.2s" line and the list's "Done · 4m ago" already say it
         // finished; the pill says what the thread is doing now.
         Status::Done => Pill::Badge("Idle", Tone::Neutral),
@@ -199,10 +205,14 @@ pub fn pill(status: Status) -> Option<Pill> {
     })
 }
 
-fn status_pill(status: Status) -> Option<AnyElement> {
-    Some(match pill(status)? {
+fn status_pill(status: Status, background_tasks: usize) -> Option<AnyElement> {
+    Some(match pill(status, background_tasks)? {
         Pill::Agent(state) => AgentStatus::new("agent-status", state).into_any_element(),
         Pill::Badge(label, tone) => Badge::new(label).dot().tone(tone).into_any_element(),
+        Pill::Background(count) => Badge::new(sidebar::background_detail(count))
+            .dot()
+            .tone(Tone::Info)
+            .into_any_element(),
     })
 }
 
@@ -418,20 +428,46 @@ mod tests {
     #[test]
     fn the_pill_says_what_the_list_says() {
         assert_eq!(
-            pill(Status::Waiting),
+            pill(Status::Waiting, 0),
             Some(Pill::Badge("Needs approval", Tone::Warning))
         );
-        assert_eq!(pill(Status::Done), Some(Pill::Badge("Idle", Tone::Neutral)));
         assert_eq!(
-            pill(Status::Stopped),
+            pill(Status::Done, 0),
+            Some(Pill::Badge("Idle", Tone::Neutral))
+        );
+        assert_eq!(
+            pill(Status::Stopped, 0),
             Some(Pill::Badge("Stopped", Tone::Neutral))
         );
         assert_eq!(
-            pill(Status::Working),
+            pill(Status::Working, 0),
             Some(Pill::Agent(AgentState::Working))
         );
-        assert_eq!(pill(Status::Failed), Some(Pill::Agent(AgentState::Failed)));
-        assert_eq!(pill(Status::Idle), None);
+        assert_eq!(
+            pill(Status::Failed, 0),
+            Some(Pill::Agent(AgentState::Failed))
+        );
+        assert_eq!(pill(Status::Idle, 0), None);
+    }
+
+    #[test]
+    fn a_command_left_running_in_the_background_replaces_idle() {
+        assert_eq!(pill(Status::Done, 1), Some(Pill::Background(1)));
+        assert_eq!(pill(Status::Stopped, 2), Some(Pill::Background(2)));
+        // The failed turn's error row is on screen right below.
+        assert_eq!(pill(Status::Failed, 1), Some(Pill::Background(1)));
+        // A running turn or an approval says more.
+        assert_eq!(
+            pill(Status::Working, 1),
+            Some(Pill::Agent(AgentState::Working))
+        );
+        assert_eq!(
+            pill(Status::Waiting, 1),
+            Some(Pill::Badge("Needs approval", Tone::Warning))
+        );
+        // The same words as the thread's row.
+        assert_eq!(sidebar::background_detail(1), "Background task running");
+        assert_eq!(sidebar::background_detail(2), "2 background tasks running");
     }
 
     #[test]

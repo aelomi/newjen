@@ -54,7 +54,8 @@ pub enum Dot {
     None,
     /// Amber: an approval is waiting for you.
     Approval,
-    /// Blue, with a slow pulse: Claude is working.
+    /// Blue, with a slow pulse: Claude is working, or a command it started still runs in the
+    /// background.
     Working,
     /// Red: the last turn failed.
     Failed,
@@ -89,12 +90,24 @@ pub struct RowFacts {
     pub failure: Option<String>,
     /// The thread's last row is the "Stopped when Newjen quit" notice.
     pub stopped_on_quit: bool,
+    /// How many commands Claude keeps running in the background (a dev server, say).
+    pub background_tasks: usize,
     /// The thread's last activity (Unix milliseconds).
     pub updated_at: i64,
 }
 
+/// "Background task running", or "3 background tasks running": a thread whose turn is over
+/// while commands Claude started keep running, in its row and its title bar.
+pub fn background_detail(count: usize) -> String {
+    match count {
+        1 => "Background task running".to_string(),
+        count => format!("{count} background tasks running"),
+    }
+}
+
 /// A thread's dot and detail line at `now_ms`. The most urgent state wins: an approval, then
-/// working, failed, stopped, a finished turn not seen yet, and last a quiet "4m ago".
+/// working, a command still running in the background once the turn is over (however it
+/// ended), failed, stopped, a finished turn not seen yet, and last a quiet "4m ago".
 pub fn row_look(facts: &RowFacts, now_ms: i64) -> RowLook {
     // "Needs approval · Bash", or just "Needs approval" when the part after the dot is unknown.
     let with = |head: &str, tail: Option<String>| match tail.filter(|tail| !tail.is_empty()) {
@@ -121,6 +134,9 @@ pub fn row_look(facts: &RowFacts, now_ms: i64) -> RowLook {
                 facts.working_for.map(|since| elapsed(since.as_secs())),
             ),
         ),
+        _ if facts.background_tasks > 0 => {
+            (Dot::Working, background_detail(facts.background_tasks))
+        }
         Status::Failed => (Dot::Failed, with("Failed", facts.failure.clone())),
         Status::Stopped if facts.stopped_on_quit => (Dot::Stopped, STOPPED_ON_QUIT.to_string()),
         Status::Stopped => (Dot::Stopped, "Stopped".to_string()),
@@ -517,6 +533,7 @@ mod tests {
             working_for: None,
             failure: None,
             stopped_on_quit: false,
+            background_tasks: 0,
             updated_at: NOW - 4 * 60 * 1000,
         }
     }
@@ -560,6 +577,48 @@ mod tests {
         let look = row_look(&facts(Status::Done), NOW);
         assert_eq!((look.dot, look.detail.as_str()), (Dot::None, "4m ago"));
         assert!(!look.strong);
+    }
+
+    #[test]
+    fn a_command_left_running_in_the_background_shows_as_working() {
+        let mut done = facts(Status::Done);
+        done.background_tasks = 1;
+        let look = row_look(&done, NOW);
+        assert_eq!(
+            (look.dot, look.detail.as_str()),
+            (Dot::Working, "Background task running")
+        );
+        assert!(!look.strong);
+
+        // Unread still makes the title strong; the line says what is going on now.
+        done.unread = true;
+        done.background_tasks = 3;
+        let look = row_look(&done, NOW);
+        assert_eq!(
+            (look.dot, look.detail.as_str()),
+            (Dot::Working, "3 background tasks running")
+        );
+        assert!(look.strong);
+
+        // The user stopped the turn, or it failed, but what it started in the background still
+        // runs (and "Try again" would stop it).
+        for status in [Status::Stopped, Status::Failed] {
+            let mut over = facts(status);
+            over.background_tasks = 2;
+            over.failure = Some("Overloaded".to_string());
+            let look = row_look(&over, NOW);
+            assert_eq!(
+                (look.dot, look.detail.as_str()),
+                (Dot::Working, "2 background tasks running")
+            );
+        }
+
+        // A running turn or an approval says more.
+        for status in [Status::Working, Status::Waiting] {
+            let mut busy = facts(status);
+            busy.background_tasks = 1;
+            assert_ne!(row_look(&busy, NOW).detail, "Background task running");
+        }
     }
 
     #[test]

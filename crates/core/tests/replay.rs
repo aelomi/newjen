@@ -704,3 +704,63 @@ fn an_interrupt_timeout_fails_the_turn_with_one_error() {
         .collect();
     assert_eq!(titles, ["Claude didn't stop, so Newjen ended the session"]);
 }
+
+#[test]
+fn background_task_then_a_turn_claude_starts_by_itself() {
+    let replay = replay("background_task");
+    let [first, second] = replay.after_each_result.as_slice() else {
+        panic!("two turns: the user's, then claude's own");
+    };
+    // The user's turn is over while the command still runs.
+    assert_eq!(first.status(), Status::Done);
+    let running: Vec<&str> = first
+        .background_tasks()
+        .iter()
+        .map(|task| task.description.as_str())
+        .collect();
+    assert_eq!(running, ["Sleep 6 seconds then echo finished"]);
+    assert!(matches!(
+        first
+            .items()
+            .iter()
+            .find(|item| matches!(item, Item::Tool { .. })),
+        Some(Item::Tool {
+            state: ToolState::Done,
+            background: true,
+            ..
+        })
+    ));
+
+    // The task finished, and claude replied about it with no message from the user.
+    let transcript = &replay.end;
+    assert_eq!(second.items(), transcript.items());
+    assert_eq!(transcript.status(), Status::Done);
+    assert!(transcript.background_tasks().is_empty());
+    let users = transcript
+        .items()
+        .iter()
+        .filter(|item| matches!(item, Item::User { .. }))
+        .count();
+    assert_eq!(users, 1);
+    assert_eq!(turn_ends(transcript).len(), 2);
+    assert_eq!(
+        assistant_texts(transcript),
+        [
+            "started",
+            "The background command finished with exit code 0 and printed \"finished\"."
+        ]
+    );
+    assert!(matches!(
+        transcript
+            .items()
+            .iter()
+            .find(|item| matches!(item, Item::Tool { .. })),
+        Some(Item::Tool {
+            state: ToolState::Done,
+            background: false,
+            ..
+        })
+    ));
+    // Each turn's own cost, not the running total.
+    assert_close(turn_ends(transcript)[1].0, 0.00042816);
+}

@@ -18,6 +18,13 @@
 //!   finish it.
 //! - `slow_stop`: ignore SIGTERM, as a claude busy with its exit hooks might, so stopping it
 //!   takes the whole grace period before SIGKILL.
+//! - `background`: run `npm run dev` in the background before replying, as claude 2.1.314
+//!   does (see the `background_task` fixture). The task runs until a `finish_task` file
+//!   appears; then claude reports it finished and starts a turn by itself, with no message.
+//! - `queued_own_turn`: on reading a message, first run the turn claude starts by itself when
+//!   that task finishes, as if the message arrived just after the task did. That turn's
+//!   result says the message waits for the next turn (`queued_turn_count: 1`).
+//! - `fail_turn`: end each turn with an error result instead of success.
 
 mod common;
 
@@ -29,7 +36,9 @@ use newjen_core::protocol::PermissionAnswer;
 use newjen_core::session::SessionConfig;
 use newjen_core::store::{Project, Store};
 use newjen_core::thread::{CONTINUE_MESSAGE, IDLE_TIMEOUT, NEW_THREAD_TITLE, Thread, finish_quit};
-use newjen_core::transcript::{Item, STOPPED_TOOL_NOTE, Status, ToolState};
+use newjen_core::transcript::{
+    BACKGROUND_STOPPED_NOTE, Item, STOPPED_TOOL_NOTE, Status, ToolState,
+};
 use serde_json::Value;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -69,11 +78,34 @@ while IFS= read -r line; do
   if [ -f "$dir/crash" ]; then
     exit 1
   fi
+  if [ -f "$dir/queued_own_turn" ]; then
+    printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"b1","run_id":"r1","tool_use_id":"tb","status":"completed","summary":"Background command completed (exit code 0)"}'
+    printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
+    printf '%s\n' '{"type":"assistant","message":{"id":"mc","content":[{"type":"text","text":"The dev server stopped."}]}}'
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"duration_ms":5,"queued_turn_count":1,"origin":{"kind":"task-notification","producer":"session-task","runId":"r1"}}'
+  fi
   printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
   if [ -f "$dir/hang" ]; then
     printf '%s\n' '{"type":"assistant","message":{"id":"m0","content":[{"type":"tool_use","id":"t0","name":"Bash","input":{"command":"sleep 60"}}]}}'
     printf '%s\n' '{"type":"stream_event","api_message_id":"m1","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Still going"}}}'
     exec sleep 60
+  fi
+  if [ -f "$dir/background" ]; then
+    printf '%s\n' '{"type":"assistant","message":{"id":"mb","content":[{"type":"tool_use","id":"tb","name":"Bash","input":{"command":"npm run dev","run_in_background":true}}]}}'
+    printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","run_id":"r1","task_type":"local_bash","description":"Start the dev server"}]}'
+    printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"b1","run_id":"r1","tool_use_id":"tb","description":"Start the dev server","is_backgrounded":true,"task_type":"local_bash"}'
+    printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tb","content":"Command running in background with ID: b1.","is_error":false}]}}'
+    (
+      while [ ! -f "$dir/finish_task" ]; do sleep 0.05; done
+      rm -f "$dir/finish_task"
+      printf '%s\n' '{"type":"system","subtype":"task_updated","task_id":"b1","run_id":"r1","patch":{"status":"completed"}}'
+      printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"b1","run_id":"r1","tool_use_id":"tb","status":"completed","summary":"Background command completed (exit code 0)"}'
+      printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+      printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
+      printf '%s\n' '{"type":"assistant","message":{"id":"mc","content":[{"type":"text","text":"The dev server stopped."}]}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"duration_ms":5}'
+    ) &
   fi
   if [ -f "$dir/ask" ]; then
     printf '%s\n' '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"t1","input":{"command":"touch one.txt"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch one.txt"}],"behavior":"allow","destination":"localSettings"}]}}'
@@ -82,7 +114,11 @@ while IFS= read -r line; do
     printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"","is_error":false}]}}'
   fi
   printf '%s\n' '{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"done"}]}}'
-  printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"duration_ms":5}'
+  if [ -f "$dir/fail_turn" ]; then
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"Overloaded","duration_ms":5}'
+  else
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"duration_ms":5}'
+  fi
 done
 "##;
 
@@ -1267,4 +1303,341 @@ fn a_thread_always_restarts_from_its_own_folder() {
     .unwrap();
     assert_eq!(thread.cwd(), copy_dir.path());
     assert_eq!(thread.session_config().cwd, copy_dir.path());
+}
+
+/// A thread whose first turn left `npm run dev` running in the background (the stand-in's
+/// `background` switch), with that turn over.
+fn thread_with_a_background_task(fixture: &Fixture) -> Thread {
+    fixture.switch("background", true);
+    let mut thread = fixture.draft();
+    thread.send("Start the dev server").unwrap();
+    finish_turn(&mut thread);
+    fixture.switch("background", false);
+    assert_eq!(thread.status(), Status::Done);
+    let descriptions: Vec<&str> = thread
+        .background_tasks()
+        .iter()
+        .map(|task| task.description.as_str())
+        .collect();
+    assert_eq!(descriptions, ["Start the dev server"]);
+    thread
+}
+
+/// Ends the stand-in's background task and feeds the thread everything up to the end of the
+/// turn claude then starts by itself.
+fn finish_the_background_task(thread: &mut Thread, fixture: &Fixture) {
+    fixture.switch("finish_task", true);
+    pump_until(thread, "claude's own turn to end", |thread| {
+        kinds(thread)
+            .iter()
+            .filter(|kind| **kind == "turn_end")
+            .count()
+            == 2
+    });
+}
+
+#[test]
+fn idle_shutdown_waits_until_background_tasks_are_done() {
+    let fixture = Fixture::new();
+    let mut thread = thread_with_a_background_task(&fixture);
+    // A dev server can run for hours with nothing to say: stopping claude would stop it.
+    assert!(!thread.idle_check(Instant::now() + IDLE_TIMEOUT * 4));
+    assert!(thread.has_session());
+
+    finish_the_background_task(&mut thread, &fixture);
+    assert!(thread.background_tasks().is_empty());
+    assert!(!thread.idle_check(Instant::now() + IDLE_TIMEOUT - Duration::from_secs(60)));
+    assert!(thread.idle_check(Instant::now() + IDLE_TIMEOUT));
+    assert!(!thread.has_session());
+    assert_eq!(thread.status(), Status::Done);
+}
+
+#[test]
+fn a_turn_claude_starts_by_itself_is_a_turn_like_any_other() {
+    let fixture = Fixture::new();
+    let mut thread = fixture.draft();
+    thread.set_active(true);
+    fixture.switch("background", true);
+    thread.send("Start the dev server").unwrap();
+    finish_turn(&mut thread);
+    fixture.switch("background", false);
+    assert!(!thread.is_unread());
+    // The user moves on to another thread while the task runs.
+    thread.set_active(false);
+
+    fixture.switch("finish_task", true);
+    pump_until(&mut thread, "claude's own turn to start", |thread| {
+        thread.status() == Status::Working
+    });
+    assert!(thread.turn_started_at().is_some());
+    assert!(fixture.store.flush(FLUSH));
+    let row = fixture.store.thread(thread.id()).unwrap().unwrap();
+    assert_eq!(row.status, Status::Working, "saved when the turn started");
+
+    finish_turn(&mut thread);
+    assert_eq!(thread.status(), Status::Done);
+    assert_eq!(thread.turn_started_at(), None);
+    assert!(thread.is_unread(), "its turn ended off screen");
+    assert_eq!(
+        kinds(&thread),
+        [
+            "user",
+            "tool",
+            "assistant",
+            "turn_end",
+            "assistant",
+            "turn_end"
+        ]
+    );
+    assert_eq!(
+        user_texts(&thread),
+        ["Start the dev server"],
+        "no message made up"
+    );
+    assert_eq!(fixture.messages_received(), ["Start the dev server"]);
+
+    let reloaded = fixture.reload(thread.id());
+    assert_eq!(reloaded.transcript().items(), thread.transcript().items());
+    assert_eq!(reloaded.status(), Status::Done);
+    assert!(reloaded.is_unread());
+}
+
+#[test]
+fn quitting_while_a_background_task_runs_says_it_was_stopped() {
+    let fixture = Fixture::new();
+    let mut thread = thread_with_a_background_task(&fixture);
+    thread.shutdown_for_quit();
+    assert!(!thread.has_session());
+    assert!(thread.background_tasks().is_empty());
+    assert_eq!(thread.status(), Status::Stopped);
+    assert_eq!(
+        kinds(&thread),
+        ["user", "tool", "assistant", "turn_end", "stopped"]
+    );
+
+    // Already on disk (shutdown_for_quit waited for it), and the same after a relaunch.
+    let row = fixture.store.thread(thread.id()).unwrap().unwrap();
+    assert_eq!(row.status, Status::Stopped);
+    let mut relaunched = fixture.reload(thread.id());
+    assert_eq!(relaunched.transcript().items(), thread.transcript().items());
+    assert_eq!(relaunched.status(), Status::Stopped);
+
+    // Continue resumes the conversation, as after any other quit.
+    relaunched.send(CONTINUE_MESSAGE).unwrap();
+    finish_turn(&mut relaunched);
+    assert_eq!(relaunched.status(), Status::Done);
+    assert_eq!(
+        flag(fixture.spawns().last().unwrap(), "--resume"),
+        Some(relaunched.session_id())
+    );
+}
+
+#[test]
+fn a_crash_while_a_background_task_runs_is_stopped_at_the_relaunch() {
+    let fixture = Fixture::new();
+    let thread = thread_with_a_background_task(&fixture);
+    // Newjen is killed here: no quit handling, only what the checkpoints saved.
+    let relaunched = fixture.reload(thread.id());
+    drop(thread);
+    assert_eq!(relaunched.status(), Status::Stopped);
+    assert_eq!(
+        kinds(&relaunched),
+        ["user", "tool", "assistant", "turn_end", "stopped"]
+    );
+    assert!(relaunched.background_tasks().is_empty());
+    assert!(!relaunched.has_session(), "nothing restarts on its own");
+
+    // Settled and saved: a second launch shows one notice, not two.
+    let again = fixture.reload(relaunched.id());
+    assert_eq!(again.transcript().items(), relaunched.transcript().items());
+}
+
+#[test]
+fn a_finished_background_task_leaves_nothing_to_stop_at_quit() {
+    let fixture = Fixture::new();
+    let mut thread = thread_with_a_background_task(&fixture);
+    finish_the_background_task(&mut thread, &fixture);
+    thread.shutdown_for_quit();
+    assert_eq!(thread.status(), Status::Done);
+    let relaunched = fixture.reload(thread.id());
+    assert_eq!(relaunched.status(), Status::Done);
+    assert!(!kinds(&relaunched).contains(&"stopped"));
+}
+
+#[test]
+fn a_message_sent_just_as_claude_starts_a_turn_by_itself_waits_for_its_own_turn() {
+    let fixture = Fixture::new();
+    let mut thread = thread_with_a_background_task(&fixture);
+    // Seen, and then the user moved on to another thread.
+    thread.set_active(true);
+    thread.set_active(false);
+    // The task has just finished, but the thread has not seen claude's own turn start yet.
+    fixture.switch("queued_own_turn", true);
+    thread.send("What next?").unwrap();
+
+    // claude answers about the task first; the user's message is still waiting, so the turn
+    // is not over: no Done, no unread, the composer stays locked.
+    let events = thread.events();
+    let deadline = Instant::now() + TIMEOUT;
+    while turn_ends(&thread) < 3 {
+        assert!(
+            thread.status().is_busy(),
+            "{:#?}",
+            thread.transcript().items()
+        );
+        assert!(!thread.is_unread());
+        assert!(thread.turn_started_at().is_some());
+        match events.try_recv() {
+            Ok(event) => thread.apply(event),
+            Err(_) => {
+                assert!(Instant::now() < deadline, "timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    assert_eq!(thread.status(), Status::Done);
+    assert!(thread.is_unread(), "the user's turn ended off screen");
+    assert_eq!(
+        kinds(&thread),
+        [
+            "user",
+            "tool",
+            "assistant",
+            "turn_end",
+            "user",
+            "assistant",
+            "turn_end",
+            "assistant",
+            "turn_end"
+        ]
+    );
+    assert_eq!(user_texts(&thread), ["Start the dev server", "What next?"]);
+    assert_eq!(
+        fixture.messages_received(),
+        ["Start the dev server", "What next?"]
+    );
+    let reloaded = fixture.reload(thread.id());
+    assert_eq!(reloaded.status(), Status::Done);
+}
+
+fn turn_ends(thread: &Thread) -> usize {
+    kinds(thread)
+        .iter()
+        .filter(|kind| **kind == "turn_end")
+        .count()
+}
+
+/// The card of the stand-in's `npm run dev` call: its state, output and background flag.
+fn background_card(thread: &Thread) -> (ToolState, Option<String>, bool) {
+    thread
+        .transcript()
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            Item::Tool {
+                tool_use_id,
+                state,
+                output,
+                background,
+                ..
+            } if tool_use_id == "tb" => Some((*state, output.clone(), *background)),
+            _ => None,
+        })
+        .expect("the npm run dev card")
+}
+
+/// Its card says Newjen stopped the command, and so does the saved thread, with no "Stopped
+/// when Newjen quit" notice: quitting did not stop it.
+fn assert_background_stopped(fixture: &Fixture, thread: &Thread, status: Status) {
+    assert!(thread.background_tasks().is_empty());
+    assert!(!thread.has_session());
+    assert_eq!(
+        background_card(thread),
+        (
+            ToolState::Failed,
+            Some(BACKGROUND_STOPPED_NOTE.to_string()),
+            false
+        )
+    );
+    assert_eq!(thread.status(), status);
+    // Newjen is killed here: only what was saved so far counts.
+    let relaunched = fixture.reload(thread.id());
+    assert_eq!(relaunched.transcript().items(), thread.transcript().items());
+    assert_eq!(relaunched.status(), status);
+    assert!(!kinds(&relaunched).contains(&"stopped"));
+}
+
+/// A thread with an "Always allow" grant whose last turn left `npm run dev` running.
+fn thread_with_a_grant_and_a_background_task(fixture: &Fixture) -> Thread {
+    fixture.switch("ask", true);
+    fixture.switch("background", true);
+    let mut thread = fixture.draft();
+    send_and_wait_for_approval(&mut thread, "Start the dev server and make a file");
+    thread
+        .answer(None, PermissionAnswer::AllowForSession)
+        .unwrap();
+    finish_turn(&mut thread);
+    fixture.switch("ask", false);
+    fixture.switch("background", false);
+    assert_eq!(thread.grants().len(), 1);
+    assert_eq!(thread.background_tasks().len(), 1);
+    thread
+}
+
+#[test]
+fn revoking_a_grant_says_it_stopped_the_background_task() {
+    let fixture = Fixture::new();
+    let mut thread = thread_with_a_grant_and_a_background_task(&fixture);
+    thread.revoke("Bash(touch one.txt)");
+    assert_background_stopped(&fixture, &thread, Status::Done);
+}
+
+#[test]
+fn revoking_mid_turn_says_it_stopped_the_background_task_when_the_turn_ends() {
+    let fixture = Fixture::new();
+    fixture.switch("ask", true);
+    let mut thread = fixture.draft();
+    send_and_wait_for_approval(&mut thread, "make a file");
+    thread
+        .answer(None, PermissionAnswer::AllowForSession)
+        .unwrap();
+    finish_turn(&mut thread);
+
+    fixture.switch("background", true);
+    send_and_wait_for_approval(&mut thread, "Start the dev server and make a file");
+    assert_eq!(thread.background_tasks().len(), 1);
+    thread.revoke("Bash(touch one.txt)");
+    thread.answer(None, PermissionAnswer::AllowOnce).unwrap();
+    finish_turn(&mut thread);
+    assert_background_stopped(&fixture, &thread, Status::Done);
+}
+
+#[test]
+fn try_again_says_it_stopped_the_background_task() {
+    let fixture = Fixture::new();
+    fixture.switch("background", true);
+    fixture.switch("fail_turn", true);
+    let mut thread = fixture.draft();
+    thread.send("Start the dev server").unwrap();
+    finish_turn(&mut thread);
+    fixture.switch("background", false);
+    fixture.switch("fail_turn", false);
+    assert_eq!(thread.status(), Status::Failed);
+    assert_eq!(thread.background_tasks().len(), 1);
+
+    thread.restart().unwrap();
+    assert!(thread.has_session(), "a fresh claude");
+    assert!(thread.background_tasks().is_empty());
+    assert_eq!(
+        background_card(&thread),
+        (
+            ToolState::Failed,
+            Some(BACKGROUND_STOPPED_NOTE.to_string()),
+            false
+        )
+    );
+    assert_eq!(thread.status(), Status::Failed);
+    let relaunched = fixture.reload(thread.id());
+    assert_eq!(relaunched.transcript().items(), thread.transcript().items());
+    assert!(!kinds(&relaunched).contains(&"stopped"));
 }

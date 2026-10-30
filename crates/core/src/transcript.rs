@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::protocol::{
-    AssistantMessage, ContentBlock, Delta, Incoming, PermissionAnswer, PermissionRequest,
-    ResultMessage, StreamEvent, StreamEventMessage, SystemMessage, UserMessage,
+    AssistantMessage, BackgroundTask, ContentBlock, Delta, Incoming, PermissionAnswer,
+    PermissionRequest, ResultMessage, StreamEvent, StreamEventMessage, SystemMessage, UserMessage,
 };
 use crate::session::SessionEvent;
 
@@ -43,6 +43,9 @@ pub const STOPPED_ON_QUIT_DETAIL: &str = "Nothing runs until you continue.";
 pub const EXPIRED_NOTE: &str = "Newjen quit before you answered";
 /// The note on a tool call that was still running when Newjen quit.
 pub const STOPPED_TOOL_NOTE: &str = "Stopped when Newjen quit";
+/// The note on a command that ran in the background until Newjen stopped its claude (to drop
+/// a revoked rule, or for "Try again").
+pub const BACKGROUND_STOPPED_NOTE: &str = "Stopped with Claude";
 /// The quiet row where a conversation had to start over because Claude no longer had it.
 pub const FRESH_START_NOTE: &str = "Claude no longer has the earlier conversation; it starts \
                                     fresh from here (earlier messages stay visible)";
@@ -147,6 +150,11 @@ pub enum Item {
         state: ToolState,
         output: Option<String>,
         took: Option<Duration>,
+        /// The command this call started still runs in the background (Bash's
+        /// `run_in_background`), after the call itself finished. Saved, so a relaunch can tell
+        /// that quitting stopped it (see [`Transcript::normalize_after_relaunch`]).
+        #[serde(default, skip_serializing_if = "is_false")]
+        background: bool,
     },
     TurnEnd {
         id: u64,
@@ -243,11 +251,21 @@ impl Item {
     }
 }
 
+/// For `skip_serializing_if`: a `false` flag is left out of the saved JSON.
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
 /// The state of one conversation. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Transcript {
     items: Vec<Item>,
     status: Status,
+    /// What claude keeps running in the background now, as its last `background_tasks_changed`
+    /// said. Empty when no claude runs.
+    background_tasks: Vec<BackgroundTask>,
+    /// Which tool call started each task (task id → tool_use_id), from `task_started`.
+    task_tools: HashMap<String, String>,
     session_id: Option<String>,
     model: Option<String>,
     /// The project directory, used to shorten file paths in tool summaries.
@@ -282,6 +300,8 @@ impl Transcript {
         Transcript {
             items: Vec::new(),
             status: Status::Idle,
+            background_tasks: Vec::new(),
+            task_tools: HashMap::new(),
             session_id: None,
             model: None,
             cwd: None,
@@ -349,6 +369,39 @@ impl Transcript {
         self.pending.front()
     }
 
+    /// What claude keeps running in the background now (a dev server, say), oldest first.
+    /// These keep running after the turn that started them, until they finish or claude stops.
+    pub fn background_tasks(&self) -> &[BackgroundTask] {
+        &self.background_tasks
+    }
+
+    /// Newjen stopped the claude running the background tasks, so they stopped with it: each
+    /// one's tool card says so ([`BACKGROUND_STOPPED_NOTE`]) and the list is emptied.
+    pub fn stop_background_tasks(&mut self) {
+        for ix in 0..self.items.len() {
+            if let Item::Tool {
+                state,
+                output,
+                background,
+                ..
+            } = &mut self.items[ix]
+                && *background
+            {
+                *background = false;
+                *state = ToolState::Failed;
+                *output = Some(BACKGROUND_STOPPED_NOTE.to_string());
+                self.touch(ix);
+            }
+        }
+        self.clear_background_tasks();
+    }
+
+    fn clear_background_tasks(&mut self) {
+        self.background_tasks.clear();
+        self.task_tools.clear();
+        self.mark_background_tools();
+    }
+
     /// The lowest item index that changed since the last [`Transcript::mark_saved`], or `None`
     /// if nothing did. Saving rewrites the rows from here on (see `Store::replace_items`).
     pub fn dirty_from(&self) -> Option<usize> {
@@ -399,23 +452,37 @@ impl Transcript {
     /// - An approval that was waiting expires ([`ToolState::Expired`]).
     /// - A tool call that was running is marked stopped ([`STOPPED_TOOL_NOTE`]).
     /// - A reply that was still streaming is marked interrupted.
-    /// - If the thread was working or waiting, it becomes `Stopped` and an [`Item::Stopped`]
-    ///   notice is added, with a Continue button. Nothing restarts on its own.
+    /// - If the thread was working or waiting, or a command still ran in the background, it
+    ///   becomes `Stopped` and an [`Item::Stopped`] notice is added, with a Continue button.
+    ///   Nothing restarts on its own.
     ///
     /// Running it twice changes nothing the second time.
     pub fn normalize_after_relaunch(&mut self) {
+        let mut background_stopped = !self.background_tasks.is_empty();
         for ix in 0..self.items.len() {
             let changed = match &mut self.items[ix] {
-                Item::Tool { state, output, .. } if *state == ToolState::Waiting => {
-                    *state = ToolState::Expired;
-                    output.get_or_insert_with(|| EXPIRED_NOTE.to_string());
-                    true
-                }
-                Item::Tool { state, output, .. } if *state == ToolState::Running => {
-                    // Shown like a call the user stopped (see `close_unfinished_tools`).
-                    *state = ToolState::Failed;
-                    output.get_or_insert_with(|| STOPPED_TOOL_NOTE.to_string());
-                    true
+                Item::Tool {
+                    state,
+                    output,
+                    background,
+                    ..
+                } => {
+                    let was_background = std::mem::take(background);
+                    background_stopped |= was_background;
+                    match state {
+                        ToolState::Waiting => {
+                            *state = ToolState::Expired;
+                            output.get_or_insert_with(|| EXPIRED_NOTE.to_string());
+                            true
+                        }
+                        ToolState::Running => {
+                            // Shown like a call the user stopped (see `close_unfinished_tools`).
+                            *state = ToolState::Failed;
+                            output.get_or_insert_with(|| STOPPED_TOOL_NOTE.to_string());
+                            true
+                        }
+                        _ => was_background,
+                    }
                 }
                 Item::Assistant {
                     live, interrupted, ..
@@ -433,7 +500,9 @@ impl Transcript {
         self.open_text.clear();
         self.pending.clear();
         self.tool_started.clear();
-        if self.status.is_busy() {
+        self.background_tasks.clear();
+        self.task_tools.clear();
+        if self.status.is_busy() || background_stopped {
             let id = self.new_id();
             self.push(Item::Stopped { id });
             self.status = Status::Stopped;
@@ -522,6 +591,9 @@ impl Transcript {
     }
 
     fn apply_incoming(&mut self, incoming: &Incoming) {
+        if !self.status.is_busy() && starts_turn(incoming) {
+            self.status = Status::Working;
+        }
         match incoming {
             Incoming::System(message) => self.apply_system(message),
             Incoming::StreamEvent(message) => self.apply_stream_event(message),
@@ -539,6 +611,18 @@ impl Transcript {
     }
 
     fn apply_system(&mut self, message: &SystemMessage) {
+        if let Some(tasks) = message.background_tasks() {
+            self.background_tasks = tasks.to_vec();
+            self.mark_background_tools();
+            return;
+        }
+        if message.subtype == "task_started"
+            && let (Some(task_id), Some(tool_use_id)) = (&message.task_id, &message.tool_use_id)
+        {
+            self.task_tools.insert(task_id.clone(), tool_use_id.clone());
+            self.mark_background_tools();
+            return;
+        }
         if message.subtype != "init" {
             return;
         }
@@ -798,13 +882,19 @@ impl Transcript {
             self.push_turn_end(result.duration_ms, cost_usd, false);
             self.status = Status::Done;
         }
+        // The user's message arrived while claude ran a turn of its own; it runs next.
+        if !result.was_stopped() && result.another_turn_follows() {
+            self.status = Status::Working;
+        }
     }
 
     /// `requested` is true when we stopped the process ourselves (`Session::shutdown`), so the
     /// exit is not an error.
     fn apply_exit(&mut self, code: Option<i32>, requested: bool) {
         self.finish_turn();
+        // Its background tasks were in its process group, so they are gone too.
         if requested {
+            self.stop_background_tasks();
             // Stopped mid-turn (for example a restart): the turn will never finish.
             if matches!(self.status, Status::Working | Status::Waiting) {
                 self.close_unfinished_tools("Stopped");
@@ -812,6 +902,7 @@ impl Transcript {
             }
             return;
         }
+        self.clear_background_tasks();
         if self.status == Status::Failed {
             return;
         }
@@ -877,7 +968,35 @@ impl Transcript {
             state: ToolState::Running,
             output: None,
             took: None,
+            background: false,
         });
+    }
+
+    /// Flags each tool card whose task is in the background list now, and unflags the rest.
+    fn mark_background_tools(&mut self) {
+        let running: Vec<&str> = self
+            .background_tasks
+            .iter()
+            .filter_map(|task| self.task_tools.get(&task.task_id).map(String::as_str))
+            .collect();
+        let changed: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, item)| match item {
+                Item::Tool {
+                    tool_use_id,
+                    background,
+                    ..
+                } if *background != running.contains(&tool_use_id.as_str()) => Some(ix),
+                _ => None,
+            })
+            .collect();
+        for ix in changed {
+            if let Some(Item::Tool { background, .. }) = self.item_mut(ix) {
+                *background = !*background;
+            }
+        }
     }
 
     /// Where the tool card for `wanted_id` is, if there is one.
@@ -947,6 +1066,18 @@ impl Transcript {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+}
+
+/// Lines that only come while a turn runs: its `init`, and the main conversation's replies.
+/// One between turns means claude started a turn by itself, as it does when a background task
+/// finishes: no user message, just `init` and a reply. It is a turn like any other.
+fn starts_turn(incoming: &Incoming) -> bool {
+    match incoming {
+        Incoming::System(message) => message.subtype == "init",
+        Incoming::Assistant(message) => message.parent_tool_use_id.is_none(),
+        Incoming::StreamEvent(message) => message.parent_tool_use_id.is_none(),
+        _ => false,
     }
 }
 
@@ -1084,6 +1215,7 @@ mod tests {
                 state: ToolState::Expired,
                 output: Some("out".to_string()),
                 took: Some(Duration::from_millis(1234)),
+                background: true,
             },
             Item::TurnEnd {
                 id: 4,
@@ -1108,6 +1240,24 @@ mod tests {
             assert_eq!(version, ITEM_SCHEMA_VERSION);
             assert_eq!(Item::from_saved(version, &json), item, "{json}");
         }
+    }
+
+    #[test]
+    fn the_background_flag_is_saved_only_when_set() {
+        // A tool row saved before the flag existed still reads, as not in the background.
+        let old = r#"{"type":"tool","id":3,"tool_use_id":"t1","name":"Bash",
+            "display_name":"Bash","summary":"ls","input":{},"state":"done","output":null,
+            "took":null}"#;
+        let item = Item::from_saved(ITEM_SCHEMA_VERSION, old);
+        assert!(matches!(
+            item,
+            Item::Tool {
+                background: false,
+                ..
+            }
+        ));
+        // And an unset flag is not written, so older versions read new rows the same.
+        assert!(!item.to_saved().1.contains("background"));
     }
 
     #[test]
@@ -1353,5 +1503,242 @@ mod tests {
         assert_eq!(loaded.items(), items.as_slice());
         assert_eq!(loaded.status(), Status::Done);
         assert_eq!(loaded.dirty_from(), None);
+    }
+
+    fn tasks_changed(ids: &[&str]) -> SessionEvent {
+        let tasks: Vec<Value> = ids
+            .iter()
+            .map(
+                |id| json!({"task_id": id, "task_type": "local_bash", "description": "Dev server"}),
+            )
+            .collect();
+        line(json!({"type": "system", "subtype": "background_tasks_changed", "tasks": tasks}))
+    }
+
+    /// A finished turn whose Bash call `t1` left task `b1` running in the background.
+    fn turn_with_a_background_task() -> Transcript {
+        let mut transcript = Transcript::with_cwd("/tmp/project");
+        transcript.push_user("start the server");
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                         "input": {"command": "npm run dev", "run_in_background": true}}]}})));
+        transcript.apply(&tasks_changed(&["b1"]));
+        transcript.apply(&line(json!({"type": "system", "subtype": "task_started",
+            "task_id": "b1", "tool_use_id": "t1", "is_backgrounded": true})));
+        transcript.apply(&line(json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": "Command running in background with ID: b1."}]}})));
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m2",
+            "content": [{"type": "text", "text": "started"}]}})));
+        transcript.apply(&line(json!({"type": "result", "subtype": "success",
+            "is_error": false})));
+        transcript
+    }
+
+    fn is_background(item: &Item) -> bool {
+        matches!(
+            item,
+            Item::Tool {
+                background: true,
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn a_background_task_outlives_its_turn_and_is_flagged_on_its_call() {
+        let mut transcript = turn_with_a_background_task();
+        assert_eq!(transcript.status(), Status::Done);
+        assert_eq!(transcript.background_tasks().len(), 1);
+        assert_eq!(transcript.background_tasks()[0].description, "Dev server");
+        assert!(matches!(
+            &transcript.items()[1],
+            Item::Tool {
+                state: ToolState::Done,
+                background: true,
+                ..
+            }
+        ));
+
+        // The list is the whole truth: once the task leaves it, its call is no longer flagged.
+        transcript.mark_saved();
+        transcript.apply(&tasks_changed(&[]));
+        assert!(transcript.background_tasks().is_empty());
+        assert!(!is_background(&transcript.items()[1]));
+        assert_eq!(transcript.dirty_from(), Some(1));
+    }
+
+    #[test]
+    fn claude_can_start_a_turn_by_itself() {
+        let mut transcript = turn_with_a_background_task();
+        transcript.apply(&line(
+            json!({"type": "system", "subtype": "task_notification",
+            "task_id": "b1", "tool_use_id": "t1", "status": "completed"}),
+        ));
+        transcript.apply(&tasks_changed(&[]));
+        assert_eq!(transcript.status(), Status::Done, "not a turn yet");
+
+        transcript.apply(&line(json!({"type": "system", "subtype": "init",
+            "session_id": "s"})));
+        assert_eq!(transcript.status(), Status::Working);
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m3",
+            "content": [{"type": "text", "text": "The server stopped."}]}})));
+        transcript.apply(&line(json!({"type": "result", "subtype": "success",
+            "is_error": false, "duration_ms": 1851})));
+        assert_eq!(transcript.status(), Status::Done);
+        let users = transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, Item::User { .. }))
+            .count();
+        assert_eq!(users, 1, "no user message is made up");
+        assert!(matches!(
+            &transcript.items()[transcript.items().len() - 2..],
+            [
+                Item::Assistant { text, live: false, .. },
+                Item::TurnEnd { duration_ms: Some(1851), stopped: false, .. }
+            ] if text == "The server stopped."
+        ));
+
+        // A streamed word between turns starts one too (if `init` was missed).
+        transcript.apply(&line(
+            json!({"type": "stream_event", "api_message_id": "m4",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "Also"}}}),
+        ));
+        assert_eq!(transcript.status(), Status::Working);
+    }
+
+    #[test]
+    fn lines_outside_a_turn_do_not_start_one() {
+        let mut transcript = turn_with_a_background_task();
+        for quiet in [
+            json!({"type": "system", "subtype": "status", "status": "requesting"}),
+            json!({"type": "system", "subtype": "hook_started", "hook_name": "Stop"}),
+            json!({"type": "system", "subtype": "task_updated", "task_id": "b1",
+                   "patch": {"status": "completed"}}),
+            json!({"type": "rate_limit_event", "rate_limit_info": {}}),
+            json!({"type": "assistant", "parent_tool_use_id": "t9",
+                   "message": {"id": "m9", "content": [{"type": "text", "text": "sub"}]}}),
+        ] {
+            transcript.apply(&line(quiet));
+            assert_eq!(transcript.status(), Status::Done);
+        }
+    }
+
+    #[test]
+    fn relaunch_stops_a_thread_whose_command_ran_in_the_background() {
+        let running = turn_with_a_background_task();
+        let mut transcript =
+            Transcript::from_saved("/tmp/project", running.items().to_vec(), running.status());
+        assert!(
+            transcript.background_tasks().is_empty(),
+            "no claude runs after a relaunch"
+        );
+        transcript.normalize_after_relaunch();
+        assert_eq!(transcript.status(), Status::Stopped);
+        assert!(matches!(
+            transcript.items().last(),
+            Some(Item::Stopped { .. })
+        ));
+        assert!(!is_background(&transcript.items()[1]));
+        assert!(matches!(
+            &transcript.items()[1],
+            Item::Tool {
+                state: ToolState::Done,
+                ..
+            }
+        ));
+
+        // Settling twice adds nothing.
+        transcript.mark_saved();
+        let count = transcript.items().len();
+        transcript.normalize_after_relaunch();
+        assert_eq!(transcript.items().len(), count);
+        assert_eq!(transcript.dirty_from(), None);
+    }
+
+    #[test]
+    fn a_background_task_dies_with_its_claude() {
+        // Newjen stopped claude ("Try again"): the card says the command stopped with it.
+        let mut transcript = turn_with_a_background_task();
+        transcript.mark_saved();
+        transcript.apply(&SessionEvent::Exited {
+            code: Some(0),
+            requested: true,
+        });
+        assert!(transcript.background_tasks().is_empty());
+        assert!(matches!(
+            &transcript.items()[1],
+            Item::Tool { state: ToolState::Failed, output: Some(note), background: false, .. }
+                if note == BACKGROUND_STOPPED_NOTE
+        ));
+        assert_eq!(transcript.dirty_from(), Some(1));
+        assert_eq!(transcript.status(), Status::Done);
+        // So a relaunch after that has nothing to stop.
+        let mut loaded = Transcript::from_saved(
+            "/tmp/project",
+            transcript.items().to_vec(),
+            transcript.status(),
+        );
+        loaded.normalize_after_relaunch();
+        assert_eq!(loaded.status(), Status::Done);
+        assert_eq!(loaded.items(), transcript.items());
+
+        // claude exited by itself: its "Claude exited" error is what the user sees.
+        let mut crashed = turn_with_a_background_task();
+        crashed.apply(&SessionEvent::Exited {
+            code: Some(1),
+            requested: false,
+        });
+        assert!(crashed.background_tasks().is_empty());
+        assert!(matches!(
+            &crashed.items()[1],
+            Item::Tool {
+                state: ToolState::Done,
+                background: false,
+                ..
+            }
+        ));
+        assert_eq!(crashed.status(), Status::Failed);
+    }
+
+    #[test]
+    fn a_message_queued_behind_claudes_own_turn_keeps_the_turn_going() {
+        let mut transcript = turn_with_a_background_task();
+        transcript.push_user("What next?");
+        transcript.apply(&tasks_changed(&[]));
+        transcript.apply(&line(json!({"type": "system", "subtype": "init",
+            "session_id": "s"})));
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m3",
+            "content": [{"type": "text", "text": "The server stopped."}]}})));
+        transcript.apply(&line(json!({"type": "result", "subtype": "success",
+            "is_error": false, "queued_turn_count": 1,
+            "origin": {"kind": "task-notification"}})));
+        assert_eq!(
+            transcript.status(),
+            Status::Working,
+            "the message runs next"
+        );
+        assert!(matches!(
+            transcript.items().last(),
+            Some(Item::TurnEnd { .. })
+        ));
+
+        transcript.apply(&line(json!({"type": "system", "subtype": "init",
+            "session_id": "s"})));
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m4",
+            "content": [{"type": "text", "text": "Here is what is next."}]}})));
+        transcript.apply(&line(json!({"type": "result", "subtype": "success",
+            "is_error": false, "queued_turn_count": 0})));
+        assert_eq!(transcript.status(), Status::Done);
+
+        // A stop ends the turn even with a message queued; claude starts that one by itself.
+        transcript.push_user("And then?");
+        transcript.apply(&line(
+            json!({"type": "result", "subtype": "error_during_execution",
+            "is_error": true, "terminal_reason": "aborted_streaming", "queued_turn_count": 1}),
+        ));
+        assert_eq!(transcript.status(), Status::Stopped);
     }
 }

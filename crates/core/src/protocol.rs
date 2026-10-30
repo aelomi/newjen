@@ -128,6 +128,41 @@ pub struct SystemMessage {
     /// Only on `init`: the working directory as the CLI sees it (on macOS `/tmp` shows up as
     /// `/private/tmp`).
     pub cwd: Option<String>,
+    /// Only on `background_tasks_changed`: every background task running now (`[]` when
+    /// none). `None` when the field is missing or not a list.
+    #[serde(deserialize_with = "lenient")]
+    pub tasks: Option<Vec<BackgroundTask>>,
+    /// On `task_started`, `task_updated` and `task_notification`: the task it is about.
+    #[serde(deserialize_with = "lenient")]
+    pub task_id: Option<String>,
+    /// On `task_started` and `task_notification`: the tool call that started the task.
+    #[serde(deserialize_with = "lenient")]
+    pub tool_use_id: Option<String>,
+}
+
+impl SystemMessage {
+    /// The full list of background tasks, if this is a `background_tasks_changed` line.
+    pub fn background_tasks(&self) -> Option<&[BackgroundTask]> {
+        match &self.tasks {
+            Some(tasks) if self.subtype == "background_tasks_changed" => Some(tasks),
+            _ => None,
+        }
+    }
+}
+
+/// One entry of `background_tasks_changed`: a command (or agent) that keeps running after
+/// the turn that started it, such as a dev server started with Bash's `run_in_background`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default)]
+pub struct BackgroundTask {
+    #[serde(deserialize_with = "lenient")]
+    pub task_id: String,
+    /// What the task does, in Claude's words, e.g. "Start the dev server".
+    #[serde(deserialize_with = "lenient")]
+    pub description: String,
+    /// For example `local_bash`.
+    #[serde(deserialize_with = "lenient")]
+    pub task_type: Option<String>,
 }
 
 /// `type: "assistant"`. Each line carries ONE finished content block. Several lines can share
@@ -465,6 +500,11 @@ pub struct ResultMessage {
     pub session_id: Option<String>,
     #[serde(deserialize_with = "lenient")]
     pub num_turns: Option<u64>,
+    /// User messages still queued when this result was produced. More than 0 means another
+    /// turn follows with no further input: the user sent a message just as claude started a
+    /// turn by itself (after a background task finished).
+    #[serde(deserialize_with = "lenient")]
+    pub queued_turn_count: Option<u64>,
 }
 
 /// Per-model usage inside a result.
@@ -482,6 +522,12 @@ impl ResultMessage {
         self.terminal_reason
             .as_deref()
             .is_some_and(|reason| reason.starts_with("aborted"))
+    }
+
+    /// True when a queued user message will start another turn right after this one (see
+    /// `queued_turn_count`).
+    pub fn another_turn_follows(&self) -> bool {
+        self.queued_turn_count.is_some_and(|count| count > 0)
     }
 
     /// This turn's cost, if the CLI reported per-turn usage: the sum of `costUSD` over
@@ -1285,6 +1331,63 @@ mod tests {
             ..ResultMessage::default()
         };
         assert!(!other.is_missing_conversation());
+    }
+
+    #[test]
+    fn a_queued_user_message_means_another_turn_follows() {
+        let result = |line: &str| match Incoming::parse(line) {
+            Incoming::Result(result) => result,
+            other => panic!("not a result: {other:?}"),
+        };
+        let own_turn = result(
+            r#"{"type":"result","subtype":"success","is_error":false,"queued_turn_count":1,
+                "origin":{"kind":"task-notification","producer":"session-task"}}"#,
+        );
+        assert!(own_turn.another_turn_follows());
+        for line in [
+            r#"{"type":"result","subtype":"success","is_error":false,"queued_turn_count":0}"#,
+            r#"{"type":"result","subtype":"success","is_error":false}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"queued_turn_count":"1"}"#,
+        ] {
+            assert!(!result(line).another_turn_follows(), "{line}");
+        }
+    }
+
+    fn system(line: &str) -> SystemMessage {
+        match Incoming::parse(line) {
+            Incoming::System(message) => message,
+            other => panic!("not a system line: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_tasks_are_read_only_from_their_own_line() {
+        let changed = system(
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[
+                {"task_id":"b1","run_id":"r","task_type":"local_bash","description":"Dev server"},
+                {"task_id":"b2","description":null}]}"#,
+        );
+        let tasks = changed.background_tasks().expect("a task list");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].task_id, "b1");
+        assert_eq!(tasks[0].description, "Dev server");
+        assert_eq!(tasks[0].task_type.as_deref(), Some("local_bash"));
+        assert_eq!(tasks[1].description, "");
+
+        let none = system(r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#);
+        assert_eq!(none.background_tasks(), Some(&[][..]));
+        let broken =
+            system(r#"{"type":"system","subtype":"background_tasks_changed","tasks":"b1"}"#);
+        assert_eq!(broken.background_tasks(), None);
+        let other = system(r#"{"type":"system","subtype":"status","tasks":[]}"#);
+        assert_eq!(other.background_tasks(), None);
+
+        let started = system(
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"t1",
+                "is_backgrounded":true}"#,
+        );
+        assert_eq!(started.task_id.as_deref(), Some("b1"));
+        assert_eq!(started.tool_use_id.as_deref(), Some("t1"));
     }
 
     #[test]

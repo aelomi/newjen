@@ -30,10 +30,14 @@
 //!
 //! **Stopping claude** (idle, revoke, archive, quit) happens on a background thread, because
 //! it can take up to about 150 ms and the app must not wait for it. A new `claude` for the
-//! thread is only started once the old one is gone.
+//! thread is only started once the old one is gone. Stopping claude also stops the commands it
+//! runs in the background ([`Thread::background_tasks`]), so it is never stopped for being idle
+//! while one runs.
 //!
 //! **Subscription safety.** Nothing here starts a turn on its own. A turn starts only from
-//! [`Thread::send`]; the two repairs above resend the user's own message once.
+//! [`Thread::send`]; the two repairs above resend the user's own message once. (claude itself
+//! starts a turn when a background task it ran finishes; [`Thread::apply`] follows that turn
+//! like any other.)
 
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
@@ -42,7 +46,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
-use crate::protocol::{Incoming, PermissionAnswer, session_rules};
+use crate::protocol::{BackgroundTask, Incoming, PermissionAnswer, session_rules};
 use crate::session::{Conversation, Session, SessionConfig, SessionEvent};
 use crate::store::{Grant, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow, now_ms};
 use crate::transcript::{Item, Status, Transcript};
@@ -56,9 +60,9 @@ pub const NEW_THREAD_TITLE: &str = "New thread";
 /// Titles longer than this many characters are cut, with "…" after them.
 pub const TITLE_MAX_CHARS: usize = 50;
 
-/// A thread's `claude` is stopped after this long without activity, but never mid-turn or
-/// while an approval waits. The next message starts it again (`--resume`). T3 Code and Codex
-/// also use 30 minutes.
+/// A thread's `claude` is stopped after this long without activity, but never mid-turn, while
+/// an approval waits or while a background task runs. The next message starts it again
+/// (`--resume`). T3 Code and Codex also use 30 minutes.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// What the Continue button on a "Stopped when Newjen quit" notice sends, as a visible message.
@@ -343,6 +347,12 @@ impl Thread {
         self.turn_started.filter(|_| self.status().is_busy())
     }
 
+    /// What claude keeps running in the background now (a dev server, say), even between
+    /// turns. Empty when no claude runs: stopping claude stops these too.
+    pub fn background_tasks(&self) -> &[BackgroundTask] {
+        self.transcript.background_tasks()
+    }
+
     /// The channel this thread's events arrive on, for the whole life of the thread. Pass each
     /// event to [`Thread::apply`]. Read it from one place only: each event is delivered once,
     /// to whichever copy of the receiver asks first.
@@ -370,8 +380,8 @@ impl Thread {
     /// Sends a user message, starting `claude` first if none runs. The first message of a
     /// draft also names the thread (see [`title_from_message`]) and saves it.
     ///
-    /// On an error nothing was sent and nothing changed, so the app can keep the text in the
-    /// composer and show why (for example claude could not be started).
+    /// On an error nothing was sent, so the app can keep the text in the composer and show why
+    /// (for example claude could not be started).
     pub fn send(&mut self, text: &str) -> Result<()> {
         if text.trim().is_empty() {
             bail!("there is nothing to send");
@@ -386,6 +396,7 @@ impl Thread {
         if let Err(error) = session.send_prompt(text) {
             // This claude can no longer receive anything; the next message starts a new one.
             self.end_session();
+            self.save_with(false);
             return Err(error);
         }
         if self.draft {
@@ -483,9 +494,10 @@ impl Thread {
         started
     }
 
-    /// Forgets a grant. claude cannot drop a rule it was given, so the process is stopped: now
-    /// if it is idle, or when the running turn ends. The next message starts a new one with
-    /// the remaining rules (`--resume`, so the conversation goes on).
+    /// Forgets a grant. claude cannot drop a rule it was given, so the process is stopped, with
+    /// any command it runs in the background: now if it is idle, or when the running turn ends.
+    /// The next message starts a new one with the remaining rules (`--resume`, so the
+    /// conversation goes on).
     pub fn revoke(&mut self, rule: &str) {
         let before = self.grants.len();
         self.grants.retain(|grant| grant.rule != rule);
@@ -500,6 +512,7 @@ impl Thread {
                 self.stop_after_turn = true;
             } else {
                 self.end_session();
+                self.save();
             }
         }
     }
@@ -514,9 +527,9 @@ impl Thread {
     }
 
     /// Stops `claude` if it has been idle for [`IDLE_TIMEOUT`] at `now`: running, no turn, no
-    /// approval waiting. The thread's status stays as it was, and the next message starts
-    /// claude again. Returns true if it stopped it. The app calls this every minute; tests pass
-    /// a `now` in the future.
+    /// approval waiting, no background task. The thread's status stays as it was, and the next
+    /// message starts claude again. Returns true if it stopped it. The app calls this every
+    /// minute; tests pass a `now` in the future.
     pub fn idle_check(&mut self, now: Instant) -> bool {
         // Also a good moment to write again what a failed write lost, in case no checkpoint
         // comes soon (say the lost write was the turn's last). Between turns only: nothing is
@@ -527,6 +540,7 @@ impl Thread {
         let idle = self.session.is_some()
             && !self.status().is_busy()
             && self.transcript.pending_approval().is_none()
+            && self.background_tasks().is_empty()
             && now.saturating_duration_since(self.last_activity) >= IDLE_TIMEOUT;
         if idle {
             self.end_session();
@@ -537,14 +551,16 @@ impl Thread {
     /// Hides the thread from the list and stops its `claude`. Its rows stay in the store.
     pub fn archive(&mut self) {
         self.end_session();
+        self.save();
         if !self.draft {
             self.store.archive(&self.id, now_ms());
         }
     }
 
-    /// At quit: stops `claude`. If a turn was running or an approval waiting, the thread is
-    /// first settled exactly as a relaunch would settle it (status Stopped, the "Stopped when
-    /// Newjen quit" notice) and saved, waiting at most [`QUIT_FLUSH_TIMEOUT`] for the disk.
+    /// At quit: stops `claude`. If a turn was running, an approval waiting or a background task
+    /// running, the thread is first settled exactly as a relaunch would settle it (status
+    /// Stopped, the "Stopped when Newjen quit" notice) and saved, waiting at most
+    /// [`QUIT_FLUSH_TIMEOUT`] for the disk.
     /// If Newjen is killed instead, the relaunch does the same from the last checkpoint.
     ///
     /// For one thread. To quit several, call [`Thread::begin_quit`] on each and then
@@ -558,7 +574,7 @@ impl Thread {
     /// starts stopping its `claude`, without waiting for either. Pass what it returns for
     /// every thread to one [`finish_quit`] call.
     pub fn begin_quit(&mut self) -> Quitting {
-        if self.status().is_busy() {
+        if self.status().is_busy() || !self.background_tasks().is_empty() {
             self.transcript.normalize_after_relaunch();
         }
         // Queue the writes before stopping claude, so the disk works while claude stops.
@@ -660,6 +676,10 @@ impl Thread {
         let was_busy = self.status().is_busy();
         self.transcript.apply(&event);
         let turn_ended = was_busy && !self.status().is_busy();
+        // claude started a turn by itself (see `Transcript::apply`).
+        if !was_busy && self.status().is_busy() {
+            self.turn_started = Some(Instant::now());
+        }
         let approval_asked = matches!(event, SessionEvent::Line(Incoming::PermissionRequest(_)));
         if approval_asked && becomes_unread(self.active, false, true) {
             self.set_unread(true);
@@ -725,6 +745,8 @@ impl Thread {
         self.generation += 1;
         self.stop_after_turn = false;
         self.session_initialized = false;
+        // Its exit will be ignored, so the background tasks it takes with it are settled here.
+        self.transcript.stop_background_tasks();
         if let Some(session) = self.session.take() {
             self.stopping.retain(|stopping| !stopping.is_finished());
             self.stopping

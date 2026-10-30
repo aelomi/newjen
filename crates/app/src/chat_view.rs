@@ -876,6 +876,7 @@ impl ChatView {
                 show_list,
                 grants: thread.grants().to_vec(),
                 status: thread.status(),
+                background_tasks: thread.background_tasks().len(),
             }
         };
         // claude cannot forget a rule, so core stops it (now, or when the turn ends) and the
@@ -1350,6 +1351,7 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
             .map(|started| now.saturating_duration_since(started)),
         failure,
         stopped_on_quit: matches!(transcript.items().last(), Some(Item::Stopped { .. })),
+        background_tasks: thread.background_tasks().len(),
         updated_at: thread.updated_at(),
     }
 }

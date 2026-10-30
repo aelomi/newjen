@@ -15,8 +15,8 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 use newjen_core::transcript::{
-    EXPIRED_NOTE, FRESH_START_NOTE, STOPPED_ON_QUIT, STOPPED_ON_QUIT_DETAIL, STOPPED_TOOL_NOTE,
-    UNREADABLE_NOTE,
+    BACKGROUND_STOPPED_NOTE, EXPIRED_NOTE, FRESH_START_NOTE, STOPPED_ON_QUIT,
+    STOPPED_ON_QUIT_DETAIL, STOPPED_TOOL_NOTE, UNREADABLE_NOTE,
 };
 use newjen_core::{Item, ToolState};
 
@@ -235,24 +235,29 @@ pub enum ToolLook {
 pub enum QuietIcon {
     /// A clock: the approval it waited for can no longer be given.
     Expired,
-    /// A pause: it was running when Newjen quit.
+    /// A pause: it was running when Newjen quit, or Newjen stopped its claude.
     Stopped,
 }
 
 /// How a call in `state` with `output` is drawn (see "Rendering decisions" in the slice 2
 /// spec): an approval Newjen quit before you answered is "Expired · Newjen quit before you
-/// answered"; a call that was running then is "Stopped when Newjen quit". Everything else is
-/// Ely's card.
+/// answered"; a call that was running then is "Stopped when Newjen quit", and a command left
+/// running in the background when Newjen stopped its claude is "Stopped when Claude
+/// restarted". Everything else is Ely's card.
 pub fn tool_look(state: ToolState, output: Option<&str>) -> ToolLook {
     match state {
         ToolState::Expired => ToolLook::Quiet {
             icon: QuietIcon::Expired,
             note: format!("Expired · {EXPIRED_NOTE}"),
         },
-        ToolState::Failed if output == Some(STOPPED_TOOL_NOTE) => ToolLook::Quiet {
-            icon: QuietIcon::Stopped,
-            note: STOPPED_TOOL_NOTE.to_string(),
-        },
+        ToolState::Failed
+            if let Some(note @ (STOPPED_TOOL_NOTE | BACKGROUND_STOPPED_NOTE)) = output =>
+        {
+            ToolLook::Quiet {
+                icon: QuietIcon::Stopped,
+                note: note.to_string(),
+            }
+        }
         state => ToolLook::Card(step_state(state)),
     }
 }
@@ -419,6 +424,13 @@ mod tests {
             ToolLook::Quiet {
                 icon: QuietIcon::Stopped,
                 note: "Stopped when Newjen quit".to_string(),
+            }
+        );
+        assert_eq!(
+            tool_look(ToolState::Failed, Some(BACKGROUND_STOPPED_NOTE)),
+            ToolLook::Quiet {
+                icon: QuietIcon::Stopped,
+                note: "Stopped with Claude".to_string(),
             }
         );
         // A tool that really failed keeps Ely's failed card.
