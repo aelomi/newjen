@@ -18,7 +18,7 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 | Language | Rust (Cargo workspace) | Toolchain 1.98.1 installed; Ely needs ≥ 1.95 |
 | UI framework | GPUI: `gpui-pre =0.3.10`, `gpui-pre-platform =0.3.10` (`font-kit`) | Version fixed by Ely |
 | Components | Ely: `ely-gpui-component =0.1.1` | Plain pinned dependency; chat, agent, terminal, editor and git (diff) components |
-| Agent | Claude Code CLI (`claude` 2.1.310 installed) over stream-json | Claude only in v1 |
+| Agent | Claude Code CLI (`claude`) over stream-json; Codex CLI (`codex app-server`) next | Newjen detects which CLIs are installed; one provider per thread. API-key providers and ACP later |
 | Isolation | Rift (`rift-snapshot`), one APFS copy-on-write copy per thread | Installed |
 | Version control | jj 0.46.0, colocated with git | Installed |
 | Code hosting | GitCafe (git.cafe), a normal git remote; `jj git push` | `cafe` 0.11.0 installed via Bun 1.4.4. Still needed: run `cafe auth login`. Private repos are free during the beta |
@@ -99,6 +99,16 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 4. jj snapshots, diff view (`ely-git`), and both landing modes.
 5. Parallel threads, notifications (Dock badge), and a terminal panel (`ely-terminal`).
 
+**After the MVP slices: providers.** Newjen detects the installed agent CLIs (`claude`, `codex`) and drives whichever one a thread uses. Detection must not spend usage, the core gets one event model with a Claude adapter and a Codex adapter, and Codex approvals keep the exact-scope rule. This step also shows the account and plan, warns about API keys in the environment, and respects usage limits. Decided 2026-10-30 ([memo](research/providers-and-subscriptions.md)); it runs in its own session once the MVP slices are done.
+
+## Subscription safety
+
+Users run Newjen on their own Claude and ChatGPT subscriptions, so it must never put their accounts at risk. Newjen spawns only the user's own installed, unmodified CLIs; it never reads or stores credentials, never calls model APIs itself, never offers its own login and never retries around usage limits. It identifies itself honestly (`CLAUDE_AGENT_SDK_CLIENT_APP=newjen/<version>` for Claude, `clientInfo` for Codex). The rules and their sources are in [the memo](research/providers-and-subscriptions.md#2-subscription-safety) and in `CLAUDE.md`.
+
+## Appearance
+
+Dark only. Light mode waits until users ask for it (decided 2026-10-30).
+
 ## Testing
 
 - Record real stream-json sessions as fixture files and replay them in core tests, so agents can verify their own changes without the UI.
@@ -106,4 +116,4 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 
 ## Open questions
 
-- None blocking. Slice 1 is built (2026-10-27). Next: slice 2, thread list, SQLite persistence and resume.
+- None blocking. Slice 1 is built (2026-10-27). Next: slice 2, thread list, SQLite persistence and resume. The threads table stores a provider from the start, so Codex threads fit in later.

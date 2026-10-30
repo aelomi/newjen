@@ -142,6 +142,38 @@ fn spawn_error_for_missing_program() {
 }
 
 #[test]
+fn child_identifies_newjen_and_drops_nested_session_vars() {
+    // A stand-in that reports what it sees on stderr. When the tests run inside a Claude Code
+    // terminal, `CLAUDECODE` is set in this process, so this also checks it is stripped.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("env-claude");
+    let mut file = std::fs::File::create(&script).unwrap();
+    writeln!(file, "#!/bin/sh").unwrap();
+    writeln!(
+        file,
+        r#"echo "client=$CLAUDE_AGENT_SDK_CLIENT_APP nested=${{CLAUDECODE-unset}}" >&2"#
+    )
+    .unwrap();
+    drop(file);
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut config = SessionConfig::new(dir.path());
+    config.program = script;
+    let (_session, events) = Session::spawn(config).unwrap();
+    let expected = format!("client=newjen/{} nested=unset", env!("CARGO_PKG_VERSION"));
+    loop {
+        match common::next_event(&events, TIMEOUT) {
+            SessionEvent::Stderr(line) => {
+                assert_eq!(line.trim_end(), expected);
+                break;
+            }
+            SessionEvent::Exited { .. } => panic!("exited before reporting its environment"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
 fn shutdown_kills_the_process_group_within_200ms() {
     // A stand-in that ignores SIGTERM (so shutdown must escalate to SIGKILL) and starts a
     // grandchild in its process group (so the whole group must die, not just the child).
