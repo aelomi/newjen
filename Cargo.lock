@@ -219,6 +219,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "newjen-core",
+ "objc2-app-kit 0.3.2",
  "serde_json",
 ]
 

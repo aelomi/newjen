@@ -4,16 +4,20 @@
 use std::rc::Rc;
 
 use ely_gpui_component::agent::ToolCallCard;
+use ely_gpui_component::buttons::{Button, ButtonVariant};
 use ely_gpui_component::chat::{ErrorMessage, MessageBubble, Role, StepState, StreamingMarkdown};
-use ely_gpui_component::layout::h_stack;
+use ely_gpui_component::layout::{h_stack, v_stack};
 use ely_gpui_component::primitives::{Icon, IconName};
-use ely_gpui_component::theme::{ActiveTheme, IconSize, TextSize};
-use ely_gpui_component::typography::Caption;
+use ely_gpui_component::theme::{ActiveTheme, IconSize, Radius, TextSize};
+use ely_gpui_component::typography::{Caption, Ellipsis};
 use gpui::{
-    AnyElement, App, ElementId, IntoElement, ParentElement, SharedString, Styled, Window, div,
-    prelude::*,
+    AnyElement, App, ElementId, FontWeight, IntoElement, ParentElement, SharedString, Styled,
+    Window, div, prelude::*, px,
 };
-use newjen_core::transcript::{FRESH_START_NOTE, STOPPED_ON_QUIT, UNREADABLE_NOTE};
+use newjen_core::transcript::{
+    EXPIRED_NOTE, FRESH_START_NOTE, STOPPED_ON_QUIT, STOPPED_ON_QUIT_DETAIL, STOPPED_TOOL_NOTE,
+    UNREADABLE_NOTE,
+};
 use newjen_core::{Item, ToolState};
 
 use crate::approval::ScopeRow;
@@ -28,19 +32,30 @@ const TOOL_TEXT_CHARS: usize = 20_000;
 const FAILED_HEAD: usize = 8;
 const FAILED_TAIL: usize = 16;
 const FAILED_LINE_CHARS: usize = 240;
+/// The shortest the hairlines beside the fresh-start note get in a narrow chat.
+const HAIRLINE_MIN: f32 = 24.0;
 
-/// Called when the user presses "Try again" on an error.
+/// Called when the user presses "Try again" on an error, or Continue on a stopped thread.
 pub type OnRestart = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// Draws one transcript item. Element ids come from the item's stable id, so Ely's per-element
 /// state (streaming reveal, open/closed cards) survives re-renders.
 ///
-/// `is_last` says whether this is the conversation's last item. Only that one can still be
-/// streaming: core keeps every reply of the turn `live` until the turn ends, but a reply
-/// followed by something else is finished, so it must not show a typing caret.
+/// `typing` says whether a reply here may type in: only the conversation's last item can still
+/// be streaming (core keeps every reply of the turn `live` until the turn ends, but a reply
+/// followed by something else is finished, so it must not show a typing caret), and not on the
+/// first frame after its thread comes on screen (see `live_reply`).
 ///
 /// `retry` is the "Try again" action for an error row, given only where `can_retry` allows it.
-pub fn item(item: &Item, is_last: bool, retry: Option<&OnRestart>, cx: &mut App) -> AnyElement {
+/// `resume` is the Continue action for the "Stopped when Newjen quit" notice, given only where
+/// `shows_continue` allows it.
+pub fn item(
+    item: &Item,
+    typing: bool,
+    retry: Option<&OnRestart>,
+    resume: Option<&OnRestart>,
+    cx: &App,
+) -> AnyElement {
     match item {
         Item::User { text, .. } => MessageBubble::new(Role::User)
             .child(text.clone())
@@ -49,7 +64,7 @@ pub fn item(item: &Item, is_last: bool, retry: Option<&OnRestart>, cx: &mut App)
             .child(StreamingMarkdown::new(
                 ("reply", *id),
                 text.clone(),
-                *live && is_last,
+                *live && typing,
             ))
             .into_any_element(),
         Item::Tool {
@@ -62,6 +77,10 @@ pub fn item(item: &Item, is_last: bool, retry: Option<&OnRestart>, cx: &mut App)
             took,
             ..
         } => {
+            // A call Newjen's quit cut short is not a failure: a quiet card says what happened.
+            if let ToolLook::Quiet { icon, note } = tool_look(*state, output.as_deref()) {
+                return quiet_tool(display_name, summary, icon, note, cx);
+            }
             let mut card =
                 ToolCallCard::new(("tool", *id), display_name.clone(), step_state(*state));
             if !summary.is_empty() {
@@ -103,12 +122,188 @@ pub fn item(item: &Item, is_last: bool, retry: Option<&OnRestart>, cx: &mut App)
         Item::Error {
             id, title, detail, ..
         } => error(("error", *id).into(), title, detail, retry),
-        // Quiet rows from saved threads. Their final design (with the Continue button) comes
-        // with the thread list.
-        Item::Stopped { .. } => caption_row(IconName::Square, STOPPED_ON_QUIT.to_string(), cx),
-        Item::FreshStart { .. } => caption_row(IconName::Info, FRESH_START_NOTE.to_string(), cx),
+        Item::Stopped { id } => stopped_notice(*id, resume, cx),
+        Item::FreshStart { .. } => fresh_start(cx),
         Item::Unreadable { .. } => caption_row(IconName::Info, UNREADABLE_NOTE.to_string(), cx),
     }
+}
+
+/// The reply still streaming at the end of `items`, if any: its id. When a thread comes on
+/// screen, this reply is drawn whole on its first frame rather than typed in from its first
+/// word. Ely's `StreamingMarkdown` remembers how much it has shown only while it is drawn, so
+/// a thread that was off screen would otherwise replay its whole reply, and switching threads
+/// must be instant. Text that arrives after that frame types in as usual.
+pub fn live_reply(items: &[Item]) -> Option<u64> {
+    match items.last() {
+        Some(Item::Assistant { id, live: true, .. }) => Some(*id),
+        _ => None,
+    }
+}
+
+/// Where Claude's memory of the conversation starts over: its reason, centered between two
+/// hairlines, drawn like Ely's labelled `Divider`. Unlike that one, the hairlines never shrink
+/// away and a label too long for one line wraps centered between them: the reason is a long
+/// sentence, and the chat column is narrower than it in small windows.
+fn fresh_start(cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let line = || {
+        div()
+            .flex_1()
+            .min_w(px(HAIRLINE_MIN))
+            .border_t_1()
+            .border_color(theme.colors.border)
+    };
+    h_stack()
+        .items_center()
+        .gap_3()
+        .child(line())
+        .child(
+            div()
+                .min_w_0()
+                .text_center()
+                .text_size(theme.text_size(TextSize::Xs))
+                .text_color(theme.colors.fg_subtle)
+                .child(FRESH_START_NOTE),
+        )
+        .child(line())
+        .into_any_element()
+}
+
+/// Whether the "Stopped when Newjen quit" notice gets its Continue button: only while it is
+/// the conversation's last row. Anything after it (a message, a turn, the fresh-start divider)
+/// means the thread already went on, and the composer is the way forward.
+pub fn shows_continue(items: &[Item]) -> bool {
+    matches!(items.last(), Some(Item::Stopped { .. }))
+}
+
+/// The notice a thread gets when Newjen quit during its turn (screen 9): "Stopped when Newjen
+/// quit / Nothing runs until you continue.", with Continue when `resume` is given.
+fn stopped_notice(id: u64, resume: Option<&OnRestart>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let colors = &theme.colors;
+    let text = v_stack()
+        .flex_1()
+        .min_w_0()
+        .gap_0p5()
+        .child(
+            div()
+                .text_size(theme.text_size(TextSize::Base))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.fg)
+                .child(STOPPED_ON_QUIT),
+        )
+        .child(
+            div()
+                .text_size(theme.text_size(TextSize::Sm))
+                .text_color(colors.fg_subtle)
+                .child(STOPPED_ON_QUIT_DETAIL),
+        );
+    h_stack()
+        .gap_2p5()
+        .px_3()
+        .py_2p5()
+        .rounded(theme.radius(Radius::Lg))
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.surface)
+        .child(
+            Icon::new(IconName::CirclePause)
+                .size(IconSize::Sm)
+                .color(colors.fg_muted),
+        )
+        .child(text)
+        .children(resume.cloned().map(|resume| {
+            Button::new(("continue", id), "Continue")
+                .variant(ButtonVariant::Secondary)
+                .on_click(move |_, window, cx| resume(window, cx))
+        }))
+        .into_any_element()
+}
+
+/// How a tool call's card looks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolLook {
+    /// Ely's tool card in this step state.
+    Card(StepState),
+    /// A quiet card for a call Newjen's quit cut short: a muted icon and a note where the time
+    /// goes, never the red failure styling (which stays for real failures).
+    Quiet { icon: QuietIcon, note: String },
+}
+
+/// The muted icon of a quiet tool card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuietIcon {
+    /// A clock: the approval it waited for can no longer be given.
+    Expired,
+    /// A pause: it was running when Newjen quit.
+    Stopped,
+}
+
+/// How a call in `state` with `output` is drawn (see "Rendering decisions" in the slice 2
+/// spec): an approval Newjen quit before you answered is "Expired · Newjen quit before you
+/// answered"; a call that was running then is "Stopped when Newjen quit". Everything else is
+/// Ely's card.
+pub fn tool_look(state: ToolState, output: Option<&str>) -> ToolLook {
+    match state {
+        ToolState::Expired => ToolLook::Quiet {
+            icon: QuietIcon::Expired,
+            note: format!("Expired · {EXPIRED_NOTE}"),
+        },
+        ToolState::Failed if output == Some(STOPPED_TOOL_NOTE) => ToolLook::Quiet {
+            icon: QuietIcon::Stopped,
+            note: STOPPED_TOOL_NOTE.to_string(),
+        },
+        state => ToolLook::Card(step_state(state)),
+    }
+}
+
+/// A quiet tool card: the same frame and header as Ely's tool card (screen 9 shows them side by
+/// side), with a muted icon in place of the status mark and the note where the time goes.
+fn quiet_tool(name: &str, summary: &str, icon: QuietIcon, note: String, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let colors = &theme.colors;
+    let icon = match icon {
+        QuietIcon::Expired => IconName::Clock,
+        QuietIcon::Stopped => IconName::CirclePause,
+    };
+    let header = h_stack()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .child(
+            div()
+                .flex_none()
+                .child(Icon::new(icon).size(IconSize::Sm).color(colors.fg_subtle)),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .font_family(theme.mono_family.clone())
+                .text_color(colors.fg)
+                .child(Ellipsis::new(name.to_string())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(colors.fg_muted)
+                .child(Ellipsis::new(summary.to_string())),
+        )
+        .child(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_color(colors.fg_subtle)
+                .child(note),
+        );
+    div()
+        .rounded(theme.radius(Radius::Md))
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.surface)
+        .text_size(theme.text_size(TextSize::Sm))
+        .child(header)
+        .into_any_element()
 }
 
 /// An error that happened in the app rather than in Claude (for example `claude` could not be
@@ -134,7 +329,7 @@ pub fn can_retry(is_last_row: bool, is_notice: bool, busy: bool) -> bool {
 }
 
 /// The quiet line under a finished turn: "✓ Done in 4.2s · $0.0041".
-fn turn_end(caption: String, stopped: bool, cx: &mut App) -> AnyElement {
+fn turn_end(caption: String, stopped: bool, cx: &App) -> AnyElement {
     let icon = if stopped {
         IconName::Square
     } else {
@@ -146,7 +341,7 @@ fn turn_end(caption: String, stopped: bool, cx: &mut App) -> AnyElement {
 /// The quiet line under the approval dock saying what "Always allow" does, with the remembered
 /// rule in the mono font. Kept to one line (the rule is already cut to fit, see
 /// `approval::scope_row`), because the dock counts it as exactly one row.
-pub fn scope(row: &ScopeRow, cx: &mut App) -> AnyElement {
+pub fn scope(row: &ScopeRow, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let color = theme.colors.fg_subtle;
     // The gaps stand in for the spaces around the rule, so they are trimmed off the words.
@@ -177,7 +372,7 @@ pub fn scope(row: &ScopeRow, cx: &mut App) -> AnyElement {
 }
 
 /// A small icon and a caption, both in the subtle text color.
-fn caption_row(icon: IconName, caption: String, cx: &mut App) -> AnyElement {
+fn caption_row(icon: IconName, caption: String, cx: &App) -> AnyElement {
     let color = cx.theme().colors.fg_subtle;
     h_stack()
         .gap_1p5()
@@ -192,7 +387,7 @@ pub fn step_state(state: ToolState) -> StepState {
         ToolState::Running => StepState::Working,
         ToolState::Waiting => StepState::Waiting,
         ToolState::Done => StepState::Done,
-        // An expired approval shows its note ("Newjen quit before you answered") as its result.
+        // `tool_look` draws expired calls as quiet cards; this is only a fallback.
         ToolState::Denied | ToolState::Failed | ToolState::Expired => StepState::Failed,
     }
 }
@@ -208,6 +403,77 @@ mod tests {
         assert_eq!(step_state(ToolState::Done), StepState::Done);
         assert_eq!(step_state(ToolState::Denied), StepState::Failed);
         assert_eq!(step_state(ToolState::Failed), StepState::Failed);
+    }
+
+    #[test]
+    fn calls_cut_short_by_quit_are_quiet_and_real_failures_stay_red() {
+        assert_eq!(
+            tool_look(ToolState::Expired, Some(EXPIRED_NOTE)),
+            ToolLook::Quiet {
+                icon: QuietIcon::Expired,
+                note: "Expired · Newjen quit before you answered".to_string(),
+            }
+        );
+        assert_eq!(
+            tool_look(ToolState::Failed, Some(STOPPED_TOOL_NOTE)),
+            ToolLook::Quiet {
+                icon: QuietIcon::Stopped,
+                note: "Stopped when Newjen quit".to_string(),
+            }
+        );
+        // A tool that really failed keeps Ely's failed card.
+        assert_eq!(
+            tool_look(ToolState::Failed, Some("exit code 1")),
+            ToolLook::Card(StepState::Failed)
+        );
+        assert_eq!(
+            tool_look(ToolState::Done, None),
+            ToolLook::Card(StepState::Done)
+        );
+    }
+
+    #[test]
+    fn continue_shows_only_while_the_stopped_notice_is_last() {
+        let user = Item::User {
+            id: 1,
+            text: "hi".to_string(),
+        };
+        let stopped = Item::Stopped { id: 2 };
+        assert!(shows_continue(&[user.clone(), stopped.clone()]));
+        // Continue was pressed (its message follows), or the conversation started over.
+        let continued = Item::User {
+            id: 3,
+            text: newjen_core::thread::CONTINUE_MESSAGE.to_string(),
+        };
+        assert!(!shows_continue(&[stopped.clone(), continued]));
+        assert!(!shows_continue(&[stopped, Item::FreshStart { id: 3 }]));
+        assert!(!shows_continue(&[user]));
+        assert!(!shows_continue(&[]));
+    }
+
+    #[test]
+    fn only_a_reply_still_streaming_at_the_end_is_drawn_whole_on_arrival() {
+        let reply = |id, live| Item::Assistant {
+            id,
+            text: "Working on it".to_string(),
+            live,
+            interrupted: false,
+        };
+        let user = Item::User {
+            id: 1,
+            text: "hi".to_string(),
+        };
+        assert_eq!(live_reply(&[user.clone(), reply(2, true)]), Some(2));
+        // Finished, or followed by another row: nothing is typing.
+        assert_eq!(live_reply(&[user.clone(), reply(2, false)]), None);
+        let error = Item::Error {
+            id: 3,
+            title: "Claude exited".to_string(),
+            detail: String::new(),
+        };
+        assert_eq!(live_reply(&[reply(2, true), error]), None);
+        assert_eq!(live_reply(&[user]), None);
+        assert_eq!(live_reply(&[]), None);
     }
 
     #[test]

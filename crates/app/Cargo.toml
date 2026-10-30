@@ -17,4 +17,5 @@ ely-gpui-component.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 newjen-core.workspace = true
+objc2-app-kit.workspace = true
 serde_json.workspace = true

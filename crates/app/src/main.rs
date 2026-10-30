@@ -1,16 +1,21 @@
 //! Newjen: a macOS window for running Claude Code.
 //!
 //! This file only starts things: it cleans up `claude` processes a crashed Newjen left behind,
-//! picks the project folder, starts GPUI with Ely's theme and fonts, and opens the window.
-//! The window's content lives in `chat_view.rs`.
+//! picks the project folder, opens the thread database and loads the project's threads, starts
+//! GPUI with Ely's theme and fonts, and opens the window. The window's content lives in
+//! `chat_view.rs`.
 //!
 //! Usage: `newjen [project-dir]` (or set `NEWJEN_PROJECT`). Defaults to the current directory.
+//! Threads are saved in `~/Library/Application Support/Newjen` (or `$NEWJEN_HOME`).
 
 mod approval;
 mod chat_view;
 mod format;
 mod keys;
+mod reduce_motion;
 mod rows;
+mod sidebar;
+mod title_bar;
 
 use std::path::{Path, PathBuf};
 
@@ -18,13 +23,16 @@ use ely_gpui_component::Assets;
 use ely_gpui_component::forms::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use ely_gpui_component::theme::{ActiveTheme, Mode, Theme};
 use gpui::{
-    App, AppContext, Bounds, Menu, MenuItem, OsAction, QuitMode, SharedString, TitlebarOptions,
-    WindowBounds, WindowOptions, px, size,
+    App, AppContext, Bounds, Context, IntoElement, Menu, MenuItem, OsAction, PromptLevel, QuitMode,
+    Render, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
 };
-use newjen_core::orphans;
+use newjen_core::{SessionConfig, Store, Thread, orphans, store};
 
-use crate::chat_view::ChatView;
-use crate::keys::{CloseWindow, Hide, HideOthers, Minimize, Quit};
+use crate::chat_view::{ChatView, Startup};
+use crate::keys::{
+    CloseWindow, Hide, HideOthers, JumpToThread, Minimize, NewThread, NextThread, PreviousThread,
+    Quit, ToggleSidebar,
+};
 
 fn main() {
     // Kill `claude` processes whose Newjen crashed, before starting new ones.
@@ -39,7 +47,12 @@ fn main() {
         eprintln!("usage: newjen [project-dir]");
         std::process::exit(2);
     }
-    let project_label = SharedString::from(format::tilde(&project, home.as_deref()));
+    // Without its database Newjen cannot run (there is nowhere to keep threads). It still
+    // starts GPUI to say so in a window: started from Finder or the Dock there is no terminal
+    // to read this line.
+    let startup = open_threads(&project, home).inspect_err(|problem| {
+        eprintln!("newjen: could not open the thread database: {problem:#}");
+    });
 
     gpui_platform::application()
         .with_assets(Assets)
@@ -53,11 +66,17 @@ fn main() {
             }
             // Match the system's light/dark mode from the first frame (no flash).
             Theme::set_mode_now(Mode::from(cx.window_appearance()), cx);
+            // And its Reduce Motion setting; the chat view's clock keeps it in step.
+            reduce_motion::sync(cx);
 
             keys::bind(cx);
             install_menus(cx);
 
-            if let Err(error) = open_window(project, project_label, cx) {
+            let opened = match startup {
+                Ok(startup) => open_window(startup, cx),
+                Err(problem) => show_database_problem(&problem, cx),
+            };
+            if let Err(error) = opened {
                 eprintln!("newjen: could not open the window: {error:#}");
                 cx.quit();
                 return;
@@ -97,6 +116,19 @@ fn install_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit Newjen", Quit),
         ]),
+        // The chat view handles these.
+        Menu::new("Thread").items([
+            MenuItem::action("New Thread", NewThread),
+            MenuItem::separator(),
+            MenuItem::action("Previous Thread", PreviousThread),
+            MenuItem::action("Next Thread", NextThread),
+            // ⌘1 to ⌘9, by place in the list. macOS shows each item's key from its binding.
+            MenuItem::submenu(
+                Menu::new("Go to Thread").items((0..keys::JUMP_KEYS.len()).map(|place| {
+                    MenuItem::action(format!("Thread {}", place + 1), JumpToThread(place))
+                })),
+            ),
+        ]),
         // Ely's text field handles these actions; the OS variant lets macOS route them too.
         Menu::new("Edit").items([
             MenuItem::os_action("Undo", Undo, OsAction::Undo),
@@ -107,11 +139,42 @@ fn install_menus(cx: &mut App) {
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
         ]),
+        Menu::new("View").items([MenuItem::action("Toggle Sidebar", ToggleSidebar)]),
         Menu::new("Window").items([
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Close", CloseWindow),
         ]),
     ]);
+}
+
+/// Opens the thread database, records that `project` was opened, and loads its threads (newest
+/// first, already settled after the last run: see `Thread::load`). Nothing is started: a
+/// thread's `claude` starts with the first message sent to it.
+///
+/// A database that cannot be opened stops Newjen after saying why (`show_database_problem`);
+/// threads that cannot be read are reported in the window and the project opens without them.
+fn open_threads(project: &Path, home: Option<PathBuf>) -> anyhow::Result<Startup> {
+    let store = Store::open()?;
+    let project = store.open_project(project)?;
+    let base_config = SessionConfig::new(project.path.clone());
+    let (threads, problem) = match Thread::load_all(&store, &project, &base_config) {
+        Ok(threads) => (threads, None),
+        Err(error) => {
+            eprintln!("newjen: could not load the saved threads: {error:#}");
+            (
+                Vec::new(),
+                Some(format!("Couldn't load threads: {error:#}")),
+            )
+        }
+    };
+    Ok(Startup {
+        store,
+        project,
+        base_config,
+        threads,
+        problem,
+        home,
+    })
 }
 
 /// The folder Claude works in: the first argument, else `$NEWJEN_PROJECT`, else the current
@@ -147,14 +210,70 @@ fn check_project(project: &Path) -> Result<(), String> {
     }
 }
 
-fn open_window(project: PathBuf, project_label: SharedString, cx: &mut App) -> anyhow::Result<()> {
+/// When the thread database cannot be opened: a plain window with a native alert that says what
+/// went wrong and where the database is, and quits when it is dismissed.
+fn show_database_problem(problem: &anyhow::Error, cx: &mut App) -> anyhow::Result<()> {
+    let folder = store::default_dir()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|_| "~/Library/Application Support/Newjen".to_string());
+    let detail = database_problem_detail(problem, &folder);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(1000.0), px(720.0)),
+            size(px(480.0), px(320.0)),
             cx,
         ))),
-        // A transparent title bar: Ely's TitleBar draws it, around the system traffic lights.
+        titlebar: Some(TitlebarOptions {
+            title: Some("Newjen".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let window = cx.open_window(options, |_, cx| cx.new(|_| Blank))?;
+    window.update(cx, |_, window, cx| {
+        let answer = window.prompt(
+            PromptLevel::Critical,
+            "Newjen couldn't open its thread database",
+            Some(&detail),
+            &["Quit"],
+            cx,
+        );
+        cx.spawn(async move |_, cx| {
+            let _ = answer.await;
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    })?;
+    Ok(())
+}
+
+/// The alert's text under its title when the thread database cannot be opened.
+fn database_problem_detail(problem: &anyhow::Error, folder: &str) -> String {
+    format!(
+        "{problem:#}.\n\nNewjen keeps its threads in newjen.db in {folder}. Check that the folder \
+         can be written to. If the file is damaged, moving it aside lets Newjen start with an \
+         empty list. Set NEWJEN_HOME to use another folder."
+    )
+}
+
+/// What the window shows behind the database alert: only the theme's background.
+struct Blank;
+
+impl Render for Blank {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().bg(cx.theme().colors.bg)
+    }
+}
+
+fn open_window(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(1200.0), px(760.0)),
+            cx,
+        ))),
+        // A transparent title bar: the thread list's header and the chat's title bar draw it,
+        // around the system traffic lights (see `sidebar::header` and `title_bar.rs`).
         titlebar: Some(TitlebarOptions {
             title: Some("Newjen".into()),
             appears_transparent: true,
@@ -163,24 +282,49 @@ fn open_window(project: PathBuf, project_label: SharedString, cx: &mut App) -> a
         window_min_size: Some(size(px(640.0), px(480.0))),
         ..Default::default()
     };
-    cx.open_window(options, |window, cx| {
+    let window = cx.open_window(options, |window, cx| {
         // Follow the system when it switches between light and dark.
         window
             .observe_window_appearance(|window, cx| {
                 Theme::set_mode(Mode::from(window.appearance()), cx);
             })
             .detach();
-        let view = cx.new(|cx| ChatView::new(project, project_label, window, cx));
-        let field = view.read(cx).field_focus(cx);
-        window.focus(&field, cx);
+        let view = cx.new(|cx| ChatView::new(startup, window, cx));
+        if let Some(field) = view.read(cx).field_focus(cx) {
+            window.focus(&field, cx);
+        }
         view
     })?;
+    // Quitting (⌘Q, or closing the window, which quits) settles and saves every thread and
+    // stops every `claude`. GPUI allows about 200 ms for this. The hook keeps the view alive
+    // itself: closing the window drops the window's hold on it before the app quits.
+    let view = window.update(cx, |_, _, cx| cx.entity())?;
+    cx.on_app_quit(move |cx| {
+        view.update(cx, |view, cx| view.quit(cx));
+        async {}
+    })
+    .detach();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_database_problem_says_what_and_where() {
+        let problem = anyhow::anyhow!("file is not a database").context("could not open newjen.db");
+        let detail = database_problem_detail(
+            &problem,
+            "/Users/someone/Library/Application Support/Newjen",
+        );
+        assert!(
+            detail.starts_with("could not open newjen.db: file is not a database."),
+            "{detail}"
+        );
+        assert!(detail.contains("in /Users/someone/Library/Application Support/Newjen."));
+        assert!(detail.contains("NEWJEN_HOME"));
+    }
 
     #[test]
     fn check_project_accepts_only_existing_folders() {

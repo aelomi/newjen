@@ -178,12 +178,14 @@ pub fn scope_row(
         SessionScope::OnceOnly(OnceReason::NoSafeRule) => return once("", false),
         SessionScope::Remembers(rules) => rules,
     };
+    // The thread keeps the rule (core saves it and gives it to every later `claude` of this
+    // thread), so it lasts "for this thread", not just for this claude process.
     // In a rule, `*` matches more than this one call, so say that in words. For Bash it stands
     // for any arguments; for other tools it is a path or domain pattern.
     let after = match rules.iter().any(|rule| rule.contains('*')) {
-        true if request.tool_name == "Bash" => " (any arguments) for this session",
-        true => " (a pattern) for this session",
-        false => " for this session",
+        true if request.tool_name == "Bash" => " (any arguments) for this thread",
+        true => " (a pattern) for this thread",
+        false => " for this thread",
     };
     const BEFORE: &str = "Always allow remembers ";
     let room = cols.saturating_sub(BEFORE.len() + after.len()).max(12);
@@ -393,19 +395,19 @@ mod tests {
         let exact = SessionScope::Remembers(vec!["touch notes.md".to_string()]);
         assert_eq!(
             text(scope_row(&exact, &touch, false, 80)),
-            "Always allow remembers `touch notes.md` for this session"
+            "Always allow remembers `touch notes.md` for this thread"
         );
         let wildcard = SessionScope::Remembers(vec!["npm test *".to_string()]);
         assert_eq!(
             text(scope_row(&wildcard, &bash("npm test --watch"), false, 80)),
-            "Always allow remembers `npm test *` (any arguments) for this session"
+            "Always allow remembers `npm test *` (any arguments) for this thread"
         );
         // Outside Bash, `*` is a path or domain pattern, not "any arguments".
         let domains = SessionScope::Remembers(vec!["domain:*.example.com".to_string()]);
         let fetch = request("WebFetch", json!({"url": "https://docs.example.com"}));
         assert_eq!(
             text(scope_row(&domains, &fetch, false, 80)),
-            "Always allow remembers `domain:*.example.com` (a pattern) for this session"
+            "Always allow remembers `domain:*.example.com` (a pattern) for this thread"
         );
         assert_eq!(
             text(scope_row(

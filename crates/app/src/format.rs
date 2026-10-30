@@ -70,6 +70,53 @@ pub fn turn_caption(duration_ms: Option<u64>, cost_usd: Option<f64>, stopped: bo
     caption
 }
 
+/// How long something has been going, in whole units for a line that ticks once a second:
+/// "12s", "1m 12s", "3h 12m".
+pub fn elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, secs % 3600 / 60)
+    }
+}
+
+/// When something happened, from `now`, as the thread list says it: "Just now", "4m ago",
+/// "2h ago", "Yesterday", "3 days ago", "3 weeks ago", "5 months ago", "2 years ago". Both
+/// times are Unix milliseconds. A time in the future (a clock that moved back) reads as
+/// "Just now".
+pub fn relative_time(then_ms: i64, now_ms: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let secs = (now_ms - then_ms).max(0) / 1000;
+    let plural = |count: i64, unit: &str| {
+        if count == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{count} {unit}s ago")
+        }
+    };
+    if secs < MINUTE {
+        "Just now".to_string()
+    } else if secs < HOUR {
+        format!("{}m ago", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{}h ago", secs / HOUR)
+    } else if secs < 2 * DAY {
+        "Yesterday".to_string()
+    } else if secs < 14 * DAY {
+        plural(secs / DAY, "day")
+    } else if secs < 60 * DAY {
+        plural(secs / (7 * DAY), "week")
+    } else if secs < 365 * DAY {
+        plural(secs / (30 * DAY), "month")
+    } else {
+        plural(secs / (365 * DAY), "year")
+    }
+}
+
 /// "0.4s", "4.2s", "1m 5s", "1h 15m".
 fn seconds(ms: u64) -> String {
     let tenths = (ms + 50) / 100;
@@ -336,6 +383,35 @@ mod tests {
         assert_eq!(turn_caption(Some(4_523_417), None, false), "Done in 1h 15m");
         assert_eq!(turn_caption(None, None, false), "Done");
         assert_eq!(turn_caption(Some(1_000), Some(0.5), true), "Stopped");
+    }
+
+    #[test]
+    fn elapsed_reads_like_the_thread_list() {
+        assert_eq!(elapsed(0), "0s");
+        assert_eq!(elapsed(12), "12s");
+        assert_eq!(elapsed(72), "1m 12s");
+        assert_eq!(elapsed(3_599), "59m 59s");
+        assert_eq!(elapsed(3 * 3600 + 12 * 60 + 40), "3h 12m");
+    }
+
+    #[test]
+    fn relative_time_reads_like_the_thread_list() {
+        let now = 1_000_000_000_000;
+        let ago = |secs: i64| relative_time(now - secs * 1000, now);
+        assert_eq!(ago(0), "Just now");
+        assert_eq!(ago(59), "Just now");
+        assert_eq!(ago(60), "1m ago");
+        assert_eq!(ago(4 * 60 + 30), "4m ago");
+        assert_eq!(ago(2 * 3600), "2h ago");
+        assert_eq!(ago(30 * 3600), "Yesterday");
+        assert_eq!(ago(2 * 86_400), "2 days ago");
+        assert_eq!(ago(9 * 86_400), "9 days ago");
+        assert_eq!(ago(21 * 86_400), "3 weeks ago");
+        assert_eq!(ago(90 * 86_400), "3 months ago");
+        assert_eq!(ago(365 * 86_400), "1 year ago");
+        assert_eq!(ago(800 * 86_400), "2 years ago");
+        // A clock that moved back never shows a negative time.
+        assert_eq!(relative_time(now + 5_000, now), "Just now");
     }
 
     #[test]

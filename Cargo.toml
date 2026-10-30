@@ -30,3 +30,6 @@ ely-gpui-component = "=0.1.1"
 gpui = { package = "gpui-pre", version = "=0.3.10" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }
 newjen-core = { path = "crates/core" }
+# macOS's own API, for the one setting GPUI and Ely do not read themselves (Reduce Motion).
+# GPUI already builds this crate, so it adds nothing new to the build.
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
