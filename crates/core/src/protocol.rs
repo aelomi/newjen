@@ -498,6 +498,16 @@ impl ResultMessage {
         )
     }
 
+    /// True when this failed result says the `--resume` session does not exist, e.g.
+    /// `"No conversation found with session ID: …"` (seen live in `errors`; see the
+    /// `error_bad_resume` fixture).
+    pub fn is_missing_conversation(&self) -> bool {
+        let says_so = |text: &str| text.contains("No conversation found");
+        self.is_error
+            && (self.error_lines().iter().any(|line| says_so(line))
+                || self.result.as_deref().is_some_and(says_so))
+    }
+
     /// The `errors` list as readable lines.
     pub fn error_lines(&self) -> Vec<String> {
         let errors = self.errors.as_deref().unwrap_or(&[]);
@@ -660,17 +670,80 @@ pub fn session_scope(request: &PermissionRequest) -> SessionScope {
     if EDIT_TOOLS.contains(&request.tool_name.as_str()) {
         return SessionScope::OnceOnly(OnceReason::Edit);
     }
-    let permissions = session_permissions(request);
-    if permissions.is_empty() {
+    let rules = session_rules(request);
+    if rules.is_empty() {
         return SessionScope::OnceOnly(OnceReason::NoSafeRule);
     }
-    let texts = permissions
+    SessionScope::Remembers(rules.iter().map(SessionRule::label).collect())
+}
+
+/// One rule that "Always allow" remembers: one Bash command (`touch a.txt`), or one MCP tool.
+/// A thread saves these and passes them back to every new claude with `--allowedTools`, so a
+/// resumed conversation keeps them (see `thread.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRule {
+    /// The tool the rule is for, e.g. `Bash` or `mcp__linear__list_issues`.
+    pub tool_name: String,
+    /// What the rule allows, e.g. the Bash command `npm test *`. `None` for a rule that names
+    /// one MCP tool and nothing else.
+    pub rule_content: Option<String>,
+}
+
+impl SessionRule {
+    /// The rule in the CLI's own notation, which `--allowedTools` takes: `Bash(touch a.txt)`,
+    /// or just the tool name for an MCP tool.
+    ///
+    /// The content is escaped the way the CLI writes rules itself: `\` becomes `\\`, and `(`
+    /// and `)` become `\(` and `\)`. claude un-escapes `--allowedTools` values when it reads
+    /// them (checked in claude 2.1.314), so without this a command such as
+    /// `sed 's/\(a\)/b/' f` would come back as a different command and no longer match.
+    pub fn cli_rule(&self) -> String {
+        match &self.rule_content {
+            Some(content) => format!("{}({})", self.tool_name, escape_rule_content(content)),
+            None => self.tool_name.clone(),
+        }
+    }
+
+    /// The text the approval dock and the grants list show: the rule's content (a command),
+    /// or `server · tool` for an MCP tool.
+    pub fn label(&self) -> String {
+        match &self.rule_content {
+            Some(content) => content.clone(),
+            None => crate::transcript::display_name(&self.tool_name),
+        }
+    }
+}
+
+/// Escapes a rule's content for the CLI's `Tool(content)` notation, exactly as claude does it
+/// itself. The backslash goes first, so the backslashes added for brackets are not doubled.
+fn escape_rule_content(content: &str) -> String {
+    content
+        .replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
+}
+
+/// The rules answering `request` with [`PermissionAnswer::AllowForSession`] makes the CLI
+/// remember. Read from the very `updatedPermissions` that answer sends, so what Newjen saves is
+/// always exactly what the CLI was told. Empty when "Always allow" acts as allow once.
+pub fn session_rules(request: &PermissionRequest) -> Vec<SessionRule> {
+    session_permissions(request)
         .iter()
         .filter_map(|permission| permission.get("rules").and_then(Value::as_array))
         .flatten()
-        .map(rule_text)
-        .collect();
-    SessionScope::Remembers(texts)
+        .filter_map(|rule| {
+            let tool_name = rule.get("toolName").and_then(Value::as_str)?.to_string();
+            let rule_content = rule
+                .get("ruleContent")
+                .and_then(Value::as_str)
+                .filter(|content| !content.trim().is_empty())
+                .map(str::to_string);
+            Some(SessionRule {
+                tool_name,
+                rule_content,
+            })
+        })
+        .collect()
 }
 
 /// True if answering `request` with [`PermissionAnswer::AllowForSession`] really makes the
@@ -771,14 +844,6 @@ fn bare_mcp_tool(rule: &Value) -> Option<&str> {
     // `mcp__server` alone would allow every tool of that server: require `mcp__server__tool`.
     let (server, name) = tool.strip_prefix("mcp__")?.split_once("__")?;
     (!server.is_empty() && !name.is_empty()).then_some(tool)
-}
-
-/// The readable text of one forwarded rule: its content, or the MCP tool's display name.
-fn rule_text(rule: &Value) -> String {
-    match rule.get("ruleContent").and_then(Value::as_str) {
-        Some(content) if !content.trim().is_empty() => content.to_string(),
-        _ => crate::transcript::display_name(bare_mcp_tool(rule).unwrap_or_default()),
-    }
 }
 
 /// The error reply to a control request Newjen does not handle, so the CLI never waits for an
@@ -1085,6 +1150,141 @@ mod tests {
             SessionScope::OnceOnly(OnceReason::Edit)
         );
         assert!(session_answer_is_allow_once(&request));
+    }
+
+    #[test]
+    fn session_rules_match_what_the_answer_sends() {
+        let request = bash_request(vec![json!({"type": "addRules", "rules": [
+            {"toolName": "Bash", "ruleContent": "git add:*"}],
+            "behavior": "allow", "destination": "localSettings"})]);
+        let rules = session_rules(&request);
+        assert_eq!(
+            rules,
+            [SessionRule {
+                tool_name: "Bash".to_string(),
+                rule_content: Some("git add:*".to_string()),
+            }]
+        );
+        assert_eq!(rules[0].cli_rule(), "Bash(git add:*)");
+        assert_eq!(rules[0].label(), "git add:*");
+
+        // No suggestion: the exact command.
+        let rules = session_rules(&bash_request(vec![]));
+        assert_eq!(rules[0].cli_rule(), "Bash(touch a.txt)");
+
+        // A command with backslashes and brackets: escaped for `--allowedTools`, while the
+        // label (and the session rule claude was sent) keep it as it is.
+        let mut sed = bash_request(vec![]);
+        sed.input = json!({"command": r"sed -i 's/\(a\)/b/' f"});
+        let rules = session_rules(&sed);
+        assert_eq!(
+            rules[0].rule_content.as_deref(),
+            Some(r"sed -i 's/\(a\)/b/' f")
+        );
+        assert_eq!(rules[0].cli_rule(), r"Bash(sed -i 's/\\\(a\\\)/b/' f)");
+        assert_eq!(rules[0].label(), r"sed -i 's/\(a\)/b/' f");
+
+        // One MCP tool, by name only.
+        let request = request_with(
+            "mcp__pencil__get_style",
+            json!({"type": "addRules", "rules": [{"toolName": "mcp__pencil__get_style"}],
+                   "behavior": "allow", "destination": "localSettings"}),
+        );
+        let rules = session_rules(&request);
+        assert_eq!(rules[0].cli_rule(), "mcp__pencil__get_style");
+        assert_eq!(rules[0].label(), "pencil · get_style");
+
+        // Nothing for edits or whole tools, as `session_scope` says.
+        let mut edit = bash_request(vec![]);
+        edit.tool_name = "Write".to_string();
+        assert!(session_rules(&edit).is_empty());
+        let mut search = bash_request(vec![]);
+        search.tool_name = "WebSearch".to_string();
+        assert!(session_rules(&search).is_empty());
+    }
+
+    /// How claude 2.1.314 reads an `--allowedTools` value (its `AJ` and `rms` functions): the
+    /// content runs from the first `(` to the final `)` that no backslash escapes, then `\(`,
+    /// `\)` and `\\` are un-escaped. Returns the tool and the content.
+    fn read_like_the_cli(rule: &str) -> (String, Option<String>) {
+        let escaped =
+            |at: usize| rule[..at].chars().rev().take_while(|c| *c == '\\').count() % 2 == 1;
+        let open = rule
+            .char_indices()
+            .find(|(at, c)| *c == '(' && !escaped(*at));
+        let close = rule
+            .char_indices()
+            .rev()
+            .find(|(at, c)| *c == ')' && !escaped(*at));
+        match (open, close) {
+            (Some((open, _)), Some((close, _))) if close == rule.len() - 1 && close > open => {
+                let content = rule[open + 1..close]
+                    .replace("\\(", "(")
+                    .replace("\\)", ")")
+                    .replace("\\\\", "\\");
+                (rule[..open].to_string(), Some(content))
+            }
+            _ => (rule.to_string(), None),
+        }
+    }
+
+    #[test]
+    fn rule_strings_are_escaped_as_the_cli_reads_them() {
+        let bash = |content: &str| SessionRule {
+            tool_name: "Bash".to_string(),
+            rule_content: Some(content.to_string()),
+        };
+        // (command, what `--allowedTools` gets). The first four were also verified live.
+        let cases = [
+            ("touch one.txt", "Bash(touch one.txt)"),
+            ("echo a,b", "Bash(echo a,b)"),
+            (r#"echo "hi there""#, r#"Bash(echo "hi there")"#),
+            ("git add:*", "Bash(git add:*)"),
+            (r#"echo "it's (here)""#, r#"Bash(echo "it's \(here\)")"#),
+            (
+                r"sed 's/\(foo\)/bar/' a.txt",
+                r"Bash(sed 's/\\\(foo\\\)/bar/' a.txt)",
+            ),
+            (r"printf 'a\\nb' > f", r"Bash(printf 'a\\\\nb' > f)"),
+            (r"echo a\", r"Bash(echo a\\)"),
+        ];
+        for (command, cli) in cases {
+            let rule = bash(command);
+            assert_eq!(rule.cli_rule(), cli);
+            // claude gets back exactly the command the user approved.
+            assert_eq!(
+                read_like_the_cli(cli),
+                ("Bash".to_string(), Some(command.to_string()))
+            );
+            // The label stays the command as it is.
+            assert_eq!(rule.label(), command);
+        }
+        let mcp = SessionRule {
+            tool_name: "mcp__pencil__get_style".to_string(),
+            rule_content: None,
+        };
+        assert_eq!(mcp.cli_rule(), "mcp__pencil__get_style");
+        assert_eq!(
+            read_like_the_cli("mcp__pencil__get_style"),
+            ("mcp__pencil__get_style".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn missing_conversation_is_recognised_only_on_errors() {
+        let missing = |is_error: bool| ResultMessage {
+            is_error,
+            errors: Some(vec![json!("No conversation found with session ID: abc")]),
+            ..ResultMessage::default()
+        };
+        assert!(missing(true).is_missing_conversation());
+        assert!(!missing(false).is_missing_conversation());
+        let other = ResultMessage {
+            is_error: true,
+            result: Some("Not logged in".to_string()),
+            ..ResultMessage::default()
+        };
+        assert!(!other.is_missing_conversation());
     }
 
     #[test]

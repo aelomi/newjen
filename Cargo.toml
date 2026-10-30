@@ -18,9 +18,12 @@ publish = false
 anyhow = "=1.0.104"
 async-channel = "=2.5.0"
 libc = "=0.2.191"
+# SQLite with its C source compiled in (`bundled`), so no system library is needed.
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 tempfile = "=3.27.0"
+uuid = { version = "=1.29.0", features = ["v4"] }
 
 # UI (crates/app only; `core` must never use these).
 ely-gpui-component = "=0.1.1"

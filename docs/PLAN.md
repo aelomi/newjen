@@ -9,7 +9,7 @@ Newjen is a macOS-only agent development environment: run many isolated Claude C
 
 Parallel agents and speed. The stack provides both. Workflow/UX and customizability follow from owning the code; they are not v1 features.
 
-**Done when:** you can open a project, start several threads, have each agent work in its own copy, approve its tool calls, review its diff, and land or discard the work, all in a native window that stays light on memory.
+**Done when:** you can open a project, start several threads, have each agent work in the project or in its own Rift copy, approve its tool calls, review its diff, and land or discard the work, all in a native window that stays light on memory.
 
 ## Stack
 
@@ -19,7 +19,7 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 | UI framework | GPUI: `gpui-pre =0.3.10`, `gpui-pre-platform =0.3.10` (`font-kit`) | Version fixed by Ely |
 | Components | Ely: `ely-gpui-component =0.1.1` | Plain pinned dependency; chat, agent, terminal, editor and git (diff) components |
 | Agent | Claude Code CLI (`claude`) over stream-json; Codex CLI (`codex app-server`) next | Newjen detects which CLIs are installed; one provider per thread. API-key providers and ACP later |
-| Isolation | Rift (`rift-snapshot`), one APFS copy-on-write copy per thread | Installed |
+| Isolation | Rift (`rift-snapshot`), an APFS copy-on-write copy, opt-in per thread | Installed. By default a thread works in the project folder; no git worktrees for now |
 | Version control | jj 0.46.0, colocated with git | Installed |
 | Code hosting | GitCafe (git.cafe), a normal git remote; `jj git push` | `cafe` 0.11.0 installed via Bun 1.4.4. Still needed: run `cafe auth login`. Private repos are free during the beta |
 | Storage | SQLite (threads, settings); Claude keeps its own transcripts | Resume with `--resume <session-id>` |
@@ -56,11 +56,11 @@ crates/
 
 - **Core owns state.** It runs one actor per thread, which owns the `claude` child process and emits typed events: text, tool use, approval needed, result, error.
 - **The app subscribes to those events** and renders them with Ely (`chat`, `agent` permissions, `git` diff viewer).
-- **Thread model:** project → threads. Each thread has one Rift copy, one Claude process and one landing mode.
+- **Thread model:** project → threads. Each thread has its own working folder (the project folder by default, or its own Rift copy when you choose one), one Claude process and one landing mode. A thread always runs from the same folder, because Claude ties `--resume` to the folder a conversation started in.
 
 ## Thread lifecycle
 
-1. **New thread:** snapshot the original (`jj status`), run `rift create --copy-all`, then `jj new` in the copy. Rift `postcreate` hooks run per-copy setup, such as rebuilding venvs or starting services named with `$RIFT_ID`.
+1. **New thread:** works in the project folder unless you choose a Rift copy (decided 2026-10-30: Rift is a choice, like worktrees are elsewhere, and must be seamless when chosen). For a Rift copy: snapshot the original (`jj status`), run `rift create --copy-all`, then `jj new` in the copy. Rift `postcreate` hooks run per-copy setup, such as rebuilding venvs or starting services named with `$RIFT_ID`.
 2. **Run:** spawn `claude` with the copy as its working directory, stream events, and surface approvals in the UI.
 3. **Land work** using one of two modes, chosen per thread with a project default:
    - **Harness-managed:** the agent is told not to commit. At the end of each turn the harness snapshots the copy with jj (`jj describe`/`jj new`). You review the diff in the app, then:
@@ -96,13 +96,13 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 1. **Slice (done 2026-10-27):** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in Ely chat, with approve/deny working. One thread, no Rift, no jj.
 2. Threads list, SQLite persistence, resume. Decided 2026-10-30 ([memo](research/threads-and-persistence.md)):
    - **Store:** `~/Library/Application Support/Newjen/newjen.db` (`NEWJEN_HOME` overrides it), WAL, migrations by `user_version`. Tables: projects, threads (with `provider`, the Claude session id and an unread flag), rendered transcript items, and grants. Writes run off the UI thread, at checkpoints only, never per streamed token.
-   - **Resume:** the Claude session id is allocated when the thread is created: `--session-id` until `init` arrives, `--resume` after.
+   - **Resume:** the Claude session id is allocated when the thread is created: `--session-id` until `init` arrives, `--resume` after. Each thread stores its own working folder and always spawns from it, so slice 3 only has to set it to a Rift copy.
    - **Relaunch:** approvals left pending show as expired and running work as interrupted. Continuing is manual; nothing restarts on its own.
    - **Processes:** a thread's `claude` keeps running when you switch away, and stops after 30 minutes idle, never mid-turn or with an approval pending. Quitting stops all of them.
    - **Grants:** "Always allow" rules are saved per thread and re-applied at every spawn with `--allowedTools`, so the dock says "for this thread". They can be listed and revoked.
    - **List:** new threads on top, a status per thread (needs approval, working, failed, stopped, unread), titles from the first message (no hidden model calls). ⌘N opens a draft that is saved only once its first message is sent, so empty threads never pile up. The sidebar hides below 760 px of window width (⌘B toggles it) and shows a dot when a hidden thread needs you. Mocks: `design/newjen.pen` screens 8–12.
    - **Deferred:** deny with a note. The approval dock replaces the composer, so it needs its own text field; it moves to slice 4 with the diff view.
-3. One Rift copy per thread, with postcreate hooks.
+3. Rift copies, chosen per thread when you create it, with postcreate hooks. The default stays the project folder. Landing (slice 4) must handle both kinds of thread.
 4. jj snapshots, diff view (`ely-git`), and both landing modes.
 5. Parallel threads, notifications (Dock badge), and a terminal panel (`ely-terminal`).
 

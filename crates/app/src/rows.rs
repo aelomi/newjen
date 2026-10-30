@@ -13,6 +13,7 @@ use gpui::{
     AnyElement, App, ElementId, IntoElement, ParentElement, SharedString, Styled, Window, div,
     prelude::*,
 };
+use newjen_core::transcript::{FRESH_START_NOTE, STOPPED_ON_QUIT, UNREADABLE_NOTE};
 use newjen_core::{Item, ToolState};
 
 use crate::approval::ScopeRow;
@@ -102,6 +103,11 @@ pub fn item(item: &Item, is_last: bool, retry: Option<&OnRestart>, cx: &mut App)
         Item::Error {
             id, title, detail, ..
         } => error(("error", *id).into(), title, detail, retry),
+        // Quiet rows from saved threads. Their final design (with the Continue button) comes
+        // with the thread list.
+        Item::Stopped { .. } => caption_row(IconName::Square, STOPPED_ON_QUIT.to_string(), cx),
+        Item::FreshStart { .. } => caption_row(IconName::Info, FRESH_START_NOTE.to_string(), cx),
+        Item::Unreadable { .. } => caption_row(IconName::Info, UNREADABLE_NOTE.to_string(), cx),
     }
 }
 
@@ -186,7 +192,8 @@ pub fn step_state(state: ToolState) -> StepState {
         ToolState::Running => StepState::Working,
         ToolState::Waiting => StepState::Waiting,
         ToolState::Done => StepState::Done,
-        ToolState::Denied | ToolState::Failed => StepState::Failed,
+        // An expired approval shows its note ("Newjen quit before you answered") as its result.
+        ToolState::Denied | ToolState::Failed | ToolState::Expired => StepState::Failed,
     }
 }
 

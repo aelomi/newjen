@@ -94,6 +94,17 @@ const LAUNCHER: &str = "(trap '' TERM; read _ <&3; kill -TERM 0; sleep 2; kill -
 /// The fd number the watcher reads (see `LAUNCHER`).
 const WATCH_FD: libc::c_int = 3;
 
+/// Which Claude conversation a new `claude` process works on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Conversation {
+    /// `--session-id <id>`: start a new conversation with this id. Newjen picks the id itself
+    /// (a v4 UUID), so it is known before claude starts. Fails if the id is already in use.
+    New(String),
+    /// `--resume <id>`: continue a saved conversation. Fails if claude has no conversation
+    /// with that id. (claude does not replay the earlier messages on stdout.)
+    Resume(String),
+}
+
 /// How to start the CLI.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
@@ -101,8 +112,13 @@ pub struct SessionConfig {
     pub program: PathBuf,
     /// The project directory the agent works in.
     pub cwd: PathBuf,
-    /// A Claude session id to continue (`--resume <id>`).
-    pub resume: Option<String>,
+    /// The conversation to start or continue. `None` lets claude pick a new id itself.
+    pub conversation: Option<Conversation>,
+    /// Rules claude may use without asking, each passed as its own `--allowedTools <rule>`
+    /// pair, e.g. `Bash(touch one.txt)` or `mcp__pencil__get_style` (see
+    /// `protocol::SessionRule::cli_rule`). This is how a thread's "Always allow" grants
+    /// outlive the claude process that first heard them.
+    pub allowed_tools: Vec<String>,
     /// Extra command-line arguments, appended after Newjen's own.
     pub extra_args: Vec<String>,
     /// Extra environment variables for the child. Mostly for tests (to drive the fake CLI).
@@ -118,7 +134,8 @@ impl SessionConfig {
         SessionConfig {
             program: find_claude(),
             cwd: cwd.into(),
-            resume: None,
+            conversation: None,
+            allowed_tools: Vec::new(),
             extra_args: Vec::new(),
             env: Vec::new(),
             interrupt_ack_timeout: INTERRUPT_ACK_TIMEOUT,
@@ -143,9 +160,22 @@ impl SessionConfig {
         .iter()
         .map(|arg| arg.to_string())
         .collect();
-        if let Some(session_id) = &self.resume {
-            args.push("--resume".to_string());
-            args.push(session_id.clone());
+        match &self.conversation {
+            Some(Conversation::New(session_id)) => {
+                args.push("--session-id".to_string());
+                args.push(session_id.clone());
+            }
+            Some(Conversation::Resume(session_id)) => {
+                args.push("--resume".to_string());
+                args.push(session_id.clone());
+            }
+            None => {}
+        }
+        // One flag per rule. The CLI accepts several rules after one flag too, but then splits
+        // them on spaces and commas, which would break rules such as `Bash(echo a,b)`.
+        for rule in &self.allowed_tools {
+            args.push("--allowedTools".to_string());
+            args.push(rule.clone());
         }
         args.extend(self.extra_args.iter().cloned());
         args
@@ -711,7 +741,7 @@ mod tests {
     #[test]
     fn args_include_the_protocol_flags_and_resume() {
         let mut config = SessionConfig::new("/tmp");
-        config.resume = Some("abc".to_string());
+        config.conversation = Some(Conversation::Resume("abc".to_string()));
         config.extra_args = vec!["--x".to_string()];
         let args = config.args();
         assert_eq!(args[0], "-p");
@@ -719,5 +749,40 @@ mod tests {
         assert!(!args.contains(&"--model".to_string()));
         let tail: Vec<&str> = args[args.len() - 3..].iter().map(String::as_str).collect();
         assert_eq!(tail, ["--resume", "abc", "--x"]);
+    }
+
+    #[test]
+    fn args_start_a_new_conversation_with_one_allowed_tools_flag_per_rule() {
+        let mut config = SessionConfig::new("/tmp");
+        config.conversation = Some(Conversation::New("id-1".to_string()));
+        config.allowed_tools = vec![
+            "Bash(touch one.txt)".to_string(),
+            "Bash(echo a,b)".to_string(),
+            "mcp__pencil__get_style".to_string(),
+        ];
+        let args = config.args();
+        assert!(!args.contains(&"--resume".to_string()));
+        let tail: Vec<&str> = args[args.len() - 8..].iter().map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            [
+                "--session-id",
+                "id-1",
+                "--allowedTools",
+                "Bash(touch one.txt)",
+                "--allowedTools",
+                "Bash(echo a,b)",
+                "--allowedTools",
+                "mcp__pencil__get_style",
+            ]
+        );
+    }
+
+    #[test]
+    fn args_without_a_conversation_let_claude_pick_one() {
+        let args = SessionConfig::new("/tmp").args();
+        assert!(!args.contains(&"--resume".to_string()));
+        assert!(!args.contains(&"--session-id".to_string()));
+        assert!(!args.contains(&"--allowedTools".to_string()));
     }
 }

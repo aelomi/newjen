@@ -30,8 +30,8 @@ use gpui::{
     Task, Window, div, font, prelude::*, px,
 };
 use newjen_core::{
-    Item, PermissionAnswer, Session, SessionConfig, SessionEvent, Status, ToolState, Transcript,
-    session_scope,
+    Conversation, Item, PermissionAnswer, Session, SessionConfig, SessionEvent, Status, ToolState,
+    Transcript, session_scope,
 };
 
 use crate::approval::{self, Room};
@@ -190,7 +190,7 @@ impl ChatView {
         }
 
         let mut config = SessionConfig::new(self.project.clone());
-        config.resume = resume;
+        config.conversation = resume.map(Conversation::Resume);
         let program = config.program.clone();
         match Session::spawn(config) {
             Ok((session, events)) => {

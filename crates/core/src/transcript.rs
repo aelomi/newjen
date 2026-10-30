@@ -7,11 +7,16 @@
 //!
 //! It never talks to the process itself. The app calls `Session::answer` and then
 //! [`Transcript::resolve_approval`] with the same answer.
+//!
+//! Items are saved to the store (see `store.rs`) as JSON, one row per item. The transcript
+//! remembers the lowest index that changed since the last save ([`Transcript::dirty_from`]),
+//! so a save rewrites only the rows from there on.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::protocol::{
@@ -23,8 +28,30 @@ use crate::session::SessionEvent;
 /// How many stderr lines to keep for the "Claude exited" error.
 const STDERR_LINES_KEPT: usize = 20;
 
-/// What the conversation is doing right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The version of the JSON shape [`Item`]s are saved in. Saved next to each row, so a later
+/// Newjen can tell old rows from new ones. Bump it when a change would make old rows load
+/// wrongly (renaming or removing a field or variant); adding a field with a default does not
+/// need it.
+pub const ITEM_SCHEMA_VERSION: u32 = 1;
+
+/// The notice added when Newjen quit (or crashed) while a thread was working or waiting.
+pub const STOPPED_ON_QUIT: &str = "Stopped when Newjen quit";
+/// The line under [`STOPPED_ON_QUIT`], next to its Continue button.
+pub const STOPPED_ON_QUIT_DETAIL: &str = "Nothing runs until you continue.";
+/// Why an approval left unanswered at quit is [`ToolState::Expired`]. Shown as
+/// "Expired · Newjen quit before you answered".
+pub const EXPIRED_NOTE: &str = "Newjen quit before you answered";
+/// The note on a tool call that was still running when Newjen quit.
+pub const STOPPED_TOOL_NOTE: &str = "Stopped when Newjen quit";
+/// The quiet row where a conversation had to start over because Claude no longer had it.
+pub const FRESH_START_NOTE: &str = "Claude no longer has the earlier conversation; it starts \
+                                    fresh from here (earlier messages stay visible)";
+/// The quiet row shown for a saved row this version of Newjen cannot read.
+pub const UNREADABLE_NOTE: &str = "This row was saved by a different version of Newjen";
+
+/// What the conversation is doing right now. Saved with the thread (see [`Status::as_str`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     /// Nothing sent yet.
     Idle,
@@ -40,8 +67,41 @@ pub enum Status {
     Failed,
 }
 
+impl Status {
+    /// The name the store saves, e.g. `"working"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Idle => "idle",
+            Status::Working => "working",
+            Status::Waiting => "waiting",
+            Status::Done => "done",
+            Status::Stopped => "stopped",
+            Status::Failed => "failed",
+        }
+    }
+
+    /// Reads a name saved by [`Status::as_str`]. A name this version does not know (saved by
+    /// a newer Newjen) reads as `Idle`, the quietest status, rather than failing the thread.
+    pub fn from_saved(name: &str) -> Status {
+        match name {
+            "working" => Status::Working,
+            "waiting" => Status::Waiting,
+            "done" => Status::Done,
+            "stopped" => Status::Stopped,
+            "failed" => Status::Failed,
+            _ => Status::Idle,
+        }
+    }
+
+    /// True while a turn is running: Claude is working, or waiting for an approval.
+    pub fn is_busy(self) -> bool {
+        matches!(self, Status::Working | Status::Waiting)
+    }
+}
+
 /// The state of one tool call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolState {
     Running,
     /// Waiting for the user's approval.
@@ -51,11 +111,18 @@ pub enum ToolState {
     Denied,
     /// The tool ran and reported an error, or the turn ended before it finished.
     Failed,
+    /// It was waiting for an approval when Newjen quit, so the question can no longer be
+    /// answered (see [`EXPIRED_NOTE`]).
+    Expired,
 }
 
 /// One row of the conversation. Every item has an `id` that never changes, so a UI can use it
 /// as a stable element id.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Saved as JSON with a `"type"` field naming the variant, e.g.
+/// `{"type":"user","id":1,"text":"hi"}` (see [`Item::to_saved`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
     User {
         id: u64,
@@ -93,6 +160,26 @@ pub enum Item {
         title: String,
         detail: String,
     },
+    /// Newjen quit (or crashed) while the thread was working or waiting, so the turn was
+    /// stopped. Shown as [`STOPPED_ON_QUIT`] / [`STOPPED_ON_QUIT_DETAIL`] with a Continue
+    /// button. Added by [`Transcript::normalize_after_relaunch`].
+    Stopped {
+        id: u64,
+    },
+    /// Claude no longer had the earlier conversation, so a new one starts here. The rows above
+    /// stay visible but Claude does not remember them. Shown as [`FRESH_START_NOTE`].
+    FreshStart {
+        id: u64,
+    },
+    /// A saved row this version of Newjen cannot read (written by a newer or older version).
+    /// Shown as a quiet [`UNREADABLE_NOTE`] row. Keeps the saved row as it was, so saving the
+    /// thread again never destroys it.
+    #[serde(skip)]
+    Unreadable {
+        id: u64,
+        schema_version: u32,
+        json: String,
+    },
 }
 
 impl Item {
@@ -103,7 +190,55 @@ impl Item {
             | Item::Assistant { id, .. }
             | Item::Tool { id, .. }
             | Item::TurnEnd { id, .. }
-            | Item::Error { id, .. } => *id,
+            | Item::Error { id, .. }
+            | Item::Stopped { id }
+            | Item::FreshStart { id }
+            | Item::Unreadable { id, .. } => *id,
+        }
+    }
+
+    /// The item as the store saves it: the schema version and the JSON text.
+    pub fn to_saved(&self) -> (u32, String) {
+        match self {
+            // Written back exactly as it was read.
+            Item::Unreadable {
+                schema_version,
+                json,
+                ..
+            } => (*schema_version, json.clone()),
+            // Cannot fail for these types (every map key is a string). If it ever did, the
+            // empty text reads back as an `Unreadable` row instead of losing the thread.
+            item => (
+                ITEM_SCHEMA_VERSION,
+                serde_json::to_string(item).unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Reads a row saved by [`Item::to_saved`]. Never fails: a row from another schema
+    /// version, an unknown variant or broken JSON becomes [`Item::Unreadable`], so one odd row
+    /// can never stop a thread from opening. Fields this version does not know are ignored.
+    pub fn from_saved(schema_version: u32, json: &str) -> Item {
+        let parsed = (schema_version == ITEM_SCHEMA_VERSION)
+            .then(|| serde_json::from_str::<Item>(json).ok())
+            .flatten();
+        parsed.unwrap_or_else(|| Item::Unreadable {
+            id: 0,
+            schema_version,
+            json: json.to_string(),
+        })
+    }
+
+    fn set_id(&mut self, new_id: u64) {
+        match self {
+            Item::User { id, .. }
+            | Item::Assistant { id, .. }
+            | Item::Tool { id, .. }
+            | Item::TurnEnd { id, .. }
+            | Item::Error { id, .. }
+            | Item::Stopped { id }
+            | Item::FreshStart { id }
+            | Item::Unreadable { id, .. } => *id = new_id,
         }
     }
 }
@@ -131,6 +266,9 @@ pub struct Transcript {
     api_error_text: Option<String>,
     /// The last few stderr lines, shown if the process exits unexpectedly.
     stderr_tail: VecDeque<String>,
+    /// The lowest index of `items` that changed since the last save (see
+    /// [`Transcript::dirty_from`]). `None` when everything is saved.
+    dirty_from: Option<usize>,
 }
 
 impl Default for Transcript {
@@ -154,7 +292,30 @@ impl Transcript {
             previous_total_cost: None,
             api_error_text: None,
             stderr_tail: VecDeque::new(),
+            dirty_from: None,
         }
+    }
+
+    /// A transcript rebuilt from saved items and status (see `Thread::load`). Item ids are
+    /// kept, so new items continue after the highest one; rows that could not be read get new
+    /// ids after that. Call [`Transcript::normalize_after_relaunch`] next.
+    pub fn from_saved(cwd: impl Into<PathBuf>, items: Vec<Item>, status: Status) -> Self {
+        let mut transcript = Self::with_cwd(cwd);
+        let highest = items.iter().map(Item::id).max().unwrap_or(0);
+        transcript.next_id = highest + 1;
+        transcript.items = items;
+        let mut seen = std::collections::HashSet::new();
+        for ix in 0..transcript.items.len() {
+            let id = transcript.items[ix].id();
+            // An unreadable row has no id (0), and a damaged file could repeat one; either
+            // would confuse a UI that keys elements by id, so give those a new one.
+            if id == 0 || !seen.insert(id) {
+                let fresh = transcript.new_id();
+                transcript.items[ix].set_id(fresh);
+            }
+        }
+        transcript.status = status;
+        transcript
     }
 
     /// Like [`Transcript::new`], but file paths inside `cwd` are shown relative to it right
@@ -188,14 +349,95 @@ impl Transcript {
         self.pending.front()
     }
 
+    /// The lowest item index that changed since the last [`Transcript::mark_saved`], or `None`
+    /// if nothing did. Saving rewrites the rows from here on (see `Store::replace_items`).
+    pub fn dirty_from(&self) -> Option<usize> {
+        self.dirty_from
+    }
+
+    /// Records that every item up to now has been saved.
+    pub fn mark_saved(&mut self) {
+        self.dirty_from = None;
+    }
+
+    /// Records that the items from `position` on must be saved again, for example because the
+    /// write that saved them failed (see `Thread::load` and `Store::write_errors`).
+    pub fn mark_changed_from(&mut self, position: usize) {
+        // Never past the end: saving from the end still clears any stale rows after it.
+        self.touch(position.min(self.items.len()));
+    }
+
     /// Adds the user's prompt and marks the conversation as working.
     pub fn push_user(&mut self, text: &str) {
         let id = self.new_id();
-        self.items.push(Item::User {
+        self.push(Item::User {
             id,
             text: text.to_string(),
         });
         self.status = Status::Working;
+    }
+
+    /// Adds the quiet row saying the conversation starts over here (see [`Item::FreshStart`]).
+    pub fn push_fresh_start(&mut self) {
+        let id = self.new_id();
+        self.push(Item::FreshStart { id });
+    }
+
+    /// Ends the turn with an error the app found itself (for example claude could not be
+    /// started again), the same way a failed turn ends.
+    pub fn fail(&mut self, title: &str, detail: String) {
+        self.finish_turn();
+        self.close_unfinished_tools("The turn ended before this finished.");
+        self.push_error(title, detail);
+        self.status = Status::Failed;
+    }
+
+    /// Settles what an earlier run of Newjen left unfinished, because nothing of it is still
+    /// running: Newjen quit (or crashed) in the middle of it. Applied when a thread is loaded,
+    /// and at quit so the saved thread already looks like this.
+    ///
+    /// - An approval that was waiting expires ([`ToolState::Expired`]).
+    /// - A tool call that was running is marked stopped ([`STOPPED_TOOL_NOTE`]).
+    /// - A reply that was still streaming is marked interrupted.
+    /// - If the thread was working or waiting, it becomes `Stopped` and an [`Item::Stopped`]
+    ///   notice is added, with a Continue button. Nothing restarts on its own.
+    ///
+    /// Running it twice changes nothing the second time.
+    pub fn normalize_after_relaunch(&mut self) {
+        for ix in 0..self.items.len() {
+            let changed = match &mut self.items[ix] {
+                Item::Tool { state, output, .. } if *state == ToolState::Waiting => {
+                    *state = ToolState::Expired;
+                    output.get_or_insert_with(|| EXPIRED_NOTE.to_string());
+                    true
+                }
+                Item::Tool { state, output, .. } if *state == ToolState::Running => {
+                    // Shown like a call the user stopped (see `close_unfinished_tools`).
+                    *state = ToolState::Failed;
+                    output.get_or_insert_with(|| STOPPED_TOOL_NOTE.to_string());
+                    true
+                }
+                Item::Assistant {
+                    live, interrupted, ..
+                } if *live => {
+                    *live = false;
+                    *interrupted = true;
+                    true
+                }
+                _ => false,
+            };
+            if changed {
+                self.touch(ix);
+            }
+        }
+        self.open_text.clear();
+        self.pending.clear();
+        self.tool_started.clear();
+        if self.status.is_busy() {
+            let id = self.new_id();
+            self.push(Item::Stopped { id });
+            self.status = Status::Stopped;
+        }
     }
 
     /// Records the user's answer to an approval: removes it from the queue and updates the
@@ -311,7 +553,8 @@ impl Transcript {
         }
     }
 
-    /// Live text: each `text_delta` grows the assistant item for its (message, block).
+    /// Live text: each `text_delta` grows the assistant item for its (message, block). The item
+    /// is marked changed, but the thread does not save on these (see `Thread::apply`).
     fn apply_stream_event(&mut self, message: &StreamEventMessage) {
         if message.parent_tool_use_id.is_some() {
             return; // A subagent's stream; slice 1 only shows the main conversation.
@@ -335,7 +578,7 @@ impl Transcript {
                 position
             }
         };
-        if let Some(Item::Assistant { text: current, .. }) = self.items.get_mut(position) {
+        if let Some(Item::Assistant { text: current, .. }) = self.item_mut(position) {
             current.push_str(text);
         }
     }
@@ -369,7 +612,7 @@ impl Transcript {
                     match self.take_open_text(message_id) {
                         Some(position) => {
                             if let Some(Item::Assistant { text: current, .. }) =
-                                self.items.get_mut(position)
+                                self.item_mut(position)
                             {
                                 *current = text.clone();
                             }
@@ -392,11 +635,12 @@ impl Transcript {
             // (`finish_turn` clears `live` at every result), so if the user stopped Claude before
             // any text arrived, an earlier turn's reply is left alone.
             while self.take_open_text(message_id).is_some() {}
-            if let Some(Item::Assistant { interrupted, .. }) = self
+            let latest_live = self
                 .items
-                .iter_mut()
-                .rev()
-                .find(|item| matches!(item, Item::Assistant { live: true, .. }))
+                .iter()
+                .rposition(|item| matches!(item, Item::Assistant { live: true, .. }));
+            if let Some(Item::Assistant { interrupted, .. }) =
+                latest_live.and_then(|position| self.item_mut(position))
             {
                 *interrupted = true;
             }
@@ -477,7 +721,7 @@ impl Transcript {
             .tool_use_id
             .clone()
             .unwrap_or_else(|| request.request_id.clone());
-        if self.find_tool_mut(&tool_use_id).is_none() {
+        if self.tool_position(&tool_use_id).is_none() {
             self.add_tool(&tool_use_id, &request.tool_name, &request.input);
         }
         if let Some(Item::Tool { state, .. }) = self.find_tool_mut(&tool_use_id) {
@@ -528,7 +772,7 @@ impl Transcript {
             self.push_turn_end(result.duration_ms, cost_usd, true);
             self.status = Status::Stopped;
         } else if result.is_error {
-            if is_missing_conversation(result) {
+            if result.is_missing_conversation() {
                 // `--resume` named a session the CLI does not have. Forget it, so the next
                 // restart starts a fresh session instead of failing the same way forever.
                 self.session_id = None;
@@ -587,9 +831,14 @@ impl Transcript {
     /// End-of-turn bookkeeping shared by `result` and process exit: text stops being live,
     /// and unanswered approvals are dropped (the CLI no longer waits for them).
     fn finish_turn(&mut self) {
-        for item in &mut self.items {
-            if let Item::Assistant { live, .. } = item {
+        for ix in 0..self.items.len() {
+            // Only items that really change are marked, so a save after a long conversation
+            // rewrites this turn's rows, not every reply since the start.
+            if let Item::Assistant { live, .. } = &mut self.items[ix]
+                && *live
+            {
                 *live = false;
+                self.touch(ix);
             }
         }
         self.open_text.clear();
@@ -598,26 +847,27 @@ impl Transcript {
 
     /// Tools still running or waiting when a turn ends will never finish: mark them failed.
     fn close_unfinished_tools(&mut self, note: &str) {
-        for item in &mut self.items {
-            if let Item::Tool { state, output, .. } = item
+        for ix in 0..self.items.len() {
+            if let Item::Tool { state, output, .. } = &mut self.items[ix]
                 && matches!(state, ToolState::Running | ToolState::Waiting)
             {
                 *state = ToolState::Failed;
                 if output.is_none() {
                     *output = Some(note.to_string());
                 }
+                self.touch(ix);
             }
         }
     }
 
     fn add_tool(&mut self, tool_use_id: &str, name: &str, input: &Value) {
-        if self.find_tool_mut(tool_use_id).is_some() {
+        if self.tool_position(tool_use_id).is_some() {
             return;
         }
         let id = self.new_id();
         self.tool_started
             .insert(tool_use_id.to_string(), Instant::now());
-        self.items.push(Item::Tool {
+        self.push(Item::Tool {
             id,
             tool_use_id: tool_use_id.to_string(),
             name: name.to_string(),
@@ -630,16 +880,42 @@ impl Transcript {
         });
     }
 
+    /// Where the tool card for `wanted_id` is, if there is one.
+    fn tool_position(&self, wanted_id: &str) -> Option<usize> {
+        self.items.iter().position(
+            |item| matches!(item, Item::Tool { tool_use_id, .. } if tool_use_id == wanted_id),
+        )
+    }
+
+    /// The tool card for `wanted_id`, to change it (so it is marked changed).
     fn find_tool_mut(&mut self, wanted_id: &str) -> Option<&mut Item> {
-        self.items
-            .iter_mut()
-            .find(|item| matches!(item, Item::Tool { tool_use_id, .. } if tool_use_id == wanted_id))
+        let position = self.tool_position(wanted_id)?;
+        self.item_mut(position)
+    }
+
+    /// Item `position`, to change it: marks it changed for the next save.
+    fn item_mut(&mut self, position: usize) -> Option<&mut Item> {
+        if position < self.items.len() {
+            self.touch(position);
+        }
+        self.items.get_mut(position)
+    }
+
+    /// Adds an item at the end and marks it changed for the next save.
+    fn push(&mut self, item: Item) {
+        self.items.push(item);
+        self.touch(self.items.len() - 1);
+    }
+
+    /// Remembers that item `position` changed since the last save.
+    fn touch(&mut self, position: usize) {
+        self.dirty_from = Some(self.dirty_from.map_or(position, |from| from.min(position)));
     }
 
     /// Adds a live assistant item and returns its position.
     fn push_assistant(&mut self, text: String) -> usize {
         let id = self.new_id();
-        self.items.push(Item::Assistant {
+        self.push(Item::Assistant {
             id,
             text,
             live: true,
@@ -650,7 +926,7 @@ impl Transcript {
 
     fn push_turn_end(&mut self, duration_ms: Option<u64>, cost_usd: Option<f64>, stopped: bool) {
         let id = self.new_id();
-        self.items.push(Item::TurnEnd {
+        self.push(Item::TurnEnd {
             id,
             duration_ms,
             cost_usd,
@@ -660,7 +936,7 @@ impl Transcript {
 
     fn push_error(&mut self, title: &str, detail: String) {
         let id = self.new_id();
-        self.items.push(Item::Error {
+        self.push(Item::Error {
             id,
             title: title.to_string(),
             detail,
@@ -672,14 +948,6 @@ impl Transcript {
         self.next_id += 1;
         id
     }
-}
-
-/// True when a failed result says the `--resume` session does not exist, e.g.
-/// `"No conversation found with session ID: …"` (seen live in `errors`).
-fn is_missing_conversation(result: &ResultMessage) -> bool {
-    let says_so = |text: &str| text.contains("No conversation found");
-    result.error_lines().iter().any(|line| says_so(line))
-        || result.result.as_deref().is_some_and(says_so)
 }
 
 /// A friendlier tool name: MCP tools arrive as `mcp__<server>__<tool>` and become
@@ -791,5 +1059,299 @@ mod tests {
             "x"
         );
         assert_eq!(summarize("SomethingElse", &json!({}), None), "");
+    }
+
+    /// One of every kind of item, as a saved thread could hold them.
+    fn every_item() -> Vec<Item> {
+        vec![
+            Item::User {
+                id: 1,
+                text: "hi \"there\"\n🦀".to_string(),
+            },
+            Item::Assistant {
+                id: 2,
+                text: "hello".to_string(),
+                live: false,
+                interrupted: true,
+            },
+            Item::Tool {
+                id: 3,
+                tool_use_id: "toolu_1".to_string(),
+                name: "Bash".to_string(),
+                display_name: "Bash".to_string(),
+                summary: "touch a.txt".to_string(),
+                input: json!({"command": "touch a.txt", "nested": [1, null, {"x": true}]}),
+                state: ToolState::Expired,
+                output: Some("out".to_string()),
+                took: Some(Duration::from_millis(1234)),
+            },
+            Item::TurnEnd {
+                id: 4,
+                duration_ms: Some(963),
+                cost_usd: Some(0.0034),
+                stopped: false,
+            },
+            Item::Error {
+                id: 5,
+                title: "Claude stopped".to_string(),
+                detail: "details".to_string(),
+            },
+            Item::Stopped { id: 6 },
+            Item::FreshStart { id: 7 },
+        ]
+    }
+
+    #[test]
+    fn every_item_survives_saving_and_loading() {
+        for item in every_item() {
+            let (version, json) = item.to_saved();
+            assert_eq!(version, ITEM_SCHEMA_VERSION);
+            assert_eq!(Item::from_saved(version, &json), item, "{json}");
+        }
+    }
+
+    #[test]
+    fn rows_that_cannot_be_read_become_placeholders_and_are_kept_as_they_were() {
+        let rows = [
+            (1, "{not json"),
+            (1, r#"{"type":"hologram","id":9}"#),
+            (1, r#"{"type":"tool","id":9,"state":"teleporting"}"#),
+            (99, r#"{"type":"user","id":9,"text":"from the future"}"#),
+        ];
+        for (version, json) in rows {
+            let item = Item::from_saved(version, json);
+            assert!(matches!(item, Item::Unreadable { .. }), "{json}");
+            // Saving it again writes back exactly what was read.
+            assert_eq!(item.to_saved(), (version, json.to_string()));
+        }
+        // A field this version does not know is ignored, not an error.
+        let item = Item::from_saved(1, r#"{"type":"user","id":3,"text":"hi","mood":"happy"}"#);
+        assert_eq!(
+            item,
+            Item::User {
+                id: 3,
+                text: "hi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn loaded_items_keep_their_ids_and_new_ones_come_after() {
+        let items = vec![
+            Item::User {
+                id: 4,
+                text: "a".to_string(),
+            },
+            Item::from_saved(1, "broken"),
+            // A repeated id (a damaged file) gets a new one.
+            Item::Stopped { id: 4 },
+        ];
+        let mut transcript = Transcript::from_saved("/tmp/p", items, Status::Done);
+        let ids: Vec<u64> = transcript.items().iter().map(Item::id).collect();
+        assert_eq!(ids, [4, 5, 6]);
+        assert_eq!(transcript.dirty_from(), None, "loading is not a change");
+        transcript.push_user("b");
+        assert_eq!(transcript.items()[3].id(), 7);
+        assert_eq!(transcript.dirty_from(), Some(3));
+    }
+
+    #[test]
+    fn statuses_are_saved_by_name() {
+        for status in [
+            Status::Idle,
+            Status::Working,
+            Status::Waiting,
+            Status::Done,
+            Status::Stopped,
+            Status::Failed,
+        ] {
+            assert_eq!(Status::from_saved(status.as_str()), status);
+        }
+        assert_eq!(Status::from_saved("napping"), Status::Idle);
+    }
+
+    fn line(value: Value) -> SessionEvent {
+        SessionEvent::Line(Incoming::from_value(value))
+    }
+
+    #[test]
+    fn only_changed_rows_are_marked_for_saving() {
+        let mut transcript = Transcript::new();
+        assert_eq!(transcript.dirty_from(), None);
+        transcript.push_user("one");
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "text", "text": "first"}]}})));
+        transcript.apply(&line(json!({"type": "result", "subtype": "success",
+            "is_error": false})));
+        assert_eq!(transcript.dirty_from(), Some(0));
+        transcript.mark_saved();
+        assert_eq!(transcript.dirty_from(), None);
+
+        // The second turn's end must not mark the first turn's reply (it is no longer live).
+        transcript.push_user("two");
+        assert_eq!(transcript.dirty_from(), Some(3));
+        transcript.apply(&line(json!({"type": "result", "subtype": "success",
+            "is_error": false})));
+        assert_eq!(transcript.dirty_from(), Some(3));
+        transcript.mark_saved();
+
+        // A streamed word changes the reply being written, so it is marked (but the thread
+        // only saves it at the next checkpoint).
+        transcript.push_user("three");
+        transcript.mark_saved();
+        transcript.apply(&line(
+            json!({"type": "stream_event", "api_message_id": "m3",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "Hel"}}}),
+        ));
+        let reply = transcript.items().len() - 1;
+        assert_eq!(transcript.dirty_from(), Some(reply));
+        transcript.mark_saved();
+        transcript.apply(&line(
+            json!({"type": "stream_event", "api_message_id": "m3",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "lo"}}}),
+        ));
+        assert_eq!(transcript.dirty_from(), Some(reply));
+    }
+
+    #[test]
+    fn a_tool_result_marks_its_card_even_when_it_is_far_up() {
+        let mut transcript = Transcript::new();
+        transcript.push_user("go");
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                         "input": {"command": "ls"}}]}})));
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "text", "text": "while it runs"}]}})));
+        transcript.mark_saved();
+        transcript.apply(&line(json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}})));
+        assert_eq!(transcript.dirty_from(), Some(1));
+    }
+
+    /// A transcript as Newjen left it when it quit: a reply streaming, one tool running, one
+    /// waiting for an approval.
+    fn interrupted_transcript() -> Transcript {
+        let mut transcript = Transcript::with_cwd("/tmp/project");
+        transcript.push_user("go");
+        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                         "input": {"command": "sleep 9"}}]}})));
+        transcript.apply(&line(json!({"type": "control_request", "request_id": "r2",
+            "request": {"subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t2",
+                        "input": {"command": "touch a.txt"}}})));
+        transcript.apply(&line(
+            json!({"type": "stream_event", "api_message_id": "m2",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "Working on"}}}),
+        ));
+        assert_eq!(transcript.status(), Status::Waiting);
+        transcript
+    }
+
+    #[test]
+    fn relaunch_expires_approvals_and_stops_what_was_running() {
+        let saved = interrupted_transcript();
+        let mut transcript =
+            Transcript::from_saved("/tmp/project", saved.items().to_vec(), saved.status());
+        transcript.normalize_after_relaunch();
+
+        assert_eq!(transcript.status(), Status::Stopped);
+        assert!(transcript.pending_approval().is_none());
+        let items = transcript.items();
+        assert!(matches!(
+            &items[1],
+            Item::Tool { state: ToolState::Failed, output: Some(note), .. }
+                if note == STOPPED_TOOL_NOTE
+        ));
+        assert!(matches!(
+            &items[2],
+            Item::Tool { state: ToolState::Expired, output: Some(note), .. }
+                if note == EXPIRED_NOTE
+        ));
+        assert!(matches!(
+            &items[3],
+            Item::Assistant {
+                live: false,
+                interrupted: true,
+                ..
+            }
+        ));
+        assert!(matches!(items[4], Item::Stopped { .. }));
+        assert_eq!(items.len(), 5);
+        assert_eq!(transcript.dirty_from(), Some(1));
+
+        // Settling twice (at quit, then again at the next launch) adds nothing.
+        transcript.mark_saved();
+        transcript.normalize_after_relaunch();
+        assert_eq!(transcript.items().len(), 5);
+        assert_eq!(transcript.dirty_from(), None);
+    }
+
+    #[test]
+    fn relaunch_stops_a_thread_that_was_working_without_an_approval() {
+        // The common case: claude was running a tool and streaming a reply, nothing to answer.
+        let mut working = Transcript::with_cwd("/tmp/project");
+        working.push_user("go");
+        working.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                         "input": {"command": "sleep 9"}}]}})));
+        working.apply(&line(
+            json!({"type": "stream_event", "api_message_id": "m2",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "Still"}}}),
+        ));
+        assert_eq!(working.status(), Status::Working);
+        assert!(working.pending_approval().is_none());
+
+        let mut transcript =
+            Transcript::from_saved("/tmp/project", working.items().to_vec(), working.status());
+        transcript.normalize_after_relaunch();
+        assert_eq!(transcript.status(), Status::Stopped);
+        let items = transcript.items();
+        assert_eq!(items.len(), 4);
+        assert!(matches!(
+            &items[1],
+            Item::Tool { state: ToolState::Failed, output: Some(note), .. }
+                if note == STOPPED_TOOL_NOTE
+        ));
+        assert!(matches!(
+            &items[2],
+            Item::Assistant { live: false, interrupted: true, text, .. } if text == "Still"
+        ));
+        assert!(matches!(items[3], Item::Stopped { .. }));
+        assert_eq!(transcript.dirty_from(), Some(1));
+    }
+
+    #[test]
+    fn rows_can_be_marked_for_saving_again() {
+        let mut transcript = Transcript::new();
+        transcript.push_user("one");
+        transcript.push_user("two");
+        transcript.mark_saved();
+        transcript.mark_changed_from(1);
+        assert_eq!(transcript.dirty_from(), Some(1));
+        // An earlier change wins; a later one does not move it.
+        transcript.mark_changed_from(5);
+        assert_eq!(transcript.dirty_from(), Some(1));
+        transcript.mark_saved();
+        // Past the end means "from the end": nothing to write, but nothing stale is kept.
+        transcript.mark_changed_from(9);
+        assert_eq!(transcript.dirty_from(), Some(2));
+    }
+
+    #[test]
+    fn relaunch_leaves_a_finished_thread_alone() {
+        let mut transcript = Transcript::new();
+        transcript.push_user("go");
+        transcript.apply(&line(json!({"type": "result", "subtype": "success",
+            "is_error": false})));
+        let items = transcript.items().to_vec();
+        let mut loaded = Transcript::from_saved("/tmp/p", items.clone(), Status::Done);
+        loaded.normalize_after_relaunch();
+        assert_eq!(loaded.items(), items.as_slice());
+        assert_eq!(loaded.status(), Status::Done);
+        assert_eq!(loaded.dirty_from(), None);
     }
 }
