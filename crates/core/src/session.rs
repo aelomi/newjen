@@ -48,14 +48,10 @@ const NESTED_SESSION_ENV_VARS: &[&str] = &[
     "CLAUDE_CODE_SESSION_ATTENDED",
     "CLAUDE_PID",
     "CLAUDE_EFFORT",
+    // Names the app driving Claude. An SDK app that launched Newjen would otherwise have its
+    // name sent on Newjen's requests. Newjen doesn't set its own, like T3 Code.
+    "CLAUDE_AGENT_SDK_CLIENT_APP",
 ];
-
-/// Tells the claude binary which app is driving it. Claude adds the value to the User-Agent it
-/// sends to Anthropic (`client-app/newjen/<version>`), so Newjen is identified honestly rather
-/// than looking like a bare `claude -p`. Set on every spawn, replacing any inherited value. See
-/// "Subscription safety" in `CLAUDE.md`.
-const CLIENT_APP_ENV_VAR: &str = "CLAUDE_AGENT_SDK_CLIENT_APP";
-const CLIENT_APP: &str = concat!("newjen/", env!("CARGO_PKG_VERSION"));
 
 /// How long `shutdown` waits after SIGTERM before it sends SIGKILL. Kept short because GPUI
 /// gives the whole app about 200 ms to quit.
@@ -314,7 +310,6 @@ impl Session {
         for name in NESTED_SESSION_ENV_VARS {
             command.env_remove(name);
         }
-        command.env(CLIENT_APP_ENV_VAR, CLIENT_APP);
         for (name, value) in &config.env {
             command.env(OsString::from(name), OsString::from(value));
         }

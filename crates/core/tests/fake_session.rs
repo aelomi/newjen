@@ -142,7 +142,7 @@ fn spawn_error_for_missing_program() {
 }
 
 #[test]
-fn child_identifies_newjen_and_drops_nested_session_vars() {
+fn child_gets_no_nested_session_vars() {
     // A stand-in that reports what it sees on stderr. When the tests run inside a Claude Code
     // terminal, `CLAUDECODE` is set in this process, so this also checks it is stripped.
     let dir = tempfile::tempdir().unwrap();
@@ -151,7 +151,7 @@ fn child_identifies_newjen_and_drops_nested_session_vars() {
     writeln!(file, "#!/bin/sh").unwrap();
     writeln!(
         file,
-        r#"echo "client=$CLAUDE_AGENT_SDK_CLIENT_APP nested=${{CLAUDECODE-unset}}" >&2"#
+        r#"echo "client=${{CLAUDE_AGENT_SDK_CLIENT_APP-unset}} nested=${{CLAUDECODE-unset}}" >&2"#
     )
     .unwrap();
     drop(file);
@@ -160,7 +160,7 @@ fn child_identifies_newjen_and_drops_nested_session_vars() {
     let mut config = SessionConfig::new(dir.path());
     config.program = script;
     let (_session, events) = Session::spawn(config).unwrap();
-    let expected = format!("client=newjen/{} nested=unset", env!("CARGO_PKG_VERSION"));
+    let expected = "client=unset nested=unset";
     loop {
         match common::next_event(&events, TIMEOUT) {
             SessionEvent::Stderr(line) => {

@@ -103,7 +103,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 
 ## Subscription safety
 
-Users run Newjen on their own Claude and ChatGPT subscriptions, so it must never put their accounts at risk. Newjen spawns only the user's own installed, unmodified CLIs; it never reads or stores credentials, never calls model APIs itself, never offers its own login and never retries around usage limits. It identifies itself honestly (`CLAUDE_AGENT_SDK_CLIENT_APP=newjen/<version>` for Claude, `clientInfo` for Codex). The rules and their sources are in [the memo](research/providers-and-subscriptions.md#2-subscription-safety) and in `CLAUDE.md`.
+Users run Newjen on their own Claude and ChatGPT subscriptions, so it must never put their accounts at risk. Newjen spawns only the user's own installed, unmodified CLIs; it never reads or stores credentials, never calls model APIs itself, never offers its own login and never retries around usage limits. It never disguises the CLI. Like T3 Code, it adds no Claude app label; Codex gets the `clientInfo` it requires. Switching a thread's provider with a context handoff, as T3 Code does, is planned for after the MVP. The rules and their sources are in [the memo](research/providers-and-subscriptions.md#2-subscription-safety) and in `CLAUDE.md`.
 
 ## Appearance
 

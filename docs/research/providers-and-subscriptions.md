@@ -79,8 +79,10 @@ These are copied into `CLAUDE.md` as standing rules.
 
 **Do:**
 - Spawn only the user's installed, unmodified `claude` and `codex`, and let them handle sign-in.
-- **Identify Newjen honestly.**
-  - Claude: set `CLAUDE_AGENT_SDK_CLIENT_APP=newjen/<version>` on every spawn, replacing any inherited value. The claude binary reads it and adds `client-app/<value>` to its User-Agent. `claude -p` already labels itself `sdk-cli`, so we neither hide nor fake what we are.
+- **Don't relabel the CLI.**
+  - Claude: `claude -p` already reports itself as `sdk-cli`. Newjen doesn't set `CLAUDE_AGENT_SDK_CLIENT_APP`, and strips any inherited value.
+    - The variable is documented only for the Agent SDK. The claude binary would add it to its User-Agent as `client-app/<value>`.
+    - Setting it was considered and dropped on 2026-10-30. No policy asks for it, T3 Code doesn't set it, and it would only make Newjen's traffic easy to single out if policy changes.
   - Codex: send `clientInfo {name:"newjen", title:"Newjen", version}`.
 - Show the account and plan in use, read from the CLI's own reports:
   - Claude: `claude auth status --json` returns `loggedIn`, `authMethod` and `subscriptionType`, plus email and organization, which should be shown only on request.
