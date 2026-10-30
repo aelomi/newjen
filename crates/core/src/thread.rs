@@ -614,13 +614,25 @@ impl Thread {
                 self.recovery.started_fresh = true;
                 self.session_id = new_id();
                 self.session_started = false;
-                self.transcript.push_fresh_start();
-                if self.recovery.message.is_some() {
-                    self.start_again();
-                } else {
-                    // Nothing to resend: the next message starts the new conversation.
-                    self.end_session();
-                    self.save();
+                match self.recovery.message.as_deref() {
+                    // "Continue where you left off." means nothing to a new conversation, so
+                    // it is not resent: the turn ends, and the user's next message starts
+                    // the new conversation.
+                    Some(CONTINUE_MESSAGE) => {
+                        self.end_turn_as_stopped();
+                        self.transcript.push_fresh_start();
+                        self.save();
+                    }
+                    Some(_) => {
+                        self.transcript.push_fresh_start();
+                        self.start_again();
+                    }
+                    None => {
+                        // Nothing to resend: the next message starts the new conversation.
+                        self.transcript.push_fresh_start();
+                        self.end_session();
+                        self.save();
+                    }
                 }
                 return;
             }

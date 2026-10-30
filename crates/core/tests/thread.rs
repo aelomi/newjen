@@ -481,6 +481,45 @@ fn a_missing_conversation_starts_fresh_and_resends_the_message_once() {
 }
 
 #[test]
+fn continue_is_not_sent_to_a_conversation_that_starts_fresh() {
+    let fixture = Fixture::new();
+    let mut thread = started_thread(&fixture);
+    let old_session = thread.session_id().to_string();
+    fixture.switch("resume_missing", true);
+    thread.send(CONTINUE_MESSAGE).unwrap();
+    finish_turn(&mut thread);
+
+    assert_eq!(
+        fixture.spawns().len(),
+        2,
+        "first turn and the failed resume only"
+    );
+    assert_eq!(
+        fixture.messages_received(),
+        ["first"],
+        "Continue is never sent"
+    );
+    assert_ne!(thread.session_id(), old_session);
+    assert!(!thread.session_started());
+    assert_eq!(thread.status(), Status::Stopped);
+    assert_eq!(kinds(&thread).last(), Some(&"fresh_start"));
+    assert!(errors(&thread).is_empty());
+    assert!(!thread.has_session());
+
+    // The user's next message starts the new conversation.
+    fixture.switch("resume_missing", false);
+    thread.send("hello again").unwrap();
+    finish_turn(&mut thread);
+    let spawns = fixture.spawns();
+    assert_eq!(
+        flag(spawns.last().unwrap(), "--session-id"),
+        Some(thread.session_id())
+    );
+    assert_eq!(fixture.messages_received(), ["first", "hello again"]);
+    assert_eq!(thread.status(), Status::Done);
+}
+
+#[test]
 fn a_missing_conversation_twice_shows_one_error() {
     let fixture = Fixture::new();
     let mut thread = started_thread(&fixture);
