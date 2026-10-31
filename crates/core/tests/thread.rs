@@ -3169,6 +3169,39 @@ fn project_preparation_sends_the_held_message_once_and_snapshot_blocks_the_next_
 }
 
 #[test]
+fn try_again_waits_for_project_preparation_and_the_snapshot_job() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    let mut thread = fixture.draft();
+    let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
+        panic!("prepare project");
+    };
+    // The job holds the stop handles, so a restart now could not wait for the old process.
+    let refused = thread.restart().unwrap_err();
+    assert!(refused.to_string().contains("starting point"), "{refused}");
+    assert!(fixture.spawns().is_empty());
+    assert!(thread.preparing().is_some());
+    thread.finish_project(job.run(&tools)).unwrap();
+    finish_turn(&mut thread);
+    assert_eq!(fixture.spawns().len(), 1);
+    let job = thread.take_snapshot_job().expect("snapshot");
+    let refused = thread.restart().unwrap_err();
+    assert!(refused.to_string().contains("snapshotting"), "{refused}");
+    assert_eq!(fixture.spawns().len(), 1);
+    assert!(!thread.has_session());
+    thread.finish_snapshot(job.run(&tools));
+    thread.restart().unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while fixture.spawns().len() < 2 {
+        assert!(Instant::now() < deadline, "the restart started nothing");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(thread.has_session());
+}
+
+#[test]
 fn archiving_project_preparation_invalidates_its_held_message() {
     let fixture = Fixture::new();
     let Some(tools) = init_thread_jj(&fixture) else {

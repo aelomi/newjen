@@ -1450,6 +1450,18 @@ impl Thread {
     /// same conversation. Sends nothing. If claude no longer has the conversation, the thread
     /// switches to a new one, so the next message works (see [`Thread::apply`]).
     pub fn restart(&mut self) -> Result<()> {
+        // A copy, project preparation or snapshot job holds the old process's stop handles,
+        // so `spawn` could not wait for it: a second agent would start before it is gone.
+        match self.preparing() {
+            Some(Waiting::Copy(_)) => bail!("Newjen is still making this thread's Rift copy"),
+            Some(Waiting::Project(_)) => {
+                bail!("Newjen is still recording this thread's starting point")
+            }
+            None => {}
+        }
+        if matches!(self.snapshot, SnapshotState::Running) {
+            bail!("Newjen is still snapshotting this thread’s work");
+        }
         if self.session.is_some() {
             // The old process's own exit event will be ignored (its generation is over), so
             // end its turn here as a requested stop would.
