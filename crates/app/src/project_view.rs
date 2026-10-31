@@ -599,8 +599,9 @@ impl ProjectView {
             let rows = self.recent.iter().map(|project| {
                 let path = project.path.clone();
                 let label = tilde(&path, self.home.as_deref());
+                let id = project.id;
                 ui::button(
-                    ("recent-project", project.id as u64),
+                    ("recent-project", id as u64),
                     label,
                     ui::Look::Ghost,
                     ui::Size::Md,
@@ -608,7 +609,7 @@ impl ProjectView {
                 )
                 .w_full()
                 .flex_none()
-                .debug_selector(|| "recent-project-row".to_string())
+                .debug_selector(move || format!("recent-project-{id}"))
                 .justify_start()
                 .on_click(cx.listener(move |view, _, window, cx| {
                     view.open_project(path.clone(), window, cx)
@@ -919,6 +920,78 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn clicking_any_recent_project_row_opens_that_project(cx: &mut TestAppContext) {
+        let (shell, path, cx) = setup(cx, "recent-rows");
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let folder = |name: &str| {
+            let folder = path.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            folder.canonicalize().unwrap()
+        };
+        let (api, website, docs) = (folder("api"), folder("website"), folder("docs"));
+        // Two projects were opened in earlier runs; only `api` is loaded now.
+        cx.update(|_, cx| {
+            shell.update(cx, |view, _| {
+                view.store.open_project(&docs).unwrap();
+                view.store.open_project(&website).unwrap();
+            })
+        });
+        open(&shell, api.clone(), cx).await;
+        cx.simulate_keystrokes("cmd-shift-o");
+        cx.run_until_parked();
+        let (ids, rows): (Vec<i64>, Vec<PathBuf>) = cx.update(|_, cx| {
+            let view = shell.read(cx);
+            view.recent
+                .iter()
+                .map(|project| (project.id, project.path.clone()))
+                .unzip()
+        });
+        assert_eq!(rows[0], api, "the just-hidden project is listed first");
+        let click_row = |cx: &mut VisualTestContext, id: i64| {
+            let selector: &'static str = Box::leak(format!("recent-project-{id}").into_boxed_str());
+            let row = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing {selector}"));
+            cx.simulate_click(row.center(), gpui::Modifiers::default());
+        };
+        click_row(cx, ids[2]);
+        cx.condition(&shell, |view, _| {
+            view.opening.is_none() && view.active.is_some()
+        })
+        .await;
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| {
+                let view = shell.read(cx);
+                view.projects[view.active.unwrap()].project.path.clone()
+            }),
+            rows[2],
+            "a recent project that is not loaded opens from its row"
+        );
+        // Back on the projects screen by menu action, a loaded but hidden project's row.
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| view.show_projects(&ShowProjects, window, cx))
+        });
+        cx.run_until_parked();
+        click_row(cx, ids[0]);
+        cx.condition(&shell, |view, _| {
+            view.opening.is_none() && view.active.is_some()
+        })
+        .await;
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| {
+                let view = shell.read(cx);
+                view.projects[view.active.unwrap()].project.path.clone()
+            }),
+            api
+        );
+        assert_eq!(cx.update(|_, cx| shell.read(cx).projects.len()), 2);
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
     async fn quitting_asks_once_for_work_in_any_loaded_project(cx: &mut TestAppContext) {
         let (shell, path, cx) = setup(cx, "quit-gate");
         let first = path.join("first");
@@ -1027,7 +1100,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(640.), px(480.)));
         cx.run_until_parked();
         let list = cx.debug_bounds("recent-projects").unwrap();
-        let row = cx.debug_bounds("recent-project-row").unwrap();
+        let row = cx.debug_bounds("recent-project-1").unwrap();
         assert!(list.bottom() <= px(480.), "{list:?}");
         assert!(list.size.height > px(100.), "{list:?}");
         assert!(row.right() <= px(640.), "{row:?}");
