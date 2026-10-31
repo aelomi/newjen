@@ -37,14 +37,20 @@ to thread lifecycle code.
 
 The shell owns database error reporting, pending copy cleanup, and combined
 shutdown. Those jobs span all projects and must not run once per project view.
-Hidden views cannot take keyboard focus. Selecting a project restores its
-composer or approval dock.
+The visible project and welcome screen recover keyboard focus after dialogs
+close. Selecting a project restores its composer or approval dock.
 
 Rift copies the repository root when the selected project is a subfolder.
 Copy creation checks busy threads' actual working folders across loaded projects.
 This includes Rift folders opened as projects. Sends into an overlapping source
 also wait while its copy is being prepared. Selecting another folder must not
 bypass the protection against copying unfinished edits.
+
+Archiving cannot delete a Rift copy used by another loaded project or thread,
+even when it is idle. This is checked before confirmation and again before
+deletion. When the copy is open as a project, restart Newjen and open only the
+original project before archiving it. The MVP does not yet close individual
+projects while keeping the app open.
 
 ## Opening folders
 
@@ -67,3 +73,5 @@ produce a recoverable error without replacing the current project.
   are constructed. Every saved thread must retain its provider and working folder.
 - Notifications and the approvals inbox must enumerate every loaded project,
   including hidden ones. They belong to the parallel-threads work.
+- Copy deletion added by landing or discard must retain the check for other
+  loaded projects and threads using that folder. This slice guards archiving.
