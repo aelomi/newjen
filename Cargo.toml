@@ -24,6 +24,8 @@ libc = "=0.2.191"
 rusqlite = { version = "=0.41.1", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+# The version GPUI Kit's diff view already uses.
+similar = "=2.7.0"
 tempfile = "=3.27.0"
 uuid = { version = "=1.29.0", features = ["v4"] }
 

@@ -1,7 +1,10 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+/// The largest patch the app shows; anything bigger is allowed once, unseen.
 const LIMIT: usize = 100_000;
+/// The largest file an edit is diffed against. A small edit in a big file still previews.
+const FILE_LIMIT: usize = 2_000_000;
 
 #[derive(Debug, Clone)]
 pub struct EditProposal {
@@ -95,7 +98,10 @@ impl EditProposal {
         let mut original = Vec::new();
         match std::fs::File::open(&self.path) {
             Ok(file) => {
-                if let Err(error) = file.take((LIMIT + 1) as u64).read_to_end(&mut original) {
+                if let Err(error) = file
+                    .take((FILE_LIMIT + 1) as u64)
+                    .read_to_end(&mut original)
+                {
                     return EditPreview::Unavailable(format!(
                         "Couldn't read the original file: {error}"
                     ));
@@ -112,7 +118,7 @@ impl EditProposal {
                 ));
             }
         }
-        if original.len() > LIMIT {
+        if original.len() > FILE_LIMIT {
             return EditPreview::TooLarge;
         }
         let Ok(original) = String::from_utf8(original) else {
@@ -135,7 +141,7 @@ impl EditProposal {
                     } else {
                         content.replacen(&edit.old, &edit.new, 1)
                     };
-                    if content.len() > LIMIT {
+                    if content.len() > FILE_LIMIT {
                         return EditPreview::TooLarge;
                     }
                 }
@@ -143,30 +149,23 @@ impl EditProposal {
             }
             FileChange::Patch(_) | FileChange::Unavailable => unreachable!(),
         };
-        if original.len() + modified.len() > LIMIT {
+        if modified.len() > FILE_LIMIT {
             return EditPreview::TooLarge;
         }
         let name = self.path.file_name().unwrap_or_default().to_string_lossy();
-        let name = serde_json::to_string(&format!("a/{name}")).expect("string");
-        let new_name = name.replacen("a/", "b/", 1);
-        let old_lines = original.lines().count();
-        let new_lines = modified.lines().count();
-        let mut patch = format!(
-            "diff --git {name} {new_name}\n--- {name}\n+++ {new_name}\n@@ -{},{} +{},{} @@\n",
-            usize::from(old_lines != 0),
-            old_lines,
-            usize::from(new_lines != 0),
-            new_lines
-        );
-        for (prefix, text) in [('-', &original), ('+', &modified)] {
-            for line in text.split_inclusive('\n') {
-                patch.push(prefix);
-                patch.push_str(line.strip_suffix('\n').unwrap_or(line));
-                patch.push('\n');
-            }
-            if !text.is_empty() && !text.ends_with('\n') {
-                patch.push_str("\\ No newline at end of file\n");
-            }
+        let old_name = serde_json::to_string(&format!("a/{name}")).expect("string");
+        let new_name = old_name.replacen("a/", "b/", 1);
+        let diff = similar::TextDiff::configure()
+            .deadline(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .diff_lines(&original, &modified);
+        let body = diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&old_name, &new_name)
+            .to_string();
+        let patch = format!("diff --git {old_name} {new_name}\n{body}");
+        if patch.len() > LIMIT {
+            return EditPreview::TooLarge;
         }
         EditPreview::Patch(patch)
     }
@@ -228,6 +227,29 @@ mod tests {
             change: FileChange::Write("x".repeat(LIMIT + 1)),
         };
         assert_eq!(proposal.preview(), EditPreview::TooLarge);
+    }
+
+    #[test]
+    fn a_one_line_edit_previews_as_one_hunk_even_in_a_large_file() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let original: String = (1..=12_000).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&path, &original).unwrap();
+        assert!(original.len() > LIMIT);
+        let proposal = EditProposal {
+            path: path.clone(),
+            change: FileChange::Replace(vec![Replacement {
+                old: "line 1500\n".into(),
+                new: "line fifteen hundred\n".into(),
+                all: false,
+            }]),
+        };
+        let EditPreview::Patch(patch) = proposal.preview() else {
+            panic!("a small edit in a big file must preview");
+        };
+        assert_eq!(patch.matches("\n@@").count(), 1, "{patch}");
+        assert!(patch.contains("-line 1500\n+line fifteen hundred\n"));
+        assert!(patch.lines().count() < 20, "{patch}");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

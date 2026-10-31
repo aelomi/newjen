@@ -3939,6 +3939,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "similar",
  "tempfile",
  "uuid",
 ]
