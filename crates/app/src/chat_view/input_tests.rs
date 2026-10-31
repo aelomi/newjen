@@ -1916,3 +1916,108 @@ async fn a_second_project_folder_thread_in_the_same_repository_is_refused(cx: &m
     cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
     finish(&chat, path, cx);
 }
+
+/// A stand-in for `codex app-server` that replays `fixture` (see `newjen-fake-codex`): one
+/// line read per message Newjen sends, each reply printed in order. Newjen numbers its
+/// requests from 1, as the fixtures do.
+fn codex_script(path: &Path, project: &Path, fixture: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let records = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../core/tests/fixtures/codex")
+            .join(fixture),
+    )
+    .unwrap();
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let mut lines = vec!["#!/bin/sh".to_string()];
+    for record in records.lines().filter(|line| !line.trim().is_empty()) {
+        let record: serde_json::Value = serde_json::from_str(record).unwrap();
+        let message = record["msg"]
+            .to_string()
+            .replace("$CWD", project.to_str().unwrap());
+        if record["dir"] == "in" {
+            lines.push("IFS= read -r line || exit 0".to_string());
+        } else {
+            lines.push(format!("printf '%s\\n' {}", quote(&message)));
+        }
+    }
+    lines.push("while IFS= read -r line; do :; done".to_string());
+    let program = path.join("codex-test");
+    std::fs::write(&program, lines.join("\n") + "\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    program
+}
+
+/// A `ChatView` whose threads talk to the Codex stand-in replaying `fixture`.
+fn setup_codex<'a>(
+    cx: &'a mut TestAppContext,
+    name: &str,
+    fixture: &str,
+) -> (Entity<ChatView>, PathBuf, &'a mut VisualTestContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        keys::bind(cx);
+        cx.set_reduce_motion(true);
+    });
+    cx.executor().allow_parking();
+    let path = std::env::temp_dir().join(format!(
+        "newjen-input-{name}-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let path = path.canonicalize().unwrap();
+    let store = Store::open_in(&path).unwrap();
+    let project = store.open_project(&path).unwrap();
+    let mut base_config = SessionConfig::new(&path);
+    base_config.agent =
+        newjen_core::agent::AgentConfig::cli_default(newjen_core::providers::Provider::Codex);
+    base_config.program = codex_script(&path, &path, fixture);
+    let startup = Startup {
+        store,
+        project,
+        base_config,
+        threads: vec![],
+        problem: None,
+        home: None,
+        tools: Tools::find(),
+    };
+    let mut chat = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| ChatView::new(startup, window, cx));
+        chat = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    (chat.unwrap(), path, cx)
+}
+
+/// Codex takes no text with a denial, so the note comes back to the composer. It must not
+/// replace what the user had typed there meanwhile.
+#[gpui::test]
+async fn a_kept_denial_note_follows_the_composer_draft(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_codex(cx, "codex-kept-note", "runtime-command-decline.jsonl");
+    cx.simulate_input("Do the command");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("my half-written follow-up");
+    pending(&chat, cx).await;
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "my half-written follow-up"
+    );
+    cx.update(|window, cx| {
+        let field = chat.read(cx).denial_note.clone().expect("denial field");
+        field.read(cx).focus_handle(cx).focus(window, cx);
+    });
+    cx.simulate_input("Not in this folder.");
+    click(cx, "deny");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "my half-written follow-up\n\nNot in this folder."
+    );
+    assert_eq!(
+        notice_title(&chat, cx).as_deref(),
+        Some("The note was not sent")
+    );
+    finish(&chat, path, cx);
+}

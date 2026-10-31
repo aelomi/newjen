@@ -1520,11 +1520,18 @@ impl ChatView {
         // already said so before the click.
         self.slots[self.active].notice = match sent {
             Ok(NoteDelivery::Delivered) => None,
-            // The provider's denial carries no text: the note waits in the composer instead.
+            // The provider's denial carries no text: the note waits in the composer instead,
+            // after anything the user had typed there.
             Ok(NoteDelivery::Kept(note)) => {
                 let label = thread.read(cx).presentation().label;
                 let field = self.ensure_field(window, cx);
-                field.update(cx, |field, cx| field.set_value(note, window, cx));
+                let typed = field.read(cx).value().trim_end().to_string();
+                let text = if typed.is_empty() {
+                    note
+                } else {
+                    format!("{typed}\n\n{note}")
+                };
+                field.update(cx, |field, cx| field.set_value(text, window, cx));
                 Some(Notice::held(
                     "The note was not sent",
                     format!("{label} can't take a note with a denial; send it as a message."),
