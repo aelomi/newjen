@@ -1,4 +1,4 @@
-use gpui::{AnyElement, App, ElementId, IntoElement, RenderOnce, SharedString, Window};
+use gpui::{AnyElement, App, ElementId, Entity, IntoElement, RenderOnce, SharedString, Window};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 
 type RenderItem = Box<dyn Fn(usize, &mut Window, &mut App) -> AnyElement>;
@@ -7,6 +7,7 @@ type RenderItem = Box<dyn Fn(usize, &mut Window, &mut App) -> AnyElement>;
 pub struct MessageList {
     id: ElementId,
     count: usize,
+    state: Entity<MessageScrollerState>,
     render: RenderItem,
 }
 
@@ -14,11 +15,13 @@ impl MessageList {
     pub fn new(
         id: impl Into<ElementId>,
         count: usize,
+        state: Entity<MessageScrollerState>,
         render: impl Fn(usize, &mut Window, &mut App) -> AnyElement + 'static,
     ) -> Self {
         Self {
             id: id.into(),
             count,
+            state,
             render: Box::new(render),
         }
     }
@@ -27,9 +30,7 @@ impl MessageList {
 impl RenderOnce for MessageList {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let count = self.count;
-        let state = window.use_keyed_state((self.id.clone(), "messages"), cx, |_, cx| {
-            MessageScrollerState::new(count, cx)
-        });
+        let state = self.state;
         let fresh = window.use_keyed_state((self.id.clone(), "fresh"), cx, |_, _| 0usize);
         let (before, away) = {
             let state = state.read(cx);

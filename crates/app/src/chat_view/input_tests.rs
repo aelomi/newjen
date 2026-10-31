@@ -968,6 +968,15 @@ fn the_snapshot_notice_clears_when_the_guard_releases(cx: &mut TestAppContext) {
     cx.simulate_input("edit project");
     cx.simulate_keystrokes("enter");
     assert_eq!(notice_title(&chat, cx).as_deref(), Some("Wait a moment"));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-notice").is_some());
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).slots[chat.read(cx).active]
+            .messages
+            .read(cx)
+            .item_count()),
+        1
+    );
     cx.update(|_, cx| {
         copying.update(cx, |thread, cx| {
             thread.note_copy_progress(rift::Progress::MainRepoReady);
@@ -977,6 +986,17 @@ fn the_snapshot_notice_clears_when_the_guard_releases(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(!cx.update(|_, cx| copying.read(cx).blocks_project_send()));
     assert_eq!(notice_title(&chat, cx), None);
+    assert!(
+        cx.debug_bounds("chat-notice").is_none(),
+        "the cleared notice is still drawn"
+    );
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).slots[chat.read(cx).active]
+            .messages
+            .read(cx)
+            .item_count()),
+        0
+    );
     drop(job);
     finish(&chat, path, cx);
 }

@@ -52,6 +52,7 @@ use crate::ui::DOCK_METRICS;
 use crate::ui::MessageList;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::TITLE_BAR_HEIGHT;
+use gpui_kit::component::message_scroller::MessageScrollerState;
 
 /// The conversation column is capped at this width and centered, as in the mocks.
 const COLUMN_WIDTH: Pixels = px(720.0);
@@ -163,6 +164,7 @@ struct Slot {
     /// The placeholder currently set on that field, to avoid resetting it every event.
     placeholder: SharedString,
     notice: Option<Notice>,
+    messages: Entity<MessageScrollerState>,
     /// Feeds the thread its events. Dropping the slot (archive) stops it.
     _pump: Task<()>,
     /// Redraws the window whenever the thread changes.
@@ -462,6 +464,7 @@ impl ChatView {
             replies: Default::default(),
             placeholder: SharedString::default(),
             notice: None,
+            messages: cx.new(|cx| MessageScrollerState::new(0, cx)),
             _pump: pump,
             _changes: changes,
         };
@@ -495,6 +498,14 @@ impl ChatView {
                     Some(NoticeKind::Snapshot)
                 ) {
                     slot.notice = None;
+                    let thread = slot.thread.read(cx);
+                    let count = Entry::count(
+                        thread.transcript().items().len(),
+                        thread.preparing().is_some(),
+                        false,
+                    );
+                    slot.messages
+                        .update(cx, |messages, cx| messages.reset(count, cx));
                 }
             }
         }
@@ -1390,6 +1401,10 @@ impl ChatView {
             },
             None => div().into_any_element(),
         };
+        let notice_row = matches!(
+            Entry::at(ix, items.len(), preparing.is_some(), notice.is_some()),
+            Some(Entry::Notice)
+        );
         let first = ix == 0;
         // Center each row in the column, like the composer below it.
         div()
@@ -1398,6 +1413,9 @@ impl ChatView {
             .justify_center()
             .px_4()
             .when(first, |row| row.pt_4())
+            .when(notice_row, |row| {
+                row.debug_selector(|| "chat-notice".to_string())
+            })
             .child(div().w_full().max_w(COLUMN_WIDTH).py_2().child(row))
             .into_any_element()
     }
@@ -1506,6 +1524,7 @@ impl ChatView {
             .child(MessageList::new(
                 "conversation",
                 count,
+                slot.messages.clone(),
                 cx.processor(|view, ix: usize, window, cx| view.render_row(ix, window, cx)),
             ))
     }
