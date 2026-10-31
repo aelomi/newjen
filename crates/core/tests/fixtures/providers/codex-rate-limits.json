@@ -19,7 +19,7 @@
       "credits": {
         "hasCredits": true,
         "unlimited": false,
-        "balance": "100.00"
+        "balance": "1000.0000000000"
       },
       "individualLimit": null,
       "spendControlReached": false,
@@ -44,7 +44,7 @@
         "credits": {
           "hasCredits": true,
           "unlimited": false,
-          "balance": "100.00"
+          "balance": "1000.0000000000"
         },
         "individualLimit": null,
         "spendControlReached": false,

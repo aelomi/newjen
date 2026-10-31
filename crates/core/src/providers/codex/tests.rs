@@ -757,9 +757,11 @@ fn recorded_ready(rows: &[Value], resume: Option<String>) -> (CodexCodec, Transc
         recorded_result(&bootstrap, "account/read"),
     );
     let limits = respond(&mut c, &models, recorded_result(&bootstrap, "model/list"));
-    // The real account report rejects ordinary usage even though the CLI accepted these
-    // credit-backed recordings. Exercise that rejection separately; turns need admission.
-    let open = respond(&mut c, &limits, json!({"rateLimits":{}}));
+    let open = respond(
+        &mut c,
+        &limits,
+        recorded_result(&bootstrap, "account/rateLimits/read"),
+    );
     let mut opened = recorded_result(
         rows,
         if resume.is_some() {
@@ -778,6 +780,7 @@ fn recorded_ready(rows: &[Value], resume: Option<String>) -> (CodexCodec, Transc
         out
     );
     let mut t = Transcript::new();
+    t.apply(&open.batch);
     t.apply(&out.batch);
     (c, t)
 }
@@ -1003,26 +1006,134 @@ fn live_codex_text_reply() {
 }
 
 #[test]
-fn recorded_usage_rejection_blocks_open_and_preserves_the_terminal_outcome_on_stop() {
+fn recorded_credit_backed_admission_opens_and_allows_turns() {
     let rows = fixture("read-only");
-    let (c, init) = new();
-    let (mut c, limits) = through_models(c, init);
-    let out = respond(
-        &mut c,
-        &limits,
-        recorded_result(&rows, "account/rateLimits/read"),
+    let (mut c, mut t) = recorded_ready(&rows, None);
+    let Some(RateLimitEvent::Warning(snapshot)) = t.rate_limit() else {
+        panic!("credits warning expected")
+    };
+    assert!(snapshot.explanation.contains("paid from Codex credits"));
+    assert!(
+        snapshot
+            .windows
+            .iter()
+            .any(|w| w.resets_at_unix_seconds.is_some())
     );
-    assert_eq!(c.runtime(), &CodexRuntime::Blocked);
-    assert!(out.messages.is_empty());
-    assert!(out.effects.contains(&ControlEffect::Shutdown));
-    let mut t = Transcript::new();
-    t.apply(&out.batch);
-    assert!(matches!(t.rate_limit(), Some(RateLimitEvent::Rejected(_))));
-    assert_eq!(t.status(), Status::Failed);
-    t.apply(&c.interrupt().batch);
-    t.apply(&c.transport_failed("process exited").batch);
-    assert_eq!(t.status(), Status::Failed);
-    assert_eq!(finished_count(&t), 1);
+    assert!(matches!(c.runtime(), CodexRuntime::Ready { .. }));
+    t.push_user("go");
+    let out = c.prompt("go").unwrap();
+    assert_eq!(out.messages[0]["method"], "turn/start");
+}
+
+#[test]
+fn snapshot_admission_respects_credits_and_spend_controls() {
+    for (credits, spend, ordinary, reached, rejected) in [
+        (Value::Null, false, Some(false), "", true),
+        (
+            json!({"hasCredits":false,"unlimited":false}),
+            false,
+            None,
+            "primary",
+            true,
+        ),
+        (
+            json!({"hasCredits":false,"unlimited":false}),
+            false,
+            Some(false),
+            "",
+            true,
+        ),
+        (
+            json!({"hasCredits":true,"unlimited":false}),
+            true,
+            Some(false),
+            "primary",
+            true,
+        ),
+        (
+            json!({"hasCredits":false,"unlimited":true}),
+            false,
+            Some(false),
+            "primary",
+            false,
+        ),
+    ] {
+        let (c, init) = new();
+        let (mut c, limits) = through_models(c, init);
+        let report = json!({"ordinaryUsageAllowed":ordinary,"rateLimits":{
+            "limitId":"codex","rateLimitReachedType":reached,"credits":credits,
+            "spendControlReached":spend,"primary":{"usedPercent":100,"resetsAt":1800000000}
+        }});
+        let out = respond(&mut c, &limits, report.clone());
+        let mut t = Transcript::new();
+        t.apply(&out.batch);
+        if rejected {
+            assert_eq!(c.runtime(), &CodexRuntime::Blocked);
+            assert!(out.messages.is_empty());
+            assert!(out.effects.contains(&ControlEffect::Shutdown));
+            let Some(RateLimitEvent::Rejected(snapshot)) = t.rate_limit() else {
+                panic!("rejection expected")
+            };
+            assert_eq!(snapshot.windows[0].resets_at_unix_seconds, Some(1800000000));
+            assert_eq!(t.status(), Status::Failed);
+            t.apply(&c.interrupt().batch);
+            t.apply(&c.transport_failed("process exited").batch);
+            assert_eq!(t.status(), Status::Failed);
+            assert_eq!(finished_count(&t), 1);
+            assert!(c.prompt("blocked").is_err());
+        } else {
+            assert_eq!(out.messages[0]["method"], "thread/start");
+            let Some(RateLimitEvent::Warning(snapshot)) = t.rate_limit() else {
+                panic!("credits warning expected")
+            };
+            assert!(snapshot.explanation.contains("paid from Codex credits"));
+            respond(&mut c, &out, open_result());
+            let updated = notification(&mut c, &mut t, "account/rateLimits/updated", report);
+            assert!(updated.messages.is_empty());
+            assert!(updated.effects.is_empty());
+            assert!(matches!(t.rate_limit(), Some(RateLimitEvent::Warning(_))));
+            assert!(c.prompt("go").is_ok());
+        }
+    }
+}
+
+#[test]
+fn cli_limit_refusals_override_credit_backed_admission_without_retry() {
+    for method in ["error", "turn/completed"] {
+        let rows = fixture("read-only");
+        let (mut c, mut t) = recorded_ready(&rows, None);
+        let CodexRuntime::Ready { thread_id } = c.runtime().clone() else {
+            panic!("ready")
+        };
+        let prompt = c.prompt("go").unwrap();
+        let active = respond(
+            &mut c,
+            &prompt,
+            json!({"turn":{"id":"turn","status":"inProgress"}}),
+        );
+        t.apply(&active.batch);
+        let error = json!({"message":"Usage limit reached","codexErrorInfo":"usageLimitExceeded"});
+        let params = if method == "error" {
+            json!({"threadId":thread_id,"turnId":"turn","willRetry":true,"error":error})
+        } else {
+            json!({"threadId":thread_id,"turn":{"id":"turn","status":"failed","error":error}})
+        };
+        let out = notification(&mut c, &mut t, method, params);
+        let Some(RateLimitEvent::Rejected(snapshot)) = t.rate_limit() else {
+            panic!("CLI refusal must reject even with credits")
+        };
+        assert!(
+            snapshot
+                .windows
+                .iter()
+                .any(|w| w.resets_at_unix_seconds.is_some())
+        );
+        assert_eq!(t.status(), Status::Failed);
+        assert_eq!(c.runtime(), &CodexRuntime::Blocked);
+        assert!(out.messages.is_empty());
+        assert!(out.effects.contains(&ControlEffect::Shutdown));
+        assert!(c.prompt("retry").is_err());
+    }
 }
 
 #[test]

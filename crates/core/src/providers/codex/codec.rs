@@ -93,6 +93,7 @@ pub struct CodexCodec {
     cursors: Vec<String>,
     account: Option<Account>,
     pub(super) limits: HashMap<String, Value>,
+    pub(super) ordinary_usage_allowed: Option<bool>,
     tier: String,
 }
 impl CodexCodec {
@@ -137,6 +138,7 @@ impl CodexCodec {
             cursors: Vec::new(),
             account: None,
             limits: HashMap::new(),
+            ordinary_usage_allowed: None,
             tier: "default".into(),
         };
         let mut out = CodecOutput::default();

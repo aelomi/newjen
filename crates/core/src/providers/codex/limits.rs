@@ -1,19 +1,21 @@
 use super::{CodecOutput, CodexCodec};
 use crate::agent::*;
-use anyhow::{Context, Result};
+use crate::providers::detect::{RateLimitSnapshot, RateLimits};
+use anyhow::Result;
 use serde_json::Value;
 
 impl CodexCodec {
     pub(super) fn rate_limits(&mut self, value: &Value, out: &mut CodecOutput) -> Result<()> {
-        let snapshot = value
-            .get("rateLimits")
-            .context("Missing rate limit snapshot")?;
-        self.merge_limit(snapshot, out);
+        let report: RateLimits = serde_json::from_value(value.clone())?;
+        if let Some(allowed) = report.ordinary_usage_allowed {
+            self.ordinary_usage_allowed = Some(allowed);
+        }
+        self.merge_limit(&value["rateLimits"], out)?;
         if let Some(buckets) = value.get("rateLimitsByLimitId").and_then(Value::as_object) {
             for (id, snapshot) in buckets {
                 let mut snapshot = snapshot.clone();
                 snapshot["limitId"] = Value::String(id.clone());
-                self.merge_limit(&snapshot, out);
+                self.merge_limit(&snapshot, out)?;
             }
         }
         if matches!(self.state, super::CodexRuntime::Blocked) {
@@ -21,40 +23,36 @@ impl CodexCodec {
                 self.limit_snapshot("Usage limit reached"),
             )));
         }
-        if value["ordinaryUsageAllowed"] == false {
-            out.event(AgentEvent::RateLimit(RateLimitEvent::Rejected(
-                self.limit_snapshot("Usage is not currently allowed"),
-            )));
-            self.fail(
-                "Usage limit reached",
-                "Codex reports that ordinary usage is not allowed. Retry only after a user action.",
-                out,
-            );
-        }
         Ok(())
     }
-    fn merge_limit(&mut self, update: &Value, out: &mut CodecOutput) {
+    fn merge_limit(&mut self, update: &Value, out: &mut CodecOutput) -> Result<()> {
         let bucket = update["limitId"].as_str().unwrap_or("default").to_owned();
         let stored = self
             .limits
             .entry(bucket.clone())
             .or_insert_with(|| serde_json::json!({}));
         merge(stored, update);
-        let snapshot = snapshot(&bucket, stored);
-        let rejected = stored["spendControlReached"] == true
-            || stored["individualLimit"]["remainingPercent"]
-                .as_i64()
-                .is_some_and(|n| n <= 0)
-            || stored["rateLimitReachedType"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty());
+        let limit: RateLimitSnapshot = serde_json::from_value(stored.clone())?;
+        let mut snapshot = snapshot(&bucket, stored);
+        let credits_can_pay = limit
+            .credits
+            .as_ref()
+            .is_some_and(|credits| credits.has_credits || credits.unlimited);
+        let plan_reached = self.ordinary_usage_allowed == Some(false)
+            || limit.reached_type.as_ref().is_some_and(|s| !s.is_empty());
+        let rejected =
+            limit.spend_control_reached == Some(true) || (plan_reached && !credits_can_pay);
+        let credit_backed = plan_reached && credits_can_pay;
+        if credit_backed && !rejected {
+            snapshot.explanation = "Plan quota reached. Turns are now paid from Codex credits on this account. Plan reset times are shown when reported; nothing resumes automatically.".into();
+        }
         let warning = snapshot
             .windows
             .iter()
             .any(|w| w.used_percent.is_some_and(|p| p >= 90.0));
         let event = if rejected {
             RateLimitEvent::Rejected(snapshot)
-        } else if warning {
+        } else if credit_backed || warning {
             RateLimitEvent::Warning(snapshot)
         } else {
             RateLimitEvent::Updated(snapshot)
@@ -63,6 +61,7 @@ impl CodexCodec {
         if rejected {
             self.fail("Usage limit reached", "Codex reports a usage or spend limit. Reset information is shown when reported; nothing resumes automatically.", out);
         }
+        Ok(())
     }
     pub(super) fn limit_snapshot(&self, explanation: &str) -> LimitSnapshot {
         let mut combined = LimitSnapshot {
