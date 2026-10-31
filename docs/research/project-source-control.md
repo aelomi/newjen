@@ -11,10 +11,10 @@ This request supersedes the earlier blanket choice to initialize jj in every pla
 Offer three choices during Add project:
 
 - **Git.** Use Git for project status, snapshots, branches, commits, and remotes. Do not initialize jj in the project or its Rift copies.
-- **Jujutsu.** Use jj for the workflow. A new repository uses a non-colocated layout, with private backing storage under `.jj`. Normal Git commands do not operate directly in that working folder.
-- **Jujutsu + Git.** Use jj for normal Newjen actions. Keep a colocated `.git` alongside `.jj` so Git tools can access the same history when needed.
+- **Jujutsu.** Use jj for the workflow. Initialize a new repository with `jj git init --no-colocate`, placing private backing storage under `.jj`. Normal Git commands do not operate directly in that working folder.
+- **Jujutsu + Git.** Use jj for normal Newjen actions. Initialize a new repository with `jj git init --colocate`, keeping `.git` alongside `.jj` so Git tools can access the same history when needed.
 
-"Jujutsu only" describes the user's workflow. It does not mean the Git storage format or executable disappears. The current documented installation requires Git 2.42 or newer. In a local probe, jj remote operations failed when its configured Git executable was unavailable, including in a non-colocated repository. [jj installation and runtime requirements](https://docs.jj-vcs.dev/latest/install-and-setup/#runtime-requirements).
+"Jujutsu only" describes the user's workflow, not storage without Git. The installation docs require Git 2.42 or newer. The dependency is capability-specific in the tested jj 0.46.0. Local initialization, snapshots, bookmarks, import, export, and colocation conversion worked with Git absent from PATH and an invalid configured Git executable. Remote operations, including fetch from another local directory, failed without Git. Settings can therefore report "Ready for local work" while disabling remotes, fetch-based landing, Git fallback, and any binary export implemented through the Git CLI. Do not label every jj operation unavailable because Git is missing. [jj installation and runtime requirements](https://docs.jj-vcs.dev/latest/install-and-setup/#runtime-requirements).
 
 Call the combined option **Jujutsu + Git**, with the description "Use jj primarily, with Git compatibility." Both tools share one backing store. This provides a fallback, not an independent backup. A scratch Git clone preserved an exported commit but did not contain `.jj` metadata. jj's operation log records repository views and recovery operations beyond ordinary Git branch history. [jj operation log](https://docs.jj-vcs.dev/latest/operation-log/).
 
@@ -26,7 +26,7 @@ Detect the repository before presenting the choice. Detection must validate repo
 
 For an existing Git repository, preselect Git. For a non-colocated jj repository, preselect Jujutsu. For a colocated repository, preselect Jujutsu + Git. Explain the detected layout beside the selection. Do not replace existing metadata merely because a different mode is highlighted.
 
-For a new folder, the final Add project summary must say what initialization will create. Git creates `.git`. Jujutsu creates `.jj` with hidden Git backing storage. The combined option creates `.jj` and a colocated `.git`.
+For a new folder, the final Add project summary must say what initialization will create. Git creates `.git`. Jujutsu creates `.jj` with hidden Git backing storage. The combined option creates `.jj` and a colocated `.git`. Always pass the chosen colocation flag explicitly. jj 0.46.0 defaults to colocation, and user configuration can change that default. Probes confirmed that explicit flags override either configuration. The non-colocated choice keeps ordinary Git tools out of the jj-only working folder, at the cost of an explicit export step for fetch-based transfer.
 
 Keep a secondary **Continue without source control** action for ordinary folders. This preserves the owner's earlier requirement for review and automatic apply without forcing initialization. It is not a fourth competing repository format.
 
@@ -89,7 +89,7 @@ For a verified Homebrew installation, use Homebrew's machine-readable package in
 
 Offer an in-app update only when the planned target is within Newjen's tested support range and ownership of the selected installation is established. Otherwise show the compatibility reason and external guidance.
 
-A native update action can run a fixed, formula-specific `brew upgrade git` or `brew upgrade jj` command through Newjen's process runner. Do not run a blanket upgrade. Homebrew can also update dependencies, so disclose that behavior. Use the selected installation's channel and formula revision, not a naive comparison with an arbitrary upstream version string. [Homebrew command reference](https://docs.brew.sh/Manpage).
+A native update action can run a fixed, formula-specific `brew upgrade git` or `brew upgrade jj` command through Newjen's process runner. Do not run a blanket upgrade. Homebrew can also upgrade dependencies, upgrade or reinstall dependents, refresh package metadata through an implicit `brew update`, and run cleanup. Disclose those possible effects. A formula-specific command is not a promise to touch only one package. Use the selected installation's channel and formula revision, not a naive comparison with an arbitrary upstream version string. [Homebrew command reference](https://docs.brew.sh/Manpage).
 
 Apple's Git comes with Xcode or Command Line Tools. Show that origin and direct updates through the Apple-managed mechanism. Do not overwrite `/usr/bin/git`, install a second Git silently, or run Homebrew against Apple Git. Custom, Cargo, MacPorts, and unknown installations initially get installation-specific guidance unless Newjen implements and tests their updater. [Git installation on macOS](https://git-scm.com/install/mac), [jj installation](https://docs.jj-vcs.dev/latest/install-and-setup/).
 
@@ -146,6 +146,12 @@ Returning edits must follow the project's selected mode. A Git target uses the G
 
 A Git-only project cannot depend on jj for hidden snapshots or landing. This adds a real Git implementation requirement for slice 4. The previous memo's dirty-baseline, binary, index, whitespace, copy-independence, and recovery requirements still apply.
 
+For **commit or branch import from a non-colocated jj copy**, the copy path alone is not a usable Git remote. Under harness-managed mode, freeze writers, finalize the reviewed snapshot and bookmark, and run `jj git export` in the copy to export its bookmarks. Discover its backing store with `jj --ignore-working-copy git root`. Fetch the selected thread bookmark from that store in the destination with the selected Git executable available to jj. Verify that the imported bookmark points to the reviewed immutable commit. Export and fetch are mutations, not passive discovery.
+
+The targeted scratch probe reproduced both failures. Fetching the non-colocated workspace path failed to find a Git repository. Fetching its backing store before export found no thread branch. Explicit export followed by fetch imported the expected commit. A colocated copy exports bookmarks automatically, so its ordinary copy path works as the remote. Do not apply the existing colocated landing recipe unchanged to jj-only projects.
+
+In agent-managed mode, running export on the agent's behalf would violate the no-version-control-writes promise. Require an already exported agent-created ref for branch import, or use a separately designed file-apply path that preserves that promise. The export recipe is an import mechanism, not permission to merge inherited baseline commits or replace the reviewed net-delta apply. A direct snapshot-file apply is also distinct from Git-based binary-patch export and may have different tool requirements.
+
 Project-folder threads have already edited their destination. They need review and keep semantics, and safe baselines for any discard action. The project choice does not solve overlapping writers. Do not copy T3's whole-checkout restore into thread-specific discard.
 
 ## Verification and handoff
@@ -154,9 +160,11 @@ The local probe `/tmp/newjen-git-landing/project-modes.py` passed twelve asserti
 
 A separate reviewer probe of a rewritten remote verified the fetch effects described above. Its scripts are `/tmp/newjen-git-landing/modes-review-astra/rewritten.py` and `ignored-fetch.py`. Both were independently rerun.
 
+The additional local probe `/tmp/newjen-git-landing/fable-check.py` passed eight assertions for explicit layout flags, local jj operations without Git, and non-colocated export and fetch. Its artifact location is in `/tmp/newjen-git-landing/latest-fable-check`. No Homebrew installation or upgrade was performed.
+
 These are mechanics tests, not a completed onboarding, settings, updater, migration, or landing feature. No GUI, build, package installation, or live Claude or Codex test was required. Review and implementation must still cover failed conversion, shared writers, tool replacement, unsupported versions, partial apply recovery, and installation ownership.
 
-The new memo received a clean review from GPT 6.1 Sol. GPT 6 Astra reproduced one issue in the earlier draft's generic Fetch promise. The jj-specific mutation warning now includes that evidence and its working-copy limitations. Those probes were independently rerun. Sol also checked Git-only operation with jj absent from PATH. Claude Fable 5.1 could not review because the provider reported a rate limit, so the required panel remains incomplete. The prose-only comment scan found no code comments or suppressions and changed no files.
+GPT 6.1 Sol gave the design a clean review. GPT 6 Astra reproduced one issue in the earlier draft's generic Fetch promise. The corrected jj-specific warning includes that evidence and its working-copy limitations. Sol also checked Git-only operation with jj absent from PATH. Claude Fable 5.1 subsequently completed the previously rate-limited review and approved the three-mode design with clarifications about explicit initialization flags, non-colocated transfer, capability-specific Git requirements, and Homebrew side effects. Those requirements are now recorded here. The implementation-relevant jj findings were independently reproduced, and Homebrew behavior was checked against its help and reference. All requested reviewers have returned. This records completed review and local corrections, not a second unanimous panel verdict on the revised text. The prose-only comment scan found no code comments or suppressions and changed no files.
 
 Implementation is outside this discussion session. The open-project session owns onboarding, slice 4 owns snapshots and landing, and the merge pass owns coordinated schema changes. Native tool settings and updating need a separately assigned implementation if they do not fit an existing lane.
 

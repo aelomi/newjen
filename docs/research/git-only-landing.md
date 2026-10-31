@@ -124,6 +124,8 @@ git -C "$source" fetch --no-tags "$copy" \
 
 A fetched branch contains committed files only. Uncommitted and ignored files remain in the copy. Importing a branch alone must not authorize deleting the copy.
 
+This copy-path recipe applies to ordinary Git or colocated jj copies. A non-colocated jj copy needs an explicit bookmark export and its discovered backing Git-store path instead. The later [project source-control design](project-source-control.md#rift-and-shared-folder-behavior) records the tested sequence and agent-managed limitation.
+
 No persistent remote is required. Use a validated thread-specific destination ref and refuse an unexpected existing value. Do not force-update a user's branch. Verify the fetched commit equals the immutable reviewed result before integration.
 
 A clean, unchanged original fast-forwarded successfully with `git merge --ff-only`. A diverged original refused fast-forward. `git merge --squash` combined non-overlapping work in the divergence test without creating a commit, but staged the result. These are separate product choices. Squash does not preserve the copy's individual commits.
@@ -229,7 +231,7 @@ These tests establish mechanics. They do not prove an application transaction, c
 
 GPT 6.1 Sol found one verified issue with inherited whitespace-fixing configuration. GPT 6 Astra found two verified issues with redirected working trees and staged ignored files. The findings were independently rerun. This memo now records the corrected requirements and tested remedies. These are local corrections after review, not a second panel approval of a production implementation.
 
-Claude Fable 5.1 could not complete its review because the provider reported a rate limit. It has no verdict. The required panel is therefore incomplete. Do not describe this memo as unanimously approved. Fable review remains for the owner or merge pass when available.
+Claude Fable 5.1 did not complete this earlier standalone landing review because the provider reported a rate limit. It later completed the broader [project source-control review](project-source-control.md#verification-and-handoff), which also examined landing and supplied the non-colocated export correction. That later verdict approves the three-mode design with documented corrections. It is not a separate retroactive approval of every statement in this historical memo.
 
 The prose-only comment scan found no code comments, commented-out code, or suppressions. It changed no files. The owner's decisions arrived during review and are recorded above. No reviewer approved an implemented landing transaction because this task implements none.
 
