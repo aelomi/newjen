@@ -1,5 +1,5 @@
-//! Newjen's own database (SQLite): projects, their threads, each thread's transcript rows and
-//! its "Always allow" grants. Claude keeps the full conversation in its own files; this is the
+//! Newjen's own database (SQLite): projects, their threads, each thread's transcript rows, its
+//! "Always allow" grants and its Rift copy. Claude keeps the full conversation in its own files; this is the
 //! small copy Newjen needs to show threads again after a relaunch.
 //!
 //! - **Where:** `$NEWJEN_HOME/newjen.db` if `NEWJEN_HOME` is set, else
@@ -29,6 +29,7 @@ use anyhow::{Context, Result, anyhow};
 use async_channel::{Receiver, Sender};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
+use crate::rift::Copy;
 use crate::transcript::Status;
 
 /// The database file's name inside the Newjen folder.
@@ -83,6 +84,18 @@ const MIGRATIONS: &[&str] = &[
          created_at INTEGER NOT NULL,
          PRIMARY KEY (thread_id, rule)
      );",
+    // Version 2: each thread's Rift copy, kept after the thread is archived until the copy is
+    // removed.
+    "CREATE TABLE copies (
+         thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+         path TEXT NOT NULL,
+         workdir TEXT NOT NULL,
+         source TEXT NOT NULL,
+         rift_id TEXT NOT NULL,
+         base TEXT,
+         created_at INTEGER NOT NULL,
+         removed_at INTEGER
+     );",
 ];
 
 /// The current time as Unix milliseconds, the unit every time in the store uses.
@@ -125,8 +138,8 @@ pub struct ThreadRow {
     pub id: String,
     pub project_id: i64,
     /// The folder the thread's agent works in, and always restarts from: the project folder,
-    /// or the thread's own Rift copy once threads can have one. It never changes, because
-    /// Claude ties `--resume` to the folder a conversation started in.
+    /// or the [`Copy::workdir`] of its Rift copy. It never changes, because Claude ties
+    /// `--resume` to the folder a conversation started in.
     pub workdir: PathBuf,
     pub title: String,
     /// Which agent CLI runs the thread. Always `"claude"` for now.
@@ -143,6 +156,9 @@ pub struct ThreadRow {
     pub updated_at: i64,
     /// When the thread was archived (hidden). `None` for a visible thread.
     pub archived_at: Option<i64>,
+    /// The thread's Rift copy, if it works in one (the `copies` table). Saved with the
+    /// thread's first row and never changed after.
+    pub copy: Option<Copy>,
 }
 
 /// One saved transcript row (the `thread_items` table). Read it with `Item::from_saved`.
@@ -242,6 +258,10 @@ enum Write {
         unread: bool,
     },
     Archive {
+        thread_id: String,
+        at: i64,
+    },
+    CopyRemoved {
         thread_id: String,
         at: i64,
     },
@@ -384,13 +404,11 @@ impl Store {
     /// them: a thread keeps its place from when it was created.
     pub fn threads(&self, project_id: i64) -> Result<Vec<ThreadRow>> {
         let read = self.reader();
-        let mut statement = read.prepare(
-            "SELECT id, project_id, title, provider, session_id, session_started, status,
-                    unread, created_at, updated_at, archived_at, workdir
-             FROM threads
+        let mut statement = read.prepare(&format!(
+            "{THREAD_COLUMNS}
              WHERE project_id = ?1 AND archived_at IS NULL
-             ORDER BY created_at DESC, rowid DESC",
-        )?;
+             ORDER BY threads.created_at DESC, threads.rowid DESC"
+        ))?;
         let rows = statement.query_map(params![project_id], thread_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -400,9 +418,7 @@ impl Store {
         let read = self.reader();
         let row = read
             .query_row(
-                "SELECT id, project_id, title, provider, session_id, session_started, status,
-                        unread, created_at, updated_at, archived_at, workdir
-                 FROM threads WHERE id = ?1",
+                &format!("{THREAD_COLUMNS} WHERE id = ?1"),
                 params![thread_id],
                 thread_row,
             )
@@ -425,6 +441,34 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The Rift copies of archived threads that are not removed yet, with their threads' ids.
+    /// Removing them at startup finishes what an earlier run could not (see `Removal`).
+    pub fn copies_to_remove(&self) -> Result<Vec<(String, Copy)>> {
+        let read = self.reader();
+        let mut statement = read.prepare(
+            "SELECT copies.thread_id, path, copies.workdir, source, rift_id, base
+             FROM copies JOIN threads ON threads.id = copies.thread_id
+             WHERE threads.archived_at IS NOT NULL AND copies.removed_at IS NULL
+             ORDER BY copies.created_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get(0)?, saved_copy(row, 1)?.expect("path is NOT NULL")))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The id of the thread whose Rift copy is at `path` and not removed yet, archived or not.
+    pub fn copy_owner(&self, path: &Path) -> Result<Option<String>> {
+        Ok(self
+            .reader()
+            .query_row(
+                "SELECT thread_id FROM copies WHERE path = ?1 AND removed_at IS NULL",
+                params![path_text(path)],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// A thread's grants, oldest first.
@@ -517,6 +561,14 @@ impl Store {
         });
     }
 
+    /// Records that the thread's Rift copy was removed.
+    pub fn mark_copy_removed(&self, thread_id: &str, at: i64) {
+        self.queue(Write::CopyRemoved {
+            thread_id: thread_id.to_string(),
+            at,
+        });
+    }
+
     fn queue(&self, write: Write) {
         // The writer only stops once every `Store` is gone, so this cannot fail while `self`
         // exists, unless the writer thread itself crashed. Say so rather than lose the write.
@@ -561,6 +613,12 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// The `SELECT … FROM` for [`thread_row`]: a thread's columns, then its copy's.
+const THREAD_COLUMNS: &str = "SELECT id, project_id, title, provider, session_id, session_started,
+        status, unread, threads.created_at, updated_at, archived_at, threads.workdir,
+        copies.path, copies.workdir, source, rift_id, base
+     FROM threads LEFT JOIN copies ON copies.thread_id = threads.id";
+
 fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
     Ok(ThreadRow {
         id: row.get(0)?,
@@ -575,7 +633,22 @@ fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         updated_at: row.get(9)?,
         archived_at: row.get(10)?,
         workdir: PathBuf::from(row.get::<_, String>(11)?),
+        copy: saved_copy(row, 12)?,
     })
+}
+
+/// The copy in the five columns from `at` (path, workdir, source, Rift id, base), if any.
+fn saved_copy(row: &Row<'_>, at: usize) -> rusqlite::Result<Option<Copy>> {
+    let Some(path) = row.get::<_, Option<String>>(at)? else {
+        return Ok(None);
+    };
+    Ok(Some(Copy {
+        path: PathBuf::from(path),
+        workdir: PathBuf::from(row.get::<_, String>(at + 1)?),
+        source: PathBuf::from(row.get::<_, String>(at + 2)?),
+        rift_id: row.get(at + 3)?,
+        base: row.get(at + 4)?,
+    }))
 }
 
 /// Starts the writer thread: it runs queued writes in order until the queue closes. A failed
@@ -648,7 +721,12 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
                 ..Unsaved::default()
             },
         ),
-        Write::UpsertProject { .. } | Write::Archive { .. } | Write::Flush(_) => return None,
+        // Not redone: the copy is removed again at the next launch, which finds nothing to do
+        // and records it then.
+        Write::UpsertProject { .. }
+        | Write::Archive { .. }
+        | Write::CopyRemoved { .. }
+        | Write::Flush(_) => return None,
     };
     Some((thread_id.clone(), lost))
 }
@@ -662,7 +740,11 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
                 params![path, now],
             )?;
         }
-        Write::SaveThread(row) => save_thread_row(connection, &row)?,
+        Write::SaveThread(row) => {
+            let transaction = connection.transaction()?;
+            save_thread_row(&transaction, &row)?;
+            transaction.commit()?;
+        }
         Write::ReplaceItems {
             thread_id,
             from_ix,
@@ -722,6 +804,12 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
                 params![thread_id, at],
             )?;
         }
+        Write::CopyRemoved { thread_id, at } => {
+            connection.execute(
+                "UPDATE copies SET removed_at = ?2 WHERE thread_id = ?1 AND removed_at IS NULL",
+                params![thread_id, at],
+            )?;
+        }
         // Everything queued before this is done (writes run in order).
         Write::Flush(done) => {
             let _ = done.send(());
@@ -730,7 +818,8 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
     Ok(())
 }
 
-/// Adds or updates a thread's row (see [`Store::save_thread`]).
+/// Adds or updates a thread's row (see [`Store::save_thread`]), and adds its copy's row the
+/// first time. Run inside a transaction, so the two go together.
 fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO threads (id, project_id, title, provider, session_id, session_started,
@@ -759,6 +848,22 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
             path_text(&row.workdir),
         ],
     )?;
+    if let Some(copy) = &row.copy {
+        connection.execute(
+            "INSERT INTO copies (thread_id, path, workdir, source, rift_id, base, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (thread_id) DO NOTHING",
+            params![
+                row.id,
+                path_text(&copy.path),
+                path_text(&copy.workdir),
+                path_text(&copy.source),
+                copy.rift_id,
+                copy.base,
+                now_ms(),
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -850,6 +955,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             archived_at: None,
+            copy: None,
         }
     }
 
@@ -933,6 +1039,44 @@ mod tests {
             .map(|grant| grant.rule)
             .collect();
         assert_eq!(rules, ["Bash(b)", "Bash(c)"]);
+    }
+
+    #[test]
+    fn a_version_1_database_gains_copies_and_keeps_its_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut connection = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO projects (id, path, created_at, last_opened_at)
+                         VALUES (1, '/tmp/project', 1, 1);
+                     INSERT INTO threads (id, project_id, workdir, title, session_id, status,
+                                          created_at, updated_at)
+                         VALUES ('t1', 1, '/tmp/project', 'Old', 's1', 'done', 1, 1);",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open_in(dir.path()).unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        assert_eq!(user_version(&connection), 2);
+        let old = store.thread("t1").unwrap().expect("kept");
+        assert_eq!(old.title, "Old");
+        assert_eq!(old.copy, None);
+
+        let copy = Copy {
+            path: PathBuf::from("/tmp/.rifts/project/c"),
+            workdir: PathBuf::from("/tmp/.rifts/project/c"),
+            source: PathBuf::from("/tmp/project"),
+            rift_id: "01RIFT".to_string(),
+            base: None,
+        };
+        let mut new = row("t2", 1);
+        new.copy = Some(copy.clone());
+        store.save_thread(new);
+        assert!(store.flush(Duration::from_secs(5)));
+        assert_eq!(store.thread("t2").unwrap().unwrap().copy, Some(copy));
     }
 
     #[test]

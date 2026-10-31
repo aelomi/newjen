@@ -28,7 +28,7 @@ fn newjen_home_holds_a_freshly_created_database() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     let tables: Vec<String> = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .unwrap()
@@ -36,5 +36,8 @@ fn newjen_home_holds_a_freshly_created_database() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(tables, ["grants", "projects", "thread_items", "threads"]);
+    assert_eq!(
+        tables,
+        ["copies", "grants", "projects", "thread_items", "threads"]
+    );
 }

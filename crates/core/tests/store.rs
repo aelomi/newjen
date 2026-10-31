@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use newjen_core::rift::Copy;
 use newjen_core::store::{Grant, Store, ThreadRow};
 use newjen_core::transcript::Status;
 
@@ -23,6 +24,17 @@ fn thread_row(id: &str, project_id: i64, created_at: i64) -> ThreadRow {
         created_at,
         updated_at: created_at,
         archived_at: None,
+        copy: None,
+    }
+}
+
+fn copy(name: &str) -> Copy {
+    Copy {
+        path: PathBuf::from(format!("/tmp/.rifts/project/{name}")),
+        workdir: PathBuf::from(format!("/tmp/.rifts/project/{name}/app")),
+        source: PathBuf::from("/tmp/project"),
+        rift_id: format!("01RIFT{}", name.to_uppercase()),
+        base: Some("4f0b21f3aa".to_string()),
     }
 }
 
@@ -227,7 +239,7 @@ fn reopening_keeps_everything_at_the_same_schema_version() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     let journal: String = connection
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();
@@ -241,7 +253,9 @@ fn deleting_a_thread_takes_its_rows_and_grants_with_it() {
     let home = tempfile::tempdir().unwrap();
     let store = Store::open_in(home.path()).unwrap();
     let project = store.open_project(&home.path().join("p")).unwrap();
-    store.save_thread(thread_row("t", project.id, 1));
+    let mut row = thread_row("t", project.id, 1);
+    row.copy = Some(copy("c"));
+    store.save_thread(row);
     store.replace_items("t", 0, rows(&["a"]));
     store.add_grant(
         "t",
@@ -263,4 +277,79 @@ fn deleting_a_thread_takes_its_rows_and_grants_with_it() {
     assert!(store.thread("t").unwrap().is_none());
     assert!(store.items("t").unwrap().is_empty());
     assert!(store.grants("t").unwrap().is_empty());
+    assert_eq!(store.copy_owner(&copy("c").path).unwrap(), None);
+}
+
+#[test]
+fn a_threads_copy_is_saved_with_its_row_and_never_changes_after() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).unwrap();
+    let project = store.open_project(&home.path().join("p")).unwrap();
+    let mut row = thread_row("t1", project.id, 1);
+    row.copy = Some(copy("first"));
+    store.save_checkpoint(row.clone(), 0, rows(&["a"]));
+    store.save_thread(thread_row("t2", project.id, 2));
+    assert!(store.flush(FLUSH));
+    assert_eq!(
+        store.thread("t1").unwrap().unwrap().copy,
+        Some(copy("first"))
+    );
+    let listed: Vec<Option<Copy>> = store
+        .threads(project.id)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.copy)
+        .collect();
+    assert_eq!(listed, [None, Some(copy("first"))]);
+
+    row.title = "Renamed".to_string();
+    row.copy = Some(copy("second"));
+    store.save_thread(row);
+    assert!(store.flush(FLUSH));
+    let saved = store.thread("t1").unwrap().unwrap();
+    assert_eq!(saved.title, "Renamed");
+    assert_eq!(saved.copy, Some(copy("first")));
+}
+
+#[test]
+fn archived_threads_copies_wait_to_be_removed_until_marked() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).unwrap();
+    let project = store.open_project(&home.path().join("p")).unwrap();
+    for (id, copy) in [
+        ("archived", Some(copy("a"))),
+        ("visible", Some(copy("v"))),
+        ("plain", None),
+    ] {
+        let mut row = thread_row(id, project.id, 1);
+        row.copy = copy;
+        store.save_thread(row);
+    }
+    store.archive("archived", 10);
+    store.archive("plain", 10);
+    assert!(store.flush(FLUSH));
+
+    assert_eq!(
+        store.copies_to_remove().unwrap(),
+        [("archived".to_string(), copy("a"))]
+    );
+    let owner = |name: &str| store.copy_owner(&copy(name).path).unwrap();
+    assert_eq!(owner("a").as_deref(), Some("archived"));
+    assert_eq!(owner("v").as_deref(), Some("visible"));
+    assert_eq!(owner("elsewhere"), None);
+
+    store.mark_copy_removed("archived", 20);
+    store.mark_copy_removed("archived", 30);
+    assert!(store.flush(FLUSH));
+    assert!(store.copies_to_remove().unwrap().is_empty());
+    assert_eq!(owner("a"), None, "a removed copy belongs to no one");
+    let removed_at: i64 = rusqlite::Connection::open(store.path())
+        .unwrap()
+        .query_row(
+            "SELECT removed_at FROM copies WHERE thread_id = 'archived'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(removed_at, 20, "marking it again changes nothing");
 }

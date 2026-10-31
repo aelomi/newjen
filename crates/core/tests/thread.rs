@@ -1424,6 +1424,7 @@ fn a_thread_always_restarts_from_its_own_folder() {
         created_at: 1,
         updated_at: 1,
         archived_at: None,
+        copy: None,
     });
     assert!(store.flush(Duration::from_secs(5)));
 
