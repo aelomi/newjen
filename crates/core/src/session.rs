@@ -90,6 +90,7 @@ pub enum Conversation {
 pub struct SessionConfig {
     /// The `claude` executable. Defaults to [`find_cli`].
     pub program: PathBuf,
+    pub agent: crate::agent::AgentConfig,
     /// The project directory the agent works in.
     pub cwd: PathBuf,
     /// The conversation to start or continue. `None` lets claude pick a new id itself.
@@ -113,6 +114,7 @@ impl SessionConfig {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         SessionConfig {
             program: find_cli(Cli::Claude),
+            agent: crate::agent::AgentConfig::cli_default(crate::providers::Provider::Claude),
             cwd: cwd.into(),
             conversation: None,
             allowed_tools: Vec::new(),
@@ -140,6 +142,15 @@ impl SessionConfig {
         .iter()
         .map(|arg| arg.to_string())
         .collect();
+        if let crate::providers::ModelSelection::Model { id } = &self.agent.model {
+            args.extend(["--model".into(), id.clone()]);
+        }
+        if let crate::agent::EffortSelection::Chosen(effort) = &self.agent.effort {
+            args.extend(["--effort".into(), effort.clone()]);
+        }
+        if self.agent.speed == crate::agent::Speed::Fast {
+            args.extend(["--fast-mode".into(), "on".into()]);
+        }
         match &self.conversation {
             Some(Conversation::New(session_id)) => {
                 args.push("--session-id".to_string());
@@ -228,6 +239,10 @@ struct Control {
 impl Session {
     /// Starts the CLI. Returns the session and the channel its events arrive on.
     pub fn spawn(config: SessionConfig) -> Result<(Session, Receiver<SessionEvent>)> {
+        anyhow::ensure!(
+            config.agent.provider == crate::providers::Provider::Claude,
+            "Codex transport is not available yet"
+        );
         let could_not_start = || {
             format!(
                 "could not start `{}` in {}",
@@ -676,6 +691,34 @@ pub(crate) fn for_each_line(source: impl Read, mut handle: impl FnMut(&str)) {
             }
         }
     }
+}
+
+pub(crate) fn reserved_id(provider: crate::providers::Provider) -> String {
+    match provider {
+        crate::providers::Provider::Claude => uuid::Uuid::new_v4().to_string(),
+        crate::providers::Provider::Codex => String::new(),
+    }
+}
+pub(crate) fn validate_conversation(
+    provider: crate::providers::Provider,
+    state: &crate::agent::ConversationState,
+) -> Result<()> {
+    use crate::agent::ConversationState;
+    use crate::providers::Provider;
+    anyhow::ensure!(
+        matches!(
+            (provider, state),
+            (
+                Provider::Claude,
+                ConversationState::Reserved(_) | ConversationState::Established(_)
+            ) | (
+                Provider::Codex,
+                ConversationState::Uncreated | ConversationState::Established(_)
+            )
+        ),
+        "Invalid provider conversation state"
+    );
+    Ok(())
 }
 
 pub(crate) use crate::providers::claude::controller::Controller;

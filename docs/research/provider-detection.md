@@ -104,11 +104,18 @@ Inspection of the installed Claude 2.1.316 native binary with `strings` found:
   policy, session opt-in and extra usage. The alias-to-model mapping and account
   entitlement are not available in `auth status`.
 
-Therefore Claude `ModelOption.fast` is `None`: detection cannot verify a per-alias,
-per-account fast option. This means **unverified/unsupported in Newjen's current
-picker**, not a claim that the CLI lacks fast mode. No turn was run to test it.
-A future change can expose the settings mechanism once capability verification
-has a safe source. Codex explicitly reports a `priority` tier named `Fast`, with
+Newjen offers this as an explicitly unverified CLI capability, with an extra-usage
+warning. It passes `--fast-mode on` only for a saved Fast choice. The CLI remains
+responsible for model/account eligibility; detection does not claim entitlement.
+
+Help-only checks on 2.1.316 accept `on`, `off`, and even an invalid value: help exits
+before validating the argument. The installed argument handler accepts only `on`
+and `off`; settings initialization maps those values to a process-local `fastMode`
+boolean. This is evidence of the syntax, not an account-without-fast execution
+check. Normal therefore omits the flag. A user's own settings may still enable
+fast mode; Newjen does not override them without verified no-fast-account behavior.
+No Claude turn was run.
+Codex explicitly reports a `priority` tier named `Fast`, with
 "2x speed, increased usage", so that tier is exposed directly.
 
 ## Recordings and verification

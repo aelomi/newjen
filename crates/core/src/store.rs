@@ -111,6 +111,16 @@ const MIGRATIONS: &[&str] = &[
          thread_id TEXT NOT NULL,
          rift_id TEXT
      );",
+    "ALTER TABLE threads ADD COLUMN conversation_id TEXT;
+     ALTER TABLE threads ADD COLUMN conversation_state TEXT NOT NULL DEFAULT 'uncreated'
+         CHECK (conversation_state IN ('uncreated', 'reserved', 'established'));
+     ALTER TABLE threads ADD COLUMN model TEXT;
+     ALTER TABLE threads ADD COLUMN effort TEXT;
+     ALTER TABLE threads ADD COLUMN speed TEXT NOT NULL DEFAULT 'normal'
+         CHECK (speed IN ('normal', 'fast'));
+     UPDATE threads SET conversation_id = session_id,
+         conversation_state = CASE WHEN session_started THEN 'established' ELSE 'reserved' END
+         WHERE provider = 'claude';",
 ];
 
 /// The current time as Unix milliseconds, the unit every time in the store uses.
@@ -159,11 +169,10 @@ pub struct ThreadRow {
     pub title: String,
     /// Which agent CLI runs the thread. Always `"claude"` for now.
     pub provider: String,
-    /// The id of Claude's own conversation (`--session-id` / `--resume`).
-    pub session_id: String,
-    /// True once claude has reported (with `system/init`) that the conversation exists, so the
-    /// next claude must `--resume` it rather than start it.
-    pub session_started: bool,
+    pub conversation: crate::agent::ConversationState,
+    pub model: crate::providers::ModelSelection,
+    pub effort: crate::agent::EffortSelection,
+    pub speed: crate::agent::Speed,
     pub status: Status,
     /// Something happened while the thread was not on screen.
     pub unread: bool,
@@ -747,9 +756,9 @@ fn path_text(path: &Path) -> String {
 }
 
 /// The `SELECT … FROM` for [`thread_row`]: a thread's columns, then its copy's.
-const THREAD_COLUMNS: &str = "SELECT id, project_id, title, provider, session_id, session_started,
+const THREAD_COLUMNS: &str = "SELECT id, project_id, title, provider, conversation_id, conversation_state,
         status, unread, threads.created_at, updated_at, archived_at, threads.workdir,
-        copies.path, copies.workdir, source, rift_id, base
+        copies.path, copies.workdir, source, rift_id, base, threads.model, threads.effort, threads.speed
      FROM threads LEFT JOIN copies ON copies.thread_id = threads.id";
 
 fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
@@ -758,8 +767,27 @@ fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         project_id: row.get(1)?,
         title: row.get(2)?,
         provider: row.get(3)?,
-        session_id: row.get(4)?,
-        session_started: row.get(5)?,
+        conversation: crate::agent::ConversationState::parse(
+            &row.get::<_, String>(5)?,
+            row.get(4)?,
+        )
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, error.into())
+        })?,
+        model: row
+            .get::<_, Option<String>>(17)?
+            .map_or(crate::providers::ModelSelection::CliDefault, |id| {
+                crate::providers::ModelSelection::Model { id }
+            }),
+        effort: row.get::<_, Option<String>>(18)?.map_or(
+            crate::agent::EffortSelection::CliDefault,
+            crate::agent::EffortSelection::Chosen,
+        ),
+        speed: match row.get::<_, String>(19)?.as_str() {
+            "normal" => crate::agent::Speed::Normal,
+            "fast" => crate::agent::Speed::Fast,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
         status: Status::from_saved(&row.get::<_, String>(6)?),
         unread: row.get(7)?,
         created_at: row.get(8)?,
@@ -1037,13 +1065,18 @@ fn retain_copy_cleanup(
 fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO threads (id, project_id, title, provider, session_id, session_started,
-                              status, unread, created_at, updated_at, archived_at, workdir)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                              status, unread, created_at, updated_at, archived_at, workdir, conversation_id, conversation_state, model, effort, speed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT (id) DO UPDATE SET
              title = excluded.title,
              provider = excluded.provider,
              session_id = excluded.session_id,
              session_started = excluded.session_started,
+             conversation_id = excluded.conversation_id,
+             conversation_state = excluded.conversation_state,
+             model = excluded.model,
+             effort = excluded.effort,
+             speed = excluded.speed,
              status = excluded.status,
              unread = excluded.unread,
              updated_at = excluded.updated_at",
@@ -1052,14 +1085,19 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
             row.project_id,
             row.title,
             row.provider,
-            row.session_id,
-            row.session_started,
+            if row.provider == "claude" { row.conversation.id().unwrap_or("") } else { "" },
+            row.provider == "claude" && matches!(row.conversation, crate::agent::ConversationState::Established(_)),
             row.status.as_str(),
             row.unread,
             row.created_at,
             row.updated_at,
             row.archived_at,
             path_text(&row.workdir),
+            row.conversation.id(),
+            row.conversation.stored_state(),
+            match &row.model { crate::providers::ModelSelection::CliDefault => None, crate::providers::ModelSelection::Model { id } => Some(id) },
+            match &row.effort { crate::agent::EffortSelection::CliDefault => None, crate::agent::EffortSelection::Chosen(effort) => Some(effort) },
+            match row.speed { crate::agent::Speed::Normal => "normal", crate::agent::Speed::Fast => "fast" },
         ],
     )?;
     if let Some(copy) = &row.copy {
@@ -1161,6 +1199,44 @@ mod tests {
         assert_eq!(user_version(&connection), 2);
     }
 
+    #[test]
+    fn legacy_conversations_and_rift_metadata_migrate_together() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
+        connection.execute_batch("INSERT INTO projects VALUES (1, '/tmp/project', 1, 1);
+            INSERT INTO threads VALUES ('reserved', 1, '/tmp/project', 'Draft', 'claude', 'old-r', 0, 'done', 0, 1, 1, NULL);
+            INSERT INTO threads VALUES ('established', 1, '/tmp/copy', 'Saved', 'claude', 'old-e', 1, 'done', 0, 1, 1, NULL);").unwrap();
+        migrate(&mut connection, &MIGRATIONS[..2]).unwrap();
+        connection.execute_batch("INSERT INTO copies VALUES ('established', '/tmp/copy', '/tmp/copy', '/tmp/project', 'rift-id', 'base', 1, NULL);").unwrap();
+        migrate(&mut connection, MIGRATIONS).unwrap();
+        assert_eq!(user_version(&connection), 3);
+        let mut query = connection.prepare(THREAD_COLUMNS).unwrap();
+        let rows: Vec<_> = query
+            .query_map([], thread_row)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows[0].conversation,
+            crate::agent::ConversationState::Reserved("old-r".into())
+        );
+        assert_eq!(
+            rows[1].conversation,
+            crate::agent::ConversationState::Established("old-e".into())
+        );
+        assert_eq!(rows[1].copy.as_ref().unwrap().rift_id, "rift-id");
+        assert!(rows.iter().all(
+            |row| row.model == crate::providers::ModelSelection::CliDefault
+                && row.effort == crate::agent::EffortSelection::CliDefault
+                && row.speed == crate::agent::Speed::Normal
+        ));
+        assert!(
+            connection
+                .execute("UPDATE threads SET speed = 'invented'", [])
+                .is_err()
+        );
+    }
+
     fn row(id: &str, project_id: i64) -> ThreadRow {
         ThreadRow {
             id: id.to_string(),
@@ -1168,8 +1244,10 @@ mod tests {
             workdir: PathBuf::from("/tmp/project"),
             title: id.to_string(),
             provider: "claude".to_string(),
-            session_id: format!("session-{id}"),
-            session_started: false,
+            conversation: crate::agent::ConversationState::Reserved(format!("session-{id}")),
+            model: crate::providers::ModelSelection::CliDefault,
+            effort: crate::agent::EffortSelection::CliDefault,
+            speed: crate::agent::Speed::Normal,
             status: Status::Done,
             unread: false,
             created_at: 1,
@@ -1280,7 +1358,7 @@ mod tests {
 
         let store = Store::open_in(dir.path()).unwrap();
         let connection = Connection::open(store.path()).unwrap();
-        assert_eq!(user_version(&connection), 2);
+        assert_eq!(user_version(&connection), MIGRATIONS.len() as i64);
         let old = store.thread("t1").unwrap().expect("kept");
         assert_eq!(old.title, "Old");
         assert_eq!(old.copy, None);

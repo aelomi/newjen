@@ -19,6 +19,22 @@ pub enum Provider {
 }
 
 impl Provider {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+}
+
+impl Provider {
     fn cli(self) -> Cli {
         match self {
             Self::Claude => Cli::Claude,
@@ -512,7 +528,7 @@ fn claude_catalog() -> ModelCatalog {
                 .map(str::to_owned)
                 .into(),
             default_effort: None,
-            fast: None,
+            fast: Some(ServiceTier { id: "fast".into(), label: "Fast (CLI checks availability)".into(), description: "May bill extra usage. Model and account eligibility are checked by the Claude CLI.".into() }),
             service_tiers: Vec::new(),
             default_service_tier: None,
         })

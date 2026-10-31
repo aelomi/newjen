@@ -352,8 +352,8 @@ impl Thread {
             cwd: project.path.clone(),
             place: Place::ProjectFolder,
             title: NEW_THREAD_TITLE.to_string(),
-            provider: PROVIDER_CLAUDE.to_string(),
-            session_id: new_id(),
+            provider: base_config.agent.provider.id().to_string(),
+            session_id: crate::session::reserved_id(base_config.agent.provider),
             session_started: false,
             transcript: Transcript::with_cwd(project.path.clone()),
             controller: Default::default(),
@@ -378,6 +378,42 @@ impl Thread {
         }
     }
 
+    /// Creates a draft from a usage-free detection result. The selection is immutable.
+    pub fn draft_with_agent(
+        store: Store,
+        project: &Project,
+        agent: crate::agent::AgentConfig,
+        detected: &crate::providers::ProviderStatus,
+    ) -> Result<Self> {
+        agent.validate(detected)?;
+        let crate::providers::Availability::Ready { binary, .. } = &detected.availability else {
+            unreachable!("validated above")
+        };
+        let mut config = SessionConfig::new(&project.path);
+        config.program = binary.clone();
+        config.agent = agent;
+        Ok(Self::new_draft(store, project, config))
+    }
+    pub fn agent_config(&self) -> Option<&crate::agent::AgentConfig> {
+        self.unavailable_reason()
+            .is_none()
+            .then_some(&self.base_config.agent)
+    }
+    pub fn unavailable_reason(&self) -> Option<String> {
+        crate::providers::Provider::from_id(&self.provider)
+            .is_none()
+            .then(|| format!("Provider '{}' is unavailable", self.provider))
+    }
+    pub fn conversation(&self) -> crate::agent::ConversationState {
+        if self.session_id.is_empty() {
+            crate::agent::ConversationState::Uncreated
+        } else if self.session_started {
+            crate::agent::ConversationState::Established(self.session_id.clone())
+        } else {
+            crate::agent::ConversationState::Reserved(self.session_id.clone())
+        }
+    }
+
     /// A saved thread, with its transcript and grants. What the previous run of Newjen left
     /// unfinished is settled first (`Transcript::normalize_after_relaunch`) and saved. No
     /// `claude` is started.
@@ -387,6 +423,9 @@ impl Thread {
         row: ThreadRow,
         base_config: SessionConfig,
     ) -> Result<Thread> {
+        if let Some(provider) = crate::providers::Provider::from_id(&row.provider) {
+            crate::session::validate_conversation(provider, &row.conversation)?;
+        }
         let saved = store.items(&row.id)?;
         // A write that failed in an earlier run can leave a gap in the saved positions (0, 1,
         // 2, 4). Rows load in order, so from the gap on a row's place on screen is not its
@@ -413,8 +452,18 @@ impl Thread {
         thread.place = row.copy.map_or(Place::ProjectFolder, Place::Copy);
         thread.title = row.title;
         thread.provider = row.provider;
-        thread.session_id = row.session_id;
-        thread.session_started = row.session_started;
+        thread.session_id = row.conversation.id().unwrap_or("").to_owned();
+        thread.session_started = matches!(
+            row.conversation,
+            crate::agent::ConversationState::Established(_)
+        );
+        thread.base_config.agent = crate::agent::AgentConfig {
+            provider: crate::providers::Provider::from_id(&thread.provider)
+                .unwrap_or(crate::providers::Provider::Claude),
+            model: row.model,
+            effort: row.effort,
+            speed: row.speed,
+        };
         thread.transcript = transcript;
         thread.grants = grants;
         thread.unread = row.unread;
@@ -1189,6 +1238,13 @@ impl Thread {
     /// Starts `claude` with [`Thread::session_config`] and forwards its events to the thread's
     /// channel under a new generation.
     fn spawn(&mut self) -> Result<()> {
+        if let Some(reason) = self.unavailable_reason() {
+            bail!("{reason}");
+        }
+        crate::session::validate_conversation(
+            self.base_config.agent.provider,
+            &self.conversation(),
+        )?;
         // Never two claudes on one conversation: wait until any being stopped are gone
         // (usually they already are).
         for stopping in self.stopping.drain(..) {
@@ -1379,8 +1435,10 @@ impl Thread {
             workdir: self.cwd.clone(),
             title: self.title.clone(),
             provider: self.provider.clone(),
-            session_id: self.session_id.clone(),
-            session_started: self.session_started,
+            conversation: self.conversation(),
+            model: self.base_config.agent.model.clone(),
+            effort: self.base_config.agent.effort.clone(),
+            speed: self.base_config.agent.speed,
             status: self.status(),
             unread: self.unread,
             created_at: self.created_at,

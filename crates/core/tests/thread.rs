@@ -462,7 +462,10 @@ fn a_draft_is_saved_by_its_first_message() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].title, "Fix the login bug");
     assert_eq!(rows[0].status, Status::Done);
-    assert!(rows[0].session_started);
+    assert!(matches!(
+        rows[0].conversation,
+        newjen_core::agent::ConversationState::Established(_)
+    ));
     assert_eq!(
         fixture.store.items(thread.id()).unwrap().len(),
         thread.transcript().items().len()
@@ -607,8 +610,11 @@ fn a_missing_conversation_starts_fresh_and_resends_the_message_once() {
     // The new conversation is saved, so the next launch resumes it.
     assert!(fixture.store.flush(FLUSH));
     let row = fixture.store.thread(thread.id()).unwrap().unwrap();
-    assert_eq!(row.session_id, new_session);
-    assert!(row.session_started);
+    assert_eq!(row.conversation.id(), Some(new_session));
+    assert!(matches!(
+        row.conversation,
+        newjen_core::agent::ConversationState::Established(_)
+    ));
 }
 
 #[test]
@@ -1484,8 +1490,12 @@ fn a_thread_always_restarts_from_its_own_folder() {
         workdir: copy_dir.path().to_path_buf(),
         title: "In a copy".to_string(),
         provider: "claude".to_string(),
-        session_id: "6f1c1f4e-2b1e-4c8e-9a51-0d9a7c2f3b10".to_string(),
-        session_started: true,
+        conversation: newjen_core::agent::ConversationState::Established(
+            "6f1c1f4e-2b1e-4c8e-9a51-0d9a7c2f3b10".into(),
+        ),
+        model: newjen_core::providers::ModelSelection::CliDefault,
+        effort: newjen_core::agent::EffortSelection::CliDefault,
+        speed: newjen_core::agent::Speed::Normal,
         status: Status::Done,
         unread: false,
         created_at: 1,

@@ -86,12 +86,12 @@ fn claude_catalog_stays_with_documented_syntax() {
     let catalog = claude_catalog();
     assert_eq!(catalog.source, CatalogSource::CliAliases);
     assert_eq!(catalog.models.len(), 4);
-    assert!(
-        catalog
-            .models
-            .iter()
-            .all(|m| m.fast.is_none() && m.default_effort.is_none())
-    );
+    assert!(catalog.models.iter().all(|m| {
+        m.fast
+            .as_ref()
+            .is_some_and(|fast| fast.description.contains("extra usage"))
+            && m.default_effort.is_none()
+    }));
 }
 
 fn script(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {

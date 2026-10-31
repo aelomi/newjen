@@ -274,7 +274,7 @@ pub enum Speed {
     Normal,
     Fast,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub provider: crate::providers::Provider,
     pub model: crate::providers::ModelSelection,
@@ -313,4 +313,78 @@ pub enum RateLimitEvent {
     Updated(LimitSnapshot),
     Warning(LimitSnapshot),
     Rejected(LimitSnapshot),
+}
+
+impl AgentConfig {
+    pub fn cli_default(provider: crate::providers::Provider) -> Self {
+        Self {
+            provider,
+            model: crate::providers::ModelSelection::CliDefault,
+            effort: EffortSelection::CliDefault,
+            speed: Speed::Normal,
+        }
+    }
+    pub fn validate(&self, status: &crate::providers::ProviderStatus) -> anyhow::Result<()> {
+        use crate::providers::{Availability, ModelSelection};
+        anyhow::ensure!(
+            self.provider == status.provider,
+            "The catalog belongs to another provider"
+        );
+        let Availability::Ready { catalog, .. } = &status.availability else {
+            anyhow::bail!(
+                "The selected provider is unavailable; check its installation and sign-in"
+            );
+        };
+        match &self.model {
+            ModelSelection::CliDefault => anyhow::ensure!(
+                self.effort == EffortSelection::CliDefault && self.speed == Speed::Normal,
+                "Choose a model before overriding effort or speed"
+            ),
+            ModelSelection::Model { id } => {
+                let model = catalog
+                    .models
+                    .iter()
+                    .find(|model| &model.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("The model is not in the provider catalog"))?;
+                if let EffortSelection::Chosen(effort) = &self.effort {
+                    anyhow::ensure!(model.efforts.contains(effort), "Unsupported effort");
+                }
+                anyhow::ensure!(
+                    self.speed == Speed::Normal || model.fast.is_some(),
+                    "This model does not offer fast mode"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationState {
+    Uncreated,
+    Reserved(String),
+    Established(String),
+}
+impl ConversationState {
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Uncreated => None,
+            Self::Reserved(id) | Self::Established(id) => Some(id),
+        }
+    }
+    pub(crate) fn stored_state(&self) -> &'static str {
+        match self {
+            Self::Uncreated => "uncreated",
+            Self::Reserved(_) => "reserved",
+            Self::Established(_) => "established",
+        }
+    }
+    pub(crate) fn parse(state: &str, id: Option<String>) -> anyhow::Result<Self> {
+        match (state, id) {
+            ("uncreated", None) => Ok(Self::Uncreated),
+            ("reserved", Some(id)) if !id.trim().is_empty() => Ok(Self::Reserved(id)),
+            ("established", Some(id)) if !id.trim().is_empty() => Ok(Self::Established(id)),
+            _ => anyhow::bail!("Invalid saved conversation state"),
+        }
+    }
 }

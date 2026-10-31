@@ -17,8 +17,10 @@ fn thread_row(id: &str, project_id: i64, created_at: i64) -> ThreadRow {
         workdir: PathBuf::from("/tmp/project"),
         title: format!("Thread {id}"),
         provider: "claude".to_string(),
-        session_id: format!("session-{id}"),
-        session_started: false,
+        conversation: newjen_core::agent::ConversationState::Reserved(format!("session-{id}")),
+        model: newjen_core::providers::ModelSelection::CliDefault,
+        effort: newjen_core::agent::EffortSelection::CliDefault,
+        speed: newjen_core::agent::Speed::Normal,
         status: Status::Done,
         unread: false,
         created_at,
@@ -96,7 +98,8 @@ fn projects_threads_items_and_grants_round_trip() {
 
     // Updating the row changes what a conversation changes, nothing else.
     row.title = "Renamed".to_string();
-    row.session_started = true;
+    row.conversation =
+        newjen_core::agent::ConversationState::Established(row.conversation.id().unwrap().into());
     row.status = Status::Stopped;
     row.updated_at = 2_000;
     let mut sneaky = row.clone();
@@ -116,7 +119,10 @@ fn projects_threads_items_and_grants_round_trip() {
     assert!(store.flush(FLUSH));
     let saved = store.thread("t1").unwrap().unwrap();
     assert_eq!(saved.title, "Renamed");
-    assert!(saved.session_started);
+    assert!(matches!(
+        saved.conversation,
+        newjen_core::agent::ConversationState::Established(_)
+    ));
     assert_eq!(saved.status, Status::Stopped);
     assert!(saved.unread);
     assert_eq!(saved.updated_at, 2_000);
@@ -239,7 +245,7 @@ fn reopening_keeps_everything_at_the_same_schema_version() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let journal: String = connection
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();
