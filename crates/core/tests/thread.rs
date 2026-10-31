@@ -2550,7 +2550,19 @@ fn a_failed_sent_checkpoint_returns_the_message_without_sending_it() {
 
 #[test]
 fn quitting_stops_rift_and_postcreate_hooks_before_recovery() {
-    let fixture = Fixture::new();
+    for provider in [
+        newjen_core::providers::Provider::Claude,
+        newjen_core::providers::Provider::Codex,
+    ] {
+        quitting_stops_rift_and_postcreate_hooks_before_recovery_for(provider);
+    }
+}
+
+fn quitting_stops_rift_and_postcreate_hooks_before_recovery_for(
+    provider: newjen_core::providers::Provider,
+) {
+    let mut fixture = Fixture::new();
+    fixture.config.agent = newjen_core::agent::AgentConfig::cli_default(provider);
     let Some(tools) = fixture.rift_tools() else {
         return;
     };
@@ -2602,7 +2614,19 @@ fn quitting_stops_rift_and_postcreate_hooks_before_recovery() {
 
 #[test]
 fn a_copy_job_not_yet_started_never_runs_rift_after_quit() {
-    let fixture = Fixture::new();
+    for provider in [
+        newjen_core::providers::Provider::Claude,
+        newjen_core::providers::Provider::Codex,
+    ] {
+        a_copy_job_not_yet_started_never_runs_rift_after_quit_for(provider);
+    }
+}
+
+fn a_copy_job_not_yet_started_never_runs_rift_after_quit_for(
+    provider: newjen_core::providers::Provider,
+) {
+    let mut fixture = Fixture::new();
+    fixture.config.agent = newjen_core::agent::AgentConfig::cli_default(provider);
     let Some(tools) = fixture.rift_tools() else {
         return;
     };
@@ -2615,8 +2639,20 @@ fn a_copy_job_not_yet_started_never_runs_rift_after_quit() {
 
 #[test]
 fn quitting_lets_a_running_jj_finish_and_prevents_the_copy_start() {
+    for provider in [
+        newjen_core::providers::Provider::Claude,
+        newjen_core::providers::Provider::Codex,
+    ] {
+        quitting_lets_a_running_jj_finish_and_prevents_the_copy_start_for(provider);
+    }
+}
+
+fn quitting_lets_a_running_jj_finish_and_prevents_the_copy_start_for(
+    provider: newjen_core::providers::Provider,
+) {
     use std::os::unix::fs::PermissionsExt;
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    fixture.config.agent = newjen_core::agent::AgentConfig::cli_default(provider);
     let Some(mut tools) = fixture.rift_tools() else {
         return;
     };

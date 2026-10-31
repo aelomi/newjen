@@ -56,6 +56,21 @@ impl Lab {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
+    fn rift_tools(&self) -> newjen_core::rift::Tools {
+        let mut tools = newjen_core::rift::Tools::find();
+        assert!(
+            tools.rift.is_absolute() && tools.jj.is_absolute(),
+            "This test requires Rift and jj"
+        );
+        let home = self.dir.path().join("rift-home");
+        std::fs::create_dir(&home).unwrap();
+        tools.env = vec![
+            ("HOME".into(), home.display().to_string()),
+            ("JJ_USER".into(), "Test".into()),
+            ("JJ_EMAIL".into(), "test@example.com".into()),
+        ];
+        tools
+    }
     fn flush(&self) {
         assert!(self.store.flush(Duration::from_secs(5)));
     }
@@ -292,18 +307,7 @@ fn relaunch_resumes_the_server_id_in_the_saved_workdir_without_an_automatic_turn
 #[test]
 fn a_codex_rift_copy_delivers_the_held_message_once_in_the_copy() {
     let lab = Lab::new("reply");
-    let mut tools = newjen_core::rift::Tools::find();
-    assert!(
-        tools.rift.is_absolute() && tools.jj.is_absolute(),
-        "This test requires Rift and jj"
-    );
-    let home = lab.dir.path().join("rift-home");
-    std::fs::create_dir(&home).unwrap();
-    tools.env = vec![
-        ("HOME".into(), home.display().to_string()),
-        ("JJ_USER".into(), "Test".into()),
-        ("JJ_EMAIL".into(), "test@example.com".into()),
-    ];
+    let tools = lab.rift_tools();
     let mut thread = lab.draft();
     thread.set_works_in(WorksIn::RiftCopy).unwrap();
     let Sent::MakingCopy(job) = thread.send("Only in the copy").unwrap() else {
@@ -345,6 +349,43 @@ fn a_codex_rift_copy_delivers_the_held_message_once_in_the_copy() {
     );
     let removal = thread.archive().unwrap();
     removal.run(&tools).unwrap();
+}
+
+#[test]
+fn a_refused_sent_checkpoint_never_delivers_the_held_message_to_codex() {
+    let lab = Lab::new("reply");
+    let tools = lab.rift_tools();
+    let mut thread = lab.draft();
+    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    let Sent::MakingCopy(job) = thread
+        .send("Do not deliver without the checkpoint")
+        .unwrap()
+    else {
+        panic!("copy job expected");
+    };
+    let copy = job.run(&tools, |_| {}).unwrap();
+    let database = rusqlite::Connection::open(lab.store.path()).unwrap();
+    database
+        .execute_batch("CREATE TRIGGER refuse_sent BEFORE INSERT ON pending_copies WHEN NEW.state = 'sent' BEGIN SELECT RAISE(ABORT, 'disk full'); END;")
+        .unwrap();
+    let failed = thread.finish_copy(Ok(copy.clone())).unwrap_err();
+    assert_eq!(failed.message, "Do not deliver without the checkpoint");
+    thread.shutdown_for_quit();
+    assert!(thread.transcript().items().is_empty());
+    assert!(!lab.input().iter().any(|m| m["method"] == "turn/start"));
+    lab.flush();
+    assert!(lab.store.thread(thread.id()).unwrap().is_none());
+    let pending = lab.store.pending_copies(lab.project.id).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].state,
+        newjen_core::store::PendingState::MakingCopy
+    );
+    assert_eq!(
+        Thread::recover_pending_copy(&lab.store, &lab.project, &pending[0], &tools).unwrap(),
+        newjen_core::thread::CopyRecovery::Draft
+    );
+    assert!(!copy.path.exists());
 }
 
 #[test]
@@ -697,7 +738,27 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
             .join()
             .unwrap()
     });
+    let database = rusqlite::Connection::open(store.path()).unwrap();
+    database
+        .execute_batch("CREATE TRIGGER hold_first_checkpoint BEFORE INSERT ON threads BEGIN SELECT RAISE(ABORT, 'test holds the first thread checkpoint'); END;")
+        .unwrap();
     thread.finish_copy(made).unwrap();
+    assert!(store.flush(Duration::from_secs(5)));
+    let pending = store.pending_copies(project.id).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].state, newjen_core::store::PendingState::Sent);
+    assert_eq!(pending[0].path, thread.copy().unwrap().path);
+    assert_eq!(
+        pending[0].rift_id.as_deref(),
+        Some(thread.copy().unwrap().rift_id.as_str())
+    );
+    assert!(store.thread(thread.id()).unwrap().is_none());
+    println!(
+        "delivery: pending_copies=1, state=Sent, Rift id/path matched, thread checkpoint held by test trigger"
+    );
+    database
+        .execute_batch("DROP TRIGGER hold_first_checkpoint;")
+        .unwrap();
     assert!(hook_seen);
     let copy = thread.copy().unwrap().clone();
     assert_eq!(thread.cwd(), copy.workdir);
