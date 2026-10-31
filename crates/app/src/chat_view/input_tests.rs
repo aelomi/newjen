@@ -696,6 +696,44 @@ fn while_its_copy_is_made_the_thread_shows_it_and_cannot_be_archived(cx: &mut Te
     cx.update(|window, cx| chat.update(cx, |view, cx| view.archive(&id, window, cx)));
     assert_eq!(cx.update(|_, cx| chat.read(cx).slots.len()), 1);
 
+    assert!(cx.debug_bounds("cancel-copy").is_some());
+    cx.simulate_keystrokes("cmd-.");
+    assert!(cx.update(|_, cx| thread.read(cx).preparing().unwrap().cancelled()));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("cancel-copy").is_none());
+    let failed = job.run(&Tools::find(), |_| {}).unwrap_err();
+    assert_eq!(failed, CopyError::Cancelled);
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.copy_made(&thread, Err(failed), window, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "fix the parser"
+    );
+    assert_eq!(notice_title(&chat, cx), None);
+    assert!(composer_focused(&chat, cx));
+    assert!(cx.debug_bounds("works-in").is_some());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn a_failed_copy_names_what_failed(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "failed-copy", false);
+    let thread = cx.update(|_, cx| chat.read(cx).thread().clone());
+    let job = cx.update(|_, cx| {
+        thread.update(cx, |thread, cx| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            let sent = thread.send("fix the parser");
+            cx.notify();
+            match sent {
+                Ok(Sent::MakingCopy(job)) => job,
+                other => panic!("expected a copy job, got {other:?}"),
+            }
+        })
+    });
     drop(job);
     let failed = CopyError::Failed {
         command: "rift create".to_string(),
@@ -714,7 +752,6 @@ fn while_its_copy_is_made_the_thread_shows_it_and_cannot_be_archived(cx: &mut Te
     );
     assert_eq!(notice_title(&chat, cx).as_deref(), Some(COPY_FAILED));
     assert!(composer_focused(&chat, cx));
-    assert!(cx.debug_bounds("works-in").is_some());
     finish(&chat, path, cx);
 }
 
@@ -760,6 +797,14 @@ async fn archiving_a_rift_thread_asks_then_deletes_its_copy(cx: &mut TestAppCont
 
     archive_from_menu(cx);
     cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert!(copy.path.exists(), "Return keeps the copy");
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).copy().is_some()));
+
+    archive_from_menu(cx);
+    let delete = cx.debug_bounds("delete-copy").unwrap();
+    cx.simulate_click(delete.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));

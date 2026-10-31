@@ -19,6 +19,8 @@ pub fn composer_field(window: &mut Window, cx: &mut Context<TextareaState>) -> T
 pub enum Footer {
     Send(OnPress),
     Stop(OnPress),
+    /// While a Rift copy is made.
+    Cancel(OnPress),
     /// Disabled, with this hint.
     Wait(&'static str),
     Disabled(&'static str),
@@ -52,7 +54,7 @@ impl RenderOnce for Composer {
         let name = self.field.read(cx).presentation().placeholder().clone();
         let send = match &self.footer {
             Footer::Send(send) => Some(send.clone()),
-            Footer::Stop(_) | Footer::Wait(_) | Footer::Disabled(_) => None,
+            Footer::Stop(_) | Footer::Cancel(_) | Footer::Wait(_) | Footer::Disabled(_) => None,
         };
         let waiting = matches!(self.footer, Footer::Wait(_) | Footer::Disabled(_));
         let hint = div()
@@ -63,9 +65,26 @@ impl RenderOnce for Composer {
             .text_xs()
             .text_color(cx.theme().muted_foreground);
         let (hint, button) = match self.footer {
+            Footer::Cancel(cancel) => (
+                hint.child(key_caps("cmd-.", cx))
+                    .child("to cancel the copy"),
+                Some((
+                    "cancel-copy",
+                    icon_button_with_look(
+                        "cancel-copy",
+                        IconName::X,
+                        "Cancel the copy",
+                        Look::Secondary,
+                        false,
+                        cx,
+                    )
+                    .on_click(move |_, window, cx| cancel(window, cx)),
+                )),
+            ),
             Footer::Stop(stop) => (
                 hint.child(key_caps("cmd-.", cx)).child("to stop"),
-                Some(
+                Some((
+                    "stop",
                     icon_button_with_look(
                         "stop",
                         IconName::Square,
@@ -75,14 +94,15 @@ impl RenderOnce for Composer {
                         cx,
                     )
                     .on_click(move |_, window, cx| stop(window, cx)),
-                ),
+                )),
             ),
             Footer::Send(send) => (
                 hint.child(key_caps("enter", cx))
                     .child("to send ·")
                     .child(key_caps("shift-enter", cx))
                     .child("for a new line"),
-                Some(
+                Some((
+                    "send",
                     icon_button_with_look(
                         "send",
                         IconName::ArrowUp,
@@ -92,18 +112,21 @@ impl RenderOnce for Composer {
                         cx,
                     )
                     .on_click(move |_, window, cx| send(window, cx)),
-                ),
+                )),
             ),
             Footer::Wait(why) => (hint.child(why), None),
             Footer::Disabled(why) => (
                 hint.child(why),
-                Some(icon_button_with_look(
+                Some((
                     "send",
-                    IconName::ArrowUp,
-                    "Send",
-                    Look::Primary,
-                    true,
-                    cx,
+                    icon_button_with_look(
+                        "send",
+                        IconName::ArrowUp,
+                        "Send",
+                        Look::Primary,
+                        true,
+                        cx,
+                    ),
                 )),
             ),
         };
@@ -148,7 +171,9 @@ impl RenderOnce for Composer {
                             .disabled(waiting),
                     ),
             )
-            .child(footer.children(button))
+            .child(footer.children(button.map(|(name, button)| {
+                div().debug_selector(move || name.to_string()).child(button)
+            })))
     }
 }
 

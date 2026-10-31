@@ -28,12 +28,15 @@ use gpui::{
 };
 use gpui_kit::base::input::{InputAccessibility, TextareaState};
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::button::ButtonVariant;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Side, WindowExt as _};
 use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
-use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
+use newjen_core::thread::{
+    self, CopyJob, NotSent, Preparing, Quitting, Sent, WorksIn, keeps_draft,
+};
 use newjen_core::{ApprovalIntent, Item, Project, SessionConfig, Status, Store, Thread, ToolState};
 
 use crate::approval::{self, Room};
@@ -79,7 +82,7 @@ const MINUTE_TICKS: u64 = 60;
 /// While a Rift copy is made, a hook line redraws the window at most this often. The clock
 /// redraws it every second anyway.
 const LINE_REDRAW: Duration = Duration::from_millis(100);
-const COPY_WAIT: &str = "You can write once the copy is ready";
+const COPY_CANCELLING: &str = "Cancelling… Rift is being stopped";
 const COPY_OUTPUT_LINES: usize = 8;
 const COPY_FAILED: &str = "Couldn't create the Rift copy";
 
@@ -684,16 +687,34 @@ impl ChatView {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let view = view.clone();
             let id = id.clone();
+            // Return closes the dialog and keeps the copy: deleting a copy takes a click.
             alert
                 .title(SharedString::from(title.clone()))
                 .description(SharedString::from(body.clone()))
-                .confirm()
-                .ok_text("Archive and delete")
-                .ok_variant(ButtonVariant::Danger)
-                .on_ok(move |_, window, cx| {
-                    let _ = view.update(cx, |view, cx| view.archive(&id, window, cx));
-                    true
-                })
+                .on_ok(|_, _, _| true)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("keep-copy")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            div().debug_selector(|| "delete-copy".into()).child(
+                                Button::new("delete-copy")
+                                    .label("Archive and delete")
+                                    .danger()
+                                    .on_click(move |event, window, cx| {
+                                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                                            let _ = view.update(cx, |view, cx| {
+                                                view.archive(&id, window, cx)
+                                            });
+                                            window.close_dialog(cx);
+                                        }
+                                    }),
+                            ),
+                        ),
+                )
         });
     }
 
@@ -1146,18 +1167,19 @@ impl ChatView {
                 if let Some(field) = self.slots[ix].field.clone().filter(|_| !message.is_empty()) {
                     field.update(cx, |field, cx| field.set_value(message, window, cx));
                 }
-                Some(match error.downcast_ref::<CopyError>() {
-                    Some(failed) => copy_failed(failed, self.home.as_deref()),
+                match error.downcast_ref::<CopyError>() {
+                    Some(CopyError::Cancelled) => None,
+                    Some(failed) => Some(copy_failed(failed, self.home.as_deref())),
                     None => {
                         let gone = self.gone_copy(thread.read(cx));
-                        spawn_notice(
+                        Some(spawn_notice(
                             &error,
                             &program,
                             thread.read(cx).presentation(),
                             gone.as_deref(),
-                        )
+                        ))
                     }
-                })
+                }
             }
         };
         self.slots[ix].notice = notice;
@@ -1213,13 +1235,17 @@ impl ChatView {
         cx.notify();
     }
 
-    /// ⌘. or the stop button: deny-and-stop a pending approval, otherwise stop the turn.
+    /// ⌘. or the stop button: deny-and-stop a pending approval, otherwise stop the turn. While
+    /// a Rift copy is made, it cancels that instead and the message comes back.
     fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = self.thread().clone();
         let (pending, busy) = {
             let thread = thread.read(cx);
             let pending = thread.transcript().pending_approval().is_some();
-            (pending, thread.status().is_busy())
+            (
+                pending,
+                thread.status().is_busy() || thread.preparing().is_some(),
+            )
         };
         if !pending && !busy {
             return;
@@ -1724,12 +1750,13 @@ impl ChatView {
     fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.sync_field(window, cx);
         let field = self.ensure_field(window, cx);
-        let (making_copy, busy, choosing) = {
+        let (making_copy, cancelling, busy, choosing) = {
             let thread = self.thread().read(cx);
             let choosing =
                 (thread.is_draft() && thread.copy().is_none()).then(|| thread.works_in());
             (
                 thread.preparing().is_some(),
+                thread.preparing().is_some_and(Preparing::cancelled),
                 is_busy(thread.status()),
                 choosing,
             )
@@ -1752,8 +1779,10 @@ impl ChatView {
             ui::Footer::Disabled("Install an agent, then Refresh")
         } else if checking {
             ui::Footer::Disabled("Checking agents…")
+        } else if cancelling {
+            ui::Footer::Wait(COPY_CANCELLING)
         } else if making_copy {
-            ui::Footer::Wait(COPY_WAIT)
+            ui::Footer::Cancel(self.press(cx, |view, window, cx| view.stop(window, cx)))
         } else if busy {
             ui::Footer::Stop(self.press(cx, |view, window, cx| view.stop(window, cx)))
         } else {
@@ -2212,6 +2241,7 @@ fn spawn_notice(
 /// Rift's own message is the last line it printed, so it is not shown twice.
 fn copy_failed(error: &CopyError, home: Option<&Path>) -> Notice {
     let (detail, output) = match error {
+        CopyError::Cancelled => (error.to_string(), Vec::new()),
         CopyError::Failed { detail, output, .. } => {
             let mut lines: Vec<String> = output
                 .iter()
