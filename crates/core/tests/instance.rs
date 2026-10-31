@@ -77,12 +77,12 @@ fn one_owner_per_folder_until_drop() {
     assert_eq!(first.directory(), directory.canonicalize().unwrap());
     assert!(InstanceLock::try_acquire(&directory).unwrap().is_none());
     drop(first);
-    assert!(directory.join("instance.lock").exists());
+    assert!(!directory.join("instance.lock").exists());
     drop(reacquire(&directory));
 }
 
 #[test]
-fn stale_lock_file_is_reused_without_erasing_it() {
+fn stale_lock_file_is_left_alone() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("instance.lock");
     std::fs::write(&path, "previous owner").unwrap();
@@ -91,6 +91,18 @@ fn stale_lock_file_is_reused_without_erasing_it() {
     assert!(InstanceLock::try_acquire(temp.path()).unwrap().is_none());
     drop(instance);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous owner");
+}
+
+#[test]
+fn deleting_a_lock_file_cannot_admit_a_second_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner = Owner::start(temp.path());
+    let path = temp.path().join("instance.lock");
+    std::fs::write(&path, "stale lock").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(InstanceLock::try_acquire(temp.path()).unwrap().is_none());
+    drop(owner);
+    drop(reacquire(temp.path()));
 }
 
 #[test]
@@ -122,7 +134,6 @@ fn process_death_releases_ownership() {
     assert!(InstanceLock::try_acquire(temp.path()).unwrap().is_none());
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
-    assert!(temp.path().join("instance.lock").exists());
     drop(reacquire(temp.path()));
 }
 
@@ -159,6 +170,4 @@ fn filesystem_failures_are_errors_instead_of_contention() {
     let file = temp.path().join("file");
     std::fs::write(&file, "not a folder").unwrap();
     assert!(InstanceLock::try_acquire(&file).is_err());
-    std::fs::create_dir(temp.path().join("instance.lock")).unwrap();
-    assert!(InstanceLock::try_acquire(temp.path()).is_err());
 }

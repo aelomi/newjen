@@ -96,7 +96,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 - **The "already in use" repair is timing-bound.** It needs claude's stderr line to arrive within the 500 ms drain after claude exits; a later line shows as a plain "Claude exited" error instead.
 - **⌘{ and ⌘} assume a US layout.** On layouts that type braces another way, previous/next thread may not fire.
 - **Reduce Motion is polled every second.** Listening for NSWorkspace's accessibility display options notification would apply it at once.
-- **One Newjen instance per data folder.** Startup takes an OS file lock before opening the store or reaping processes. A second launch shows an alert and leaves the running instance alone. The lock releases on exit or crash; separate `NEWJEN_HOME` folders can run in parallel.
+- **One Newjen instance per data folder.** Startup takes an OS lock on the folder itself before opening the store or reaping processes. A second launch shows an alert and leaves the running instance alone. The lock releases on exit or crash; separate `NEWJEN_HOME` folders can run in parallel.
 
 ## Build order (one vertical slice first)
 

@@ -1,10 +1,10 @@
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 
 /// Exclusive ownership of a Newjen data folder until this guard is dropped or its process exits.
-/// The lock file stays on disk so every launch locks the same file.
+/// Locks the folder itself, so deleting a file inside it cannot release ownership.
 #[derive(Debug)]
 #[must_use = "keep the guard alive while using the data folder"]
 pub struct InstanceLock {
@@ -21,14 +21,8 @@ impl InstanceLock {
         let directory = directory
             .canonicalize()
             .with_context(|| format!("could not resolve {}", directory.display()))?;
-        let path = directory.join("instance.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("could not open {}", path.display()))?;
+        let file = File::open(&directory)
+            .with_context(|| format!("could not open {}", directory.display()))?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self {
                 _file: file,
@@ -36,7 +30,7 @@ impl InstanceLock {
             })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => {
-                Err(error).with_context(|| format!("could not lock {}", path.display()))
+                Err(error).with_context(|| format!("could not lock {}", directory.display()))
             }
         }
     }
