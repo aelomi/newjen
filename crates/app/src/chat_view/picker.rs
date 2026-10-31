@@ -55,9 +55,9 @@ impl ChatView {
                                 .iter()
                                 .find(|s| s.provider == config.provider)
                         {
-                            let current_valid = thread
-                                .agent_config()
-                                .is_some_and(|a| a.validate(status).is_ok());
+                            let current_valid = thread.agent_config().is_some_and(|a| {
+                                view.picker.statuses.iter().any(|s| a.validate(s).is_ok())
+                            });
                             if first_check || !current_valid {
                                 let _ = thread.set_agent_config(config, status);
                             }
@@ -197,7 +197,16 @@ impl ChatView {
             Menu::Effort => "effort-picker",
         };
         let title = label.clone();
-        let button = ui::button_with_icon(id, label, icon, ui::Look::Ghost, ui::Size::Sm, cx)
+        let button = ui::button(id, label, ui::Look::Ghost, ui::Size::Sm, cx)
+            .when(menu == Menu::Effort, |button| {
+                button.icon(Icon::new(icon).text_color(
+                    if picker::is_fast(self.thread().read(cx).agent_config()) {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().muted_foreground
+                    },
+                ))
+            })
             .max_w(px(240.))
             .overflow_hidden()
             .tooltip(title)
@@ -229,11 +238,9 @@ impl ChatView {
                     .on_open_change(move |open, window, cx| {
                         let _ = change.update(cx, |v, cx| v.picker_open(menu, *open, window, cx));
                     })
-                    .content(move |state, window, cx| {
-                        let close = cx.entity().downgrade();
-                        let _ = state;
+                    .content(move |_, window, cx| {
                         content
-                            .update(cx, |v, cx| v.render_picker_menu(menu, close, window, cx))
+                            .update(cx, |v, cx| v.render_picker_menu(menu, window, cx))
                             .unwrap_or_else(|_| div().into_any_element())
                     }),
             )
@@ -243,7 +250,6 @@ impl ChatView {
     fn render_picker_menu(
         &self,
         menu: Menu,
-        close: gpui::WeakEntity<gpui_kit::component::popover::PopoverState>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -275,7 +281,7 @@ impl ChatView {
                 tabs = tabs.child(
                     ui::button(
                         ("provider-tab", ix),
-                        format!("● {}", status.provider.presentation().label),
+                        "",
                         if ix == self.picker.tab {
                             ui::Look::Secondary
                         } else {
@@ -285,7 +291,14 @@ impl ChatView {
                         cx,
                     )
                     .flex_1()
-                    .text_color(color)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().size(px(6.)).rounded_full().bg(color))
+                            .child(status.provider.presentation().label),
+                    )
+                    .debug_selector(move || format!("provider-tab-{ix}"))
                     .on_click(cx.listener(move |v, _, _, cx| {
                         v.picker.tab = ix;
                         v.picker.row = 0;
@@ -402,7 +415,6 @@ impl ChatView {
                     body = body.child(self.picker_row(
                         ix,
                         (row.label, row.detail, selected, choice),
-                        close.clone(),
                         cx,
                     ));
                 }
@@ -415,14 +427,11 @@ impl ChatView {
                     let selected = config.effort == effort;
                     let mut choice = config.clone();
                     choice.effort = effort;
-                    body = body.child(self.picker_row(
-                        ix,
-                        (label, detail, selected, choice),
-                        close.clone(),
-                        cx,
-                    ));
+                    body = body.child(self.picker_row(ix, (label, detail, selected, choice), cx));
                 }
                 if let Some(detail) = picker::fast_detail(&config, status) {
+                    let fast_row = picker::effort_rows(&config, status).len();
+                    let warning = matches!(&status.availability, providers::Availability::Ready { catalog, .. } if catalog.source == providers::CatalogSource::CliAliases);
                     let mut choice = config.clone();
                     choice.speed = if choice.speed == Speed::Fast {
                         Speed::Normal
@@ -431,21 +440,28 @@ impl ChatView {
                     };
                     body = body.child(
                         v_flex()
+                            .when(self.picker.row == fast_row, |r| r.bg(cx.theme().muted))
                             .border_t_1()
                             .border_color(cx.theme().border)
                             .p_2()
                             .child(
-                                Switch::new("agent-fast")
-                                    .label("Fast")
-                                    .checked(config.speed == Speed::Fast)
-                                    .on_click(cx.listener(move |v, _, w, cx| {
-                                        v.choose_agent(choice.clone(), w, cx)
-                                    })),
+                                h_flex().justify_between().child("Fast").child(
+                                    Switch::new("agent-fast")
+                                        .accessibility_label("Fast")
+                                        .checked(config.speed == Speed::Fast)
+                                        .on_click(cx.listener(move |v, _, w, cx| {
+                                            v.choose_agent(choice.clone(), w, cx)
+                                        })),
+                                ),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().warning)
+                                    .text_color(if warning {
+                                        cx.theme().warning
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
                                     .child(detail.to_owned()),
                             ),
                     );
@@ -526,7 +542,12 @@ impl ChatView {
                                             .statuses
                                             .iter()
                                             .find(|s| s.provider == a.provider)
-                                            .map(|s| picker::effort_rows(a, s).len())
+                                            .map(|s| {
+                                                picker::effort_rows(a, s).len()
+                                                    + usize::from(
+                                                        picker::fast_detail(a, s).is_some(),
+                                                    )
+                                            })
                                     })
                                     .unwrap_or(0)
                             };
@@ -544,17 +565,27 @@ impl ChatView {
                                 })
                             } else {
                                 config.and_then(|mut a| {
-                                    v.picker
+                                    let status = v
+                                        .picker
                                         .statuses
                                         .iter()
-                                        .find(|s| s.provider == a.provider)
-                                        .and_then(|s| {
-                                            picker::effort_rows(&a, s).get(v.picker.row).cloned()
-                                        })
-                                        .map(|(e, _)| {
-                                            a.effort = e;
-                                            a
-                                        })
+                                        .find(|s| s.provider == a.provider)?;
+                                    let rows = picker::effort_rows(&a, status);
+                                    if let Some((effort, _)) = rows.get(v.picker.row) {
+                                        a.effort = effort.clone();
+                                        Some(a)
+                                    } else if v.picker.row == rows.len()
+                                        && picker::fast_detail(&a, status).is_some()
+                                    {
+                                        a.speed = if a.speed == Speed::Fast {
+                                            Speed::Normal
+                                        } else {
+                                            Speed::Fast
+                                        };
+                                        Some(a)
+                                    } else {
+                                        None
+                                    }
                                 })
                             };
                             if let Some(choice) = choice {
@@ -596,7 +627,6 @@ impl ChatView {
         &self,
         ix: usize,
         row: (String, Option<String>, bool, AgentConfig),
-        close: gpui::WeakEntity<gpui_kit::component::popover::PopoverState>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let (label, detail, selected, choice) = row;
@@ -629,7 +659,6 @@ impl ChatView {
         row.on_click(cx.listener(move |v, _, window, cx| {
             v.choose_agent(choice.clone(), window, cx);
             v.picker.open = None;
-            let _ = close.update(cx, |p, cx| p.dismiss(window, cx));
             v.ensure_field(window, cx)
                 .read(cx)
                 .focus_handle(cx)

@@ -719,10 +719,10 @@ impl ProviderStatus {
     }
     pub fn clears_limit(&self) -> bool {
         self.provider == Provider::Codex
-            && matches!(&self.availability, Availability::Ready { rate_limits: Some(report), .. } if report.ordinary_usage_allowed == Some(true))
+            && matches!(&self.availability, Availability::Ready { rate_limits: Some(report), .. } if report.ordinary_usage_allowed != Some(false) && report.rate_limits.primary.as_ref().is_some_and(|w| w.used_percent < 100) && report.rate_limits.secondary.as_ref().is_none_or(|w| w.used_percent < 100))
             && matches!(
                 self.limit_event(),
-                Some(crate::agent::RateLimitEvent::Updated(_))
+                Some(crate::agent::RateLimitEvent::Updated(snapshot)) if snapshot.windows.iter().all(|w| w.used_percent.is_none_or(|p| p < 100.0))
             )
     }
 }

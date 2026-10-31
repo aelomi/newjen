@@ -309,12 +309,24 @@ pub fn account_view(status: &ProviderStatus) -> AccountView {
                     Warning::ClaudeCapabilitiesUnverified | Warning::RateLimitsUnavailable => {},
                 }
             }
-            if matches!(
-                status.limit_event(),
-                Some(crate::agent::RateLimitEvent::Warning(_))
-            ) {
-                view.callouts
-                    .push("Plan limit reached. Credits on this account now pay for turns.".into());
+            if let Some(crate::agent::RateLimitEvent::Warning(snapshot)) = status.limit_event() {
+                let mut detail =
+                    "Plan limit reached. Credits on this account now pay for turns.".to_owned();
+                if let Some(reset) = limit_reset(&snapshot) {
+                    detail.push_str(&format!(
+                        " Plan resets {}.",
+                        reset_time(reset, crate::store::now_ms() / 1000)
+                    ));
+                }
+                if let Availability::Ready {
+                    rate_limits: Some(report),
+                    ..
+                } = &status.availability
+                    && let Some(weekly) = &report.rate_limits.secondary
+                {
+                    detail.push_str(&format!(" Weekly {}% used.", weekly.used_percent));
+                }
+                view.callouts.push(detail);
                 view.health = Health::Warning;
             }
         }
@@ -322,25 +334,20 @@ pub fn account_view(status: &ProviderStatus) -> AccountView {
     view
 }
 
+pub fn limit_reset(snapshot: &crate::agent::LimitSnapshot) -> Option<i64> {
+    snapshot
+        .windows
+        .iter()
+        .filter(|w| w.used_percent.is_none_or(|p| p >= 100.0))
+        .filter_map(|w| w.resets_at_unix_seconds)
+        .max()
+}
+
 pub fn paused_until(event: Option<&crate::agent::RateLimitEvent>, now: i64) -> Option<i64> {
     let Some(crate::agent::RateLimitEvent::Rejected(snapshot)) = event else {
         return None;
     };
-    let exhausted = snapshot
-        .windows
-        .iter()
-        .filter(|w| w.used_percent.is_some_and(|p| p >= 100.0))
-        .filter_map(|w| w.resets_at_unix_seconds)
-        .max();
-    exhausted
-        .or_else(|| {
-            snapshot
-                .windows
-                .iter()
-                .filter_map(|w| w.resets_at_unix_seconds)
-                .min()
-        })
-        .filter(|reset| *reset > now)
+    limit_reset(snapshot).filter(|reset| *reset > now)
 }
 
 pub fn reset_time(reset: i64, now: i64) -> String {
@@ -418,6 +425,12 @@ mod limit_tests {
         assert_eq!(
             paused_until(Some(&RateLimitEvent::Warning(snapshot.clone())), 100),
             None
+        );
+        snapshot.windows[0].resets_at_unix_seconds = None;
+        assert_eq!(
+            paused_until(Some(&RateLimitEvent::Rejected(snapshot.clone())), 100),
+            None,
+            "an unused weekly window cannot supply a refused primary window's missing reset"
         );
         for window in &mut snapshot.windows {
             window.resets_at_unix_seconds = None;

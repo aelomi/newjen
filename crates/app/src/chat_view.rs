@@ -13,6 +13,7 @@
 //! calls on the thread on screen and draws what the threads say. Every change ends with
 //! `cx.notify()`, which asks GPUI to call `render` again.
 
+mod limits;
 mod picker;
 
 use std::ops::Range;
@@ -752,7 +753,8 @@ impl ChatView {
             let thread = slot.thread.read(cx);
             thread.status().is_busy() || thread.preparing().is_some()
         });
-        if minute || busy {
+        let limited = self.thread().read(cx).limit_event().is_some();
+        if minute || busy || limited {
             cx.notify();
         }
     }
@@ -876,7 +878,12 @@ impl ChatView {
                 .statuses
                 .iter()
                 .any(|s| !newjen_core::picker::model_rows(s).is_empty());
+        let paused = self.thread().read(cx).paused_until(now_ms() / 1000);
         let placeholder = SharedString::from(match status {
+            _ if paused.is_some() => format!(
+                "Paused until {}",
+                newjen_core::picker::reset_time(paused.expect("checked"), now_ms() / 1000)
+            ),
             _ if no_agent && self.thread().read(cx).is_draft() => "No agent to send to yet".into(),
             _ if making_copy => self
                 .thread()
@@ -1408,14 +1415,29 @@ impl ChatView {
         let row = match Entry::at(ix, items.len(), preparing.is_some(), notice.is_some()) {
             Some(Entry::Item(ix)) => {
                 let item = &items[ix];
-                rows::item(
-                    item,
-                    slot.replies.get(&item.id()).map(|reply| reply.view(cx)),
-                    retry,
-                    resume,
-                    rows::stopped_resends(items, ix),
-                    cx,
-                )
+                if limits::notice_replaces_error(item, ix + 1 == items.len(), thread.limit_event())
+                {
+                    return div().into_any_element();
+                }
+                if limits::is_limit_error(item) {
+                    rows::error(
+                        ("limit-history", item.id()).into(),
+                        &format!("{} usage limit reached", thread.presentation().label),
+                        "The CLI refused this turn. Newjen did not retry or resume it.",
+                        &[],
+                        None,
+                        cx,
+                    )
+                } else {
+                    rows::item(
+                        item,
+                        slot.replies.get(&item.id()).map(|reply| reply.view(cx)),
+                        retry,
+                        resume,
+                        rows::stopped_resends(items, ix),
+                        cx,
+                    )
+                }
             }
             Some(Entry::HeldMessage) => preparing.map_or_else(
                 || div().into_any_element(),
@@ -1700,6 +1722,7 @@ impl ChatView {
     }
 
     fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.sync_field(window, cx);
         let field = self.ensure_field(window, cx);
         let (making_copy, busy, choosing) = {
             let thread = self.thread().read(cx);
@@ -1718,10 +1741,17 @@ impl ChatView {
                 .iter()
                 .any(|s| !newjen_core::picker::model_rows(s).is_empty());
         let checking = self.picker.refreshing && self.picker.statuses.is_empty();
-        let footer = if no_agent {
-            ui::Footer::Wait("Install an agent, then Refresh")
+        let paused = self
+            .thread()
+            .read(cx)
+            .paused_until(now_ms() / 1000)
+            .is_some();
+        let footer = if paused {
+            ui::Footer::Disabled("Limit reached")
+        } else if no_agent {
+            ui::Footer::Disabled("Install an agent, then Refresh")
         } else if checking {
-            ui::Footer::Wait("Checking agents…")
+            ui::Footer::Disabled("Checking agents…")
         } else if making_copy {
             ui::Footer::Wait(COPY_WAIT)
         } else if busy {
@@ -1962,6 +1992,7 @@ impl Render for ChatView {
             None => self.render_composer(window, cx),
         };
         let problem = self.render_save_problem(cx);
+        let limit_notice = self.render_limit_notice(cx);
 
         let docked = (placement == Placement::Docked).then(|| {
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
@@ -2031,6 +2062,7 @@ impl Render for ChatView {
                             .max_w(COLUMN_WIDTH)
                             .gap(px(DOCK_METRICS.scope_gap))
                             .children(problem)
+                            .children(limit_notice)
                             .child(bottom),
                     ),
             );

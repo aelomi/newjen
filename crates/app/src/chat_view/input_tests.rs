@@ -1148,7 +1148,8 @@ fn agent_picker_keys_switch_tabs_choose_effort_and_return_focus(cx: &mut TestApp
     });
     click(cx, "agent-picker");
     assert!(cx.debug_bounds("provider-menu").is_some());
-    cx.simulate_keystrokes("right down enter");
+    cx.simulate_keystrokes("right");
+    click(cx, "agent-row-1");
     cx.update(|_, cx| {
         let view = chat.read(cx);
         let thread = view.thread().read(cx);
@@ -1172,6 +1173,18 @@ fn agent_picker_keys_switch_tabs_choose_effort_and_return_focus(cx: &mut TestApp
             .effort
             .clone()),
         newjen_core::EffortSelection::Chosen("high".into())
+    );
+    click(cx, "effort-picker");
+    cx.simulate_keystrokes("down down down down enter");
+    assert_eq!(
+        cx.update(|_, cx| chat
+            .read(cx)
+            .thread()
+            .read(cx)
+            .agent_config()
+            .unwrap()
+            .speed),
+        newjen_core::Speed::Fast
     );
     click(cx, "agent-picker");
     cx.simulate_keystrokes("escape");

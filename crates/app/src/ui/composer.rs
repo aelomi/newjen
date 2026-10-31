@@ -21,6 +21,7 @@ pub enum Footer {
     Stop(OnPress),
     /// Disabled, with this hint.
     Wait(&'static str),
+    Disabled(&'static str),
 }
 
 #[derive(IntoElement)]
@@ -51,9 +52,9 @@ impl RenderOnce for Composer {
         let name = self.field.read(cx).presentation().placeholder().clone();
         let send = match &self.footer {
             Footer::Send(send) => Some(send.clone()),
-            Footer::Stop(_) | Footer::Wait(_) => None,
+            Footer::Stop(_) | Footer::Wait(_) | Footer::Disabled(_) => None,
         };
-        let waiting = matches!(self.footer, Footer::Wait(_));
+        let waiting = matches!(self.footer, Footer::Wait(_) | Footer::Disabled(_));
         let hint = div()
             .flex()
             .items_center()
@@ -94,6 +95,17 @@ impl RenderOnce for Composer {
                 ),
             ),
             Footer::Wait(why) => (hint.child(why), None),
+            Footer::Disabled(why) => (
+                hint.child(why),
+                Some(icon_button_with_look(
+                    "send",
+                    IconName::ArrowUp,
+                    "Send",
+                    Look::Primary,
+                    true,
+                    cx,
+                )),
+            ),
         };
         let footer = match self.picker {
             Some(picker) => div()
@@ -102,9 +114,10 @@ impl RenderOnce for Composer {
                 .gap_1()
                 .child(picker)
                 .child(div().flex_1())
-                .when(window.viewport_size().width >= gpui::px(1040.), |r| {
-                    r.child(hint)
-                }),
+                .when(
+                    waiting || window.viewport_size().width >= gpui::px(1040.),
+                    |r| r.child(hint),
+                ),
             None => div()
                 .flex()
                 .items_center()

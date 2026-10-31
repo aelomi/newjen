@@ -588,3 +588,31 @@ fn plan_exhaustion_with_available_credits_warns_and_finishes_the_user_turn() {
         1
     );
 }
+
+#[test]
+fn an_explicit_clear_account_refresh_lifts_the_pause_without_starting_a_turn() {
+    let lab = Lab::new("limit");
+    let mut thread = lab.draft();
+    thread.send("One submitted message").unwrap();
+    finish(&mut thread);
+    assert!(thread.paused_until(1_700_000_000).is_some());
+    let before = lab.input().len();
+    let status=providers::ProviderStatus { provider:Provider::Codex, availability:Availability::Ready {
+        binary:lab.config.program.clone(),version:"0.166.0".into(),account:providers::Account { billing:providers::Billing::Subscription,plan:None,email:None },
+        catalog:providers::ModelCatalog { source:providers::CatalogSource::AccountModels,models:vec![] },
+        rate_limits:Some(Box::new(serde_json::from_value(serde_json::json!({"rateLimits":{"primary":{"usedPercent":12,"resetsAt":1800000000},"spendControlReached":false}})).unwrap())),warnings:vec![]
+    } };
+    thread.refresh_limits(&status);
+    assert_eq!(thread.paused_until(1_700_000_000), None);
+    assert!(!thread.has_session());
+    assert_eq!(lab.input().len(), before);
+    lab.flush();
+    let loaded = Thread::load(
+        lab.store.clone(),
+        &lab.project,
+        lab.store.thread(thread.id()).unwrap().unwrap(),
+        lab.config.clone(),
+    )
+    .unwrap();
+    assert_eq!(loaded.paused_until(1_700_000_000), None);
+}
