@@ -1,5 +1,7 @@
 # Landing work without an existing jj repository
 
+The later [project source-control design](project-source-control.md) supersedes the blanket copy-local jj policy below. Git mode now requires a Git implementation without jj, while jj modes use the selected layout. The transfer experiments and automatic apply requirement remain relevant. The decision sections below record the earlier discussion, not the current per-project mode policy.
+
 Research and decision date 2026-10-31. The owner chose jj confined to Rift copies for plain Git projects and required automatic apply for folders without version control. This memo changes no Newjen behavior.
 
 Newjen needs to review and return a thread's work without requiring a Git user to adopt jj. A folder without version control needs the same review-and-apply loop. Both cases include threads that edit the project folder and threads in Rift copies.
@@ -89,7 +91,7 @@ Record the complete initial jj snapshot as `B`, then start a child change before
 
 This is the selected approach for harness-managed copies. In agent-managed mode, adding jj and periodically snapshotting it contradicts the promise that Newjen does not write version control on the agent's behalf. Agent-managed Git threads need a saved baseline for review, but Newjen should not move their branches, clear their index, or invent final commits.
 
-Do not use `jj diff --git` alone as the transfer artifact. A supplemental probe created a new binary file in a non-colocated jj copy. jj emitted a descriptive `Binary files ... differ` record, and `git apply --check` rejected it. Running `git diff --binary --full-index B T` against the copy's backing Git store produced an applicable patch and restored the exact binary bytes in a non-repo destination. For a colocated copy, use its `.git` store. The non-colocated probe used `.jj/repo/store/git` with jj 0.46.0. Treat that storage path as version-specific and validate it in the core adapter. A direct file transaction from snapshot contents is another option. jj snapshots do not require using jj's display diff for transfer.
+Do not use `jj diff --git` alone as the transfer artifact. A supplemental probe created a new binary file in a non-colocated jj copy. jj emitted a descriptive `Binary files ... differ` record, and `git apply --check` rejected it. Running `git diff --binary --full-index B T` against the copy's backing Git store produced an applicable patch and restored the exact binary bytes in a non-repo destination. For a colocated copy, use its `.git` store. The non-colocated probe used `.jj/repo/store/git` with jj 0.46.0. That path was only an experimental detail. Use the documented `jj --ignore-working-copy git root` to discover it in the core adapter, as verified in the later project-mode probe. A direct file transaction from snapshot contents is another option. jj snapshots do not require using jj's display diff for transfer.
 
 jj's documented compatibility gaps include Git attributes, hooks, submodules, sparse checkouts, partial clones, and unfinished Git operations. The scratch tests cover ordinary files, not those configurations. Read the [jj compatibility documentation](https://docs.jj-vcs.dev/latest/git-compatibility/) before expanding support.
 
