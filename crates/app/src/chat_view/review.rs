@@ -375,22 +375,54 @@ impl ChatView {
         });
         cx.spawn_in(window, async move |view, cx| {
             let result = task.await;
-            let _ = view.update_in(cx, |view, _, cx| {
+            let _ = view.update_in(cx, |view, window, cx| {
                 view.review_loading = false;
                 match result {
-                    Ok(receipt) => match if receipt.truncated { Ok(Vec::new()) } else { DiffFile::parse(&receipt.patch) } {
-                        Ok(files) => {
-                            let message = if receipt.truncated { "The diff is too large to show. Landing is blocked." } else if mode == LandingMode::AgentManaged { "Only work recorded with jj is shown. Git commits are not imported; use jj and bookmark your work. The copy stays after landing." } else if receipt.patch.is_empty() { "No changes." } else { "Review the changes, then land or discard the work." }.into();
-                            view.review_panel = Some(ReviewPanel { thread: id, receipt, diff: cx.new(|cx| DiffState::new(files, cx)), busy: false, message });
-                        }
-                        Err(error) => view.slots[view.active].notice = Some(Notice::held("Couldn't display the diff", error.to_string())),
-                    },
-                    Err(error) => view.slots[view.active].notice = Some(Notice::held("Couldn't review work", format!("{error:#}"))),
+                    Ok(receipt) => view.show_review(id, receipt, mode, window, cx),
+                    Err(error) => {
+                        view.slots[view.active].notice =
+                            Some(Notice::held("Couldn't review work", format!("{error:#}")))
+                    }
                 }
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// Puts the review panel for thread `id` on screen with `receipt`'s diff. The panel
+    /// replaces the composer, so the root takes the keyboard: ⌘1–9 and the other shortcuts
+    /// keep working while the diff is open.
+    pub(super) fn show_review(
+        &mut self,
+        id: String,
+        receipt: Review,
+        mode: LandingMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match if receipt.truncated {
+            Ok(Vec::new())
+        } else {
+            DiffFile::parse(&receipt.patch)
+        } {
+            Ok(files) => {
+                let message = if receipt.truncated { "The diff is too large to show. Landing is blocked." } else if mode == LandingMode::AgentManaged { "Only work recorded with jj is shown. Git commits are not imported; use jj and bookmark your work. The copy stays after landing." } else if receipt.patch.is_empty() { "No changes." } else { "Review the changes, then land or discard the work." }.into();
+                self.review_panel = Some(ReviewPanel {
+                    thread: id,
+                    receipt,
+                    diff: cx.new(|cx| DiffState::new(files, cx)),
+                    busy: false,
+                    message,
+                });
+                window.focus(&self.root, cx);
+            }
+            Err(error) => {
+                self.slots[self.active].notice =
+                    Some(Notice::held("Couldn't display the diff", error.to_string()))
+            }
+        }
     }
 
     fn resolve_review(

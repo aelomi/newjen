@@ -2021,3 +2021,47 @@ async fn a_kept_denial_note_follows_the_composer_draft(cx: &mut TestAppContext) 
     );
     finish(&chat, path, cx);
 }
+
+/// The review panel takes the composer's place, so the keyboard must stay with the view:
+/// ⌘1–9 switch threads (closing the panel) as they do anywhere else.
+#[gpui::test]
+fn thread_jump_keys_work_while_the_review_panel_is_open(cx: &mut TestAppContext) {
+    use newjen_core::landing::{LandingMode, Review};
+    let (chat, path, cx) = setup(cx, "review-keys", false);
+    cx.simulate_input("first thread");
+    cx.simulate_keystrokes("cmd-n");
+    cx.simulate_input("second thread");
+    assert_eq!(cx.update(|_, cx| chat.read(cx).active), 0);
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let id = view.thread().read(cx).id().to_string();
+            let receipt = Review {
+                base: "base".into(),
+                head: "head".into(),
+                patch: String::new(),
+                truncated: false,
+            };
+            view.show_review(id, receipt, LandingMode::HarnessManaged, window, cx);
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| chat.read(cx).review_panel.is_some()));
+    assert!(
+        cx.update(|window, cx| chat.read(cx).root.is_focused(window)),
+        "the root holds the keyboard while the diff replaces the composer"
+    );
+    cx.simulate_keystrokes("cmd-2");
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).active),
+        1,
+        "⌘2 switches threads with the review panel open"
+    );
+    assert!(cx.update(|_, cx| chat.read(cx).review_panel.is_none()));
+    assert!(composer_focused(&chat, cx));
+    cx.simulate_input(" continues");
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(1, cx)),
+        "first thread continues"
+    );
+    finish(&chat, path, cx);
+}

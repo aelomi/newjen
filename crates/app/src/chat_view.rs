@@ -502,7 +502,10 @@ impl ChatView {
     /// replaces it), the terminal, or the root for the inbox.
     fn focus_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
         let focus = match self.panel {
-            Panel::Thread if self.composer_has_keys() => self.field_focus(cx),
+            // The review panel stands in for the composer while it is open.
+            Panel::Thread if self.composer_has_keys() && self.review_panel.is_none() => {
+                self.field_focus(cx)
+            }
             Panel::Terminal => self.slots[self.active]
                 .terminal
                 .as_ref()
