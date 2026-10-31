@@ -1,0 +1,514 @@
+//! Rift copies: a thread's own copy-on-write clone of the project, so agents that work at the
+//! same time never touch each other's files. No UI.
+//!
+//! **Making one** ([`create`]): the folder copied is the jj root around the project, else its
+//! git root, else the project folder itself, and `rift init` runs there once. In a jj repo the
+//! main repo and the copy then never share a working-copy change, so fetching the copy's work
+//! back later makes no divergent change:
+//! 1. One snapshot of the main repo. If its `@` has changes, `jj new` there, so they are
+//!    committed and the main repo goes on in a new empty change.
+//! 2. The copy's work starts on the main repo's `@-`, the copy's [`Copy::base`].
+//! 3. `rift create --copy-all`, which also copies gitignored files (`node_modules`, `target/`).
+//! 4. `jj new <base>` in the copy. The copy's old `@` (the main repo's working-copy change) is
+//!    abandoned there when it is empty.
+//!
+//! A step that fails after the copy exists removes it again.
+//!
+//! **Removing one** ([`remove`]): `rift remove` moves the copy into the `.trash` folder beside
+//! it, and that one entry is then deleted here. `rift gc` is never run: it empties every Rift
+//! trash on the Mac.
+//!
+//! Every jj read that is not meant to snapshot passes `--ignore-working-copy`.
+
+use std::collections::VecDeque;
+use std::ffi::OsStr;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::session::{find_program, for_each_line, is_executable};
+
+/// The file Rift keeps a folder's id in, at the root of the project and of each copy.
+const MARKER: &str = ".rift";
+
+/// The folder `rift remove` moves a copy into, beside the copy.
+const TRASH: &str = ".trash";
+
+/// How many of the last stderr lines an error keeps (hook output, then Rift's own message).
+const KEPT_LINES: usize = 20;
+
+/// After a tool exits, how long to wait for the last lines it printed. Bounded, because a
+/// process a hook left running can keep the pipes open.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The `rift` and `jj` programs, and extra environment for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tools {
+    pub rift: PathBuf,
+    pub jj: PathBuf,
+    /// Mostly for tests: their own `HOME` gives them their own Rift registry.
+    pub env: Vec<(String, String)>,
+}
+
+impl Tools {
+    /// The installed `rift` and `jj` ([`find_rift`], [`find_jj`]).
+    pub fn find() -> Tools {
+        Tools {
+            rift: find_rift(),
+            jj: find_jj(),
+            env: Vec::new(),
+        }
+    }
+}
+
+/// Finds `rift`, overridden by `$NEWJEN_RIFT`. The `rift` npm installs is a Node script, and an
+/// app started from Finder may have no `node` on its `PATH`, so the native binary shipped
+/// beside the script is used when it is there.
+pub fn find_rift() -> PathBuf {
+    let found = find_program("NEWJEN_RIFT", "rift", &[".bun/bin", ".npm-global/bin"]);
+    native_rift(&found).unwrap_or(found)
+}
+
+/// Finds `jj`, overridden by `$NEWJEN_JJ`.
+pub fn find_jj() -> PathBuf {
+    find_program("NEWJEN_JJ", "jj", &[".cargo/bin"])
+}
+
+/// `<package>/prebuilds/darwin-<arch>/rift` for the npm package's `bin/rift.js`.
+fn native_rift(found: &Path) -> Option<PathBuf> {
+    let script = std::fs::canonicalize(found).ok()?;
+    if !script.ends_with("bin/rift.js") {
+        return None;
+    }
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        _ => return None,
+    };
+    let native = script
+        .parent()?
+        .parent()?
+        .join(format!("prebuilds/darwin-{arch}/rift"));
+    is_executable(&native).then_some(native)
+}
+
+/// A thread's Rift copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copy {
+    /// The copy's root folder.
+    pub path: PathBuf,
+    /// Where the thread works: the project's place inside the copy (`path` for a project at
+    /// the root, `path/<subfolder>` for one below it).
+    pub workdir: PathBuf,
+    /// The folder it was copied from (the project's jj or git root).
+    pub source: PathBuf,
+    /// Rift's id for the copy, from its `.rift` file.
+    pub rift_id: String,
+    /// The jj commit the copy's work starts on. `None` when the project is not a jj repo.
+    pub base: Option<String>,
+}
+
+impl Copy {
+    /// What a copy thread's claude gets in its environment, so the commands it runs (a dev
+    /// server, say) can tell copies apart, e.g. to pick a port.
+    pub fn env(&self) -> Vec<(String, String)> {
+        vec![
+            ("RIFT_ID".to_string(), self.rift_id.clone()),
+            (
+                "RIFT_SOURCE".to_string(),
+                self.source.to_string_lossy().into_owned(),
+            ),
+        ]
+    }
+}
+
+/// Why a copy could not be made or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyError {
+    /// Something is already at the copy's path, perhaps left by an earlier try that could not
+    /// clean up. `rift_id` is its Rift id, if it has one.
+    Exists {
+        path: PathBuf,
+        rift_id: Option<String>,
+    },
+    /// Rift still lists a copy at this path, but its folder was deleted. Only `rift gc` makes
+    /// Rift forget it, and that also empties every Rift trash on the Mac.
+    Registered(PathBuf),
+    /// A step failed. `detail` is the tool's own message, `output` the last lines it and Rift's
+    /// hooks printed.
+    Failed {
+        command: String,
+        detail: String,
+        output: Vec<String>,
+    },
+}
+
+impl fmt::Display for CopyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CopyError::Exists { path, .. } => write!(f, "{} already exists", path.display()),
+            CopyError::Registered(path) => write!(
+                f,
+                "Rift still lists a copy at {}, but its folder is gone. `rift gc` makes Rift \
+                 forget it (and empties every Rift trash on this Mac).",
+                path.display()
+            ),
+            CopyError::Failed {
+                command, detail, ..
+            } => write!(f, "`{command}` failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for CopyError {}
+
+/// Makes a Rift copy of the project at `project_dir` named `name` (see the module docs).
+/// Blocking: it can take seconds, more with Rift hooks. Each line Rift and its hooks print on
+/// stderr goes to `on_line` as it arrives.
+pub fn create(
+    tools: &Tools,
+    project_dir: &Path,
+    name: &str,
+    mut on_line: impl FnMut(&str),
+) -> Result<Copy, CopyError> {
+    let project = std::fs::canonicalize(project_dir)
+        .map_err(|error| failure("rift create", format!("{}: {error}", project_dir.display())))?;
+    let (root, jj) = project_root(&project);
+    let home = std::env::var_os("HOME").and_then(|home| std::fs::canonicalize(home).ok());
+    let (Some(parent), Some(root_name)) = (root.parent(), root.file_name()) else {
+        return Err(failure(
+            "rift create",
+            "Newjen won't copy the whole disk".to_string(),
+        ));
+    };
+    if home.as_deref() == Some(root.as_path()) {
+        return Err(failure(
+            "rift create",
+            "Newjen won't copy your whole home folder".to_string(),
+        ));
+    }
+    let rel = project
+        .strip_prefix(&root)
+        .expect("the root contains the project")
+        .to_path_buf();
+    let into = parent.join(".rifts").join(root_name);
+    let path = into.join(name);
+    if path.exists() {
+        return Err(CopyError::Exists {
+            rift_id: read_id(&path),
+            path,
+        });
+    }
+
+    if !root.join(MARKER).exists() {
+        run(
+            tools,
+            &tools.rift,
+            &[OsStr::new("init"), root.as_os_str()],
+            &root,
+            |_| {},
+        )?;
+    }
+    let base = if jj {
+        Some(prepare_main_repo(tools, &root)?)
+    } else {
+        None
+    };
+    let created = run(
+        tools,
+        &tools.rift,
+        &[
+            OsStr::new("create"),
+            OsStr::new("--copy-all"),
+            OsStr::new("--name"),
+            OsStr::new(name),
+            OsStr::new("--into"),
+            into.as_os_str(),
+            root.as_os_str(),
+        ],
+        &root,
+        &mut on_line,
+    );
+    if let Err(error) = created {
+        if path.exists() {
+            return Err(remove_after(tools, &path, error));
+        }
+        return Err(match error {
+            CopyError::Failed { detail, .. }
+                if detail.contains("overlaps another managed workspace") =>
+            {
+                CopyError::Registered(path)
+            }
+            error => error,
+        });
+    }
+
+    let finish = || -> Result<Copy, CopyError> {
+        let rift_id = read_id(&path)
+            .ok_or_else(|| failure("rift create", format!("{} has no Rift id", path.display())))?;
+        if let Some(base) = &base {
+            run(
+                tools,
+                &tools.jj,
+                &jj_args(&["new", base.as_str()]),
+                &path,
+                |_| {},
+            )?;
+        }
+        Ok(Copy {
+            workdir: path.join(&rel),
+            path: path.clone(),
+            source: root.clone(),
+            rift_id,
+            base: base.clone(),
+        })
+    };
+    finish().map_err(|error| remove_after(tools, &path, error))
+}
+
+/// Removes the copy at `path` whose Rift id is `rift_id` (see the module docs). Nothing to do
+/// if it is already gone, so it can run again after a crash.
+pub fn remove(tools: &Tools, path: &Path, rift_id: &str) -> Result<(), CopyError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(failure(
+            "rift remove",
+            format!("{} is not a copy", path.display()),
+        ));
+    };
+    if rift_id.is_empty() || !rift_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(failure(
+            "rift remove",
+            format!("{rift_id:?} is not a Rift id"),
+        ));
+    }
+    if path.exists() {
+        run(
+            tools,
+            &tools.rift,
+            &[OsStr::new("remove"), path.as_os_str()],
+            parent,
+            |_| {},
+        )?;
+    }
+    let entry = parent
+        .join(TRASH)
+        .join(format!("{rift_id}-{}", name.to_string_lossy()));
+    if entry.symlink_metadata().is_ok() {
+        std::fs::remove_dir_all(&entry).map_err(|error| {
+            failure(
+                "rift remove",
+                format!("could not delete {}: {error}", entry.display()),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The folder to copy for `project` (canonical), and whether it is a jj repo: the nearest
+/// folder with a `.jj` in it, else the nearest with a `.git`, else `project`.
+fn project_root(project: &Path) -> (PathBuf, bool) {
+    let nearest = |marker: &str| {
+        project
+            .ancestors()
+            .find(|dir| dir.join(marker).exists())
+            .map(Path::to_path_buf)
+    };
+    match nearest(".jj") {
+        Some(root) => (root, true),
+        None => (
+            nearest(".git").unwrap_or_else(|| project.to_path_buf()),
+            false,
+        ),
+    }
+}
+
+/// Steps 1 and 2 of the module docs, in the main repo at `root`. Returns the base.
+fn prepare_main_repo(tools: &Tools, root: &Path) -> Result<String, CopyError> {
+    // Without `--ignore-working-copy`: this is the one snapshot.
+    let state = run(
+        tools,
+        &tools.jj,
+        &jj_args(&[
+            "log",
+            "--no-graph",
+            "-r",
+            "@",
+            "-T",
+            r#"if(empty && parents.len() == 1, "clean", "changed")"#,
+        ]),
+        root,
+        |_| {},
+    )?;
+    if state != "clean" {
+        run(tools, &tools.jj, &jj_args(&["new"]), root, |_| {})?;
+    }
+    run(
+        tools,
+        &tools.jj,
+        &jj_args(&[
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            "@-",
+            "-T",
+            "commit_id",
+        ]),
+        root,
+        |_| {},
+    )
+}
+
+fn jj_args<'a>(args: &[&'a str]) -> Vec<&'a OsStr> {
+    std::iter::once("--color=never")
+        .chain(args.iter().copied())
+        .map(OsStr::new)
+        .collect()
+}
+
+/// The Rift id in `copy`'s `.rift` file.
+fn read_id(copy: &Path) -> Option<String> {
+    let id = std::fs::read_to_string(copy.join(MARKER)).ok()?;
+    Some(id.trim().to_string()).filter(|id| !id.is_empty())
+}
+
+/// `error`, after removing the half-made copy at `path`. If that fails too, the error says so.
+fn remove_after(tools: &Tools, path: &Path, error: CopyError) -> CopyError {
+    let removed = match read_id(path) {
+        Some(rift_id) => remove(tools, path, &rift_id),
+        None => Err(failure(
+            "rift remove",
+            format!("{} has no Rift id", path.display()),
+        )),
+    };
+    match (error, removed) {
+        (error, Ok(())) => error,
+        (
+            CopyError::Failed {
+                command,
+                detail,
+                output,
+            },
+            Err(cleanup),
+        ) => CopyError::Failed {
+            command,
+            detail: format!("{detail}. Removing the half-made copy failed too: {cleanup}"),
+            output,
+        },
+        (error, Err(_)) => error,
+    }
+}
+
+fn failure(command: &str, detail: String) -> CopyError {
+    CopyError::Failed {
+        command: command.to_string(),
+        detail,
+        output: Vec::new(),
+    }
+}
+
+/// One line a tool printed.
+enum Printed {
+    Out(String),
+    Err(String),
+}
+
+/// Runs `program` with `args` in `cwd` and returns its stdout, trimmed. Each stderr line goes
+/// to `on_line` as it arrives. Fails with the tool's last stderr line if it exits non-zero.
+fn run(
+    tools: &Tools,
+    program: &Path,
+    args: &[&OsStr],
+    cwd: &Path,
+    mut on_line: impl FnMut(&str),
+) -> Result<String, CopyError> {
+    let program_name = program
+        .file_name()
+        .unwrap_or(program.as_os_str())
+        .to_string_lossy();
+    let command_text = std::iter::once(program_name.as_ref())
+        .chain(args.iter().map(|arg| arg.to_str().unwrap_or("…")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in &tools.env {
+        command.env(name, value);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| failure(&command_text, format!("could not run it: {error}")))?;
+
+    let (lines, printed) = mpsc::channel();
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let out_lines = lines.clone();
+    thread::spawn(move || {
+        for_each_line(stdout, |line| {
+            let _ = out_lines.send(Printed::Out(line.to_string()));
+        })
+    });
+    thread::spawn(move || {
+        for_each_line(stderr, |line| {
+            let _ = lines.send(Printed::Err(line.to_string()));
+        })
+    });
+
+    let mut stdout = String::new();
+    let mut kept = VecDeque::new();
+    let mut handle = |printed: Printed| match printed {
+        Printed::Out(line) => {
+            stdout.push_str(&line);
+            stdout.push('\n');
+        }
+        Printed::Err(line) => {
+            on_line(&line);
+            if kept.len() == KEPT_LINES {
+                kept.pop_front();
+            }
+            kept.push_back(line);
+        }
+    };
+    let status = loop {
+        match printed.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => handle(line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break child.wait(),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(status) = child.try_wait().transpose() {
+                    let deadline = Instant::now() + DRAIN_TIMEOUT;
+                    while let Ok(line) =
+                        printed.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        handle(line);
+                    }
+                    break status;
+                }
+            }
+        }
+    }
+    .map_err(|error| failure(&command_text, error.to_string()))?;
+
+    if status.success() {
+        return Ok(stdout.trim().to_string());
+    }
+    let output: Vec<String> = kept.into_iter().collect();
+    let detail = output
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| status.to_string());
+    Err(CopyError::Failed {
+        command: command_text,
+        detail,
+        output,
+    })
+}

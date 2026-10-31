@@ -182,39 +182,38 @@ impl SessionConfig {
     }
 }
 
-/// Finds the `claude` executable.
-///
-/// Order: `$NEWJEN_CLAUDE`, then every directory on `$PATH`, then the usual install locations.
-/// The fallbacks matter because apps started from Finder get a minimal `PATH` that usually
-/// does not include where `claude` was installed. If nothing is found, returns plain `claude`
-/// so the spawn error message names it.
+/// Finds the `claude` executable (see [`find_program`]), overridden by `$NEWJEN_CLAUDE`.
 pub fn find_claude() -> PathBuf {
-    if let Some(path) = std::env::var_os("NEWJEN_CLAUDE").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("claude");
-            if is_executable(&candidate) {
-                return candidate;
-            }
-        }
-    }
-    let mut fallbacks = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        fallbacks.push(home.join(".local/bin/claude"));
-        fallbacks.push(home.join(".claude/local/claude"));
-    }
-    fallbacks.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    fallbacks.push(PathBuf::from("/usr/local/bin/claude"));
-    fallbacks
-        .into_iter()
-        .find(|candidate| is_executable(candidate))
-        .unwrap_or_else(|| PathBuf::from("claude"))
+    find_program("NEWJEN_CLAUDE", "claude", &[".local/bin", ".claude/local"])
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Finds the executable `name`.
+///
+/// Order: `$<override_var>`, then every directory on `$PATH`, then `home_dirs` (relative to
+/// `$HOME`), `/opt/homebrew/bin` and `/usr/local/bin`. The fallbacks matter because apps
+/// started from Finder get a minimal `PATH` that usually does not include where the program
+/// was installed. If nothing is found, returns plain `name` so the spawn error names it.
+pub(crate) fn find_program(override_var: &str, name: &str, home_dirs: &[&str]) -> PathBuf {
+    if let Some(path) = std::env::var_os(override_var).filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    let on_path = std::env::var_os("PATH")
+        .map(|path_var| std::env::split_paths(&path_var).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let in_home = home_dirs
+        .iter()
+        .filter_map(|dir| Some(home.as_ref()?.join(dir)));
+    on_path
+        .into_iter()
+        .chain(in_home)
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     // `metadata` follows symlinks, so a symlink to the real binary counts.
     std::fs::metadata(path)
@@ -719,7 +718,7 @@ fn spawn_stderr_reader(
 
 /// Calls `handle` for every line (without the newline). Invalid UTF-8 is replaced rather than
 /// treated as an error, so one odd byte never stops the reader.
-fn for_each_line(source: impl Read, mut handle: impl FnMut(&str)) {
+pub(crate) fn for_each_line(source: impl Read, mut handle: impl FnMut(&str)) {
     let mut reader = BufReader::new(source);
     let mut buffer = Vec::new();
     loop {
