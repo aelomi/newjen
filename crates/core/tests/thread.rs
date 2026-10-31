@@ -14,7 +14,6 @@
 //! - `other_in_use`: print another error that says "already in use" (a busy port) on stderr
 //!   and exit 1, without reading stdin.
 //! - `crash`: read a message, then exit 1 without answering.
-//! - `close_stdin`: close stdin, wait for `flush_write_failure`, print a warning, and stay alive.
 //! - `never_init`: read a message, then hang without ever sending `init`, as a claude still
 //!   starting up would.
 //! - `no_init`: never send `init`, but otherwise run turns as usual.
@@ -66,7 +65,11 @@ printf '%s|%s|%s\n' "$(pwd -P)" "${RIFT_ID:-}" "${RIFT_SOURCE:-}" >> "$dir/cwd.l
 if [ -f "$dir/close_stdin" ]; then
   exec 0<&-
   while [ ! -f "$dir/flush_write_failure" ]; do sleep 0.01; done
-  echo "warning: slow start" >&2
+  if [ -f "$dir/flush_with_init" ]; then
+    echo '{"type":"system","subtype":"init"}'
+  else
+    echo "warning: slow start" >&2
+  fi
   while :; do sleep 1; done
 fi
 if [ -f "$dir/slow_stop" ]; then trap '' TERM; fi
@@ -1243,44 +1246,55 @@ fn stopping_while_claude_starts_cancels_the_in_use_repair() {
 
 #[test]
 fn a_flushed_write_failure_ends_the_session_before_the_next_send() {
-    let fixture = Fixture::new();
-    fixture.switch("close_stdin", true);
-    let mut thread = fixture.draft();
-    thread.send(&"lost message".repeat(100_000)).unwrap();
+    for flush_with_init in [false, true] {
+        let fixture = Fixture::new();
+        fixture.switch("close_stdin", true);
+        fixture.switch("flush_with_init", flush_with_init);
+        let mut thread = fixture.draft();
+        thread.set_active(true);
+        thread.send(&"lost message".repeat(100_000)).unwrap();
 
-    let events = thread.events();
-    let deadline = Instant::now() + TIMEOUT;
-    let failure = loop {
-        match events.try_recv() {
-            Ok(event) => break event,
-            Err(async_channel::TryRecvError::Empty) => {
-                assert!(Instant::now() < deadline, "stdin write did not fail");
-                std::thread::sleep(Duration::from_millis(5));
+        let events = thread.events();
+        let deadline = Instant::now() + TIMEOUT;
+        let failure = loop {
+            match events.try_recv() {
+                Ok(event) => break event,
+                Err(async_channel::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "stdin write did not fail");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(async_channel::TryRecvError::Closed) => panic!("event channel closed"),
             }
-            Err(async_channel::TryRecvError::Closed) => panic!("event channel closed"),
-        }
-    };
-    assert!(matches!(failure.event(), SessionEvent::WriteFailed(_)));
-    thread.apply(failure);
-    assert!(thread.status().is_busy(), "the startup failure is held");
+        };
+        assert!(matches!(failure.event(), SessionEvent::WriteFailed(_)));
+        thread.apply(failure);
+        assert!(thread.status().is_busy(), "the startup failure is held");
+        assert!(thread.has_session());
 
-    fixture.switch("close_stdin", false);
-    fixture.switch("flush_write_failure", true);
-    finish_turn(&mut thread);
-    assert_eq!(thread.status(), Status::Failed);
-    assert_eq!(errors(&thread).len(), 1);
-    assert_eq!(errors(&thread)[0].0, "Could not reach Claude");
-    assert_eq!(thread.turn_started_at(), None);
-    settle(&mut thread);
-    assert_eq!(fixture.spawns().len(), 1, "no automatic restart");
-    assert!(fixture.messages_received().is_empty(), "nothing was resent");
+        fixture.switch("close_stdin", false);
+        fixture.switch("flush_write_failure", true);
+        finish_turn(&mut thread);
+        assert_eq!(thread.status(), Status::Failed);
+        assert!(!thread.has_session());
+        assert_eq!(errors(&thread).len(), 1);
+        assert_eq!(errors(&thread)[0].0, "Could not reach Claude");
+        assert_eq!(thread.turn_started_at(), None);
+        assert!(fixture.store.flush(FLUSH));
+        assert_eq!(
+            fixture.store.thread(thread.id()).unwrap().unwrap().status,
+            Status::Failed
+        );
+        settle(&mut thread);
+        assert_eq!(fixture.spawns().len(), 1, "no automatic restart");
+        assert!(fixture.messages_received().is_empty(), "nothing was resent");
 
-    thread.send("next explicit message").unwrap();
-    finish_turn(&mut thread);
-    assert_eq!(thread.status(), Status::Done);
-    assert_eq!(fixture.spawns().len(), 2);
-    assert_eq!(fixture.messages_received(), ["next explicit message"]);
-    assert_eq!(errors(&thread).len(), 1);
+        thread.send("next explicit message").unwrap();
+        finish_turn(&mut thread);
+        assert_eq!(thread.status(), Status::Done);
+        assert_eq!(fixture.spawns().len(), 2);
+        assert_eq!(fixture.messages_received(), ["next explicit message"]);
+        assert_eq!(errors(&thread).len(), 1);
+    }
 }
 
 #[test]

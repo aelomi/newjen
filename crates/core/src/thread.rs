@@ -1233,7 +1233,7 @@ impl Thread {
         self.last_activity = Instant::now();
 
         let was_busy = self.status().is_busy();
-        let batch = match self.controller.apply(
+        let (batch, surfaced_write_failure) = match self.controller.apply(
             &event,
             self.generation,
             &self.cwd,
@@ -1256,7 +1256,8 @@ impl Thread {
                 self.save();
                 return;
             }
-            crate::session::Update::Apply(batch) => batch,
+            crate::session::Update::Apply(batch) => (batch, false),
+            crate::session::Update::SurfacedWriteFailure(batch) => (batch, true),
         };
         let approval_asked = batch
             .events
@@ -1293,6 +1294,7 @@ impl Thread {
             }
             // This process can no longer be talked to; let it go.
             SessionEvent::WriteFailed(_) | SessionEvent::InterruptTimedOut => self.end_session(),
+            _ if surfaced_write_failure => self.end_session(),
             _ => {}
         }
         if limit_rejected {
@@ -1660,10 +1662,15 @@ mod tests {
         let store = Store::open_in(home.path()).unwrap();
         let project = store.open_project(project_dir.path()).unwrap();
         let received = project_dir.path().join("stdin.log");
+        let spawns = project_dir.path().join("spawns.log");
         let script = project_dir.path().join("claude");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\ncat >> '{}'\n", received.display()),
+            format!(
+                "#!/bin/sh\necho start >> '{}'\ncat >> '{}'\n",
+                spawns.display(),
+                received.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
@@ -1683,10 +1690,8 @@ mod tests {
         while delivered() == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let event = |thread: &Thread, event| ThreadEvent {
-            generation: thread.generation,
-            event,
-        };
+        assert_eq!(delivered(), 1);
+        let generation = thread.generation;
         let in_use = format!("Error: Session ID {} is already in use.", thread.session_id);
         for e in [
             SessionEvent::WriteFailed("Broken pipe".to_string()),
@@ -1697,14 +1702,18 @@ mod tests {
                 requested: false,
             },
         ] {
-            let e = event(&thread, e);
-            thread.apply(e);
+            thread.apply(ThreadEvent {
+                generation,
+                event: e,
+            });
         }
 
         assert!(!thread.status().is_busy(), "{:?}", thread.status());
         assert_eq!(thread.controller.message(), None);
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(delivered(), 1, "the message reached claude again");
+        assert_eq!(std::fs::read_to_string(spawns).unwrap().lines().count(), 1);
+        assert!(!thread.has_session());
         thread.end_session();
     }
 

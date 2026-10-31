@@ -972,6 +972,9 @@ pub(crate) enum Update {
     FreshRestart,
     FreshStopped,
     Apply(crate::agent::AgentBatch),
+    /// A held write failure is real now. The batch holds only what was held back; the
+    /// thread ends the session and saves, and the next send starts a new process.
+    SurfacedWriteFailure(crate::agent::AgentBatch),
 }
 
 #[cfg(test)]

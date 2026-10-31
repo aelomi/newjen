@@ -165,6 +165,12 @@ impl Controller {
                     .translate_generation(generation, &SessionEvent::WriteFailed(detail), Some(cwd))
                     .events,
             );
+            // The process that failed the write is gone for good, so the event that surfaced
+            // the failure can't revive its turn.
+            return Update::SurfacedWriteFailure(AgentBatch {
+                events,
+                checkpoint: crate::agent::Checkpoint::Save,
+            });
         }
 
         let batch = self
