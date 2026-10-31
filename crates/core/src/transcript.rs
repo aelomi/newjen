@@ -349,6 +349,11 @@ impl Transcript {
         transcript
     }
 
+    /// Shows file paths relative to `cwd` from now on (a thread that moved into its Rift copy).
+    pub fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
+        self.cwd = Some(cwd.into());
+    }
+
     pub fn items(&self) -> &[Item] {
         &self.items
     }

@@ -23,6 +23,13 @@
 //! a message only while its turn runs; a Stop pressed in that window ends the turn at once
 //! instead (see [`Thread::stop`]).
 //!
+//! **Where it works.** In the project folder, or in a Rift copy of its own. A draft chooses
+//! ([`Thread::set_works_in`]). A draft that wants a copy holds its first message while the copy
+//! is made: [`Thread::send`] hands back a [`CopyJob`] for the app to run off the UI thread, and
+//! [`Thread::finish_copy`] then moves the thread into the copy and sends the message, once.
+//! The copy is the thread's folder from then on, because Claude ties `--resume` to the folder.
+//! Archiving the thread hands back a [`Removal`] that deletes the copy.
+//!
 //! **Saving.** A thread is a *draft* until its first message is sent; drafts are never saved.
 //! After that, the row and the changed transcript rows are saved at checkpoints only (a
 //! message sent, a reply or tool call finished, an approval asked or answered, the turn's end,
@@ -36,9 +43,10 @@
 //! while one runs.
 //!
 //! **Subscription safety.** Nothing here starts a turn on its own. A turn starts only from
-//! [`Thread::send`]; the two repairs above resend the user's own message once. (claude itself
-//! starts a turn when a background task it ran finishes; [`Thread::apply`] follows that turn
-//! like any other.)
+//! [`Thread::send`] (or, for a first message held for a Rift copy, [`Thread::finish_copy`]);
+//! the two repairs above resend the user's own message once. A copy that could not be made is
+//! never tried again by itself. (claude itself starts a turn when a background task it ran
+//! finishes; [`Thread::apply`] follows that turn like any other.)
 
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
@@ -48,6 +56,7 @@ use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
 use crate::protocol::{BackgroundTask, Incoming, PermissionAnswer, ResultMessage, session_rules};
+use crate::rift::{self, CopyError, Tools};
 use crate::session::{Conversation, Session, SessionConfig, SessionEvent};
 use crate::store::{Grant, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow, now_ms};
 use crate::transcript::{Item, Status, Transcript};
@@ -117,8 +126,10 @@ impl ThreadEvent {
 pub struct Thread {
     id: String,
     project_id: i64,
+    project_dir: PathBuf,
     /// The folder claude works in.
     cwd: PathBuf,
+    place: Place,
     title: String,
     provider: String,
     /// Claude's own conversation id (`--session-id` / `--resume`).
@@ -144,8 +155,7 @@ pub struct Thread {
     unread: bool,
     /// Whether this is the thread on screen (see [`Thread::set_active`]).
     active: bool,
-    /// Not saved yet: no message has been sent.
-    draft: bool,
+    stage: Stage,
     created_at: i64,
     updated_at: i64,
     /// The last time anything happened (an event, a message, an answer), for idle shutdown.
@@ -159,6 +169,156 @@ pub struct Thread {
     /// What the store last got for the thread's row, so unchanged rows are not rewritten.
     saved_row: Option<RowState>,
     store: Store,
+}
+
+/// Where a thread is in its life. Only a saved thread is written to the store.
+#[derive(Debug)]
+enum Stage {
+    /// Nothing sent yet.
+    Draft,
+    /// The first message waits while the thread's Rift copy is made.
+    Preparing(Preparing),
+    /// Its first message was sent.
+    Saved,
+}
+
+/// Where a thread works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Place {
+    ProjectFolder,
+    /// A Rift copy of its own, made when the first message is sent. Drafts only.
+    NewCopy,
+    Copy(rift::Copy),
+}
+
+/// Where a draft works, as the user chose (see [`Thread::set_works_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorksIn {
+    ProjectFolder,
+    RiftCopy,
+}
+
+/// A first message held while the thread's Rift copy is made (see [`Thread::send`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preparing {
+    message: String,
+    started_at: Instant,
+    last_line: Option<String>,
+}
+
+impl Preparing {
+    /// The message, sent once the copy is ready.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// When the user sent it, for "Making a Rift copy · 3s".
+    pub fn started_at(&self) -> Instant {
+        self.started_at
+    }
+
+    /// The last line Rift or its hooks printed (see [`Thread::note_copy_line`]).
+    pub fn last_line(&self) -> Option<&str> {
+        self.last_line.as_deref()
+    }
+}
+
+/// What [`Thread::send`] did with a message.
+#[derive(Debug)]
+pub enum Sent {
+    /// It went to claude.
+    Started,
+    /// It is held until the thread's Rift copy is made: run the job off the UI thread and pass
+    /// what it returns to [`Thread::finish_copy`].
+    MakingCopy(CopyJob),
+}
+
+/// Makes a thread's Rift copy ([`rift::create`]). It can take seconds, so the app runs it on a
+/// background thread.
+#[must_use = "run it, then pass the result to `Thread::finish_copy`"]
+pub struct CopyJob {
+    project_dir: PathBuf,
+    name: String,
+    store: Store,
+}
+
+impl std::fmt::Debug for CopyJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopyJob")
+            .field("project_dir", &self.project_dir)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CopyJob {
+    /// Makes the copy. Each line Rift and its hooks print goes to `on_line` (pass it on to
+    /// [`Thread::note_copy_line`]). A copy an earlier try of this thread left at its path is
+    /// removed first, but never one that belongs to a thread.
+    pub fn run(
+        self,
+        tools: &Tools,
+        mut on_line: impl FnMut(&str),
+    ) -> Result<rift::Copy, CopyError> {
+        match rift::create(tools, &self.project_dir, &self.name, &mut on_line) {
+            Err(CopyError::Exists {
+                path,
+                rift_id: Some(rift_id),
+            }) if matches!(self.store.copy_owner(&path), Ok(None)) => {
+                rift::remove(tools, &path, &rift_id)?;
+                rift::create(tools, &self.project_dir, &self.name, on_line)
+            }
+            made => made,
+        }
+    }
+}
+
+/// A first message that could not be sent, back for the composer, and why.
+#[derive(Debug)]
+pub struct NotSent {
+    /// Empty when nothing was held.
+    pub message: String,
+    pub error: anyhow::Error,
+}
+
+/// Removes an archived thread's Rift copy, once its `claude` has stopped, and records that it
+/// is gone. It can take seconds, so the app runs it on a background thread.
+#[must_use = "run it off the UI thread, or the copy stays until the next launch"]
+pub struct Removal {
+    thread_id: String,
+    copy: rift::Copy,
+    stopping: Vec<JoinHandle<()>>,
+    store: Store,
+}
+
+impl Removal {
+    /// The copies of threads archived before (say, Newjen quit before removing them). The app
+    /// runs these at startup. Running one that is already gone just records it.
+    pub fn pending(store: &Store) -> Result<Vec<Removal>> {
+        Ok(store
+            .copies_to_remove()?
+            .into_iter()
+            .map(|(thread_id, copy)| Removal {
+                thread_id,
+                copy,
+                stopping: Vec::new(),
+                store: store.clone(),
+            })
+            .collect())
+    }
+
+    pub fn copy(&self) -> &rift::Copy {
+        &self.copy
+    }
+
+    pub fn run(self, tools: &Tools) -> Result<()> {
+        for stopping in self.stopping {
+            let _ = stopping.join();
+        }
+        rift::remove(tools, &self.copy.path, &self.copy.rift_id)?;
+        self.store.mark_copy_removed(&self.thread_id, now_ms());
+        Ok(())
+    }
 }
 
 /// The parts of the thread's row that change during a conversation (the unread flag is saved
@@ -199,7 +359,9 @@ impl Thread {
         Thread {
             id: new_id(),
             project_id: project.id,
+            project_dir: project.path.clone(),
             cwd: project.path.clone(),
+            place: Place::ProjectFolder,
             title: NEW_THREAD_TITLE.to_string(),
             provider: PROVIDER_CLAUDE.to_string(),
             session_id: new_id(),
@@ -215,7 +377,7 @@ impl Thread {
             grants: Vec::new(),
             unread: false,
             active: false,
-            draft: true,
+            stage: Stage::Draft,
             created_at: now,
             updated_at: now,
             last_activity: Instant::now(),
@@ -259,6 +421,7 @@ impl Thread {
         let mut thread = Thread::new_draft(store, project, base_config);
         thread.id = row.id;
         thread.cwd = row.workdir;
+        thread.place = row.copy.map_or(Place::ProjectFolder, Place::Copy);
         thread.title = row.title;
         thread.provider = row.provider;
         thread.session_id = row.session_id;
@@ -266,7 +429,7 @@ impl Thread {
         thread.transcript = transcript;
         thread.grants = grants;
         thread.unread = row.unread;
-        thread.draft = false;
+        thread.stage = Stage::Saved;
         thread.created_at = row.created_at;
         thread.updated_at = row.updated_at;
         thread.saved_row = Some(RowState {
@@ -343,9 +506,49 @@ impl Thread {
         self.unread
     }
 
-    /// Not saved yet (no message sent). See [`keeps_draft`] for switching away from one.
+    /// Nothing sent yet. A thread whose first message waits for its Rift copy is not a draft
+    /// any more (see [`Thread::preparing`]). See [`keeps_draft`] for switching away from one.
     pub fn is_draft(&self) -> bool {
-        self.draft
+        matches!(self.stage, Stage::Draft)
+    }
+
+    /// The project folder, or a Rift copy of its own.
+    pub fn works_in(&self) -> WorksIn {
+        match self.place {
+            Place::ProjectFolder => WorksIn::ProjectFolder,
+            Place::NewCopy | Place::Copy(_) => WorksIn::RiftCopy,
+        }
+    }
+
+    /// The thread's Rift copy, once it is made.
+    pub fn copy(&self) -> Option<&rift::Copy> {
+        match &self.place {
+            Place::Copy(copy) => Some(copy),
+            Place::ProjectFolder | Place::NewCopy => None,
+        }
+    }
+
+    /// The first message, while it waits for the thread's Rift copy to be made. The thread is
+    /// busy then: nothing else can be sent, and no claude runs for it.
+    pub fn preparing(&self) -> Option<&Preparing> {
+        match &self.stage {
+            Stage::Preparing(preparing) => Some(preparing),
+            Stage::Draft | Stage::Saved => None,
+        }
+    }
+
+    /// True if a new Rift copy must not be made now, because making one snapshots the main
+    /// repo and may run `jj new` there: this thread works in the project folder and its agent
+    /// is busy (a turn, an approval, a background task, any of which can be mid-edit), or this
+    /// thread's own copy is being made. The app refuses with "wait for <thread> to finish".
+    pub fn blocks_copy_creation(&self) -> bool {
+        match (&self.stage, &self.place) {
+            (Stage::Preparing(_), _) => true,
+            (_, Place::ProjectFolder) => {
+                self.status().is_busy() || !self.background_tasks().is_empty()
+            }
+            (_, Place::NewCopy | Place::Copy(_)) => false,
+        }
     }
 
     /// True while a `claude` process runs for this thread.
@@ -393,6 +596,9 @@ impl Thread {
             &rules,
         );
         config.cwd = self.cwd.clone();
+        if let Place::Copy(copy) = &self.place {
+            config.env.extend(copy.env());
+        }
         config
     }
 
@@ -415,18 +621,96 @@ impl Thread {
     // What the app does
     // -----------------------------------------------------------------------------------------
 
+    /// Chooses where a draft works. Only a draft whose Rift copy is not made yet can change.
+    pub fn set_works_in(&mut self, works_in: WorksIn) -> Result<()> {
+        if !self.is_draft() || self.copy().is_some() {
+            bail!("only a new thread can choose where it works");
+        }
+        self.place = match works_in {
+            WorksIn::ProjectFolder => Place::ProjectFolder,
+            WorksIn::RiftCopy => Place::NewCopy,
+        };
+        Ok(())
+    }
+
     /// Sends a user message, starting `claude` first if none runs. The first message of a
     /// draft also names the thread (see [`title_from_message`]) and saves it.
     ///
+    /// The first message of a draft that wants a Rift copy is held instead, and nothing else
+    /// happens until the app runs the [`CopyJob`] it gets back and passes the result to
+    /// [`Thread::finish_copy`].
+    ///
     /// On an error nothing was sent, so the app can keep the text in the composer and show why
     /// (for example claude could not be started).
-    pub fn send(&mut self, text: &str) -> Result<()> {
+    pub fn send(&mut self, text: &str) -> Result<Sent> {
         if text.trim().is_empty() {
             bail!("there is nothing to send");
+        }
+        if self.preparing().is_some() {
+            bail!("Newjen is still making this thread's Rift copy");
         }
         if self.status().is_busy() {
             bail!("Claude is still working on the last message");
         }
+        if self.place == Place::NewCopy {
+            self.title = title_from_message(text);
+            self.stage = Stage::Preparing(Preparing {
+                message: text.to_string(),
+                started_at: Instant::now(),
+                last_line: None,
+            });
+            self.last_activity = Instant::now();
+            return Ok(Sent::MakingCopy(CopyJob {
+                project_dir: self.project_dir.clone(),
+                name: copy_name(&self.id),
+                store: self.store.clone(),
+            }));
+        }
+        self.deliver(text)?;
+        Ok(Sent::Started)
+    }
+
+    /// Records the latest line Rift or its hooks printed while the copy is made.
+    pub fn note_copy_line(&mut self, line: &str) {
+        if let Stage::Preparing(preparing) = &mut self.stage
+            && !line.trim().is_empty()
+        {
+            preparing.last_line = Some(line.to_string());
+        }
+    }
+
+    /// Takes what the [`CopyJob`] from [`Thread::send`] returned. With the copy, the thread
+    /// moves into it (any `claude` a Try again left is stopped first) and the held message is
+    /// sent, as [`Thread::send`] sends it. Otherwise, or if that send fails, the thread is a
+    /// draft again and the message comes back for the composer. Only the first call after a
+    /// send does anything: later ones fail and send nothing.
+    pub fn finish_copy(&mut self, made: Result<rift::Copy, CopyError>) -> Result<(), NotSent> {
+        let preparing = match std::mem::replace(&mut self.stage, Stage::Draft) {
+            Stage::Preparing(preparing) => preparing,
+            stage => {
+                self.stage = stage;
+                return Err(NotSent {
+                    message: String::new(),
+                    error: anyhow!("this thread was not waiting for a Rift copy"),
+                });
+            }
+        };
+        let message = preparing.message;
+        let sent = made.map_err(anyhow::Error::from).and_then(|copy| {
+            self.end_session();
+            self.cwd = copy.workdir.clone();
+            self.transcript.set_cwd(copy.workdir.clone());
+            self.place = Place::Copy(copy);
+            self.deliver(&message)
+        });
+        sent.map_err(|error| {
+            self.title = NEW_THREAD_TITLE.to_string();
+            NotSent { message, error }
+        })
+    }
+
+    /// The part of [`Thread::send`] that writes the message to claude.
+    fn deliver(&mut self, text: &str) -> Result<()> {
         if self.session.is_none() {
             self.spawn()?;
         }
@@ -437,8 +721,8 @@ impl Thread {
             self.save_with(false);
             return Err(error);
         }
-        if self.draft {
-            self.draft = false;
+        if self.is_draft() {
+            self.stage = Stage::Saved;
             self.title = title_from_message(text);
         }
         self.transcript.push_user(text);
@@ -542,7 +826,7 @@ impl Thread {
         if self.grants.len() == before {
             return;
         }
-        if !self.draft {
+        if self.is_saved() {
             self.store.remove_grant(&self.id, rule);
         }
         if self.session.is_some() {
@@ -586,8 +870,13 @@ impl Thread {
         idle
     }
 
-    /// Hides the thread from the list and stops its `claude`. Its rows stay in the store.
-    pub fn archive(&mut self) {
+    /// Hides the thread from the list and stops its `claude`. Its rows stay in the store. A
+    /// thread with a Rift copy hands back the [`Removal`] that deletes it.
+    ///
+    /// A first message held for a Rift copy is dropped, so a later [`Thread::finish_copy`]
+    /// sends nothing; the copy being made is left behind, so the app should not archive a
+    /// thread while it is [`Thread::preparing`].
+    pub fn archive(&mut self) -> Option<Removal> {
         if self.session.is_some() {
             self.transcript.apply(&SessionEvent::Exited {
                 code: None,
@@ -596,9 +885,18 @@ impl Thread {
         }
         self.end_session();
         self.save();
-        if !self.draft {
-            self.store.archive(&self.id, now_ms());
+        match self.stage {
+            Stage::Saved => self.store.archive(&self.id, now_ms()),
+            Stage::Preparing(_) => self.stage = Stage::Draft,
+            Stage::Draft => {}
         }
+        let copy = self.copy()?.clone();
+        Some(Removal {
+            thread_id: self.id.clone(),
+            copy,
+            stopping: std::mem::take(&mut self.stopping),
+            store: self.store.clone(),
+        })
     }
 
     /// At quit: stops `claude`. If a turn was running, an approval waiting or a background task
@@ -856,11 +1154,15 @@ impl Thread {
         }
     }
 
+    fn is_saved(&self) -> bool {
+        matches!(self.stage, Stage::Saved)
+    }
+
     fn add_grant(&mut self, grant: Grant) {
         if self.grants.iter().any(|known| known.rule == grant.rule) {
             return;
         }
-        if !self.draft {
+        if self.is_saved() {
             self.store.add_grant(&self.id, grant.clone());
         }
         self.grants.push(grant);
@@ -871,7 +1173,7 @@ impl Thread {
             return;
         }
         self.unread = unread;
-        if !self.draft {
+        if self.is_saved() {
             self.store.set_unread(&self.id, unread);
         }
     }
@@ -884,7 +1186,7 @@ impl Thread {
 
     /// [`Thread::save`]; `touch_time` says whether this counts as activity (`updated_at`).
     fn save_with(&mut self, touch_time: bool) -> bool {
-        if self.draft {
+        if !self.is_saved() {
             return false;
         }
         // First, whatever a failed write lost is marked to be written again.
@@ -945,7 +1247,7 @@ impl Thread {
             created_at: self.created_at,
             updated_at: self.updated_at,
             archived_at: None,
-            copy: None,
+            copy: self.copy().cloned(),
         }
     }
 }
@@ -1039,6 +1341,16 @@ fn is_checkpoint(event: &SessionEvent) -> bool {
     }
 }
 
+/// The name of a thread's Rift copy: `newjen-` and the start of the thread's id.
+fn copy_name(thread_id: &str) -> String {
+    let short: String = thread_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect();
+    format!("newjen-{short}")
+}
+
 /// A new random id (a v4 UUID), for threads and Claude conversations.
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -1070,7 +1382,7 @@ mod tests {
         config.program = script;
 
         let mut thread = Thread::new_draft(store, &project, config);
-        thread.send("only once").unwrap();
+        let _ = thread.send("only once").unwrap();
         let delivered = || {
             std::fs::read_to_string(&received)
                 .unwrap_or_default()

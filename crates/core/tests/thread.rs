@@ -1,8 +1,9 @@
 //! Runs real `Thread`s against a shell-script stand-in for claude, with a real store in a temp
 //! folder. No network, no Claude login.
 //!
-//! The stand-in (`STAND_IN`) records the arguments of every start in `spawns.log` and every
-//! stdin line in `stdin.log`. Empty files in its folder switch on odd behaviour, so a test can
+//! The stand-in (`STAND_IN`) records the arguments of every start in `spawns.log`, the folder
+//! it started in with its `RIFT_ID` and `RIFT_SOURCE` in `cwd.log`, and every stdin line in
+//! `stdin.log`. Empty files in its folder switch on odd behaviour, so a test can
 //! change it between turns:
 //! - `new_in_use` / `resume_in_use`: with `--session-id` / `--resume`, print claude's
 //!   "already in use" error on stderr and exit 1, without reading stdin.
@@ -43,9 +44,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use newjen_core::protocol::PermissionAnswer;
+use newjen_core::rift::{Copy, CopyError, Tools};
 use newjen_core::session::{SessionConfig, SessionEvent};
 use newjen_core::store::{Project, Store};
-use newjen_core::thread::{CONTINUE_MESSAGE, IDLE_TIMEOUT, NEW_THREAD_TITLE, Thread, finish_quit};
+use newjen_core::thread::{
+    CONTINUE_MESSAGE, IDLE_TIMEOUT, NEW_THREAD_TITLE, Removal, Sent, Thread, WorksIn, finish_quit,
+};
 use newjen_core::transcript::{
     BACKGROUND_STOPPED_NOTE, Item, STOPPED_TOOL_NOTE, Status, ToolState,
 };
@@ -56,6 +60,7 @@ const FLUSH: Duration = Duration::from_secs(5);
 
 const STAND_IN: &str = r##"#!/bin/sh
 dir="$FAKE_DIR"
+printf '%s|%s|%s\n' "$(pwd -P)" "${RIFT_ID:-}" "${RIFT_SOURCE:-}" >> "$dir/cwd.log"
 { for arg in "$@"; do printf '%s\n' "$arg"; done; echo "---"; } >> "$dir/spawns.log"
 if [ -f "$dir/slow_stop" ]; then trap '' TERM; fi
 if [ -f "$dir/vanish" ]; then rm -f "$0"; fi
@@ -272,6 +277,54 @@ impl Fixture {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Where each start of the stand-in ran, with the `RIFT_ID` and `RIFT_SOURCE` it saw, as
+    /// `folder|id|source`.
+    fn cwds(&self) -> Vec<String> {
+        std::fs::read_to_string(self.path("cwd.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A folder standing in for a Rift copy of the project, as `rift::create` would report it.
+    fn fake_copy(&self) -> Copy {
+        let path = self.path("copies/newjen-test");
+        std::fs::create_dir_all(&path).unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        Copy {
+            workdir: path.clone(),
+            path,
+            source: std::fs::canonicalize(&self.project.path).unwrap(),
+            rift_id: "01TESTCOPY".to_string(),
+            base: None,
+        }
+    }
+
+    /// A draft that wants a Rift copy, with its first message sent and held.
+    fn preparing(&self, text: &str) -> (Thread, newjen_core::thread::CopyJob) {
+        let mut thread = self.draft();
+        thread.set_works_in(WorksIn::RiftCopy).unwrap();
+        let Sent::MakingCopy(job) = thread.send(text).unwrap() else {
+            panic!("the message should wait for the copy");
+        };
+        (thread, job)
+    }
+
+    /// The installed `rift` and `jj` with a `HOME` of their own (so a Rift registry of their
+    /// own), or `None`, with the reason printed, when they are not installed.
+    fn rift_tools(&self) -> Option<Tools> {
+        let mut tools = Tools::find();
+        if !tools.rift.is_absolute() || !tools.jj.is_absolute() {
+            eprintln!("skipped: `rift` or `jj` is not installed");
+            return None;
+        }
+        let home = self.path("rift-home");
+        std::fs::create_dir_all(&home).unwrap();
+        tools.env = vec![("HOME".to_string(), home.display().to_string())];
+        Some(tools)
     }
 
     /// A second connection to the database, to change it behind the store's back.
@@ -1918,4 +1971,223 @@ fn always_allow_that_never_reaches_claude_saves_no_grant() {
     assert!(thread.grants().is_empty());
     assert!(fixture.store.flush(FLUSH));
     assert!(fixture.store.grants(thread.id()).unwrap().is_empty());
+}
+
+#[test]
+fn a_rift_draft_holds_its_first_message_until_its_copy_is_ready_then_sends_it_once() {
+    let fixture = Fixture::new();
+    let (mut thread, _job) = fixture.preparing("Fix the login bug");
+    assert!(!thread.is_draft(), "kept when the user switches away");
+    assert_eq!(thread.works_in(), WorksIn::RiftCopy);
+    assert_eq!(thread.title(), "Fix the login bug");
+    let held = thread.preparing().expect("preparing");
+    assert_eq!(held.message(), "Fix the login bug");
+    assert!(held.started_at() <= Instant::now());
+    assert!(
+        thread.send("another").is_err(),
+        "busy while the copy is made"
+    );
+    assert!(thread.set_works_in(WorksIn::ProjectFolder).is_err());
+    thread.note_copy_line("installing deps");
+    assert_eq!(
+        thread.preparing().unwrap().last_line(),
+        Some("installing deps")
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        fixture.spawns().is_empty(),
+        "no claude runs while preparing"
+    );
+    assert!(fixture.store.flush(FLUSH));
+    assert!(
+        fixture
+            .store
+            .threads(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let copy = fixture.fake_copy();
+    thread.finish_copy(Ok(copy.clone())).unwrap();
+    finish_turn(&mut thread);
+    assert_eq!(thread.status(), Status::Done);
+    assert_eq!(thread.copy(), Some(&copy));
+    assert_eq!(thread.cwd(), copy.workdir);
+    assert_eq!(fixture.messages_received(), ["Fix the login bug"]);
+    assert_eq!(
+        fixture.cwds(),
+        [format!(
+            "{}|{}|{}",
+            copy.workdir.display(),
+            copy.rift_id,
+            copy.source.display()
+        )]
+    );
+
+    assert!(thread.finish_copy(Ok(copy.clone())).is_err());
+    settle(&mut thread);
+    assert_eq!(
+        fixture.messages_received(),
+        ["Fix the login bug"],
+        "never twice"
+    );
+    assert_eq!(fixture.spawns().len(), 1);
+
+    let row = fixture.store.thread(thread.id()).unwrap().unwrap();
+    assert_eq!(row.workdir, copy.workdir);
+    assert_eq!(row.copy.as_ref(), Some(&copy));
+    let loaded = fixture.reload(thread.id());
+    assert_eq!(loaded.copy(), Some(&copy));
+    assert_eq!(loaded.session_config().cwd, copy.workdir);
+    assert!(
+        loaded
+            .session_config()
+            .env
+            .contains(&("RIFT_ID".to_string(), copy.rift_id.clone()))
+    );
+}
+
+#[test]
+fn a_copy_that_could_not_be_made_hands_the_message_back_to_a_draft_that_still_wants_one() {
+    let fixture = Fixture::new();
+    let (mut thread, _job) = fixture.preparing("Fix the login bug");
+    let failure = CopyError::Failed {
+        command: "rift create".to_string(),
+        detail: "postcreate hook failed".to_string(),
+        output: vec!["npm ERR! missing script: setup".to_string()],
+    };
+
+    let not_sent = thread.finish_copy(Err(failure.clone())).unwrap_err();
+    assert_eq!(not_sent.message, "Fix the login bug");
+    assert_eq!(not_sent.error.downcast_ref::<CopyError>(), Some(&failure));
+    assert!(thread.is_draft());
+    assert!(thread.preparing().is_none());
+    assert_eq!(thread.works_in(), WorksIn::RiftCopy);
+    assert_eq!(thread.copy(), None);
+    assert_eq!(thread.title(), NEW_THREAD_TITLE);
+    settle(&mut thread);
+    assert!(fixture.spawns().is_empty(), "nothing tried again by itself");
+    assert!(fixture.store.flush(FLUSH));
+    assert!(
+        fixture
+            .store
+            .threads(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(matches!(
+        thread.send("Fix the login bug").unwrap(),
+        Sent::MakingCopy(_)
+    ));
+}
+
+#[test]
+fn a_claude_left_by_try_again_is_stopped_before_the_draft_moves_into_its_copy() {
+    let fixture = Fixture::new();
+    let mut thread = fixture.draft();
+    thread.restart().unwrap();
+    fixture.wait_for_spawns(1);
+    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    let Sent::MakingCopy(_job) = thread.send("hello").unwrap() else {
+        panic!("the message should wait for the copy");
+    };
+
+    let copy = fixture.fake_copy();
+    thread.finish_copy(Ok(copy.clone())).unwrap();
+    finish_turn(&mut thread);
+    let cwds = fixture.cwds();
+    assert_eq!(cwds.len(), 2);
+    assert!(cwds[1].starts_with(&format!("{}|", copy.workdir.display())));
+    assert_eq!(fixture.messages_received(), ["hello"]);
+}
+
+#[test]
+fn archiving_a_rift_thread_removes_its_copy_once_claude_has_stopped() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    std::fs::write(fixture.project.path.join("a.txt"), "a\n").unwrap();
+    let (mut thread, job) = fixture.preparing("Look around");
+    let job_tools = tools.clone();
+    let made = std::thread::spawn(move || job.run(&job_tools, |_| {}))
+        .join()
+        .unwrap();
+    let copy = made.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(copy.workdir.join("a.txt")).unwrap(),
+        "a\n"
+    );
+    thread.finish_copy(Ok(copy.clone())).unwrap();
+    finish_turn(&mut thread);
+    assert!(thread.has_session());
+
+    let removal = thread.archive().expect("a thread with a copy");
+    assert!(!thread.has_session());
+    assert_eq!(removal.copy(), &copy);
+    removal.run(&tools).unwrap();
+    assert!(!copy.path.exists());
+    assert!(fixture.store.flush(FLUSH));
+    assert_eq!(fixture.store.copy_owner(&copy.path).unwrap(), None);
+    assert!(Removal::pending(&fixture.store).unwrap().is_empty());
+}
+
+#[test]
+fn copies_of_threads_archived_before_a_relaunch_are_removed_at_startup() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let (mut thread, job) = fixture.preparing("Look around");
+    let copy = job.run(&tools, |_| {}).unwrap();
+    thread.finish_copy(Ok(copy.clone())).unwrap();
+    finish_turn(&mut thread);
+    drop(thread.archive());
+    assert!(fixture.store.flush(FLUSH));
+    assert!(copy.path.exists(), "Newjen quit before removing it");
+
+    let pending = Removal::pending(&fixture.store).unwrap();
+    assert_eq!(pending.len(), 1);
+    for removal in pending {
+        removal.run(&tools).unwrap();
+    }
+    assert!(!copy.path.exists());
+    assert!(fixture.store.flush(FLUSH));
+    assert!(Removal::pending(&fixture.store).unwrap().is_empty());
+}
+
+#[test]
+fn a_new_copy_waits_for_agents_busy_in_the_project_folder_and_for_another_copy() {
+    let fixture = Fixture::new();
+    let mut idle = fixture.draft();
+    let _ = idle.send("one").unwrap();
+    finish_turn(&mut idle);
+    assert!(!idle.blocks_copy_creation());
+
+    fixture.switch("hang", true);
+    let mut busy = fixture.draft();
+    let _ = busy.send("two").unwrap();
+    assert!(
+        busy.blocks_copy_creation(),
+        "mid-turn in the project folder"
+    );
+
+    let (preparing, _job) = fixture.preparing("three");
+    assert!(
+        preparing.blocks_copy_creation(),
+        "another copy is being made"
+    );
+
+    let (mut in_copy, _job) = fixture.preparing("four");
+    in_copy.finish_copy(Ok(fixture.fake_copy())).unwrap();
+    assert!(in_copy.status().is_busy());
+    assert!(!in_copy.blocks_copy_creation(), "it works in its own copy");
+    busy.shutdown_for_quit();
+    in_copy.shutdown_for_quit();
+    assert!(!busy.blocks_copy_creation(), "stopped");
+    fixture.switch("hang", false);
+
+    let background = thread_with_a_background_task(&fixture);
+    assert!(background.blocks_copy_creation(), "a background task runs");
 }

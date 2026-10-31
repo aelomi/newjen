@@ -26,6 +26,7 @@ use gpui::{
 };
 use gpui_kit::base::input::{InputAccessibility, TextareaState};
 use gpui_kit::base::{h_flex, v_flex};
+use newjen_core::rift::Tools;
 use newjen_core::store::now_ms;
 use newjen_core::thread::{self, Quitting, keeps_draft};
 use newjen_core::transcript::display_name;
@@ -379,7 +380,7 @@ impl ChatView {
                 // `archive` stops it on a background thread; dropped with the thread instead,
                 // it would stop on this one and freeze the window for a moment. For a draft it
                 // writes nothing: it never touched the store.
-                thread.update(cx, |thread, _| thread.archive());
+                remove_copy(thread.update(cx, |thread, _| thread.archive()));
                 // Dropping the slot stops its task.
                 self.slots.remove(leaving);
                 target = sidebar::shifted(target, leaving);
@@ -427,10 +428,10 @@ impl ChatView {
         };
         let len = self.slots.len();
         let slot = self.slots.remove(ix);
-        slot.thread.update(cx, |thread, cx| {
-            thread.archive();
+        remove_copy(slot.thread.update(cx, |thread, cx| {
             cx.notify();
-        });
+            thread.archive()
+        }));
         drop(slot);
         if ix != self.active {
             self.active = sidebar::shifted(self.active, ix);
@@ -649,7 +650,7 @@ impl ChatView {
         let went_out = sent.is_ok();
         self.slots[self.active].notice = match sent {
             // Writing worked, so an older "could not reach Claude" notice is out of date.
-            Ok(()) => None,
+            Ok(_) => None,
             Err(error) if had_claude => notice_after(Err(error), "Could not reach Claude"),
             // No claude was running, so the error is from starting one.
             Err(error) => Some(spawn_notice(&error, &program)),
@@ -1417,6 +1418,13 @@ fn after_write_error(line: Option<String>, seen: bool, error: String) -> (Option
         (line, true)
     } else {
         (Some(error), true)
+    }
+}
+
+/// Deletes an archived thread's Rift copy off the UI thread.
+fn remove_copy(removal: Option<thread::Removal>) {
+    if let Some(removal) = removal {
+        std::thread::spawn(move || removal.run(&Tools::find()));
     }
 }
 
