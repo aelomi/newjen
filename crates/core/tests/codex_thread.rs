@@ -511,6 +511,362 @@ fn live_codex_thread_reply() {
 }
 
 #[test]
+#[ignore = "spends Codex credits using the installed, unmodified CLI"]
+fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
+    use newjen_core::agent::ApprovalKind;
+    use newjen_core::rift::{Progress, Tools};
+    use std::process::Command;
+
+    fn jj(tools: &Tools, cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new(&tools.jj)
+            .args(args)
+            .current_dir(cwd)
+            .envs(tools.env.iter().map(|(name, value)| (name, value)))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "jj {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn agent_cwd() -> PathBuf {
+        let output = Command::new("/bin/ps")
+            .args(["-axo", "ppid=,pid=,comm="])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let processes: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                let parent = fields.next().unwrap().parse::<u32>().unwrap();
+                let pid = fields.next().unwrap().parse::<u32>().unwrap();
+                let program = fields.collect::<Vec<_>>().join(" ");
+                (parent, pid, program)
+            })
+            .collect();
+        let mut descendants = vec![std::process::id()];
+        let mut at = 0;
+        while at < descendants.len() {
+            let parent = descendants[at];
+            descendants.extend(processes.iter().filter(|p| p.0 == parent).map(|p| p.1));
+            at += 1;
+        }
+        let pids: Vec<_> = processes
+            .iter()
+            .filter(|p| {
+                descendants.contains(&p.1)
+                    && Path::new(&p.2)
+                        .file_name()
+                        .is_some_and(|name| name == "codex")
+            })
+            .map(|p| p.1)
+            .collect();
+        assert_eq!(pids.len(), 1, "expected one Codex child: {pids:?}");
+        let output = Command::new("/usr/sbin/lsof")
+            .args(["-a", "-p", &pids[0].to_string(), "-d", "cwd", "-Fn"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let cwd = text
+            .lines()
+            .find_map(|line| line.strip_prefix('n'))
+            .unwrap();
+        PathBuf::from(cwd).canonicalize().unwrap()
+    }
+
+    fn complete(thread: &mut Thread, allow_commands: bool, cwd: &Path) -> usize {
+        let events = thread.events();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut approvals = 0;
+        while thread.status().is_busy() && Instant::now() < deadline {
+            if let Some(request) = thread.transcript().pending_approval().cloned() {
+                assert!(allow_commands, "the resume reply must not use tools");
+                assert!(matches!(request.view().kind, ApprovalKind::Command { .. }));
+                assert_eq!(agent_cwd(), cwd);
+                println!(
+                    "approval=AllowOnce, cwd={}, command={}",
+                    cwd.display(),
+                    request.view().tool.summary
+                );
+                thread
+                    .answer(Some(request.key()), ApprovalIntent::AllowOnce)
+                    .unwrap();
+                approvals += 1;
+            }
+            match events.try_recv() {
+                Ok(event) => thread.apply(event),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        println!(
+            "status={:?}, conversation={:?}, reply={:?}, limit={:?}",
+            thread.status(),
+            thread.conversation(),
+            reply(thread),
+            thread.limit_event()
+        );
+        assert_eq!(
+            thread.status(),
+            Status::Done,
+            "{:?}",
+            thread.transcript().items()
+        );
+        assert_eq!(agent_cwd(), cwd);
+        approvals
+    }
+
+    let mut tools = Tools::find();
+    for (name, program) in [("rift", &tools.rift), ("jj", &tools.jj)] {
+        if !program.is_absolute() || !program.is_file() {
+            eprintln!("skipped: `{name}` is not installed");
+            return;
+        }
+    }
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("rift-home");
+    let project_dir = root.join("project");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&project_dir).unwrap();
+    tools.env = vec![
+        ("HOME".into(), home.display().to_string()),
+        ("JJ_USER".into(), "Test".into()),
+        ("JJ_EMAIL".into(), "test@example.com".into()),
+    ];
+    jj(&tools, &project_dir, &["git", "init", "--colocate"]);
+    std::fs::write(project_dir.join("base.txt"), "base\n").unwrap();
+    jj(&tools, &project_dir, &["commit", "-m", "base"]);
+    std::fs::write(project_dir.join("base.txt"), "uncommitted edit\n").unwrap();
+    std::fs::write(
+        project_dir.join(".rift.toml"),
+        "version = 1\n[[hooks.postcreate]]\nrun = \"echo live-codex-copy-ready\"\n",
+    )
+    .unwrap();
+
+    let status = providers::detect(Provider::Codex);
+    let Availability::Ready {
+        catalog,
+        account,
+        warnings,
+        ..
+    } = &status.availability
+    else {
+        panic!("Codex is unavailable: {status:?}");
+    };
+    println!(
+        "Codex billing={:?}, plan={:?}, warnings={warnings:?}",
+        account.billing, account.plan
+    );
+    assert!(catalog.models.iter().any(|model| model.id == "gpt-6-luna"));
+    let store = Store::open_in(&root.join("state")).unwrap();
+    let project = store.open_project(&project_dir).unwrap();
+    let mut config = AgentConfig::cli_default(Provider::Codex);
+    config.model = ModelSelection::Model {
+        id: "gpt-6-luna".into(),
+    };
+    config.effort = EffortSelection::Chosen("low".into());
+    let mut thread = Thread::draft_with_agent(store.clone(), &project, config, &status).unwrap();
+    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    let prompt = "Create a file named hello.txt containing exactly hi, using a shell command. Do not delegate.";
+    let Sent::MakingCopy(job) = thread.send(prompt).unwrap() else {
+        panic!("copy job expected");
+    };
+    assert!(!thread.has_session());
+    assert!(thread.transcript().items().is_empty());
+    assert_eq!(store.pending_copies(project.id).unwrap().len(), 1);
+    let mut hook_seen = false;
+    let made = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                job.run(&tools, |progress| {
+                    println!("copy progress: {progress:?}");
+                    hook_seen |= progress == Progress::Line("live-codex-copy-ready".into());
+                    thread.note_copy_progress(progress);
+                })
+            })
+            .join()
+            .unwrap()
+    });
+    thread.finish_copy(made).unwrap();
+    assert!(hook_seen);
+    let copy = thread.copy().unwrap().clone();
+    assert_eq!(thread.cwd(), copy.workdir);
+    assert_eq!(
+        std::fs::read_to_string(copy.path.join("base.txt")).unwrap(),
+        "uncommitted edit\n"
+    );
+    assert!(
+        complete(&mut thread, true, &copy.workdir) > 0,
+        "expected a shell approval"
+    );
+    let users: Vec<_> = thread
+        .transcript()
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            Item::User {
+                text, unconfirmed, ..
+            } => {
+                assert!(!unconfirmed);
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, [prompt]);
+    assert_eq!(
+        std::fs::read(copy.workdir.join("hello.txt")).unwrap(),
+        b"hi"
+    );
+    assert!(!project.path.join("hello.txt").exists());
+    assert!(store.flush(Duration::from_secs(5)));
+    let id = thread.id().to_owned();
+    let row = store.thread(&id).unwrap().unwrap();
+    assert_eq!(row.workdir, copy.workdir);
+    assert_eq!(row.copy.as_ref(), Some(&copy));
+    let base = copy.base.as_deref().expect("jj base");
+    assert_eq!(
+        jj(
+            &tools,
+            &project.path,
+            &[
+                "log",
+                "--ignore-working-copy",
+                "--no-graph",
+                "-r",
+                base,
+                "-T",
+                "commit_id"
+            ]
+        ),
+        base
+    );
+    assert_eq!(
+        jj(
+            &tools,
+            &project.path,
+            &[
+                "log",
+                "--ignore-working-copy",
+                "--no-graph",
+                "-r",
+                "@-",
+                "-T",
+                "commit_id"
+            ]
+        ),
+        base
+    );
+    assert!(
+        jj(
+            &tools,
+            &project.path,
+            &[
+                "log",
+                "--ignore-working-copy",
+                "--no-graph",
+                "-r",
+                "divergent()",
+                "-T",
+                "commit_id"
+            ]
+        )
+        .is_empty()
+    );
+    assert!(store.pending_copies(project.id).unwrap().is_empty());
+    println!(
+        "checks: user_items=1, hello.txt=hi only in copy, process_cwd={}, saved_workdir/copy=matched, main_base={base}, divergent=0, pending_copies=0",
+        copy.workdir.display()
+    );
+
+    let conversation = thread.conversation();
+    assert!(matches!(conversation, ConversationState::Established(_)));
+    thread.shutdown_for_quit();
+    assert!(store.flush(Duration::from_secs(5)));
+    drop(thread);
+    let row = store.thread(&id).unwrap().unwrap();
+    let mut loaded = Thread::load(
+        store.clone(),
+        &project,
+        row,
+        SessionConfig::new(&project.path),
+    )
+    .unwrap();
+    assert!(!loaded.has_session());
+    assert_eq!(loaded.cwd(), copy.workdir);
+    assert_eq!(loaded.conversation(), conversation);
+    let old_items = loaded.transcript().items().len();
+    loaded
+        .send("What file did you create, and where? Do not use tools.")
+        .unwrap();
+    assert_eq!(complete(&mut loaded, false, &copy.workdir), 0);
+    assert_eq!(loaded.conversation(), conversation);
+    let resumed = &loaded.transcript().items()[old_items..];
+    let answer = resumed
+        .iter()
+        .filter_map(|item| match item {
+            Item::Assistant { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(answer.contains("hello.txt"), "{answer}");
+    assert!(
+        !resumed
+            .iter()
+            .any(|item| matches!(item, Item::Tool { .. } | Item::FreshStart { .. }))
+    );
+    let costs: Vec<_> = loaded
+        .transcript()
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            Item::TurnEnd { cost_usd, .. } => Some(*cost_usd),
+            _ => None,
+        })
+        .collect();
+    println!(
+        "resume: same conversation, cwd={}, reply={answer:?}, turn_costs_usd={costs:?}",
+        loaded.cwd().display()
+    );
+    let removal = loaded.archive().expect("copy removal");
+    let trash = copy.path.parent().unwrap().join(".trash").join(format!(
+        "{}-{}",
+        copy.rift_id,
+        copy.path.file_name().unwrap().to_str().unwrap()
+    ));
+    std::thread::spawn(move || removal.run(&tools))
+        .join()
+        .unwrap()
+        .unwrap();
+    assert!(!copy.path.exists());
+    assert!(!trash.exists());
+    assert!(store.flush(Duration::from_secs(5)));
+    let db = rusqlite::Connection::open(store.path()).unwrap();
+    let removed_at: Option<i64> = db
+        .query_row(
+            "SELECT removed_at FROM copies WHERE thread_id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(removed_at.is_some());
+    assert!(store.thread(&id).unwrap().unwrap().archived_at.is_some());
+    assert!(store.pending_copies(project.id).unwrap().is_empty());
+    println!("archive: copy gone, trash entry gone, removed_at={removed_at:?}");
+}
+
+#[test]
 fn claude_limit_rejection_also_stops_and_persists_reset_without_a_repair() {
     let lab = Lab::new("reply");
     let mut config = SessionConfig::new(&lab.project.path);
