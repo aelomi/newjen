@@ -5,6 +5,7 @@
 
 mod approval;
 mod assets;
+mod attention;
 mod chat_view;
 mod format;
 mod keys;
@@ -12,6 +13,7 @@ mod project_view;
 mod reply;
 mod rows;
 mod sidebar;
+mod terminal;
 mod theme;
 mod title_bar;
 mod ui;
@@ -29,7 +31,8 @@ use newjen_core::{Project, Store, orphans, store};
 use crate::assets::AppAssets;
 use crate::keys::{
     CloseWindow, Hide, HideOthers, JumpToThread, Minimize, NewThread, NextThread, OpenProject,
-    OpenRecentProject, PreviousThread, Quit, ShowProjects, ToggleSidebar,
+    OpenRecentProject, PreviousThread, Quit, ShowApprovals, ShowProjects, ToggleSidebar,
+    ToggleTerminal,
 };
 use crate::project_view::ProjectView;
 use gpui_kit::component::ActiveTheme as _;
@@ -130,9 +133,9 @@ fn acquire_instance() -> Result<InstanceLock, StartupProblem> {
 }
 
 /// The menu bar and the app-wide actions behind it, so Newjen behaves like any Mac app
-/// (⌘H, ⌘M, ⌘W, the Edit menu).
+/// (⌘H, ⌘M, ⌘W, the Edit menu). ⌘Q and ⌘W are bound where the window is opened: they ask
+/// before stopping work (`ProjectView::request_quit`).
 fn install_menus(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
     cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
     cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
     // A key press is handled while GPUI is busy with the window, which can't be updated from
@@ -141,14 +144,6 @@ fn install_menus(cx: &mut App) {
         if let Some(window) = cx.active_window() {
             cx.defer(move |cx| {
                 let _ = window.update(cx, |_, window, _| window.minimize_window());
-            });
-        }
-    });
-    // Closing the only window quits (`QuitMode::LastWindowClosed`), which stops Claude cleanly.
-    cx.on_action(|_: &CloseWindow, cx: &mut App| {
-        if let Some(window) = cx.active_window() {
-            cx.defer(move |cx| {
-                let _ = window.update(cx, |_, window, _| window.remove_window());
             });
         }
     });
@@ -197,7 +192,11 @@ fn update_menus(recent: &[Project], cx: &mut App) {
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
         ]),
-        Menu::new("View").items([MenuItem::action("Toggle Sidebar", ToggleSidebar)]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::action("Approvals Inbox", ShowApprovals),
+            MenuItem::action("Toggle Terminal", ToggleTerminal),
+        ]),
         Menu::new("Window").items([
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Close", CloseWindow),
@@ -228,6 +227,8 @@ fn check_project(project: &Path) -> Result<(), String> {
 /// cannot be opened): a plain window with a native alert that says what went wrong, and quits
 /// when it is dismissed.
 fn show_startup_problem(problem: &StartupProblem, cx: &mut App) -> anyhow::Result<()> {
+    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    cx.on_action(|_: &CloseWindow, cx: &mut App| cx.quit());
     let detail = problem.detail();
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -297,18 +298,41 @@ fn open_window(
         window_min_size: Some(size(px(640.0), px(480.0))),
         ..Default::default()
     };
-    let (_, view) = gpui_kit::open_window(options, cx, |window, cx| {
+    let (window_handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
         // Follow the system when it switches between light and dark.
         window
             .observe_window_appearance(|window, cx| {
                 gpui_kit::component::Theme::change(window.appearance(), Some(window), cx);
             })
             .detach();
-        cx.new(|cx| ProjectView::new(store, home, project, window, cx))
+        let view = cx.new(|cx| ProjectView::new(store, home, project, window, cx));
+        // The Dock badge, notifications and the native quit hook, once for the app's life.
+        view.update(cx, |view, cx| view.install_attention(window, cx));
+        let closing = view.downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let _ = closing.update(cx, |view, cx| view.request_quit(window, cx));
+            false
+        });
+        view
     })?;
-    // Quitting (⌘Q, or closing the window, which quits) settles and saves every thread and
-    // stops every `claude`. GPUI allows about 200 ms for this. The hook keeps the view alive
-    // itself: closing the window drops the window's hold on it before the app quits.
+    // ⌘Q and ⌘W ask first when work would be lost. They act on the window that was opened,
+    // not the active one: minimized, the window is not active, yet the keys still arrive.
+    // A key press is handled while GPUI is busy with the window, hence `defer`.
+    let asking = view.downgrade();
+    let request = move |cx: &mut App| {
+        let view = asking.clone();
+        cx.defer(move |cx| {
+            let _ = window_handle.update(cx, |_, window, cx| {
+                let _ = view.update(cx, |view, cx| view.request_quit(window, cx));
+            });
+        });
+    };
+    let quit = request.clone();
+    cx.on_action(move |_: &Quit, cx| quit(cx));
+    cx.on_action(move |_: &CloseWindow, cx| request(cx));
+    // Quitting settles and saves every thread and stops every agent and terminal. GPUI
+    // allows about 200 ms for this. The hook keeps the view alive itself: closing the window
+    // drops the window's hold on it before the app quits.
     cx.on_app_quit(move |cx| {
         view.update(cx, |view, cx| view.quit(cx));
         async {}

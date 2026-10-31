@@ -1646,3 +1646,239 @@ async fn a_denial_note_is_sent_from_its_own_field_and_cleared_for_the_next_reque
     }));
     finish(&chat, path, cx);
 }
+
+fn request_key(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> newjen_core::ApprovalKey {
+    cx.update(|_, cx| {
+        chat.read(cx)
+            .thread()
+            .read(cx)
+            .transcript()
+            .pending_approval()
+            .unwrap()
+            .key()
+    })
+}
+
+/// A second project in the same window, as `ProjectView` makes one: it sees `peers` and is
+/// out of sight until shown.
+fn peer_project(
+    name: &str,
+    with_approvals: bool,
+    peers: Vec<&Entity<ChatView>>,
+    path: &Path,
+    cx: &mut VisualTestContext,
+) -> Entity<ChatView> {
+    let folder = path.join(name);
+    std::fs::create_dir_all(&folder).unwrap();
+    let store = cx.update(|_, cx| peers[0].read(cx).store.clone());
+    let project = store.open_project(&folder).unwrap();
+    let mut base_config = SessionConfig::new(&folder);
+    if with_approvals {
+        base_config.program = script(path);
+    }
+    let startup = Startup {
+        store,
+        project,
+        base_config,
+        threads: vec![],
+        problem: None,
+        home: None,
+        tools: Tools {
+            rift: PathBuf::from("/bin/rift"),
+            jj: PathBuf::from("/bin/jj"),
+            env: vec![],
+        },
+    };
+    cx.update(|window, cx| {
+        let peer = cx.new(|cx| ChatView::new(startup, window, cx));
+        peer.update(cx, |view, cx| {
+            view.set_copy_peers(peers.iter().map(|peer| peer.downgrade()).collect());
+            view.set_visible(false, window, cx);
+        });
+        peer
+    })
+}
+
+#[gpui::test]
+async fn inbox_answers_the_captured_thread_in_any_project_without_selecting_it(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "inbox-routing", true);
+    cx.simulate_input("first thread");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let first = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    let first_request = request_id(&chat, cx);
+    let first_key = request_key(&chat, cx);
+    // The second waiting thread is in another loaded project, out of sight.
+    let peer = peer_project("other", true, vec![&chat], &path, cx);
+    cx.update(|window, cx| {
+        peer.update(cx, |view, cx| {
+            assert!(view.send_text("second thread", window, cx));
+        })
+    });
+    pending(&peer, cx).await;
+    let second = cx.update(|_, cx| peer.read(cx).thread().read(cx).id().to_string());
+    let second_key = request_key(&peer, cx);
+    assert_ne!(second_key, first_key);
+    let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = opened.clone();
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.set_copy_peers(vec![peer.downgrade()]);
+            view.set_thread_opener(std::rc::Rc::new(move |id, _, _| {
+                seen.borrow_mut().push(id.to_string())
+            }));
+            assert_eq!(view.waiting_threads(cx), 1);
+            assert_eq!(view.waiting_everywhere(cx), 2);
+            assert_eq!(view.quit_blockers(cx).waiting, 1);
+            view.open_inbox(window, cx);
+            // Another request's key never answers this one.
+            view.answer_thread(
+                &first,
+                Some(second_key),
+                ApprovalIntent::AllowOnce,
+                window,
+                cx,
+            );
+        })
+    });
+    assert_eq!(answers(&path).len(), 0);
+    cx.run_until_parked();
+    let selector = |thread: &str, button: &str| -> &'static str {
+        Box::leak(format!("inbox-{thread}-{button}").into_boxed_str())
+    };
+    assert!(
+        cx.debug_bounds(selector(&first, "always")).is_none(),
+        "the inbox offers no session grant"
+    );
+    click(cx, selector(&second, "once"));
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert_eq!(view.thread().read(cx).id(), first);
+        assert_eq!(view.panel, Panel::Inbox);
+    });
+    wait_answers(cx, &path, 1).await;
+    assert_eq!(
+        answers(&path)[0]["response"]["response"]["behavior"],
+        "allow"
+    );
+    assert_eq!(request_id(&chat, cx), first_request);
+    assert_eq!(request_id(&peer, cx), "second-tool");
+    cx.simulate_keystrokes("escape");
+    cx.simulate_keystrokes("cmd-enter");
+    assert_eq!(
+        answers(&path).len(),
+        1,
+        "inbox keys must not answer the hidden dock"
+    );
+    click(cx, selector(&first, "deny"));
+    wait_answers(cx, &path, 2).await;
+    assert_eq!(
+        answers(&path)[1]["response"]["response"]["behavior"],
+        "deny"
+    );
+    cx.run_until_parked();
+    assert_eq!(request_id(&chat, cx), "second-tool");
+    // "Open thread" on another project's row goes through the window, which switches
+    // projects; this project's own rows open here.
+    click(cx, selector(&second, "open"));
+    assert_eq!(opened.borrow().as_slice(), std::slice::from_ref(&second));
+    assert!(cx.update(|_, cx| chat.read(cx).panel == Panel::Inbox));
+    click(cx, selector(&first, "open"));
+    assert_eq!(opened.borrow().len(), 1);
+    assert!(cx.update(|_, cx| chat.read(cx).panel == Panel::Thread));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn closing_the_drawer_restores_focus_to_the_visible_panel(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "drawer-panel-focus", false);
+    cx.executor().allow_parking();
+    cx.simulate_resize(size(px(700.), px(600.)));
+    cx.simulate_keystrokes("cmd-b");
+    assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+    cx.simulate_keystrokes("cmd-shift-a");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(!window.has_active_sheet(cx));
+        assert_eq!(chat.read(cx).panel, Panel::Inbox);
+        assert!(chat.read(cx).root.is_focused(window));
+    });
+    cx.simulate_keystrokes("cmd-b");
+    cx.simulate_keystrokes("cmd-`");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(!window.has_active_sheet(cx));
+        let view = chat.read(cx);
+        assert_eq!(view.panel, Panel::Terminal);
+        assert!(
+            view.slots[view.active]
+                .terminal
+                .as_ref()
+                .unwrap()
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+        assert_eq!(view.quit_blockers(cx).terminals, 1);
+    });
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn archiving_the_selected_terminal_returns_to_a_visible_conversation(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "archive-terminal-panel", false);
+    cx.executor().allow_parking();
+    cx.simulate_keystrokes("cmd-`");
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let id = view.thread().read(cx).id().to_string();
+            view.archive(&id, window, cx);
+            assert_eq!(view.panel, Panel::Thread);
+            assert!(view.slots[view.active].terminal.is_none());
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window)));
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn a_terminal_keeps_its_draft_and_working_folder_until_closed(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "terminal-folder-retention", false);
+    cx.executor().allow_parking();
+    cx.simulate_keystrokes("cmd-`");
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.toggle_terminal(window, cx);
+            view.choose_works_in(WorksIn::RiftCopy, window, cx);
+            assert_eq!(view.thread().read(cx).works_in(), WorksIn::ProjectFolder);
+        })
+    });
+    cx.simulate_keystrokes("cmd-n");
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            assert_eq!(view.slots.len(), 2);
+            assert!(view.slots[1].terminal.is_some());
+            // The project-folder shell could change files under a copy's snapshot.
+            view.choose_works_in(WorksIn::RiftCopy, window, cx);
+            let hold = view.copy_hold(&view.thread().clone(), cx).unwrap();
+            assert_eq!(hold.title, "Close the project terminal first");
+        })
+    });
+    // A peer project in the same repository sees that terminal too.
+    let peer = peer_project("sibling", false, vec![&chat], &path, cx);
+    std::fs::create_dir_all(path.join(".git")).unwrap();
+    cx.update(|_, cx| {
+        peer.update(cx, |view, cx| {
+            view.thread().clone().update(cx, |thread, _| {
+                thread.set_works_in(WorksIn::RiftCopy).unwrap()
+            });
+            let hold = view.copy_hold(&view.thread().clone(), cx).unwrap();
+            assert_eq!(hold.title, "Close the project terminal first");
+        })
+    });
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    finish(&chat, path, cx);
+}

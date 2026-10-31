@@ -28,6 +28,8 @@ actions!(
         PreviousThread,
         NextThread,
         ToggleSidebar,
+        ShowApprovals,
+        ToggleTerminal,
     ]
 );
 
@@ -70,6 +72,8 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-{", PreviousThread, Some(CONTEXT)),
         KeyBinding::new("cmd-}", NextThread, Some(CONTEXT)),
         KeyBinding::new("cmd-b", ToggleSidebar, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-a", ShowApprovals, Some(CONTEXT)),
+        KeyBinding::new("cmd-`", ToggleTerminal, Some(CONTEXT)),
     ]);
     cx.bind_keys(
         JUMP_KEYS

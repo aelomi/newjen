@@ -64,6 +64,8 @@ pub struct ApprovalCard {
     preview: Option<AnyElement>,
     edit: bool,
     ready: bool,
+    once_only: bool,
+    selector_prefix: String,
     note: Option<Entity<gpui_kit::base::input::TextareaState>>,
 }
 
@@ -82,8 +84,21 @@ impl ApprovalCard {
             preview: None,
             edit: false,
             ready: true,
+            once_only: false,
+            selector_prefix: String::new(),
             note: None,
         }
+    }
+    /// Only Allow once and Deny: the inbox never grants for a session (that stays in the
+    /// thread's own dock, where the scope row explains what is remembered).
+    pub fn once_only(mut self) -> Self {
+        self.once_only = true;
+        self
+    }
+    /// Puts `prefix` before the buttons' debug selectors, so tests can tell cards apart.
+    pub fn selectors(mut self, prefix: impl Into<String>) -> Self {
+        self.selector_prefix = prefix.into();
+        self
     }
     pub fn preview(mut self, preview: Option<AnyElement>, ready: bool) -> Self {
         self.edit = preview.is_some();
@@ -103,9 +118,10 @@ impl RenderOnce for ApprovalCard {
         let c = cx.theme();
         let choice = |id: &'static str, label: &'static str, look, answer: ApprovalIntent| {
             let on_answer = self.on_answer.clone();
+            let selector = format!("{}{id}", self.selector_prefix);
             button((self.id.clone(), id), label, look, Size::Md, cx)
                 .disabled(!self.ready && !answer.is_deny())
-                .debug_selector(move || id.to_string())
+                .debug_selector(move || selector.clone())
                 .on_click(move |_, window, cx| on_answer(answer, window, cx))
         };
         div()
@@ -163,7 +179,7 @@ impl RenderOnce for ApprovalCard {
                     .justify_end()
                     .gap(px(m.title_gap))
                     .child(choice("deny", "Deny", Look::Ghost, ApprovalIntent::Deny))
-                    .children((!self.edit).then(|| {
+                    .children((!self.edit && !self.once_only).then(|| {
                         choice(
                             "always",
                             "Always allow",

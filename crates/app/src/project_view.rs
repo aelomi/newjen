@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, IntoElement, ParentElement, PathPromptOptions,
+    App, AppContext, Context, Entity, FocusHandle, IntoElement, ParentElement, PathPromptOptions,
     Render, Styled, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_kit::base::v_flex;
@@ -9,14 +9,28 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, TitleBar};
 use newjen_core::rift::Tools;
 use newjen_core::{Project, SessionConfig, Store, Thread, thread};
 
-use crate::chat_view::{ChatView, Startup};
+use crate::attention::{NativeAttention, NativeQuitGuard};
+use crate::chat_view::{Attention, ChatView, QuitBlockers, Startup};
 use crate::format::tilde;
 use crate::keys::{OpenProject, OpenRecentProject, ShowProjects};
 use crate::ui;
 
+/// How often the attention adapter delivers the notifications it holds (see
+/// `NativeAttention::poll`).
+const ATTENTION_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
 struct OpenedProject {
     project: Project,
     chat: Entity<ChatView>,
+    _attention: Subscription,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QuitPhase {
+    #[default]
+    Running,
+    Confirming,
+    Stopping,
 }
 
 enum LoadedProject {
@@ -38,8 +52,16 @@ pub struct ProjectView {
     save_problem_seen: bool,
     background_problem: Option<String>,
     focus: FocusHandle,
+    /// The Dock badge and desktop notifications, once the window is open (not in tests).
+    attention: Option<NativeAttention>,
+    quit_guard: Option<NativeQuitGuard>,
+    quit_phase: QuitPhase,
+    /// The badge count last shown, so AppKit is only asked when it changes.
+    badge: usize,
+    attention_note: Option<&'static str>,
     _errors: Task<()>,
     _focus: Subscription,
+    _attention_tasks: Vec<Task<()>>,
 }
 
 impl ProjectView {
@@ -89,7 +111,13 @@ impl ProjectView {
             save_problem_seen: false,
             background_problem: None,
             focus: cx.focus_handle(),
+            attention: None,
+            quit_guard: None,
+            quit_phase: QuitPhase::Running,
+            badge: 0,
+            attention_note: None,
             _errors: listener,
+            _attention_tasks: Vec::new(),
             _focus: cx.on_focus_lost(window, |view, window, cx| {
                 if view.active.is_none() {
                     cx.defer_in(window, |view, window, cx| {
@@ -150,6 +178,7 @@ impl ProjectView {
                                 let project = startup.project.clone();
                                 let chat = cx.new(|cx| ChatView::new(*startup, window, cx));
                                 let shell = cx.weak_entity();
+                                let opener = cx.weak_entity();
                                 chat.update(cx, |chat, _| {
                                     chat.set_project_chooser(std::rc::Rc::new(
                                         move |window, cx| {
@@ -158,8 +187,20 @@ impl ProjectView {
                                             });
                                         },
                                     ));
+                                    chat.set_thread_opener(std::rc::Rc::new(
+                                        move |thread_id, window, cx| {
+                                            let _ = opener.update(cx, |view, cx| {
+                                                view.reveal_thread(thread_id, window, cx);
+                                            });
+                                        },
+                                    ));
                                 });
-                                view.projects.push(OpenedProject { project, chat });
+                                let attention = cx.subscribe(&chat, Self::attend);
+                                view.projects.push(OpenedProject {
+                                    project,
+                                    chat,
+                                    _attention: attention,
+                                });
                                 for (index, project) in view.projects.iter().enumerate() {
                                     let peers = view
                                         .projects
@@ -176,6 +217,11 @@ impl ProjectView {
                             }
                         };
                         view.show(index, window, cx);
+                        view.refresh_badge(cx);
+                        let note = view.attention_note;
+                        view.projects[index]
+                            .chat
+                            .update(cx, |chat, cx| chat.set_attention_note(note, cx));
                         view.recent = recent;
                         crate::update_menus(&view.recent, cx);
                         view.problem = None;
@@ -296,6 +342,185 @@ impl ProjectView {
             .flat_map(|project| project.chat.update(cx, |chat, cx| chat.begin_quit(cx)))
             .collect();
         thread::finish_quit(&self.store, quitting);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Attention and quitting, over every loaded project
+    // -----------------------------------------------------------------------------------------
+
+    /// The Dock badge, desktop notifications and the native quit hook. Called once when the
+    /// window opens; they live as long as the app.
+    pub fn install_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let attention = NativeAttention::new();
+        let clicks = attention.clicks();
+        self.attention = Some(attention);
+        self.refresh_badge(cx);
+        self.sync_attention_note(cx);
+        // A click on a notification brings the thread on screen. It never answers.
+        self._attention_tasks
+            .push(cx.spawn_in(window, async move |view, cx| {
+                while let Ok(id) = clicks.recv().await {
+                    let _ = view.update_in(cx, |view, window, cx| {
+                        cx.activate(true);
+                        if let Some(attention) = &mut view.attention {
+                            attention.dismiss(&id);
+                        }
+                        view.reveal_thread(&id, window, cx);
+                    });
+                }
+            }));
+        self._attention_tasks.push(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(ATTENTION_POLL).await;
+                let polled = view.update(cx, |view, cx| {
+                    if let Some(attention) = &mut view.attention {
+                        attention.poll();
+                    }
+                    view.sync_attention_note(cx);
+                });
+                if polled.is_err() {
+                    break;
+                }
+            }
+        }));
+        match NativeQuitGuard::install() {
+            Ok(guard) => {
+                let requests = guard.requests();
+                self.quit_guard = Some(guard);
+                self._attention_tasks
+                    .push(cx.spawn_in(window, async move |view, cx| {
+                        while requests.recv().await.is_ok() {
+                            let _ = view.update_in(cx, |view, window, cx| {
+                                cx.activate(true);
+                                view.request_quit(window, cx);
+                            });
+                        }
+                    }));
+            }
+            Err(error) => {
+                self.problem = Some(format!(
+                    "Native quit confirmation is unavailable: {error:#}"
+                ));
+            }
+        }
+    }
+
+    /// A project's thread changed in a way the badge or a notification cares about.
+    fn attend(&mut self, _: Entity<ChatView>, event: &Attention, cx: &mut Context<Self>) {
+        if let Some(attention) = &mut self.attention {
+            match event {
+                Attention::Dismiss(thread_id) => attention.dismiss(thread_id),
+                Attention::Notify {
+                    thread_id,
+                    title,
+                    kind,
+                } => attention.notify(thread_id, title, *kind),
+            }
+        }
+        self.refresh_badge(cx);
+        self.sync_attention_note(cx);
+    }
+
+    /// Tells every project's inbox why desktop notifications are off, when they are.
+    fn sync_attention_note(&mut self, cx: &mut Context<Self>) {
+        let note = self
+            .attention
+            .as_ref()
+            .and_then(NativeAttention::capability_note);
+        if note == self.attention_note {
+            return;
+        }
+        self.attention_note = note;
+        for project in &self.projects {
+            project
+                .chat
+                .update(cx, |chat, cx| chat.set_attention_note(note, cx));
+        }
+    }
+
+    /// Threads waiting for an approval, in every loaded project.
+    fn waiting_threads(&self, cx: &App) -> usize {
+        self.projects
+            .iter()
+            .map(|project| project.chat.read(cx).waiting_threads(cx))
+            .sum()
+    }
+
+    fn refresh_badge(&mut self, cx: &App) {
+        let waiting = self.waiting_threads(cx);
+        if waiting == self.badge {
+            return;
+        }
+        self.badge = waiting;
+        if let Some(attention) = &self.attention {
+            attention.set_badge(waiting);
+        }
+    }
+
+    /// Brings `thread_id` on screen, switching to its project if needed.
+    fn reveal_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .projects
+            .iter()
+            .position(|project| project.chat.read(cx).has_thread(thread_id, cx))
+        else {
+            return;
+        };
+        self.show(index, window, cx);
+        self.projects[index]
+            .chat
+            .update(cx, |chat, cx| chat.show_thread(thread_id, window, cx));
+    }
+
+    fn quit_blockers(&self, cx: &App) -> QuitBlockers {
+        let mut blockers = QuitBlockers::default();
+        for project in &self.projects {
+            blockers.add(&project.chat.read(cx).quit_blockers(cx));
+        }
+        blockers
+    }
+
+    /// ⌘Q, ⌘W, the window's close button and macOS asking the app to quit all come here:
+    /// one confirmation when work would be lost, otherwise the app quits.
+    pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase != QuitPhase::Running {
+            return;
+        }
+        let blockers = self.quit_blockers(cx);
+        if !blockers.any() {
+            self.quit_phase = QuitPhase::Stopping;
+            self.allow_quit();
+            cx.quit();
+            return;
+        }
+        self.quit_phase = QuitPhase::Confirming;
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            "Quit Newjen and stop its work?",
+            Some(&blockers.detail()),
+            &["Keep working", "Quit and stop"],
+            cx,
+        );
+        cx.spawn(async move |view, cx| {
+            let confirmed = answer.await == Ok(1);
+            let _ = view.update(cx, |view, cx| {
+                if confirmed {
+                    view.quit_phase = QuitPhase::Stopping;
+                    view.allow_quit();
+                    cx.quit();
+                } else {
+                    view.quit_phase = QuitPhase::Running;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn allow_quit(&self) {
+        if let Some(guard) = &self.quit_guard {
+            guard.allow_quit();
+        }
     }
 
     fn welcome(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -561,6 +786,70 @@ mod tests {
                 .contains("does not exist")
         }));
         finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn quitting_asks_once_for_work_in_any_loaded_project(cx: &mut TestAppContext) {
+        let (shell, path, cx) = setup(cx, "quit-gate");
+        let first = path.join("first");
+        let second = path.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        open(&shell, first, cx).await;
+        // Nothing to lose: the app quits without a question.
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
+        cx.update(|_, cx| {
+            shell.update(cx, |view, _| view.quit_phase = QuitPhase::Running);
+        });
+        // A terminal in the first project, then the second project on screen.
+        cx.simulate_keystrokes("cmd-`");
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_blockers(cx).terminals),
+            1
+        );
+        open(&shell, second, cx).await;
+        assert_eq!(cx.update(|_, cx| shell.read(cx).active), Some(1));
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_blockers(cx).terminals),
+            1
+        );
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        assert!(cx.has_pending_prompt());
+        // A second request while the question is up does not ask again.
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Confirming
+        );
+        cx.simulate_prompt_answer("Keep working");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_blockers(cx).terminals),
+            1
+        );
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        cx.simulate_prompt_answer("Quit and stop");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
+        // Quitting stops the terminal with everything else.
+        cx.update(|_, cx| shell.update(cx, |view, cx| view.quit(cx)));
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_blockers(cx).terminals),
+            0
+        );
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[gpui::test]

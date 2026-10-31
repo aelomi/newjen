@@ -13,8 +13,50 @@ pub(super) struct ApprovalPreview {
 }
 
 impl ApprovalPreview {
+    fn reading(request: newjen_core::ApprovalKey) -> Self {
+        Self {
+            request,
+            diff: None,
+            message: "Reading the proposed edit…".into(),
+            expected: None,
+            validating: false,
+        }
+    }
+
     pub(super) fn loading(&self) -> bool {
         self.expected.is_none() || self.validating
+    }
+
+    /// The proposed edit as read from the disk: a diff to show, or why there is none. An
+    /// oversized or unavailable preview still allows once, as the message says.
+    fn fill(&mut self, preview: EditPreview, cx: &mut App) {
+        self.expected = Some(preview.clone());
+        match preview {
+            EditPreview::Patch(patch) => match DiffFile::parse(&patch) {
+                Ok(files) => {
+                    self.diff = Some(cx.new(|cx| DiffState::new(files, cx)));
+                    self.message.clear();
+                }
+                Err(error) => self.message = format!("Couldn't display the proposed edit: {error}"),
+            },
+            EditPreview::TooLarge => {
+                self.message = "This edit is too large to preview. Allow once is the only \
+                                available approval."
+                    .into()
+            }
+            EditPreview::Unavailable(reason) => self.message = reason,
+        }
+    }
+
+    pub(super) fn render(&self, height: f32, cx: &App) -> AnyElement {
+        match &self.diff {
+            Some(diff) => div()
+                .h(px((height - 390.).clamp(64., 150.)))
+                .w_full()
+                .child(Diff::new(diff).soft_wrap(true))
+                .into_any_element(),
+            None => ui::caption(self.message.clone(), cx).into_any_element(),
+        }
     }
 }
 
@@ -104,42 +146,135 @@ impl ChatView {
             return;
         };
         let request = request.key();
-        self.edit_preview = Some(ApprovalPreview {
-            request,
-            diff: None,
-            message: "Reading the proposed edit…".into(),
-            expected: None,
-            validating: false,
-        });
+        self.edit_preview = Some(ApprovalPreview::reading(request));
         let task = cx.background_spawn(async move { proposal.preview() });
         cx.spawn_in(window, async move |view, cx| {
             let preview = task.await;
             let _ = view.update_in(cx, |view, _, cx| {
-                let Some(current) = view.edit_preview.as_mut().filter(|current| current.request == request) else { return; };
-                current.expected = Some(preview.clone());
-                match preview {
-                    EditPreview::Patch(patch) => match DiffFile::parse(&patch) {
-                        Ok(files) => { current.diff = Some(cx.new(|cx| DiffState::new(files, cx))); current.message.clear(); }
-                        Err(error) => current.message = format!("Couldn't display the proposed edit: {error}"),
-                    },
-                    EditPreview::TooLarge => current.message = "This edit is too large to preview. Allow once is the only available approval.".into(),
-                    EditPreview::Unavailable(reason) => current.message = reason,
-                }
+                let Some(current) = view
+                    .edit_preview
+                    .as_mut()
+                    .filter(|current| current.request == request)
+                else {
+                    return;
+                };
+                current.fill(preview, cx);
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
     }
 
     pub(super) fn render_edit_preview(&self, height: f32, cx: &App) -> Option<AnyElement> {
-        let preview = self.edit_preview.as_ref()?;
-        Some(match &preview.diff {
-            Some(diff) => div()
-                .h(px((height - 390.).clamp(64., 150.)))
-                .w_full()
-                .child(Diff::new(diff).soft_wrap(true))
-                .into_any_element(),
-            None => ui::caption(preview.message.clone(), cx).into_any_element(),
+        Some(self.edit_preview.as_ref()?.render(height, cx))
+    }
+
+    /// The inbox row's preview of row `ix`'s pending file edit, read the same way as the
+    /// dock's. Nothing for a request that is not a file edit.
+    pub(super) fn prepare_slot_preview(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.slots[ix].preview = None;
+        let thread = self.slots[ix].thread.read(cx);
+        let Some(request) = thread.transcript().pending_approval() else {
+            return;
+        };
+        let Some(proposal) = thread.pending_edit() else {
+            return;
+        };
+        let request = request.key();
+        let thread = self.slots[ix].thread.clone();
+        self.slots[ix].preview = Some(ApprovalPreview::reading(request));
+        let task = cx.background_spawn(async move { proposal.preview() });
+        cx.spawn_in(window, async move |view, cx| {
+            let preview = task.await;
+            let _ = view.update_in(cx, |view, _, cx| {
+                let Some(slot) = view.slots.iter_mut().find(|slot| slot.thread == thread) else {
+                    return;
+                };
+                let Some(current) = slot
+                    .preview
+                    .as_mut()
+                    .filter(|current| current.request == request)
+                else {
+                    return;
+                };
+                current.fill(preview, cx);
+                cx.notify();
+            });
         })
+        .detach();
+    }
+
+    /// The inbox's answer for `thread_id`'s request `key`: Allow once or Deny, never a
+    /// session grant. A file edit is allowed only once its preview is read, and only if the
+    /// file is still as previewed; otherwise the preview is read again and nothing is sent.
+    pub(super) fn inbox_answer(
+        &mut self,
+        thread_id: &str,
+        key: newjen_core::ApprovalKey,
+        choice: ApprovalIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let choice = if choice.is_deny() {
+            ApprovalIntent::Deny
+        } else {
+            ApprovalIntent::AllowOnce
+        };
+        let Some(preview) = self.slots[ix]
+            .preview
+            .as_mut()
+            .filter(|_| !choice.is_deny())
+        else {
+            self.answer_thread(thread_id, Some(key), choice, window, cx);
+            return;
+        };
+        if preview.loading() || preview.request != key {
+            return;
+        }
+        let expected = preview.expected.clone().expect("read");
+        let Some(proposal) = self.slots[ix].thread.read(cx).pending_edit() else {
+            return;
+        };
+        self.slots[ix].preview.as_mut().expect("checked").validating = true;
+        let thread = self.slots[ix].thread.clone();
+        let task = cx.background_spawn(async move { proposal.preview() });
+        cx.spawn_in(window, async move |view, cx| {
+            let current = task.await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                let Some(ix) = view.slots.iter().position(|slot| slot.thread == thread) else {
+                    return;
+                };
+                let Some(preview) = view.slots[ix]
+                    .preview
+                    .as_mut()
+                    .filter(|preview| preview.request == key)
+                else {
+                    return;
+                };
+                preview.validating = false;
+                let id = thread.read(cx).id().to_string();
+                if current == expected {
+                    view.answer_thread(&id, Some(key), ApprovalIntent::AllowOnce, window, cx);
+                } else {
+                    view.prepare_slot_preview(ix, window, cx);
+                    view.slots[ix].notice = Some(Notice::held(
+                        "The file changed",
+                        "Review the updated edit before allowing it.".into(),
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     pub(super) fn run_snapshot(

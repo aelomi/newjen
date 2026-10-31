@@ -13,6 +13,8 @@
 //! calls on the thread on screen and draws what the threads say. Every change ends with
 //! `cx.notify()`, which asks GPUI to call `render` again.
 
+mod inbox;
+mod lifecycle;
 mod limits;
 mod picker;
 mod review;
@@ -40,6 +42,7 @@ use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps
 use newjen_core::{ApprovalIntent, Item, Project, SessionConfig, Status, Store, Thread, ToolState};
 
 use crate::approval::{self, Room};
+pub use crate::chat_view::lifecycle::{Attention, QuitBlockers};
 use crate::format::{elapsed, fit_rows, short_path, text_rows, tilde};
 use crate::keys::{
     self, JumpToThread, KeyRoute, NewThread, NextThread, PreviousThread, Stop, ToggleSidebar,
@@ -47,6 +50,7 @@ use crate::keys::{
 use crate::reply;
 use crate::rows::{self, OnRestart};
 use crate::sidebar::{self, OnPress, Placement, RowFacts};
+use crate::terminal::TerminalPanel;
 use crate::theme::SIDEBAR;
 use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
 use crate::ui;
@@ -156,6 +160,19 @@ enum CopyProgress {
     Made(Result<rift::Copy, CopyError>),
 }
 
+/// What the main column shows: the thread on screen, the approvals inbox across every loaded
+/// project, or the thread's terminal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Panel {
+    #[default]
+    Thread,
+    Inbox,
+    Terminal,
+}
+
+/// Opens a thread of any loaded project (see `ProjectView::reveal_thread`).
+pub type OnOpenThread = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
 /// One thread and what the window keeps for it.
 struct Slot {
     thread: Entity<Thread>,
@@ -163,6 +180,17 @@ struct Slot {
     /// half-typed text (and its undo history) stays with its thread.
     field: Option<Entity<TextareaState>>,
     replies: reply::Replies,
+    /// Its shell, once opened from the Terminal tab. It keeps running while the thread or the
+    /// project is out of sight, and stops with the thread (archive, quit, Close terminal).
+    terminal: Option<Entity<TerminalPanel>>,
+    /// What the thread last looked like, to notice the transitions worth a notification.
+    observed: lifecycle::Observed,
+    /// The pending approval's path outside the thread's folder, for the inbox row
+    /// (`approval::outside_path` reads the disk, so once per request).
+    inbox_outside: Option<String>,
+    /// The pending file edit's diff for the inbox row, with the same requirement as the dock:
+    /// an allow is checked against the file as it is now.
+    preview: Option<review::ApprovalPreview>,
     /// The placeholder currently set on that field, to avoid resetting it every event.
     placeholder: SharedString,
     notice: Option<Notice>,
@@ -189,7 +217,12 @@ pub struct Startup {
 
 pub struct ChatView {
     project_chooser: Option<OnPress>,
+    thread_opener: Option<OnOpenThread>,
     visible: bool,
+    panel: Panel,
+    /// Why desktop notifications cannot be shown, if they can't (`ProjectView` keeps it in
+    /// step with the attention adapter); the inbox says so.
+    attention_note: Option<&'static str>,
     copy_peers: Vec<gpui::WeakEntity<ChatView>>,
     store: Store,
     project: Project,
@@ -270,7 +303,10 @@ impl ChatView {
         ];
         let mut view = ChatView {
             project_chooser: None,
+            thread_opener: None,
             visible: true,
+            panel: Panel::Thread,
+            attention_note: None,
             copy_peers: vec![],
             store,
             project,
@@ -427,6 +463,17 @@ impl ChatView {
         self.project_chooser = Some(chooser);
     }
 
+    pub fn set_thread_opener(&mut self, opener: OnOpenThread) {
+        self.thread_opener = Some(opener);
+    }
+
+    pub fn set_attention_note(&mut self, note: Option<&'static str>, cx: &mut Context<Self>) {
+        if self.attention_note != note {
+            self.attention_note = note;
+            cx.notify();
+        }
+    }
+
     /// When the focused element leaves the window (an overlay closed without handing focus
     /// back, say): the composer takes it, or the root while the dock replaces the composer, so
     /// the shortcuts keep working.
@@ -437,14 +484,25 @@ impl ChatView {
         // Deferred: GPUI draws no new frame for focus that a focus-lost listener moves, so the
         // composer would not show its focus until the next redraw.
         cx.defer_in(window, |view, window, cx| {
-            if !view.visible {
-                return;
-            }
-            match view.field_focus(cx) {
-                Some(field) if view.composer_has_keys() => window.focus(&field, cx),
-                _ => window.focus(&view.root, cx),
+            if view.visible {
+                view.focus_panel(window, cx);
             }
         });
+    }
+
+    /// The keyboard goes to what the panel shows: the composer (or the root while the dock
+    /// replaces it), the terminal, or the root for the inbox.
+    fn focus_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = match self.panel {
+            Panel::Thread if self.composer_has_keys() => self.field_focus(cx),
+            Panel::Terminal => self.slots[self.active]
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.focus_handle(cx)),
+            _ => None,
+        }
+        .unwrap_or_else(|| self.root.clone());
+        window.focus(&focus, cx);
     }
 
     fn composer_has_keys(&self) -> bool {
@@ -462,6 +520,11 @@ impl ChatView {
     /// `claude`, all at once (see `newjen_core::thread::finish_quit`). GPUI gives the whole app
     /// about 200 ms; this takes about as long as the slowest `claude` takes to stop.
     pub fn begin_quit(&mut self, cx: &mut Context<Self>) -> Vec<Quitting> {
+        for slot in &mut self.slots {
+            if let Some(terminal) = slot.terminal.take() {
+                terminal.update(cx, |terminal, _| terminal.shutdown());
+            }
+        }
         for (ix, slot) in self.slots.iter().enumerate() {
             if let Err(error) = slot.thread.read(cx).save_draft(&self.composer_text(ix, cx)) {
                 self.save_problem = Some(format!("Couldn't save the draft: {error:#}"));
@@ -486,6 +549,11 @@ impl ChatView {
     /// Puts `thread` in the list at row `at`, in its own entity, with the task that feeds it its
     /// events.
     fn add_slot(&mut self, thread: Thread, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let observed = lifecycle::Observed::of(&thread);
+        let inbox_outside = thread
+            .transcript()
+            .pending_approval()
+            .and_then(|request| approval::outside_path(request.view(), thread.cwd()));
         let events = thread.events();
         let thread = cx.new(|_| thread);
         let weak = thread.downgrade();
@@ -509,6 +577,10 @@ impl ChatView {
             thread,
             field: None,
             replies: Default::default(),
+            terminal: None,
+            observed,
+            inbox_outside,
+            preview: None,
             placeholder: SharedString::default(),
             notice: None,
             messages: cx.new(|cx| MessageScrollerState::new(0, cx)),
@@ -518,6 +590,7 @@ impl ChatView {
         let at = at.min(self.slots.len());
         self.slots.insert(at, slot);
         self.sync_replies(at, cx);
+        self.prepare_slot_preview(at, window, cx);
         let thread = self.slots[at].thread.clone();
         self.run_snapshot(&thread, window, cx);
     }
@@ -562,6 +635,7 @@ impl ChatView {
         }
         if let Some(ix) = self.slots.iter().position(|slot| slot.thread == *thread) {
             self.sync_replies(ix, cx);
+            self.observe_attention(ix, window, cx);
             self.run_snapshot(thread, window, cx);
         }
         if self
@@ -595,9 +669,10 @@ impl ChatView {
     /// ⌘N or the "New thread" row: a new draft on screen with the cursor in its composer. On
     /// a draft that has nothing typed yet, that draft is the new thread, so none pile up.
     fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel = Panel::Thread;
         self.drawer_open = false;
         let composer = self.composer_text(self.active, cx);
-        if is_empty_draft(self.thread().read(cx).is_draft(), &composer) {
+        if self.is_empty_slot(self.active, &composer, cx) {
             self.enter(window, cx);
             return;
         }
@@ -615,6 +690,7 @@ impl ChatView {
             return;
         }
         self.review_panel = None;
+        self.panel = Panel::Thread;
         self.drawer_open = false;
         if target >= self.slots.len() {
             return;
@@ -623,13 +699,13 @@ impl ChatView {
             let leaving = self.active;
             let composer = self.composer_text(leaving, cx);
             let thread = self.slots[leaving].thread.clone();
-            let draft = thread.read(cx).is_draft();
+            let empty = self.is_empty_slot(leaving, &composer, cx);
             thread.update(cx, |thread, cx| {
                 thread.set_active(false);
                 cx.notify();
             });
             let mut target = target;
-            if is_empty_draft(draft, &composer) {
+            if empty {
                 // A draft can have a `claude` already (Try again after a failed first send).
                 // `archive` stops it on a background thread; dropped with the thread instead,
                 // it would stop on this one and freeze the window for a moment. For a draft it
@@ -645,10 +721,21 @@ impl ChatView {
         self.enter(window, cx);
     }
 
-    fn show_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn show_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.index_of(thread_id, cx) {
             self.show(ix, window, cx);
         }
+    }
+
+    pub fn has_thread(&self, thread_id: &str, cx: &App) -> bool {
+        self.index_of(thread_id, cx).is_some()
+    }
+
+    /// A draft with nothing typed and no terminal: switching away drops it (see
+    /// `is_empty_draft`). A terminal keeps its draft, as the shell may be in use.
+    fn is_empty_slot(&self, ix: usize, composer: &str, cx: &App) -> bool {
+        let slot = &self.slots[ix];
+        is_empty_draft(slot.thread.read(cx).is_draft(), composer) && slot.terminal.is_none()
     }
 
     /// Makes the thread at `active` the one on screen: clears its unread flag, gives its
@@ -668,7 +755,9 @@ impl ChatView {
         self.dock_request = None;
         self.making_copy_shown = false;
         self.sync_field(window, cx);
-        if self.composer_has_keys() {
+        if self.panel != Panel::Thread {
+            self.focus_panel(window, cx);
+        } else if self.composer_has_keys() {
             let field = self.ensure_field(window, cx);
             let handle = field.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
@@ -693,12 +782,17 @@ impl ChatView {
             return;
         }
         let len = self.slots.len();
-        let slot = self.slots.remove(ix);
+        let mut slot = self.slots.remove(ix);
+        // The shell may be in the copy that is about to be removed.
+        if let Some(terminal) = slot.terminal.take() {
+            terminal.update(cx, |terminal, _| terminal.shutdown());
+        }
         let removal = slot.thread.update(cx, |thread, cx| {
             cx.notify();
             thread.archive()
         });
         drop(slot);
+        cx.emit(Attention::Dismiss(thread_id.to_string()));
         self.remove_copies(removal, cx);
         if ix != self.active {
             self.active = sidebar::shifted(self.active, ix);
@@ -712,6 +806,7 @@ impl ChatView {
                 self.active = 0;
             }
         }
+        self.panel = Panel::Thread;
         self.enter(window, cx);
     }
 
@@ -852,6 +947,8 @@ impl ChatView {
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_jump))
             .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_show_approvals))
+            .on_action(cx.listener(Self::on_toggle_terminal))
             .children(list)
             .into_any_element()
     }
@@ -945,7 +1042,7 @@ impl ChatView {
     /// while an approval is pending (so ⌘↵ and Esc reach `on_key_down`), back in the field
     /// afterwards, and a placeholder that fits the moment.
     fn sync_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.visible {
+        if !self.visible || self.panel != Panel::Thread {
             return;
         }
         let field = self.ensure_field(window, cx);
@@ -1166,6 +1263,15 @@ impl ChatView {
         if wants_copy && let Some(missing) = missing_tool(&self.tools, jj_repo) {
             return Some(missing);
         }
+        // A shell can change files while Rift snapshots the project.
+        if wants_copy && self.project_terminal_open(&source, cx) {
+            return Some(Notice::held(
+                "Close the project terminal first",
+                "A terminal can change files while Rift snapshots the project. Close the \
+                 terminal before making a copy."
+                    .to_string(),
+            ));
+        }
         let blocks_send = |other: &Thread| {
             let busy = if project_folder {
                 other.blocks_project_send()
@@ -1340,6 +1446,18 @@ impl ChatView {
     }
 
     fn choose_works_in(&mut self, works_in: WorksIn, window: &mut Window, cx: &mut Context<Self>) {
+        if self.slots[self.active].terminal.is_some()
+            && self.thread().read(cx).works_in() != works_in
+        {
+            self.slots[self.active].notice = Some(Notice::held(
+                "Close the terminal before changing folders",
+                "The terminal stays in this thread's working folder. Close it before choosing \
+                 a Rift copy."
+                    .to_string(),
+            ));
+            cx.notify();
+            return;
+        }
         let thread = self.thread().clone();
         if thread
             .update(cx, |thread, _| thread.set_works_in(works_in))
@@ -1398,6 +1516,32 @@ impl ChatView {
             Err(error) => notice_after(Err(error), thread.read(cx).presentation().answer_failed),
         };
         self.sync_field(window, cx);
+        cx.notify();
+    }
+
+    /// Answers `thread_id`'s pending approval from the inbox, whichever thread is on screen.
+    /// `key` names the request the button belonged to, so a stale click answers nothing.
+    pub(super) fn answer_thread(
+        &mut self,
+        thread_id: &str,
+        key: Option<newjen_core::ApprovalKey>,
+        choice: ApprovalIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let thread = self.slots[ix].thread.clone();
+        let sent = thread.update(cx, |thread, cx| {
+            let sent = thread.answer(key, choice);
+            cx.notify();
+            sent
+        });
+        self.slots[ix].notice = notice_after(sent, thread.read(cx).presentation().answer_failed);
+        if ix == self.active {
+            self.sync_field(window, cx);
+        }
         cx.notify();
     }
 
@@ -1481,12 +1625,14 @@ impl ChatView {
 
     /// Where a key press goes (see `keys::key_route`).
     fn key_route(&self, event: &KeyDownEvent, window: &Window, cx: &App) -> KeyRoute {
-        let pending = self
-            .thread()
-            .read(cx)
-            .transcript()
-            .pending_approval()
-            .is_some();
+        // Only the dock on screen takes ⌘↵ and Esc: never a dock hidden behind the inbox.
+        let pending = self.panel == Panel::Thread
+            && self
+                .thread()
+                .read(cx)
+                .transcript()
+                .pending_approval()
+                .is_some();
         keys::key_route(event, self.drawer_open, overlay_focused(window), pending)
     }
 
@@ -1558,6 +1704,24 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.toggle_sidebar(window, cx);
+    }
+
+    fn on_show_approvals(
+        &mut self,
+        _: &keys::ShowApprovals,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_inbox(window, cx);
+    }
+
+    fn on_toggle_terminal(
+        &mut self,
+        _: &keys::ToggleTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_terminal(window, cx);
     }
 
     /// A click handler for buttons and rows, which receive `&mut App` rather than our
@@ -2238,17 +2402,25 @@ impl Render for ChatView {
             )
         };
         let title_bar = self.render_title_bar(placement, main_width, window, cx);
-        let body = if self.review_panel.is_some() {
-            self.render_review(cx)
-        } else if empty {
-            self.render_empty_state(cx).into_any_element()
-        } else {
-            self.render_messages(cx).into_any_element()
+        let body = match self.panel {
+            Panel::Inbox => self.render_inbox(window, cx),
+            Panel::Terminal => self.slots[self.active]
+                .terminal
+                .clone()
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| div().into_any_element()),
+            Panel::Thread if self.review_panel.is_some() => self.render_review(cx),
+            Panel::Thread if empty => self.render_empty_state(cx).into_any_element(),
+            Panel::Thread => self.render_messages(cx).into_any_element(),
         };
-        let bottom = match self.render_dock(main_width, window, cx) {
-            Some(dock) => dock,
-            None if self.review_panel.is_some() => div().into_any_element(),
-            None => self.render_composer(window, cx),
+        let bottom = if self.panel != Panel::Thread {
+            div().into_any_element()
+        } else {
+            match self.render_dock(main_width, window, cx) {
+                Some(dock) => dock,
+                None if self.review_panel.is_some() => div().into_any_element(),
+                None => self.render_composer(window, cx),
+            }
         };
         let problem = self.render_save_problem(cx);
         let limit_notice = self.render_limit_notice(cx);
@@ -2288,10 +2460,7 @@ impl Render for ChatView {
             });
         } else if placement != Placement::Drawer && window.has_active_sheet(cx) {
             window.close_sheet(cx);
-            match self.field_focus(cx) {
-                Some(field) if self.composer_has_keys() => field.focus(window, cx),
-                _ => self.root.focus(window, cx),
-            }
+            self.focus_panel(window, cx);
         }
 
         let theme = cx.theme();
@@ -2309,9 +2478,9 @@ impl Render for ChatView {
             .min_w_0()
             .h_full()
             .child(title_bar)
+            .child(self.render_panel_tabs(cx))
             .children(
-                self.dock_request
-                    .is_none()
+                (self.panel == Panel::Thread && self.dock_request.is_none())
                     .then(|| self.render_review_toolbar(cx)),
             )
             .child(body)
@@ -2358,6 +2527,8 @@ impl Render for ChatView {
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_jump))
             .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_show_approvals))
+            .on_action(cx.listener(Self::on_toggle_terminal))
             .flex()
             .bg(bg)
             .text_color(fg)
