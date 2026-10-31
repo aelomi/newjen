@@ -34,6 +34,7 @@ fn setup<'a>(
         threads: vec![],
         problem: None,
         home: None,
+        tools: Tools::find(),
     };
     let mut chat = None;
     let (_, cx) = cx.add_window_view(|window, cx| {

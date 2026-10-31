@@ -116,6 +116,7 @@ pub struct Startup {
     /// A problem reading the saved threads, shown once like a failed save.
     pub problem: Option<String>,
     pub home: Option<PathBuf>,
+    pub tools: Tools,
 }
 
 pub struct ChatView {
@@ -126,6 +127,7 @@ pub struct ChatView {
     project_name: SharedString,
     project_label: SharedString,
     home: Option<PathBuf>,
+    tools: Tools,
     /// Every thread, in list order (newest first). Never empty: with no saved thread, a draft.
     slots: Vec<Slot>,
     /// The thread on screen, as an index into `slots`.
@@ -172,6 +174,7 @@ impl ChatView {
             threads,
             problem,
             home,
+            tools,
         } = startup;
         let project_name = project
             .path
@@ -195,6 +198,7 @@ impl ChatView {
             project_name: project_name.into(),
             project_label: project_label.into(),
             home,
+            tools,
             slots: Vec::new(),
             active: 0,
             sidebar_hidden: false,
@@ -223,6 +227,14 @@ impl ChatView {
         // The newest thread is on screen at launch. Nothing is started: a thread's `claude`
         // starts with the first message sent to it.
         view.enter(window, cx);
+        match thread::Removal::pending(&view.store) {
+            Ok(pending) => view.remove_copies(pending, cx),
+            Err(error) => {
+                view.save_problem.get_or_insert(format!(
+                    "Couldn't list the Rift copies to remove: {error:#}"
+                ));
+            }
+        }
         view
     }
 
@@ -380,7 +392,8 @@ impl ChatView {
                 // `archive` stops it on a background thread; dropped with the thread instead,
                 // it would stop on this one and freeze the window for a moment. For a draft it
                 // writes nothing: it never touched the store.
-                remove_copy(thread.update(cx, |thread, _| thread.archive()));
+                let removal = thread.update(cx, |thread, _| thread.archive());
+                self.remove_copies(removal, cx);
                 // Dropping the slot stops its task.
                 self.slots.remove(leaving);
                 target = sidebar::shifted(target, leaving);
@@ -428,11 +441,12 @@ impl ChatView {
         };
         let len = self.slots.len();
         let slot = self.slots.remove(ix);
-        remove_copy(slot.thread.update(cx, |thread, cx| {
+        let removal = slot.thread.update(cx, |thread, cx| {
             cx.notify();
             thread.archive()
-        }));
+        });
         drop(slot);
+        self.remove_copies(removal, cx);
         if ix != self.active {
             self.active = sidebar::shifted(self.active, ix);
             cx.notify();
@@ -506,6 +520,28 @@ impl ChatView {
             .any(|slot| slot.thread.read(cx).status().is_busy());
         if minute || busy {
             cx.notify();
+        }
+    }
+
+    /// A failed removal is tried again at the next launch (`Removal::pending`).
+    fn remove_copies(
+        &mut self,
+        removals: impl IntoIterator<Item = thread::Removal>,
+        cx: &mut Context<Self>,
+    ) {
+        for removal in removals {
+            let path = tilde(&removal.copy().path, self.home.as_deref());
+            let tools = self.tools.clone();
+            let removed = cx.background_spawn(async move { removal.run(&tools) });
+            cx.spawn(async move |view, cx| {
+                if let Err(error) = removed.await {
+                    let _ = view.update(cx, |view, cx| {
+                        view.save_problem = Some(removal_problem(&path, &error));
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
         }
     }
 
@@ -1421,11 +1457,8 @@ fn after_write_error(line: Option<String>, seen: bool, error: String) -> (Option
     }
 }
 
-/// Deletes an archived thread's Rift copy off the UI thread.
-fn remove_copy(removal: Option<thread::Removal>) {
-    if let Some(removal) = removal {
-        std::thread::spawn(move || removal.run(&Tools::find()));
-    }
+fn removal_problem(path: &str, error: &anyhow::Error) -> String {
+    format!("Couldn't remove the Rift copy at {path}: {error:#}")
 }
 
 /// A draft with nothing typed in its composer: switching away drops it, and ⌘N on it just
@@ -1526,6 +1559,16 @@ mod tests {
         // With nothing on screen, the first failure shows.
         let (line, _) = after_write_error(None, false, "Couldn't save threads: x".to_string());
         assert_eq!(line.as_deref(), Some("Couldn't save threads: x"));
+    }
+
+    #[test]
+    fn a_failed_removal_names_the_copy_and_why() {
+        let error = anyhow::anyhow!("`rift remove` failed: permission denied");
+        assert_eq!(
+            removal_problem("~/.rifts/app/newjen-1a2b3c4d", &error),
+            "Couldn't remove the Rift copy at ~/.rifts/app/newjen-1a2b3c4d: `rift remove` failed: \
+             permission denied"
+        );
     }
 
     #[test]

@@ -27,6 +27,7 @@ use gpui::{
     Render, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
 };
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+use newjen_core::rift::Tools;
 use newjen_core::{SessionConfig, Store, Thread, orphans, store};
 
 use crate::assets::AppAssets;
@@ -173,6 +174,7 @@ fn open_threads(project: &Path, home: Option<PathBuf>) -> anyhow::Result<Startup
         threads,
         problem,
         home,
+        tools: Tools::find(),
     })
 }
 
