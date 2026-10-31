@@ -1,5 +1,6 @@
 mod approvals;
 pub(crate) mod controller;
+pub(crate) use approvals::edit_proposal;
 pub mod events;
 pub mod presentation;
 

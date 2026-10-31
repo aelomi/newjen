@@ -56,6 +56,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
+use crate::agent::NoteDelivery;
+use crate::landing::{self, LandingMode};
 #[cfg(test)]
 use crate::protocol::{Incoming, ResultMessage};
 #[cfg(test)]
@@ -106,6 +108,10 @@ pub struct Thread {
     /// The folder claude works in.
     cwd: PathBuf,
     place: Place,
+    landing_mode: LandingMode,
+    review_base: Option<String>,
+    landing_resolved: bool,
+    snapshot: SnapshotState,
     title: String,
     provider: String,
     /// Claude's own conversation id (`--session-id` / `--resume`).
@@ -155,8 +161,19 @@ enum Stage {
     Draft,
     /// The first message waits while the thread's Rift copy is made.
     Preparing(Preparing),
+    /// A message waits while the project folder's base is recorded.
+    PreparingProject(PreparingProject),
     /// Its first message was sent.
     Saved,
+}
+
+#[derive(Debug, Default)]
+enum SnapshotState {
+    #[default]
+    Clean,
+    Pending,
+    Running,
+    Failed(String),
 }
 
 /// Where a thread works.
@@ -219,6 +236,68 @@ impl Preparing {
     }
 }
 
+/// A message held while the project folder's base is recorded for landing (see
+/// [`Thread::send`] and [`ProjectJob`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparingProject {
+    message: String,
+    started_at: Instant,
+    /// The thread was saved before: a later message, not a draft's first one.
+    was_saved: bool,
+}
+
+/// What the app shows while a thread's first message waits (see [`Thread::preparing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting<'a> {
+    /// The thread's Rift copy is being made.
+    Copy(&'a Preparing),
+    /// The project folder's base is being recorded.
+    Project(&'a PreparingProject),
+}
+
+impl Waiting<'_> {
+    /// The held message.
+    pub fn message(&self) -> &str {
+        match self {
+            Waiting::Copy(preparing) => &preparing.message,
+            Waiting::Project(preparing) => &preparing.message,
+        }
+    }
+
+    /// When the user sent it, for "Making a Rift copy · 3s".
+    pub fn started_at(&self) -> Instant {
+        match self {
+            Waiting::Copy(preparing) => preparing.started_at,
+            Waiting::Project(preparing) => preparing.started_at,
+        }
+    }
+
+    /// The last line Rift or its hooks printed; nothing for project preparation.
+    pub fn last_line(&self) -> Option<&str> {
+        match self {
+            Waiting::Copy(preparing) => preparing.last_line(),
+            Waiting::Project(_) => None,
+        }
+    }
+
+    /// Where the copy is being made; nothing for project preparation.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Waiting::Copy(preparing) => Some(preparing.path()),
+            Waiting::Project(_) => None,
+        }
+    }
+
+    /// The user cancelled the copy (see [`Preparing::cancelled`]). Project preparation is
+    /// quick and cannot be cancelled.
+    pub fn cancelled(&self) -> bool {
+        match self {
+            Waiting::Copy(preparing) => preparing.cancelled(),
+            Waiting::Project(_) => false,
+        }
+    }
+}
+
 /// What [`Thread::send`] did with a message.
 #[derive(Debug)]
 pub enum Sent {
@@ -227,6 +306,43 @@ pub enum Sent {
     /// It is held until the thread's Rift copy is made: run the job off the UI thread and pass
     /// what it returns to [`Thread::finish_copy`].
     MakingCopy(CopyJob),
+    PreparingProject(ProjectJob),
+}
+
+#[derive(Debug)]
+#[must_use = "run it off the UI thread, then call Thread::finish_project"]
+pub struct ProjectJob {
+    cwd: PathBuf,
+    thread_id: String,
+    stopping: Vec<JoinHandle<()>>,
+}
+
+impl ProjectJob {
+    pub fn run(self, tools: &Tools) -> Result<String> {
+        for stopping in self.stopping {
+            let _ = stopping.join();
+        }
+        landing::prepare_project(tools, &self.cwd, &self.thread_id)
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "run it off the UI thread, then call Thread::finish_snapshot"]
+pub struct SnapshotJob {
+    cwd: PathBuf,
+    title: String,
+    thread_id: String,
+    mode: LandingMode,
+    stopping: Vec<JoinHandle<()>>,
+}
+
+impl SnapshotJob {
+    pub fn run(self, tools: &Tools) -> Result<()> {
+        for stopping in self.stopping {
+            let _ = stopping.join();
+        }
+        landing::snapshot(tools, &self.cwd, self.mode, &self.title, &self.thread_id)
+    }
 }
 
 /// Makes a thread's Rift copy ([`rift::create`]). It can take seconds, so the app runs it on a
@@ -332,6 +448,9 @@ impl Removal {
             &self.copy.path,
             &self.copy.rift_id,
         )?;
+        if self.copy.base.is_some() {
+            landing::cleanup_remote(tools, &self.copy.source, &self.thread_id)?;
+        }
         self.store.mark_copy_removed(&self.thread_id, now_ms());
         Ok(())
     }
@@ -345,6 +464,9 @@ struct RowState {
     session_id: String,
     session_started: bool,
     status: Status,
+    review_base: Option<String>,
+    landing_resolved: bool,
+    snapshot_needed: bool,
 }
 
 impl Thread {
@@ -362,6 +484,10 @@ impl Thread {
             project_dir: project.path.clone(),
             cwd: project.path.clone(),
             place: Place::ProjectFolder,
+            landing_mode: project.landing_mode,
+            review_base: None,
+            landing_resolved: false,
+            snapshot: SnapshotState::Clean,
             title: NEW_THREAD_TITLE.to_string(),
             provider: base_config.agent.provider.id().to_string(),
             session_id: crate::session::reserved_id(base_config.agent.provider),
@@ -490,6 +616,20 @@ impl Thread {
         thread.id = row.id;
         thread.cwd = row.workdir;
         thread.place = row.copy.map_or(Place::ProjectFolder, Place::Copy);
+        thread.landing_mode = row.landing_mode;
+        thread.review_base = row
+            .review_base
+            .or_else(|| thread.copy().and_then(|copy| copy.base.clone()));
+        thread.landing_resolved = row.landing_resolved;
+        thread.snapshot = if row.snapshot_needed
+            || (row.status.is_busy()
+                && thread.review_base.is_some()
+                && thread.landing_mode == LandingMode::HarnessManaged)
+        {
+            SnapshotState::Pending
+        } else {
+            SnapshotState::Clean
+        };
         thread.title = row.title;
         thread.provider = row.provider;
         thread.session_id = row.conversation.id().unwrap_or("").to_owned();
@@ -510,6 +650,9 @@ impl Thread {
             session_id: thread.session_id.clone(),
             session_started: thread.session_started,
             status: row.status,
+            review_base: thread.review_base.clone(),
+            landing_resolved: thread.landing_resolved,
+            snapshot_needed: thread.work_pending(),
         });
         // Keep `updated_at`: settling the old run is not new activity.
         thread.save_with(false);
@@ -705,11 +848,13 @@ impl Thread {
         }
     }
 
-    /// The first message, while it waits for the thread's Rift copy to be made. The thread is
-    /// busy then: nothing else can be sent, and no claude runs for it.
-    pub fn preparing(&self) -> Option<&Preparing> {
+    /// The message that waits while the thread's Rift copy is made or the project folder's
+    /// base is recorded. The thread is busy then: nothing else can be sent, and no claude
+    /// runs for it.
+    pub fn preparing(&self) -> Option<Waiting<'_>> {
         match &self.stage {
-            Stage::Preparing(preparing) => Some(preparing),
+            Stage::Preparing(preparing) => Some(Waiting::Copy(preparing)),
+            Stage::PreparingProject(preparing) => Some(Waiting::Project(preparing)),
             Stage::Draft | Stage::Saved => None,
         }
     }
@@ -720,9 +865,11 @@ impl Thread {
     /// thread's own copy is being made. The app refuses with "wait for <thread> to finish".
     pub fn blocks_copy_creation(&self) -> bool {
         match (&self.stage, &self.place) {
-            (Stage::Preparing(_), _) => true,
+            (Stage::Preparing(_) | Stage::PreparingProject(_), _) => true,
             (_, Place::ProjectFolder) => {
-                self.status().is_busy() || !self.background_tasks().is_empty()
+                self.status().is_busy()
+                    || self.work_pending()
+                    || !self.background_tasks().is_empty()
             }
             (_, Place::NewCopy | Place::Copy(_)) => false,
         }
@@ -794,6 +941,9 @@ impl Thread {
         let mut config = self.base_config.clone();
         config.bind(&self.session_id, self.session_started, &rules);
         config.cwd = self.cwd.clone();
+        if self.landing_mode == LandingMode::HarnessManaged {
+            config.instructions = Some("Newjen manages version control for this thread. Do not commit, describe, rebase, merge, create bookmarks or branches, or otherwise write version-control metadata. Make file changes only. Newjen snapshots the folder after each turn.".to_string());
+        }
         if let Place::Copy(copy) = &self.place {
             config.env.extend(copy.env());
         }
@@ -818,6 +968,94 @@ impl Thread {
     // -----------------------------------------------------------------------------------------
     // What the app does
     // -----------------------------------------------------------------------------------------
+
+    /// The file edit the pending approval proposes, for its preview. `None` when nothing is
+    /// pending or it is not a file edit.
+    pub fn pending_edit(&self) -> Option<crate::edits::EditProposal> {
+        let request = self.transcript.pending_approval()?;
+        self.controller.edit_proposal(request.view(), &self.cwd)
+    }
+
+    pub fn landing_mode(&self) -> LandingMode {
+        self.landing_mode
+    }
+
+    pub fn set_landing_mode(&mut self, mode: LandingMode) -> Result<()> {
+        if !self.is_draft() {
+            bail!("only a new thread can choose its landing mode");
+        }
+        self.landing_mode = mode;
+        Ok(())
+    }
+
+    pub fn review_base(&self) -> Option<&str> {
+        self.review_base.as_deref()
+    }
+
+    pub fn landing_finished(&self) -> bool {
+        self.landing_resolved
+    }
+
+    pub fn owns_project_work(&self) -> bool {
+        self.place == Place::ProjectFolder
+            && !self.landing_resolved
+            && (self.review_base.is_some()
+                || matches!(self.stage, Stage::PreparingProject(_))
+                || self.status().is_busy()
+                || !self.background_tasks().is_empty())
+    }
+
+    pub fn work_pending(&self) -> bool {
+        !matches!(self.snapshot, SnapshotState::Clean)
+    }
+
+    pub fn snapshot_error(&self) -> Option<&str> {
+        match &self.snapshot {
+            SnapshotState::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    pub fn take_snapshot_job(&mut self) -> Option<SnapshotJob> {
+        if !matches!(self.snapshot, SnapshotState::Pending)
+            || self.status().is_busy()
+            || !self.background_tasks().is_empty()
+        {
+            return None;
+        }
+        self.end_session();
+        self.snapshot = SnapshotState::Running;
+        Some(SnapshotJob {
+            cwd: self.cwd.clone(),
+            title: self.title.clone(),
+            thread_id: self.id.clone(),
+            mode: self.landing_mode,
+            stopping: std::mem::take(&mut self.stopping),
+        })
+    }
+
+    pub fn finish_snapshot(&mut self, result: Result<()>) {
+        if !matches!(self.snapshot, SnapshotState::Running) {
+            return;
+        }
+        self.snapshot = match result {
+            Ok(()) => SnapshotState::Clean,
+            Err(error) => SnapshotState::Failed(error.to_string()),
+        };
+        self.save_with(false);
+    }
+
+    pub fn retry_snapshot(&mut self) {
+        if matches!(self.snapshot, SnapshotState::Failed(_)) {
+            self.snapshot = SnapshotState::Pending;
+        }
+    }
+
+    pub fn finish_landing(&mut self) {
+        self.end_session();
+        self.landing_resolved = true;
+        self.save();
+    }
 
     /// Chooses where a draft works. Only a draft whose Rift copy is not made yet can change.
     pub fn set_works_in(&mut self, works_in: WorksIn) -> Result<()> {
@@ -855,6 +1093,12 @@ impl Thread {
         }
         if self.preparing().is_some() {
             bail!("Newjen is still making this thread's Rift copy");
+        }
+        if self.landing_resolved {
+            bail!("this thread’s work was already landed or discarded");
+        }
+        if self.work_pending() {
+            bail!("Newjen is still snapshotting this thread’s work");
         }
         if self.status().is_busy() {
             bail!(
@@ -896,8 +1140,64 @@ impl Thread {
                 store: self.store.clone(),
             }));
         }
+        if self.review_base.is_none() && self.cwd.ancestors().any(|path| path.join(".jj").exists())
+        {
+            self.end_session();
+            let was_saved = self.is_saved();
+            if !was_saved {
+                self.title = title_from_message(text);
+            }
+            self.stage = Stage::PreparingProject(PreparingProject {
+                message: text.to_string(),
+                started_at: Instant::now(),
+                was_saved,
+            });
+            return Ok(Sent::PreparingProject(ProjectJob {
+                cwd: self.cwd.clone(),
+                thread_id: self.id.clone(),
+                stopping: std::mem::take(&mut self.stopping),
+            }));
+        }
         self.deliver(text)?;
         Ok(Sent::Started)
+    }
+
+    /// Takes what the [`ProjectJob`] from [`Thread::send`] returned. With the base recorded,
+    /// the held message is sent, as [`Thread::send`] sends it. Otherwise, or if that send
+    /// fails, the thread is as it was and the message comes back for the composer.
+    pub fn finish_project(&mut self, prepared: Result<String>) -> Result<(), NotSent> {
+        let preparing = match std::mem::replace(&mut self.stage, Stage::Draft) {
+            Stage::PreparingProject(preparing) => preparing,
+            stage => {
+                self.stage = stage;
+                return Err(NotSent {
+                    message: String::new(),
+                    error: anyhow!("this thread was not waiting for project preparation"),
+                    copy_to_remove: None,
+                });
+            }
+        };
+        let message = preparing.message;
+        self.stage = if preparing.was_saved {
+            Stage::Saved
+        } else {
+            Stage::Draft
+        };
+        let sent = prepared.and_then(|base| {
+            self.end_session();
+            self.review_base = Some(base);
+            self.deliver(&message)
+        });
+        sent.map_err(|error| {
+            if !preparing.was_saved {
+                self.title = NEW_THREAD_TITLE.to_string();
+            }
+            NotSent {
+                message,
+                error,
+                copy_to_remove: None,
+            }
+        })
     }
 
     /// [`Thread::stop`] while the copy is made: Rift and its hooks are stopped as quitting
@@ -968,6 +1268,7 @@ impl Thread {
         self.copy_job = None;
         let sent = made.map_err(anyhow::Error::from).and_then(|copy| {
             self.end_session();
+            self.review_base = copy.base.clone();
             self.cwd = copy.workdir.clone();
             self.transcript.set_cwd(copy.workdir.clone());
             self.place = Place::Copy(copy);
@@ -1033,26 +1334,42 @@ impl Thread {
         key: Option<crate::agent::ApprovalKey>,
         answer: crate::agent::ApprovalIntent,
     ) -> Result<()> {
+        self.answer_with_note(key, answer, None).map(|_| ())
+    }
+
+    /// [`Thread::answer`] with the user's note for a denial: claude gets it as the denial's
+    /// message, so the model knows why; Codex's decision carries no text, so the note comes
+    /// back as [`NoteDelivery::Kept`] for the composer. An allow ignores the note.
+    pub fn answer_with_note(
+        &mut self,
+        key: Option<crate::agent::ApprovalKey>,
+        answer: crate::agent::ApprovalIntent,
+        note: Option<&str>,
+    ) -> Result<NoteDelivery> {
         let Some(request) = self.transcript.pending_approval().cloned() else {
-            return Ok(());
+            return Ok(NoteDelivery::Delivered);
         };
         if key.is_some_and(|key| key != request.key()) {
-            return Ok(());
+            return Ok(NoteDelivery::Delivered);
         }
         // Resolve first: a second click or key press now finds nothing to answer.
         self.transcript.resolve_approval(request.key(), answer);
         self.last_activity = Instant::now();
         let Some(sent) = self
             .controller
-            .answer(request.key(), answer, self.session.as_ref())
+            .answer(request.key(), answer, note, self.session.as_ref())
         else {
-            return Ok(());
+            return Ok(NoteDelivery::Delivered);
         };
         let sent = sent.map(|receipt| {
             let now = now_ms();
             for mut grant in receipt.grants {
                 grant.created_at = now;
                 self.add_grant(grant);
+            }
+            match receipt.note_kept {
+                Some(note) => NoteDelivery::Kept(note),
+                None => NoteDelivery::Delivered,
             }
         });
         self.save();
@@ -1193,10 +1510,15 @@ impl Thread {
         self.save();
         match self.stage {
             Stage::Saved => self.store.archive(&self.id, now_ms()),
+            Stage::PreparingProject(ref preparing) if preparing.was_saved => {
+                self.store.archive(&self.id, now_ms());
+                self.stage = Stage::Saved;
+            }
             Stage::Preparing(_) => {
                 self.store.discard_pending_copy(&self.id);
                 self.stage = Stage::Draft;
             }
+            Stage::PreparingProject(_) => self.stage = Stage::Draft,
             Stage::Draft => self.store.discard_pending_copy(&self.id),
         }
         let copy = self.copy()?.clone();
@@ -1254,6 +1576,9 @@ impl Thread {
             self.stage = Stage::Draft;
         }
         if self.status().is_busy() || !self.background_tasks().is_empty() {
+            if self.landing_mode == LandingMode::HarnessManaged && self.review_base.is_some() {
+                self.snapshot = SnapshotState::Pending;
+            }
             self.transcript.normalize_after_relaunch();
         }
         // Queue the writes before stopping claude, so the disk works while claude stops.
@@ -1464,6 +1789,9 @@ impl Thread {
         }
         self.turn_started = None;
         self.controller.end_turn();
+        if self.landing_mode == LandingMode::HarnessManaged && self.review_base.is_some() {
+            self.snapshot = SnapshotState::Pending;
+        }
         if self.stop_after_turn {
             self.end_session();
         }
@@ -1523,6 +1851,9 @@ impl Thread {
             session_id: self.session_id.clone(),
             session_started: self.session_started,
             status: self.status(),
+            review_base: self.review_base.clone(),
+            landing_resolved: self.landing_resolved,
+            snapshot_needed: self.work_pending(),
         };
         let items_from = self.transcript.dirty_from();
         if items_from.is_none() && self.saved_row.as_ref() == Some(&state) {
@@ -1565,6 +1896,10 @@ impl Thread {
             updated_at: self.updated_at,
             archived_at: None,
             copy: self.copy().cloned(),
+            landing_mode: self.landing_mode,
+            review_base: self.review_base.clone(),
+            landing_resolved: self.landing_resolved,
+            snapshot_needed: self.work_pending(),
         }
     }
 }

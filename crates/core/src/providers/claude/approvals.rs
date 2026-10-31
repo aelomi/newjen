@@ -83,30 +83,69 @@ impl Approvals {
     pub(super) fn clear(&mut self) {
         self.pending.clear();
     }
+    /// `note` goes to claude as the denial's `message` (see
+    /// `protocol::permission_response_with_note`); an allow ignores it.
     pub(super) fn answer(
         &mut self,
         key: ApprovalKey,
         intent: ApprovalIntent,
+        note: Option<&str>,
     ) -> Option<ApprovalReply> {
         let position = self.pending.iter().position(|pending| pending.key == key)?;
         let pending = self.pending.remove(position)?;
+        let reply =
+            |answer| protocol::permission_response_with_note(&pending.request, answer, note);
         let (message, grants) = match intent {
             ApprovalIntent::AllowForSession => (pending.remembered, pending.grants),
-            ApprovalIntent::AllowOnce => (
-                protocol::permission_response(&pending.request, PermissionAnswer::AllowOnce),
-                vec![],
-            ),
-            ApprovalIntent::Deny => (
-                protocol::permission_response(&pending.request, PermissionAnswer::Deny),
-                vec![],
-            ),
-            ApprovalIntent::DenyAndStop => (
-                protocol::permission_response(&pending.request, PermissionAnswer::DenyAndStop),
-                vec![],
-            ),
+            ApprovalIntent::AllowOnce => (reply(PermissionAnswer::AllowOnce), vec![]),
+            ApprovalIntent::Deny => (reply(PermissionAnswer::Deny), vec![]),
+            ApprovalIntent::DenyAndStop => (reply(PermissionAnswer::DenyAndStop), vec![]),
         };
         Some(ApprovalReply { message, grants })
     }
+}
+
+/// The edit claude's Write/Edit/MultiEdit/NotebookEdit tool proposes, from the tool's input,
+/// for the preview on the approval card. `None` for any other tool.
+pub(crate) fn edit_proposal(
+    tool_name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+) -> Option<crate::edits::EditProposal> {
+    use crate::edits::{EditProposal, FileChange, Replacement};
+    if !["Write", "Edit", "MultiEdit", "NotebookEdit"].contains(&tool_name) {
+        return None;
+    }
+    let path = input["file_path"]
+        .as_str()
+        .or_else(|| input["notebook_path"].as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    let replacement = |value: &serde_json::Value| {
+        Some(Replacement {
+            old: value["old_string"].as_str()?.into(),
+            new: value["new_string"].as_str()?.into(),
+            all: value["replace_all"].as_bool().unwrap_or(false),
+        })
+    };
+    let change = match tool_name {
+        "Write" => input["content"]
+            .as_str()
+            .map(|content| FileChange::Write(content.into())),
+        "Edit" => replacement(input).map(|edit| FileChange::Replace(vec![edit])),
+        "MultiEdit" => input["edits"]
+            .as_array()
+            .and_then(|edits| edits.iter().map(replacement).collect::<Option<Vec<_>>>())
+            .map(FileChange::Replace),
+        _ => None,
+    }
+    .unwrap_or(FileChange::Unavailable);
+    Some(EditProposal { path, change })
 }
 
 fn view(request: &PermissionRequest, cwd: Option<&Path>) -> ApprovalView {
@@ -234,7 +273,7 @@ mod tests {
                 ] {
                     let mut approvals = Approvals::default();
                     let shown = approvals.request(&request, None);
-                    let reply = approvals.answer(shown.key(), intent).unwrap();
+                    let reply = approvals.answer(shown.key(), intent, None).unwrap();
                     assert_eq!(
                         serde_json::to_vec(&reply.message).unwrap(),
                         serde_json::to_vec(&protocol::permission_response(&request, wire)).unwrap()
@@ -256,7 +295,7 @@ mod tests {
                         expected
                     );
                     assert!(
-                        approvals.answer(shown.key(), intent).is_none(),
+                        approvals.answer(shown.key(), intent, None).is_none(),
                         "already consumed"
                     );
                 }
@@ -274,7 +313,7 @@ mod tests {
         assert_ne!(a.key(), b.key());
         assert!(
             first
-                .answer(b.key(), ApprovalIntent::AllowForSession)
+                .answer(b.key(), ApprovalIntent::AllowForSession, None)
                 .is_none()
         );
         let second = first.request(
@@ -285,11 +324,15 @@ mod tests {
             None,
         );
         assert_ne!(a.key(), second.key(), "two callbacks for one tool");
-        first.answer(a.key(), ApprovalIntent::Deny).unwrap();
-        assert!(first.answer(a.key(), ApprovalIntent::AllowOnce).is_none());
+        first.answer(a.key(), ApprovalIntent::Deny, None).unwrap();
         assert!(
             first
-                .answer(second.key(), ApprovalIntent::AllowOnce)
+                .answer(a.key(), ApprovalIntent::AllowOnce, None)
+                .is_none()
+        );
+        assert!(
+            first
+                .answer(second.key(), ApprovalIntent::AllowOnce, None)
                 .is_some()
         );
         let stale = first.request(&request, None).key();
@@ -298,10 +341,77 @@ mod tests {
         assert_ne!(stale, current);
         assert!(
             first
-                .answer(stale, ApprovalIntent::AllowForSession)
+                .answer(stale, ApprovalIntent::AllowForSession, None)
                 .is_none()
         );
-        assert!(first.answer(current, ApprovalIntent::AllowOnce).is_some());
+        assert!(
+            first
+                .answer(current, ApprovalIntent::AllowOnce, None)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_denial_note_becomes_the_deny_message_and_allows_ignore_it() {
+        let request = request("r1", "Bash", json!({"command":"touch a"}));
+        for (intent, interrupt) in [
+            (ApprovalIntent::Deny, false),
+            (ApprovalIntent::DenyAndStop, true),
+        ] {
+            let mut approvals = Approvals::default();
+            let key = approvals.request(&request, None).key();
+            let reply = approvals.answer(key, intent, Some(" Not here. ")).unwrap();
+            assert_eq!(
+                reply.message["response"]["response"]["message"],
+                "Not here."
+            );
+            assert_eq!(
+                reply.message["response"]["response"]["interrupt"].as_bool(),
+                interrupt.then_some(true)
+            );
+        }
+        let mut approvals = Approvals::default();
+        let key = approvals.request(&request, None).key();
+        let reply = approvals
+            .answer(key, ApprovalIntent::AllowOnce, Some("ignored"))
+            .unwrap();
+        assert_eq!(
+            reply.message,
+            protocol::permission_response(&request, PermissionAnswer::AllowOnce)
+        );
+    }
+
+    #[test]
+    fn edit_proposals_come_from_claudes_edit_tools_only() {
+        use crate::edits::FileChange;
+        let cwd = Path::new("/work");
+        let write =
+            edit_proposal("Write", &json!({"file_path":"src/a.rs","content":"x"}), cwd).unwrap();
+        assert_eq!(write.path, Path::new("/work/src/a.rs"));
+        assert!(matches!(write.change, FileChange::Write(content) if content == "x"));
+        let edit = edit_proposal(
+            "Edit",
+            &json!({"file_path":"/elsewhere/a.rs","old_string":"a","new_string":"b","replace_all":true}),
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(edit.path, Path::new("/elsewhere/a.rs"));
+        assert!(
+            matches!(&edit.change, FileChange::Replace(edits) if edits.len() == 1 && edits[0].all)
+        );
+        let multi = edit_proposal(
+            "MultiEdit",
+            &json!({"file_path":"a.rs","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]}),
+            cwd,
+        )
+        .unwrap();
+        assert!(matches!(&multi.change, FileChange::Replace(edits) if edits.len() == 2));
+        let notebook =
+            edit_proposal("NotebookEdit", &json!({"notebook_path":"n.ipynb"}), cwd).unwrap();
+        assert!(matches!(notebook.change, FileChange::Unavailable));
+        let broken = edit_proposal("Edit", &json!({"file_path":"a.rs"}), cwd).unwrap();
+        assert!(matches!(broken.change, FileChange::Unavailable));
+        assert!(edit_proposal("Bash", &json!({"command":"rm a"}), cwd).is_none());
     }
 
     #[test]

@@ -77,8 +77,13 @@ impl Controller {
         self.recovery.in_use_line = None;
         self.recovery.write_failure = None;
     }
-    pub fn answer(&mut self, key: ApprovalKey, intent: ApprovalIntent) -> Option<ApprovalReply> {
-        self.translator.answer(key, intent)
+    pub fn answer(
+        &mut self,
+        key: ApprovalKey,
+        intent: ApprovalIntent,
+        note: Option<&str>,
+    ) -> Option<ApprovalReply> {
+        self.translator.answer_with_note(key, intent, note)
     }
     pub fn translate(&mut self, event: &SessionEvent, cwd: Option<&Path>) -> AgentBatch {
         self.translator.translate(event, cwd)

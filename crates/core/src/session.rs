@@ -104,6 +104,10 @@ pub struct SessionConfig {
     pub allowed_tools: Vec<String>,
     /// Extra command-line arguments, appended after Newjen's own.
     pub extra_args: Vec<String>,
+    /// Newjen's own instructions for the agent (how the thread's version control works), sent
+    /// through each provider's mechanism: claude's `--append-system-prompt`, Codex's
+    /// `developerInstructions`.
+    pub instructions: Option<String>,
     /// Extra environment variables for the child. Mostly for tests (to drive the fake CLI).
     pub env: Vec<(String, String)>,
     /// How long an interrupt may go unanswered before the session is ended. Defaults to
@@ -121,6 +125,7 @@ impl SessionConfig {
             conversation: None,
             allowed_tools: Vec::new(),
             extra_args: Vec::new(),
+            instructions: None,
             env: Vec::new(),
             interrupt_ack_timeout: INTERRUPT_ACK_TIMEOUT,
         }
@@ -199,6 +204,10 @@ impl SessionConfig {
         for rule in &self.allowed_tools {
             args.push("--allowedTools".to_string());
             args.push(rule.clone());
+        }
+        if let Some(instructions) = &self.instructions {
+            args.push("--append-system-prompt".to_string());
+            args.push(instructions.clone());
         }
         args.extend(self.extra_args.iter().cloned());
         args
@@ -402,13 +411,17 @@ impl Session {
         self.write_line(&reply.message)?;
         Ok(crate::agent::AnswerReceipt {
             grants: reply.grants,
+            note_kept: None,
         })
     }
 
+    /// Codex's decision carries no text, so a note given with a denial comes back in the
+    /// receipt for the app to keep.
     fn answer_codex(
         &self,
         key: crate::agent::ApprovalKey,
         intent: crate::agent::ApprovalIntent,
+        note: Option<&str>,
     ) -> Result<crate::agent::AnswerReceipt> {
         let Some(codec) = &self.control.codex else {
             anyhow::bail!("This process has no approval route");
@@ -417,7 +430,14 @@ impl Session {
         if let Some(out) = out {
             self.control.codex_output(out)?;
         }
-        Ok(crate::agent::AnswerReceipt { grants: Vec::new() })
+        Ok(crate::agent::AnswerReceipt {
+            grants: Vec::new(),
+            note_kept: note
+                .filter(|_| intent.is_deny())
+                .map(str::trim)
+                .filter(|note| !note.is_empty())
+                .map(str::to_string),
+        })
     }
     fn process_grants(&self) -> Vec<crate::agent::GrantView> {
         self.control
@@ -838,10 +858,13 @@ impl Controller {
         self.initialized = false;
         self.claude.spawned();
     }
+    /// `note` is the text given with a denial; each provider carries it as it can (see
+    /// `Thread::answer_with_note`).
     pub fn answer(
         &mut self,
         key: crate::agent::ApprovalKey,
         intent: crate::agent::ApprovalIntent,
+        note: Option<&str>,
         session: Option<&Session>,
     ) -> Option<Result<crate::agent::AnswerReceipt>> {
         let Some(session) = session else {
@@ -850,9 +873,27 @@ impl Controller {
         match self.provider {
             crate::providers::Provider::Claude => self
                 .claude
-                .answer(key, intent)
+                .answer(key, intent, note)
                 .map(|reply| session.answer(reply)),
-            crate::providers::Provider::Codex => Some(session.answer_codex(key, intent)),
+            crate::providers::Provider::Codex => Some(session.answer_codex(key, intent, note)),
+        }
+    }
+    /// The file edit a pending approval proposes, for the preview on the approval card.
+    pub fn edit_proposal(
+        &self,
+        view: &crate::agent::ApprovalView,
+        cwd: &std::path::Path,
+    ) -> Option<crate::edits::EditProposal> {
+        if !matches!(view.kind, crate::agent::ApprovalKind::FileChange { .. }) {
+            return None;
+        }
+        match self.provider {
+            crate::providers::Provider::Claude => {
+                crate::providers::claude::edit_proposal(&view.tool.name, &view.tool.arguments, cwd)
+            }
+            crate::providers::Provider::Codex => {
+                Some(crate::providers::codex::edit_proposal(&view.tool, cwd))
+            }
         }
     }
     pub fn translate(
@@ -1019,6 +1060,20 @@ mod tests {
                 "mcp__pencil__get_style",
             ]
         );
+    }
+
+    #[test]
+    fn instructions_reach_claude_as_an_appended_system_prompt_and_never_codex_argv() {
+        let mut config = SessionConfig::new("/tmp");
+        config.instructions = Some("Make file changes only.".to_string());
+        let args = config.args();
+        let at = args
+            .iter()
+            .position(|arg| arg == "--append-system-prompt")
+            .unwrap();
+        assert_eq!(args[at + 1], "Make file changes only.");
+        config.agent = crate::agent::AgentConfig::cli_default(crate::providers::Provider::Codex);
+        assert_eq!(config.args(), ["app-server"]);
     }
 
     #[test]

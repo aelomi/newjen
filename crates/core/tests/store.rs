@@ -27,6 +27,10 @@ fn thread_row(id: &str, project_id: i64, created_at: i64) -> ThreadRow {
         updated_at: created_at,
         archived_at: None,
         copy: None,
+        landing_mode: newjen_core::landing::LandingMode::HarnessManaged,
+        review_base: None,
+        landing_resolved: false,
+        snapshot_needed: false,
     }
 }
 
@@ -245,7 +249,7 @@ fn reopening_keeps_everything_at_the_same_schema_version() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, newjen_core::store::SCHEMA_VERSION);
     let journal: String = connection
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();
@@ -391,4 +395,29 @@ fn recent_projects_survive_reopening_without_duplicate_rows() {
         )
     );
     assert!(opened.last_opened_at >= first.last_opened_at);
+}
+
+#[test]
+fn landing_settings_and_review_state_survive_reopen() {
+    use newjen_core::landing::LandingMode;
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).unwrap();
+    let project = store
+        .open_project(std::path::Path::new("/tmp/landing-project"))
+        .unwrap();
+    store.set_default_landing_mode(project.id, LandingMode::AgentManaged);
+    let mut row = thread_row("landing", project.id, 1);
+    row.landing_mode = LandingMode::AgentManaged;
+    row.review_base = Some("abc123".to_string());
+    row.snapshot_needed = true;
+    row.landing_resolved = true;
+    store.save_thread(row.clone());
+    assert!(store.flush(FLUSH));
+    drop(store);
+    let store = Store::open_in(home.path()).unwrap();
+    assert_eq!(store.thread("landing").unwrap(), Some(row));
+    assert_eq!(
+        store.open_project(&project.path).unwrap().landing_mode,
+        LandingMode::AgentManaged
+    );
 }

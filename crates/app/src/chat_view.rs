@@ -34,9 +34,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Side, WindowExt as _};
 use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
-use newjen_core::thread::{
-    self, CopyJob, NotSent, Preparing, Quitting, Sent, WorksIn, keeps_draft,
-};
+use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
 use newjen_core::{ApprovalIntent, Item, Project, SessionConfig, Status, Store, Thread, ToolState};
 
 use crate::approval::{self, Room};
@@ -1076,6 +1074,10 @@ impl ChatView {
                 self.make_copy(&thread, job, window, cx);
                 None
             }
+            Ok(Sent::PreparingProject(job)) => {
+                self.prepare_project(&thread, job, window, cx);
+                None
+            }
             Err(error) if error.downcast_ref::<CopyError>().is_some() => Some(copy_failed(
                 error.downcast_ref::<CopyError>().expect("checked"),
                 self.home.as_deref(),
@@ -1223,6 +1225,49 @@ impl ChatView {
             };
             let _ = view.update_in(cx, |view, window, cx| {
                 view.copy_made(&thread, made, window, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// Runs the [`thread::ProjectJob`] from `Thread::send` off the UI thread and hands what it
+    /// returns to `Thread::finish_project`, which sends the held message. If that fails the
+    /// message comes back to the composer with a notice.
+    fn prepare_project(
+        &mut self,
+        thread: &Entity<Thread>,
+        job: thread::ProjectJob,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tools = self.tools.clone();
+        let task = cx.background_spawn(async move { job.run(&tools) });
+        let thread = thread.downgrade();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = task.await;
+            let Some(thread) = thread.upgrade() else {
+                return;
+            };
+            let _ = view.update_in(cx, |view, window, cx| {
+                let result = thread.update(cx, |thread, cx| {
+                    let result = thread.finish_project(result);
+                    cx.notify();
+                    result
+                });
+                if let Err(error) = result
+                    && let Some(ix) = view.slots.iter().position(|slot| slot.thread == thread)
+                {
+                    view.slots[ix].notice = Some(Notice::held(
+                        "Couldn't prepare the project",
+                        error.error.to_string(),
+                    ));
+                    if ix == view.active {
+                        let field = view.ensure_field(window, cx);
+                        field.update(cx, |field, cx| field.set_value(error.message, window, cx));
+                    }
+                }
+                view.sync_field(window, cx);
+                cx.notify();
             });
         })
         .detach();
@@ -1860,7 +1905,9 @@ impl ChatView {
                 (thread.is_draft() && thread.copy().is_none()).then(|| thread.works_in());
             (
                 thread.preparing().is_some(),
-                thread.preparing().is_some_and(Preparing::cancelled),
+                thread
+                    .preparing()
+                    .is_some_and(|waiting| waiting.cancelled()),
                 is_busy(thread.status()),
                 choosing,
             )

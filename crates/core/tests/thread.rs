@@ -816,6 +816,48 @@ fn send_and_wait_for_approval(thread: &mut Thread, text: &str) {
 }
 
 #[test]
+fn a_denial_note_goes_to_claude_as_the_message_and_an_allow_ignores_it() {
+    use newjen_core::agent::NoteDelivery;
+    let fixture = Fixture::new();
+    fixture.switch("ask", true);
+    let mut thread = fixture.draft();
+    send_and_wait_for_approval(&mut thread, "make a file");
+    let delivered = thread
+        .answer_with_note(
+            None,
+            ApprovalIntent::DenyAndStop,
+            Some(" Use a scratch folder instead. "),
+        )
+        .unwrap();
+    assert_eq!(delivered, NoteDelivery::Delivered);
+    finish_turn(&mut thread);
+    let answer = fixture
+        .stdin()
+        .into_iter()
+        .find(|line| line["type"] == "control_response")
+        .unwrap();
+    assert_eq!(
+        answer["response"]["response"]["message"],
+        "Use a scratch folder instead."
+    );
+    assert_eq!(answer["response"]["response"]["interrupt"], true);
+
+    send_and_wait_for_approval(&mut thread, "again");
+    thread
+        .answer_with_note(None, ApprovalIntent::AllowOnce, Some("ignored"))
+        .unwrap();
+    finish_turn(&mut thread);
+    let allowed = fixture
+        .stdin()
+        .into_iter()
+        .filter(|line| line["type"] == "control_response")
+        .nth(1)
+        .unwrap();
+    assert_eq!(allowed["response"]["response"]["behavior"], "allow");
+    assert!(allowed["response"]["response"].get("message").is_none());
+}
+
+#[test]
 fn always_allow_is_saved_and_given_to_every_later_claude_until_revoked() {
     let fixture = Fixture::new();
     fixture.switch("ask", true);
@@ -1565,6 +1607,10 @@ fn a_thread_always_restarts_from_its_own_folder() {
         updated_at: 1,
         archived_at: None,
         copy: None,
+        landing_mode: newjen_core::landing::LandingMode::HarnessManaged,
+        review_base: None,
+        landing_resolved: false,
+        snapshot_needed: false,
     });
     assert!(store.flush(Duration::from_secs(5)));
 
@@ -2870,6 +2916,10 @@ fn failed_attempt_stays_tracked(works_in: WorksIn, failure: CleanupFailure) {
     thread.set_works_in(works_in).unwrap();
     match thread.send("second try").unwrap() {
         Sent::MakingCopy(job) => drop(job),
+        Sent::PreparingProject(job) => {
+            thread.finish_project(job.run(&tools)).unwrap();
+            finish_turn(&mut thread);
+        }
         Sent::Started => finish_turn(&mut thread),
     }
     assert!(fixture.store.flush(FLUSH));
@@ -3002,7 +3052,7 @@ fn cancelling_during_a_rift_hook_stops_it_and_removes_the_copy() {
         })
     });
     started.recv_timeout(Duration::from_secs(20)).unwrap();
-    let path = thread.preparing().unwrap().path().to_path_buf();
+    let path = thread.preparing().unwrap().path().unwrap().to_path_buf();
     let stopped = Instant::now();
     thread.stop().unwrap();
     assert!(thread.send("not yet").is_err());
@@ -3044,4 +3094,245 @@ fn a_copy_finished_after_cancelling_is_removed_instead_of_used() {
     assert!(thread.is_draft());
     assert!(fixture.messages_received().is_empty());
     assert!(fixture.spawns().is_empty());
+}
+
+fn init_thread_jj(fixture: &Fixture) -> Option<Tools> {
+    let mut tools = fixture.rift_tools()?;
+    tools.env.extend([
+        ("JJ_USER".to_string(), "Test".to_string()),
+        ("JJ_EMAIL".to_string(), "test@example.invalid".to_string()),
+    ]);
+    let output = std::process::Command::new(&tools.jj)
+        .args(["git", "init", "--colocate"])
+        .current_dir(&fixture.project.path)
+        .envs(tools.env.iter().map(|(key, value)| (key, value)))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(tools)
+}
+
+#[test]
+fn project_preparation_sends_the_held_message_once_and_snapshot_blocks_the_next_send() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    let mut thread = fixture.draft();
+    let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
+        panic!("prepare project");
+    };
+    assert!(fixture.spawns().is_empty());
+    assert!(
+        thread.owns_project_work(),
+        "preparation reserves the project folder"
+    );
+    assert!(thread.send("second").is_err());
+    assert!(thread.finish_copy(Ok(fixture.fake_copy())).is_err());
+    let base = job.run(&tools).unwrap();
+    thread.finish_project(Ok(base.clone())).unwrap();
+    finish_turn(&mut thread);
+    assert_eq!(fixture.messages_received(), ["Make a change"]);
+    assert!(thread.finish_project(Ok(base)).is_err());
+    assert!(thread.work_pending());
+    assert!(thread.send("second").is_err());
+    assert!(thread.has_session());
+    let job = thread.take_snapshot_job().expect("snapshot");
+    assert!(
+        !thread.has_session(),
+        "the agent must stop before jj can snapshot"
+    );
+    assert!(thread.take_snapshot_job().is_none());
+    thread.finish_snapshot(job.run(&tools));
+    assert!(!thread.work_pending());
+    assert!(thread.snapshot_error().is_none());
+    assert!(fixture.store.flush(FLUSH));
+    let loaded = fixture.reload(thread.id());
+    assert_eq!(loaded.review_base(), thread.review_base());
+    assert!(loaded.owns_project_work());
+    thread.send("second").unwrap();
+    finish_turn(&mut thread);
+    assert_eq!(fixture.messages_received(), ["Make a change", "second"]);
+    assert_eq!(fixture.spawns().len(), 2);
+    assert_eq!(
+        flag(fixture.spawns().last().unwrap(), "--resume"),
+        Some(thread.session_id())
+    );
+}
+
+#[test]
+fn archiving_project_preparation_invalidates_its_held_message() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    let mut thread = fixture.draft();
+    let Sent::PreparingProject(job) = thread.send("Do not send after archive").unwrap() else {
+        panic!("prepare project");
+    };
+    assert!(thread.archive().is_none());
+    assert!(thread.finish_project(job.run(&tools)).is_err());
+    assert!(fixture.spawns().is_empty());
+    assert!(fixture.messages_received().is_empty());
+}
+
+#[test]
+fn agent_managed_project_prepares_a_baseline_but_does_not_schedule_turn_snapshots() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    let before = newjen_core::landing::head(&tools, &fixture.project.path).unwrap();
+    let mut thread = fixture.draft();
+    thread
+        .set_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
+        .unwrap();
+    assert!(
+        !thread
+            .session_config()
+            .args()
+            .iter()
+            .any(|arg| arg == "--append-system-prompt")
+    );
+    let Sent::PreparingProject(job) = thread.send("Manage changes yourself").unwrap() else {
+        panic!("prepare project");
+    };
+    let base = job.run(&tools).unwrap();
+    assert_eq!(base, before);
+    assert_ne!(
+        newjen_core::landing::head(&tools, &fixture.project.path).unwrap(),
+        before
+    );
+    thread.finish_project(Ok(base)).unwrap();
+    finish_turn(&mut thread);
+    assert!(!thread.work_pending());
+    assert!(thread.take_snapshot_job().is_none());
+    assert!(
+        thread
+            .set_landing_mode(newjen_core::landing::LandingMode::HarnessManaged)
+            .is_err()
+    );
+}
+
+#[test]
+fn a_snapshot_failure_keeps_the_next_message_blocked_until_explicit_retry() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    let mut thread = fixture.draft();
+    let Sent::PreparingProject(job) = thread.send("Keep my work").unwrap() else {
+        panic!("prepare project");
+    };
+    thread.finish_project(job.run(&tools)).unwrap();
+    finish_turn(&mut thread);
+    let _job = thread.take_snapshot_job().unwrap();
+    thread.finish_snapshot(Err(anyhow::anyhow!("disk full")));
+    assert_eq!(thread.snapshot_error(), Some("disk full"));
+    assert!(thread.send("second").is_err());
+    assert!(thread.take_snapshot_job().is_none());
+    thread.retry_snapshot();
+    let job = thread.take_snapshot_job().expect("explicit retry");
+    thread.finish_snapshot(job.run(&tools));
+    assert!(!thread.work_pending());
+    assert_eq!(fixture.messages_received(), ["Keep my work"]);
+}
+
+#[test]
+fn relaunch_requires_a_snapshot_before_sending_after_an_interrupted_jj_turn() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    fixture.switch("hang_after_init", true);
+    let mut thread = fixture.draft();
+    let Sent::PreparingProject(job) = thread.send("Save interrupted files").unwrap() else {
+        panic!("prepare project");
+    };
+    thread.finish_project(job.run(&tools)).unwrap();
+    pump_until(&mut thread, "session init", |thread| {
+        thread.session_started()
+    });
+    assert!(fixture.store.flush(FLUSH));
+    let row = fixture.store.thread(thread.id()).unwrap().unwrap();
+    assert!(row.status.is_busy());
+    thread.shutdown_for_quit();
+    let mut loaded = Thread::load(
+        fixture.store.clone(),
+        &fixture.project,
+        row,
+        fixture.config.clone(),
+    )
+    .unwrap();
+    assert!(loaded.work_pending());
+    assert!(loaded.send("next").is_err());
+    let job = loaded.take_snapshot_job().unwrap();
+    loaded.finish_snapshot(job.run(&tools));
+    assert!(!loaded.work_pending());
+    assert_eq!(fixture.messages_received(), ["Save interrupted files"]);
+}
+
+#[test]
+fn a_legacy_project_thread_prepares_its_next_turn_without_changing_its_title_or_conversation() {
+    let fixture = Fixture::new();
+    let mut thread = fixture.draft();
+    thread.send("Original title").unwrap();
+    finish_turn(&mut thread);
+    let id = thread.session_id().to_string();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    let Sent::PreparingProject(job) = thread.send("Follow up").unwrap() else {
+        panic!("prepare legacy project");
+    };
+    assert_eq!(thread.title(), "Original title");
+    assert!(thread.owns_project_work());
+    thread.finish_project(job.run(&tools)).unwrap();
+    finish_turn(&mut thread);
+    assert_eq!(thread.title(), "Original title");
+    assert_eq!(thread.session_id(), id);
+    assert_eq!(fixture.messages_received(), ["Original title", "Follow up"]);
+    assert_eq!(
+        flag(fixture.spawns().last().unwrap(), "--resume"),
+        Some(id.as_str())
+    );
+    assert!(thread.work_pending());
+    let job = thread.take_snapshot_job().unwrap();
+    thread.finish_snapshot(job.run(&tools));
+    assert!(!thread.work_pending());
+}
+
+#[test]
+fn graceful_quit_keeps_the_snapshot_requirement_for_partial_work() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    fixture.switch("hang_after_init", true);
+    let mut thread = fixture.draft();
+    let Sent::PreparingProject(job) = thread.send("Keep partial work").unwrap() else {
+        panic!("prepare");
+    };
+    thread.finish_project(job.run(&tools)).unwrap();
+    pump_until(&mut thread, "session init", |thread| {
+        thread.session_started()
+    });
+    std::fs::write(fixture.project.path.join("partial.txt"), "partial\n").unwrap();
+    thread.shutdown_for_quit();
+    assert!(fixture.store.flush(FLUSH));
+    let row = fixture.store.thread(thread.id()).unwrap().unwrap();
+    assert_eq!(row.status, Status::Stopped);
+    assert!(row.snapshot_needed);
+    let mut loaded = fixture.reload(thread.id());
+    assert!(loaded.work_pending());
+    let job = loaded.take_snapshot_job().unwrap();
+    loaded.finish_snapshot(job.run(&tools));
+    assert!(!loaded.work_pending());
+    let review =
+        newjen_core::landing::review(&tools, loaded.cwd(), loaded.review_base().unwrap()).unwrap();
+    assert!(review.patch.contains("partial.txt"));
 }

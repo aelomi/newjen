@@ -90,7 +90,17 @@ impl ClaudeEvents {
         key: crate::agent::ApprovalKey,
         intent: crate::agent::ApprovalIntent,
     ) -> Option<crate::agent::ApprovalReply> {
-        self.approvals.answer(key, intent)
+        self.answer_with_note(key, intent, None)
+    }
+
+    /// [`ClaudeEvents::answer`] with the user's note for a denial, sent as its `message`.
+    pub fn answer_with_note(
+        &mut self,
+        key: crate::agent::ApprovalKey,
+        intent: crate::agent::ApprovalIntent,
+        note: Option<&str>,
+    ) -> Option<crate::agent::ApprovalReply> {
+        self.approvals.answer(key, intent, note)
     }
 
     fn content_key(&mut self) -> ContentKey {

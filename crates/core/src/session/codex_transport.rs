@@ -12,7 +12,8 @@ impl CodexProcess {
             Some(Conversation::Resume(id)) => Some(id.clone()),
             Some(Conversation::New(_)) | None => None,
         };
-        let (codec, out) = CodexCodec::new(config.agent.clone(), config.cwd.clone(), resume)?;
+        let (mut codec, out) = CodexCodec::new(config.agent.clone(), config.cwd.clone(), resume)?;
+        codec.set_instructions(config.instructions.clone());
         Ok((
             Self {
                 codec,

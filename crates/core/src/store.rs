@@ -29,6 +29,7 @@ use anyhow::{Context, Result, anyhow};
 use async_channel::{Receiver, Sender};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
+use crate::landing::LandingMode;
 use crate::rift::Copy;
 use crate::transcript::Status;
 
@@ -129,7 +130,17 @@ const MIGRATIONS: &[&str] = &[
          thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
          report TEXT NOT NULL
      );",
+    "ALTER TABLE projects ADD COLUMN landing_mode TEXT NOT NULL DEFAULT 'harness_managed'
+         CHECK (landing_mode IN ('harness_managed', 'agent_managed'));
+     ALTER TABLE threads ADD COLUMN landing_mode TEXT NOT NULL DEFAULT 'harness_managed'
+         CHECK (landing_mode IN ('harness_managed', 'agent_managed'));
+     ALTER TABLE threads ADD COLUMN review_base TEXT;
+     ALTER TABLE threads ADD COLUMN landing_resolved INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE threads ADD COLUMN snapshot_needed INTEGER NOT NULL DEFAULT 0;",
 ];
+
+/// The `user_version` of a database at the current schema.
+pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// The current time as Unix milliseconds, the unit every time in the store uses.
 pub fn now_ms() -> i64 {
@@ -162,6 +173,7 @@ pub struct Project {
     pub path: PathBuf,
     pub created_at: i64,
     pub last_opened_at: i64,
+    pub landing_mode: LandingMode,
 }
 
 /// One saved thread (the `threads` table).
@@ -191,6 +203,10 @@ pub struct ThreadRow {
     /// The thread's Rift copy, if it works in one (the `copies` table). Saved with the
     /// thread's first row and never changed after.
     pub copy: Option<Copy>,
+    pub landing_mode: LandingMode,
+    pub review_base: Option<String>,
+    pub landing_resolved: bool,
+    pub snapshot_needed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +327,10 @@ enum Write {
     UpsertProject {
         path: String,
         now: i64,
+    },
+    SetLandingMode {
+        project_id: i64,
+        mode: LandingMode,
     },
     SaveThread(ThreadRow),
     ReplaceItems {
@@ -504,7 +524,7 @@ impl Store {
         self.flush(OPEN_PROJECT_TIMEOUT);
         self.reader()
             .query_row(
-                "SELECT id, path, created_at, last_opened_at FROM projects WHERE path = ?1",
+                "SELECT id, path, created_at, last_opened_at, landing_mode FROM projects WHERE path = ?1",
                 params![path_text],
                 |row| {
                     Ok(Project {
@@ -512,6 +532,7 @@ impl Store {
                         path: PathBuf::from(row.get::<_, String>(1)?),
                         created_at: row.get(2)?,
                         last_opened_at: row.get(3)?,
+                        landing_mode: saved_landing_mode(row, 4)?,
                     })
                 },
             )
@@ -522,7 +543,7 @@ impl Store {
     pub fn projects(&self) -> Result<Vec<Project>> {
         let read = self.reader();
         let mut statement = read.prepare(
-            "SELECT id, path, created_at, last_opened_at FROM projects
+            "SELECT id, path, created_at, last_opened_at, landing_mode FROM projects
              ORDER BY last_opened_at DESC, id DESC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -531,9 +552,14 @@ impl Store {
                 path: PathBuf::from(row.get::<_, String>(1)?),
                 created_at: row.get(2)?,
                 last_opened_at: row.get(3)?,
+                landing_mode: saved_landing_mode(row, 4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_default_landing_mode(&self, project_id: i64, mode: LandingMode) {
+        self.queue(Write::SetLandingMode { project_id, mode });
     }
 
     /// The project's threads that are not archived, newest first. Activity never reorders
@@ -826,7 +852,8 @@ fn path_text(path: &Path) -> String {
 /// The `SELECT … FROM` for [`thread_row`]: a thread's columns, then its copy's.
 const THREAD_COLUMNS: &str = "SELECT id, project_id, title, provider, conversation_id, conversation_state,
         status, unread, threads.created_at, updated_at, archived_at, threads.workdir,
-        copies.path, copies.workdir, source, rift_id, base, threads.model, threads.effort, threads.speed
+        copies.path, copies.workdir, source, rift_id, base, threads.model, threads.effort, threads.speed,
+        landing_mode, review_base, landing_resolved, snapshot_needed
      FROM threads LEFT JOIN copies ON copies.thread_id = threads.id";
 
 fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
@@ -863,7 +890,17 @@ fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         archived_at: row.get(10)?,
         workdir: PathBuf::from(row.get::<_, String>(11)?),
         copy: saved_copy(row, 12)?,
+        landing_mode: saved_landing_mode(row, 20)?,
+        review_base: row.get(21)?,
+        landing_resolved: row.get(22)?,
+        snapshot_needed: row.get(23)?,
     })
+}
+
+fn saved_landing_mode(row: &Row<'_>, at: usize) -> rusqlite::Result<LandingMode> {
+    row.get::<_, String>(at)?
+        .parse()
+        .map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
 /// The copy in the five columns from `at` (path, workdir, source, Rift id, base), if any.
@@ -954,6 +991,7 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         // and records it then.
         Write::RememberAgent { .. }
         | Write::Limit { .. }
+        | Write::SetLandingMode { .. }
         | Write::UpsertProject { .. }
         | Write::Archive { .. }
         | Write::CopyRemoved { .. }
@@ -969,6 +1007,12 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
 
 fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> {
     match write {
+        Write::SetLandingMode { project_id, mode } => {
+            connection.execute(
+                "UPDATE projects SET landing_mode = ?2 WHERE id = ?1",
+                params![project_id, mode.as_str()],
+            )?;
+        }
         Write::RememberAgent { project_id, config } => {
             connection.execute("INSERT INTO project_agent_choices (project_id, config) VALUES (?1, ?2) ON CONFLICT(project_id) DO UPDATE SET config=excluded.config", params![project_id, config])?;
         }
@@ -1143,8 +1187,9 @@ fn retain_copy_cleanup(
 fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO threads (id, project_id, title, provider, session_id, session_started,
-                              status, unread, created_at, updated_at, archived_at, workdir, conversation_id, conversation_state, model, effort, speed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                              status, unread, created_at, updated_at, archived_at, workdir, conversation_id, conversation_state, model, effort, speed,
+                              landing_mode, review_base, landing_resolved, snapshot_needed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
          ON CONFLICT (id) DO UPDATE SET
              title = excluded.title,
              provider = excluded.provider,
@@ -1157,7 +1202,11 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
              speed = excluded.speed,
              status = excluded.status,
              unread = excluded.unread,
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at,
+             landing_mode = excluded.landing_mode,
+             review_base = excluded.review_base,
+             landing_resolved = excluded.landing_resolved,
+             snapshot_needed = excluded.snapshot_needed",
         params![
             row.id,
             row.project_id,
@@ -1176,6 +1225,10 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
             match &row.model { crate::providers::ModelSelection::CliDefault => None, crate::providers::ModelSelection::Model { id } => Some(id) },
             match &row.effort { crate::agent::EffortSelection::CliDefault => None, crate::agent::EffortSelection::Chosen(effort) => Some(effort) },
             match row.speed { crate::agent::Speed::Normal => "normal", crate::agent::Speed::Fast => "fast" },
+            row.landing_mode.as_str(),
+            row.review_base,
+            row.landing_resolved,
+            row.snapshot_needed,
         ],
     )?;
     if let Some(copy) = &row.copy {
@@ -1287,7 +1340,7 @@ mod tests {
         migrate(&mut connection, &MIGRATIONS[..2]).unwrap();
         connection.execute_batch("INSERT INTO copies VALUES ('established', '/tmp/copy', '/tmp/copy', '/tmp/project', 'rift-id', 'base', 1, NULL);").unwrap();
         migrate(&mut connection, MIGRATIONS).unwrap();
-        assert_eq!(user_version(&connection), 4);
+        assert_eq!(user_version(&connection), SCHEMA_VERSION);
         let mut query = connection.prepare(THREAD_COLUMNS).unwrap();
         let rows: Vec<_> = query
             .query_map([], thread_row)
@@ -1332,6 +1385,10 @@ mod tests {
             updated_at: 1,
             archived_at: None,
             copy: None,
+            landing_mode: crate::landing::LandingMode::HarnessManaged,
+            review_base: None,
+            landing_resolved: false,
+            snapshot_needed: false,
         }
     }
 

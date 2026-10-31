@@ -1,5 +1,5 @@
 use newjen_core::agent::{
-    AgentConfig, ApprovalIntent, ConversationState, EffortSelection, GrantLifetime,
+    AgentConfig, ApprovalIntent, ConversationState, EffortSelection, GrantLifetime, NoteDelivery,
 };
 use newjen_core::providers::{self, Availability, ModelSelection, Provider};
 use newjen_core::thread::{Sent, WorksIn};
@@ -162,7 +162,18 @@ fn command_allow_deny_and_exact_session_grants_use_the_right_decision() {
             thread.transcript().pending_approval().is_some()
         });
         let request = thread.transcript().pending_approval().unwrap().clone();
-        thread.answer(Some(request.key()), intent).unwrap();
+        // Codex's decision carries no text, so a note comes back for the composer.
+        let delivered = thread
+            .answer_with_note(Some(request.key()), intent, Some(" Not in this folder. "))
+            .unwrap();
+        assert_eq!(
+            delivered,
+            if intent.is_deny() {
+                NoteDelivery::Kept("Not in this folder.".into())
+            } else {
+                NoteDelivery::Delivered
+            }
+        );
         // A stale click must not send a second answer.
         thread.answer(Some(request.key()), intent).unwrap();
         finish(&mut thread);
@@ -192,6 +203,23 @@ fn command_allow_deny_and_exact_session_grants_use_the_right_decision() {
                 .count(),
             1
         );
+        assert!(
+            !lab.input()
+                .iter()
+                .any(|m| m.to_string().contains("Not in this folder"))
+        );
+        let opened = lab
+            .input()
+            .into_iter()
+            .find(|m| m["method"] == "thread/start")
+            .unwrap();
+        assert!(
+            opened["params"]["developerInstructions"]
+                .as_str()
+                .is_some_and(|text| text.contains("version control")),
+            "Newjen's instructions reach Codex as developer instructions: {opened}"
+        );
+        assert!(!opened.to_string().contains("--append-system-prompt"));
     }
 }
 
@@ -203,6 +231,13 @@ fn file_edits_are_once_only_even_when_always_allow_is_requested() {
     until(&mut thread, |thread| {
         thread.transcript().pending_approval().is_some()
     });
+    let proposal = thread
+        .pending_edit()
+        .expect("a file change proposes an edit");
+    assert!(matches!(
+        proposal.preview(),
+        newjen_core::edits::EditPreview::Unavailable(_)
+    ));
     thread
         .answer(None, ApprovalIntent::AllowForSession)
         .unwrap();

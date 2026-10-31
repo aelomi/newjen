@@ -682,6 +682,20 @@ pub fn permission_response(request: &PermissionRequest, answer: PermissionAnswer
     })
 }
 
+pub fn permission_response_with_note(
+    request: &PermissionRequest,
+    answer: PermissionAnswer,
+    note: Option<&str>,
+) -> Value {
+    let mut response = permission_response(request, answer);
+    if answer.is_deny()
+        && let Some(note) = note.map(str::trim).filter(|note| !note.is_empty())
+    {
+        response["response"]["response"]["message"] = json!(note);
+    }
+    response
+}
+
 fn allow(request: &PermissionRequest) -> Value {
     json!({ "behavior": "allow", "updatedInput": request.input })
 }
@@ -932,6 +946,29 @@ mod tests {
             suggestions,
             blocked_path: None,
         }
+    }
+
+    #[test]
+    fn denial_notes_are_encoded_and_empty_notes_keep_the_default() {
+        let request = bash_request(vec![]);
+        let reply = permission_response_with_note(
+            &request,
+            PermissionAnswer::DenyAndStop,
+            Some("Use a test folder instead.\nKeep my files."),
+        );
+        assert_eq!(
+            reply["response"]["response"]["message"],
+            "Use a test folder instead.\nKeep my files."
+        );
+        assert_eq!(reply["response"]["response"]["interrupt"], true);
+        assert_eq!(
+            permission_response_with_note(&request, PermissionAnswer::Deny, Some("  ")),
+            permission_response(&request, PermissionAnswer::Deny)
+        );
+        assert_eq!(
+            permission_response_with_note(&request, PermissionAnswer::AllowOnce, Some("ignored")),
+            permission_response(&request, PermissionAnswer::AllowOnce)
+        );
     }
 
     #[test]

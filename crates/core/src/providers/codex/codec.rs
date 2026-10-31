@@ -78,6 +78,7 @@ pub struct CodexCodec {
     config: AgentConfig,
     cwd: PathBuf,
     resume: Option<String>,
+    instructions: Option<String>,
     next_rpc: i64,
     rpc: HashMap<RpcId, PendingRpc>,
     pub(super) namespace: u64,
@@ -120,6 +121,7 @@ impl CodexCodec {
             config,
             cwd,
             resume,
+            instructions: None,
             next_rpc: 0,
             rpc: HashMap::new(),
             namespace: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
@@ -145,6 +147,11 @@ impl CodexCodec {
         let id = codec.reserve(PendingRpc::Initialize);
         out.messages.push(rpc::initialize(&id));
         Ok((codec, out))
+    }
+    /// Newjen's own instructions for the thread, sent as `developerInstructions` when it is
+    /// started or resumed. Set them before the initialize response arrives.
+    pub fn set_instructions(&mut self, instructions: Option<String>) {
+        self.instructions = instructions.filter(|text| !text.trim().is_empty());
     }
     pub fn runtime(&self) -> &CodexRuntime {
         &self.state
@@ -379,6 +386,9 @@ impl CodexCodec {
         let mut params = json!({"cwd":self.cwd,"approvalPolicy":"untrusted","sandbox":"read-only","approvalsReviewer":"user","serviceTier":self.tier});
         if let ModelSelection::Model { id } = &self.config.model {
             params["model"] = json!(id);
+        }
+        if let Some(instructions) = &self.instructions {
+            params["developerInstructions"] = json!(instructions);
         }
         let method = match &self.resume {
             Some(id) => {

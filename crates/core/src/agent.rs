@@ -183,6 +183,16 @@ pub struct ApprovalReply {
 #[derive(Debug)]
 pub struct AnswerReceipt {
     pub(crate) grants: Vec<crate::store::Grant>,
+    /// A denial note the provider could not carry with its decision.
+    pub(crate) note_kept: Option<String>,
+}
+/// What became of the note given with a denial (see `Thread::answer_with_note`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteDelivery {
+    /// The provider got the note with the denial, or there was nothing to deliver.
+    Delivered,
+    /// The provider's denial carries no text, so the note comes back for the composer.
+    Kept(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

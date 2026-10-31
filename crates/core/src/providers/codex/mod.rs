@@ -5,6 +5,7 @@ mod items;
 mod limits;
 mod wire;
 
+pub(crate) use approvals::edit_proposal;
 pub use codec::{CodecOutput, CodexCodec, CodexRuntime, ControlEffect};
 
 #[cfg(test)]

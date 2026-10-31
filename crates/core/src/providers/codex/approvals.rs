@@ -1,7 +1,10 @@
+use std::fmt::Write as _;
+
 use serde_json::{Value, json};
 
 use super::{CodecOutput, CodexCodec, wire::*};
 use crate::agent::*;
+use crate::edits::{EditProposal, FileChange};
 
 #[derive(Debug)]
 pub(super) enum CacheScope {
@@ -229,4 +232,78 @@ fn file_path(tool: &ToolDescriptor) -> Option<String> {
         .get("path")?
         .as_str()
         .map(str::to_owned)
+}
+
+/// The edit a file-change approval proposes, for the preview on the approval card. Codex's
+/// `changes` carry one diff per file: hunks for an update, the whole content for an added or
+/// deleted file. They become one git-style patch; without them the preview is unavailable.
+pub(crate) fn edit_proposal(tool: &ToolDescriptor, cwd: &std::path::Path) -> EditProposal {
+    let Some(changes) = tool.arguments.as_array().filter(|c| !c.is_empty()) else {
+        return EditProposal {
+            path: cwd.to_path_buf(),
+            change: FileChange::Unavailable,
+        };
+    };
+    let mut patch = String::new();
+    let mut first_path = None;
+    for change in changes {
+        let (Some(path), Some(diff)) = (change["path"].as_str(), change["diff"].as_str()) else {
+            return EditProposal {
+                path: cwd.to_path_buf(),
+                change: FileChange::Unavailable,
+            };
+        };
+        first_path.get_or_insert_with(|| std::path::PathBuf::from(path));
+        let quoted = |prefix: &str| {
+            serde_json::to_string(&format!("{prefix}/{}", path.trim_start_matches('/')))
+                .expect("string")
+        };
+        let (old, new) = (quoted("a"), quoted("b"));
+        let _ = writeln!(patch, "diff --git {old} {new}");
+        let whole = |prefix: char, text: &str| {
+            let mut body = String::new();
+            for line in text.split_inclusive('\n') {
+                body.push(prefix);
+                body.push_str(line.strip_suffix('\n').unwrap_or(line));
+                body.push('\n');
+            }
+            if !text.is_empty() && !text.ends_with('\n') {
+                body.push_str("\\ No newline at end of file\n");
+            }
+            (text.lines().count(), body)
+        };
+        match change["kind"]["type"].as_str() {
+            Some("add") => {
+                let (lines, body) = whole('+', diff);
+                let _ = write!(
+                    patch,
+                    "--- /dev/null\n+++ {new}\n@@ -0,0 +1,{lines} @@\n{body}"
+                );
+            }
+            Some("delete") => {
+                let (lines, body) = whole('-', diff);
+                let _ = write!(
+                    patch,
+                    "--- {old}\n+++ /dev/null\n@@ -1,{lines} +0,0 @@\n{body}"
+                );
+            }
+            _ => {
+                // An update may end with "\n\nMoved to: <path>", which is not part of the diff.
+                let hunks = diff
+                    .split_once("\n\nMoved to: ")
+                    .map_or(diff, |(hunks, _)| hunks);
+                if !hunks.starts_with("--- ") && !hunks.starts_with("diff --git ") {
+                    let _ = writeln!(patch, "--- {old}\n+++ {new}");
+                }
+                patch.push_str(hunks);
+                if !hunks.ends_with('\n') {
+                    patch.push('\n');
+                }
+            }
+        }
+    }
+    EditProposal {
+        path: first_path.expect("non-empty changes"),
+        change: FileChange::Patch(patch),
+    }
 }

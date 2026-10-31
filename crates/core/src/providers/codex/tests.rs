@@ -1294,3 +1294,99 @@ fn empty_deltas_do_not_create_blank_reply_rows() {
     );
     assert_eq!(t.items().len(), 1);
 }
+
+fn limits_result() -> Value {
+    json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":10,"resetsAt":1800000000}}})
+}
+
+#[test]
+fn instructions_reach_codex_as_developer_instructions_when_the_thread_opens() {
+    let (mut codec, init) = new();
+    codec.set_instructions(Some("Use jj, not git.".into()));
+    let (mut codec, limits) = through_models(codec, init);
+    let open = respond(&mut codec, &limits, limits_result());
+    assert_eq!(open.messages[0]["method"], "thread/start");
+    assert_eq!(
+        open.messages[0]["params"]["developerInstructions"],
+        "Use jj, not git."
+    );
+    let (mut codec, init) = CodexCodec::new(
+        config(),
+        "/tmp/newjen-codex-scratch".into(),
+        Some("thread".into()),
+    )
+    .unwrap();
+    codec.set_instructions(Some("Use jj, not git.".into()));
+    let (mut codec, limits) = through_models(codec, init);
+    let open = respond(&mut codec, &limits, limits_result());
+    assert_eq!(open.messages[0]["method"], "thread/resume");
+    assert_eq!(
+        open.messages[0]["params"]["developerInstructions"],
+        "Use jj, not git."
+    );
+
+    let (mut codec, init) = new();
+    codec.set_instructions(Some("  ".into()));
+    let (mut codec, limits) = through_models(codec, init);
+    let open = respond(&mut codec, &limits, limits_result());
+    assert!(
+        open.messages[0]["params"]
+            .get("developerInstructions")
+            .is_none()
+    );
+    assert!(
+        !open.messages[0]["params"]
+            .to_string()
+            .contains("--append-system-prompt")
+    );
+}
+
+#[test]
+fn file_change_previews_become_one_patch_or_are_honestly_unavailable() {
+    use crate::edits::{EditPreview, FileChange};
+    let cwd = std::path::Path::new("/work");
+    let tool = |arguments| ToolDescriptor {
+        id: "tool".into(),
+        name: "File change".into(),
+        display_name: "File change".into(),
+        summary: String::new(),
+        arguments,
+    };
+    let proposal = edit_proposal(
+        &tool(json!([
+            {"path":"/work/a.txt","kind":{"type":"update","move_path":null},"diff":"@@ -1 +1 @@\n-a\n+b\n"},
+            {"path":"/work/new.txt","kind":{"type":"add"},"diff":"one\ntwo"},
+            {"path":"/work/old.txt","kind":{"type":"delete"},"diff":"gone\n"},
+            {"path":"/work/m.txt","kind":{"type":"update","move_path":"/work/n.txt"},"diff":"@@ -1 +1 @@\n-m\n+n\n\n\nMoved to: /work/n.txt"}
+        ])),
+        cwd,
+    );
+    assert_eq!(proposal.path, std::path::PathBuf::from("/work/a.txt"));
+    let FileChange::Patch(patch) = &proposal.change else {
+        panic!("patch")
+    };
+    assert_eq!(
+        patch,
+        "diff --git \"a/work/a.txt\" \"b/work/a.txt\"\n--- \"a/work/a.txt\"\n+++ \"b/work/a.txt\"\n@@ -1 +1 @@\n-a\n+b\n\
+         diff --git \"a/work/new.txt\" \"b/work/new.txt\"\n--- /dev/null\n+++ \"b/work/new.txt\"\n@@ -0,0 +1,2 @@\n+one\n+two\n\\ No newline at end of file\n\
+         diff --git \"a/work/old.txt\" \"b/work/old.txt\"\n--- \"a/work/old.txt\"\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n\
+         diff --git \"a/work/m.txt\" \"b/work/m.txt\"\n--- \"a/work/m.txt\"\n+++ \"b/work/m.txt\"\n@@ -1 +1 @@\n-m\n+n\n"
+    );
+    assert!(matches!(proposal.preview(), EditPreview::Patch(_)));
+    for arguments in [Value::Null, json!([]), json!([{"path":"/work/a.txt"}])] {
+        let proposal = edit_proposal(&tool(arguments), cwd);
+        assert!(matches!(proposal.change, FileChange::Unavailable));
+        assert!(matches!(proposal.preview(), EditPreview::Unavailable(_)));
+    }
+}
+
+#[test]
+fn a_denial_note_is_kept_because_codex_decisions_carry_no_text() {
+    let mut c = ready();
+    let mut t = Transcript::new();
+    start(&mut c, &mut t);
+    let key = ask(&mut c, &mut t, json!(1), false, json!({"grantRoot":"/"}));
+    let out = c.answer(key, ApprovalIntent::Deny).unwrap();
+    assert_eq!(out.messages[0]["result"], json!({"decision":"decline"}));
+    assert!(!out.messages[0].to_string().contains("message"));
+}
