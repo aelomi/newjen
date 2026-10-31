@@ -703,6 +703,9 @@ impl Thread {
             _ => {}
         }
 
+        // Read before the held lines go in: one of them can end the turn, and that turn end
+        // must still clear the message a repair would resend.
+        let was_busy = self.status().is_busy();
         // Anything held back above is real now (the repair did not apply), so it goes in
         // first, in the order it happened.
         if let Some(line) = self.recovery.in_use_line.take() {
@@ -712,7 +715,6 @@ impl Thread {
             self.transcript.apply(&SessionEvent::WriteFailed(detail));
         }
 
-        let was_busy = self.status().is_busy();
         self.transcript.apply(&event);
         let turn_ended = was_busy && !self.status().is_busy();
         // claude started a turn by itself (see `Transcript::apply`).
@@ -1044,6 +1046,64 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Found by the TurnStart model: a write failure held back during start-up, flushed by an
+    /// unrelated stderr line, ended the turn without clearing the message, so the "already in
+    /// use" repair resent it after the turn had failed.
+    #[test]
+    fn a_turn_ended_by_a_held_write_failure_is_never_resent() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let project = store.open_project(project_dir.path()).unwrap();
+        let received = project_dir.path().join("stdin.log");
+        let script = project_dir.path().join("claude");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat >> '{}'\n", received.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut config = SessionConfig::new(project_dir.path());
+        config.program = script;
+
+        let mut thread = Thread::new_draft(store, &project, config);
+        thread.send("only once").unwrap();
+        let delivered = || {
+            std::fs::read_to_string(&received)
+                .unwrap_or_default()
+                .matches("only once")
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let event = |thread: &Thread, event| ThreadEvent {
+            generation: thread.generation,
+            event,
+        };
+        let in_use = format!("Error: Session ID {} is already in use.", thread.session_id);
+        for e in [
+            SessionEvent::WriteFailed("Broken pipe".to_string()),
+            SessionEvent::Stderr("warning: slow start".to_string()),
+            SessionEvent::Stderr(in_use),
+            SessionEvent::Exited {
+                code: Some(1),
+                requested: false,
+            },
+        ] {
+            let e = event(&thread, e);
+            thread.apply(e);
+        }
+
+        assert!(!thread.status().is_busy(), "{:?}", thread.status());
+        assert_eq!(thread.recovery.message, None);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(delivered(), 1, "the message reached claude again");
+        thread.end_session();
+    }
 
     #[test]
     fn title_is_the_first_line_collapsed_and_cut() {
