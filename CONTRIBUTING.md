@@ -1,6 +1,6 @@
 # Contributing to Newjen
 
-Newjen is a native macOS agent development environment (ADE). It runs many Claude Code agents in parallel, each in the project or in its own copy of it, from a fast, low-memory GPUI app.
+Newjen is a native macOS agent development environment (ADE). It runs many Claude Code and Codex agents in parallel, each in the project or in its own copy of it, from a fast, low-memory GPUI app.
 
 The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](docs/PLAN.md). Read it before making architectural changes. Research behind the bigger decisions is in [`docs/research/`](docs/research/).
 
@@ -20,11 +20,11 @@ The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](doc
 | Language | Rust, in a Cargo workspace. Toolchain 1.98+. |
 | UI | GPUI via `gpui = { package = "gpui-pre", version = "=0.3.10" }` and `gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }`. |
 | Components | **GPUI Kit** (Longbridge): `gpui-kit = "=0.8.1"`, a plain crates.io dependency built on the same GPUI. Use Kit's own components with Kit's default theme, sizes and fonts. **Do not fork or vendor it.** Newjen hand-builds only the approval card, tool card and working-dot pulse, from Kit pieces; `crates/app/src/ui/` also holds thin behavior helpers. If a Kit bug blocks work, use a temporary `[patch.crates-io]` entry and report it upstream. |
-| Agents | Claude Code CLI over stream-json now; Codex CLI (`codex app-server`) after the MVP slices. Newjen detects which CLIs are installed and uses one provider per thread. API-key providers and ACP agents come later. |
+| Agents | Claude Code CLI over stream-json and Codex CLI (`codex app-server`), both in the MVP (decided 2026-10-31). Newjen detects which CLIs are installed without spending usage, and each thread picks one provider, model, effort and speed when it is created. `core` has one neutral event and approval model (`agent.rs`) with a Claude adapter and a Codex adapter under `providers/`. API-key providers and ACP agents come later. |
 | Isolation | **Rift** copy-on-write copies, **opt-in per thread**: by default a thread works in the project folder, and you choose a Rift copy when you want one. When chosen, it must be seamless. No git worktrees for now. |
 | Version control | **jj (Jujutsu)**, colocated with git. |
 | Hosting | **GitCafe** (`git.cafe`, CLI `cafe`). **Never use GitHub or the `gh` CLI for this repo.** |
-| Storage | SQLite for app state. Claude keeps its own transcripts; resume with `--resume <session-id>`. |
+| Storage | SQLite for app state, migrations by `user_version` in one append-only list (`store.rs`). The CLIs keep their own transcripts; Claude resumes with `--resume <session-id>`, Codex with `thread/resume`. |
 | CI | GitCafe Actions, workflow in `.github/workflows/ci.yml` (GitCafe reads GitHub Actions syntax from that folder). Runs on a self-hosted macOS runner. |
 
 
@@ -32,15 +32,21 @@ The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](doc
 
 ```
 crates/
-  core/   # package `newjen-core`. No UI: Claude sessions, protocol, transcript state, SQLite store. Tested headlessly.
+  core/   # package `newjen-core`. No UI. Tested headlessly.
+          #   agent.rs: the provider-neutral events, approvals and agent config the app sees.
+          #   providers/: detection (`detect.rs`), the Claude adapter (stream-json) and the Codex adapter (app-server JSON-RPC).
+          #   session.rs, thread.rs, transcript.rs: one process per thread, its lifecycle and the rendered transcript.
+          #   rift.rs: Rift copies. landing.rs, edits.rs: jj snapshots, review, landing and edit previews.
+          #   store.rs: SQLite. instance.rs: the single-instance lock. env.rs: the login shell's PATH.
   app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
+          #   src/project_view.rs: the window, its loaded projects, the Dock badge, notifications and the quit gate.
+          #   src/chat_view.rs (+ chat_view/): one project's threads, composer, approval dock, picker, review pane, inbox.
+          #   src/terminal.rs: the per-thread terminal panel. src/attention.rs: AppKit badge and notification adapters.
           #   src/theme.rs: the sidebar width. src/ui/: approval card, tool card, pulse and thin Kit helpers.
           #   src/assets.rs: extra Kit icons. THIRD-PARTY-NOTICES.md: embedded Lucide icon licenses.
 design/   # newjen.pen: pen.dev mocks of every UI state. Mock UI changes here first.
-docs/     # PLAN.md and research memos.
+docs/     # PLAN.md, landing.md (how review and landing work) and research memos.
 ```
-
-`core/src/rift.rs` makes and removes Rift copies with jj. Later slices add jj snapshots and landing to `core`, and maybe a `cli/` crate that drives `core` from the terminal.
 
 ## Build order
 
@@ -49,8 +55,9 @@ Build one vertical slice first, and don't start wrappers for later steps before 
 1. `cargo run` opens a window. You type a prompt, Claude replies over stream-json, and the reply renders in the chat. Approve and deny work. One thread; no Rift, no jj. **Done (2026-10-27).**
 2. Thread list, SQLite persistence, resume. **Done (2026-10-31).**
 3. Rift copies, chosen per thread (the default stays the project folder). **Done (2026-10-31).**
-4. jj snapshots, diff view (GPUI Kit `diff`), and both landing modes (see the plan).
-5. Parallel threads, Dock badge notifications, and a terminal panel (GPUI Kit has none; build it on a terminal crate such as `alacritty_terminal`).
+4. jj snapshots, diff view (GPUI Kit `diff`), and both landing modes (see the plan and [`docs/landing.md`](docs/landing.md)). **Done (2026-10-31).**
+5. Parallel threads, an approvals inbox, Dock badge and notifications, a terminal panel (on `alacritty_terminal`), and a quit prompt. **Done (2026-10-31).**
+6. Providers: Claude and Codex side by side, with a model, effort and speed picker and usage-limit pauses. **Done (2026-10-31)**, part of the MVP.
 
 ## Verified facts (tested on macOS)
 
@@ -92,7 +99,8 @@ Checked against claude 2.1.310. `crates/core/tests/fixtures/` holds sanitized re
 - **Hooks:** `.rift.toml` holds `version = 1` and `[[hooks.postcreate]]` tables with `run = "…"`. Hooks print to stderr, which Newjen shows while the copy is made, and see `RIFT_ID`, `RIFT_SOURCE`, `RIFT_DESTINATION` and `RIFT_PARENT_ID`. A failed `postcreate` leaves the copy registered, so Newjen removes it. Anything a `postcreate` hook leaves running in the background is stopped when `rift create` ends.
 - **`rift` on `PATH` is a Node script.** Newjen runs the native binary beside it (`prebuilds/darwin-<arch>/rift`), so apps started from Finder work without Node.
 - **Copy ownership:** the unique name proves ownership of the exact destination. Save the Rift id before `jj new` in the copy. Before sending the held message, acknowledge a sent pending row; recovery keeps sent copies even if the thread checkpoint failed. Recovery validates the project copy parent and the thread name.
-- **Copy jobs stop on quit:** `rift create` and its hooks run in their own process group, registered for crash recovery. Quit sends SIGTERM, then SIGKILL; a running jj finishes.
+- **Copy jobs stop on quit and on Cancel:** `rift create` and its hooks run in their own process group, registered for crash recovery. Quit, or ⌘. while the copy is made, sends SIGTERM, then SIGKILL; a running jj finishes. A cancelled copy is removed and the held message comes back to the composer.
+- **Hooks get the login shell's PATH.** An app started from Finder has a minimal `PATH`; `Tools::with_env` passes `env::resolved_path()` to Rift and its hooks.
 - **Remove copies by path:** `rift remove <copy-path>` (not the name) moves the copy to `.trash` next to it. Newjen then deletes that one trash entry. A different Rift id at the destination is preserved; our own trash entry is still removed. A missing `.rift` marker means an owned half-made or cleaned copy, removed directly after checking its parent and refusing symlinks. Never run `rift gc` from Newjen: it empties every Rift trash on the Mac.
 - **UI reads of jj must pass `--ignore-working-copy`.** Without it, each read snapshots an agent's half-written files.
 - **jj does not run git hooks.** Run any checks they would have done from the harness.
@@ -107,6 +115,7 @@ Users run Newjen on their own Claude and ChatGPT subscriptions. **Never do anyth
 - **Don't disguise or relabel the CLI.** `claude -p` already reports itself to Anthropic as a non-interactive (`sdk-cli`) session, so don't change that. Like T3 Code, Newjen doesn't set `CLAUDE_AGENT_SDK_CLIENT_APP` and strips any inherited value. Codex requires `clientInfo`; send the name `newjen`.
 - **Respect usage limits.** Every turn starts from a user action. Never auto-retry, auto-resume at a limit reset, or auto-continue a turn. Stop on a rejected rate limit and show when it resets.
 - **Say which account pays.** Show the account and plan from the CLI's own report (`claude auth status --json`, Codex `account/read`), and warn when `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` will bill the API instead.
+- **Codex runs with `approvalPolicy: untrusted` and a read-only sandbox**, so every write and every non-trivial command asks, as Claude's `--permission-mode default` does. Newjen's own instructions to a thread go through each CLI's official seam: `--append-system-prompt` for Claude, `developerInstructions` on `thread/start` for Codex.
 - **No "Claude Code" in Newjen's name or UI labels.** Prose such as the README may say it "runs Claude Code".
 
 ## GPUI and GPUI Kit: don't guess APIs
@@ -130,9 +139,9 @@ Mock a change in `design/newjen.pen` with [pen.dev](https://pen.dev) first, incl
 ## Commands
 
 ```sh
-cargo run -p app [-- <project dir>]   # launch the app (once crates/app exists)
-cargo test --workspace                # all tests; no network or Claude login needed (Rift tests skip without rift and jj)
-cargo test -p newjen-core -- --ignored   # live test against the real claude CLI (uses your login)
+cargo run -p app [-- <project dir>]   # launch the app; without a folder it shows the project chooser
+cargo test --workspace --locked       # all tests; no network or login needed (Rift tests skip without rift and jj)
+cargo test -p newjen-core -- --ignored   # live tests against the real claude and codex CLIs (use your logins)
 cargo build --release                 # optimized build
 ```
 

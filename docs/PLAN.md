@@ -1,6 +1,6 @@
 # Newjen: plan (2026-10-26)
 
-Newjen is a macOS-only agent development environment: run many isolated Claude Code agents in parallel from a fast native app.
+Newjen is a macOS-only agent development environment: run many isolated Claude Code and Codex agents in parallel from a fast native app.
 
 - **Location:** `~/Newjen`, with remote `https://git.cafe/ericrasputin/newjen` (GitCafe, public, default branch `master`).
 - **Audience:** personal for now, with plans to open it to contributors later. Keep the repo contributor-ready: pick an open-source license early, keep a clear README and CONTRIBUTING.md, and avoid personal paths or secrets in code. Code signing and auto-updates come later.
@@ -18,7 +18,7 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 | Language | Rust (Cargo workspace) | Toolchain 1.98.1 installed |
 | UI framework | GPUI: `gpui-pre =0.3.10`, `gpui-pre-platform =0.3.10` (`font-kit`) | The version GPUI Kit pins |
 | Components | GPUI Kit (Longbridge): `gpui-kit =0.8.1` | Plain pinned dependency, Apache-2.0. Kit components with Kit's default theme, sizes and fonts: title bar, list items, Sheet, Popover, messages/scroller, markdown, input, buttons, tags and menus; diff in slice 4. Newjen hand-builds only the approval card, tool card and working-dot pulse, with thin behavior helpers. |
-| Agent | Claude Code CLI (`claude`) over stream-json; Codex CLI (`codex app-server`) next | Newjen detects which CLIs are installed; one provider per thread. API-key providers and ACP later |
+| Agent | Claude Code CLI (`claude`) over stream-json and Codex CLI (`codex app-server`), both in the MVP (decided 2026-10-31) | Newjen detects which CLIs are installed without spending usage; each thread picks its provider, model, effort and speed. API-key providers and ACP later |
 | Isolation | Rift (`rift-snapshot`), an APFS copy-on-write copy, opt-in per thread | Installed. By default a thread works in the project folder; no git worktrees for now |
 | Version control | jj 0.46.0, colocated with git | Installed |
 | Code hosting | GitCafe (git.cafe), a normal git remote; `jj git push` | `cafe` 0.11.0 installed via Bun 1.4.4. Still needed: run `cafe auth login`. Private repos are free during the beta |
@@ -57,9 +57,9 @@ crates/
   cli/       # (optional) small CLI that drives core, used for testing and debugging
 ```
 
-- **Core owns state.** It runs one actor per thread, which owns the `claude` child process and emits typed events: text, tool use, approval needed, result, error.
+- **Core owns state.** It runs one actor per thread, which owns the agent's child process (`claude` or `codex app-server`) and emits one set of provider-neutral events (`agent.rs`): text, tool use, approval needed, result, error, usage limits. Each provider has an adapter under `providers/` that translates its wire protocol into those events and back.
 - **The app subscribes to those events** and renders them with Kit's own components and default theme (`cx.theme()`). Newjen owns only the approval card, tool card, working-dot pulse and thin key/focus helpers (`crates/app/src/ui/`). Replies keep lazily built `TextViewState` entities; Kit draws markdown and highlighted code blocks, and `MessageScroller` follows the tail. No bundled fonts or separate palette. `diff` comes in slice 4.
-- **Thread model:** project → threads. Each thread has its own working folder (the project folder by default, or its own Rift copy when you choose one), one Claude process and one landing mode. A thread always runs from the same folder, because Claude ties `--resume` to the folder a conversation started in.
+- **Thread model:** projects → threads, several projects open in one window. Each thread has its own working folder (the project folder by default, or its own Rift copy when you choose one), one provider with its model, effort and speed, one agent process, one landing mode, and optionally one terminal. A thread always runs from the same folder, because Claude ties `--resume` to the folder a conversation started in.
 
 ## Thread lifecycle
 
@@ -96,7 +96,10 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 - **The "already in use" repair is timing-bound.** It needs claude's stderr line to arrive within the 500 ms drain after claude exits; a later line shows as a plain "Claude exited" error instead.
 - **⌘{ and ⌘} assume a US layout.** On layouts that type braces another way, previous/next thread may not fire.
 - **Reduce Motion is polled every second.** Listening for NSWorkspace's accessibility display options notification would apply it at once.
-- **One Newjen instance per data folder.** Startup takes an OS lock on the folder itself before opening the store or reaping processes. A second launch shows an alert and leaves the running instance alone. The lock releases on exit or crash; separate `NEWJEN_HOME` folders can run in parallel.
+- **One Newjen instance per data folder.** Startup takes an OS lock on the folder itself before opening the store or reaping processes. A second launch shows an alert and leaves the running instance alone (it does not hand its project over yet). The lock releases on exit or crash; separate `NEWJEN_HOME` folders can run in parallel.
+- **Desktop notifications need an app bundle.** `cargo run` has no bundle id, so only the Dock badge works; the inbox says so. Authorization also failed on the development Mac even from a temporary bundle, so banners are unverified.
+- **A Codex denial carries no note.** The typed note stays in the composer to send as a message.
+- **The terminal stops its shell with SIGKILL** on close, archive and quit; a bounded graceful stop is a follow-up. Detached daemons that ignore the PTY hangup can outlive a crash.
 
 ## Build order (one vertical slice first)
 
@@ -110,14 +113,21 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
    - **List:** new threads on top, a status per thread (needs approval, working, failed, stopped, unread), titles from the first message (no hidden model calls). ⌘N opens a draft that is saved only once its first message is sent, so empty threads never pile up. The sidebar hides below 760 px of window width (⌘B toggles it) and shows a dot when a hidden thread needs you. Mocks: `design/newjen.pen` screens 8–12.
    - **Deferred:** deny with a note. The approval dock replaces the composer, so it needs its own text field; it moves to slice 4 with the diff view.
 3. **Done 2026-10-31.** Rift copies, chosen per thread when you create it, with postcreate hooks. The default stays the project folder. Landing (slice 4) must handle both kinds of thread. Every other ADE checked isolates with git worktrees; none uses copy-on-write copies. Their most common complaint is cleanup that deleted work ([memo](research/isolation.md)).
-4. jj snapshots, diff view (GPUI Kit `diff`), and both landing modes.
-5. Parallel threads, notifications (Dock badge), and a terminal panel (on a terminal crate such as `alacritty_terminal`; GPUI Kit has none).
+4. **Done 2026-10-31.** jj snapshots, diff view (GPUI Kit `diff`), and both landing modes ([how it works](landing.md)). Each thread chooses **Harness manages jj** (Newjen snapshots after every turn and the agent is told not to commit) or **Agent manages jj** (Newjen never writes version control there), with a project default. Review shows the diff since the thread's base; **Rebase and land**, **Merge and land**, **Discard work** and **Keep files and close** resolve it. Landing runs the checks declared in `.newjen/checks.json`, since jj runs no git hooks. Edit approvals show the before-and-after diff and recheck the file before allowing; a denial can carry a note (Claude receives it as the deny message; Codex's decision carries no text, so the note stays in the composer). Only colocated jj repositories can land; [what Git-only projects and plain folders need](research/git-only-landing.md) and [the per-project source-control modes](research/project-source-control.md) are decided on paper, not built.
+5. **Done 2026-10-31.** One approvals inbox across every loaded project (Allow once and Deny; grants stay in the thread's dock), a Dock badge counting threads waiting on you, notifications only when Newjen is in the background, a per-thread terminal panel on `alacritty_terminal` and `portable-pty`, and one quit prompt for ⌘Q, ⌘W and the native quit that counts running turns, approvals, background tasks, Rift preparation, snapshots and terminals ([memo](research/slice5-lifecycle.md)).
+6. **Done 2026-10-31, in the MVP** (decided 2026-10-31; the plan had put it after the MVP). Providers: Newjen detects the installed agent CLIs without spending usage ([memo](research/provider-detection.md)), drives Claude over stream-json and Codex over `codex app-server` ([memo](research/codex-codec.md)) through one neutral event and approval model, and each new thread picks its agent, model, effort and speed in the composer; the last choice becomes the project's default. It shows the account and plan, warns about API keys in the environment, and pauses sending when a usage limit is rejected until the reset time (Codex can confirm an early reset with Refresh; Claude cannot report its limits without spending usage). Codex approvals keep the exact-scope rule. Nothing retries or resumes on its own.
 
-**After the MVP slices: providers.** Newjen detects the installed agent CLIs (`claude`, `codex`) and drives whichever one a thread uses. Detection must not spend usage, the core gets one event model with a Claude adapter and a Codex adapter, and Codex approvals keep the exact-scope rule. This step also shows the account and plan, warns about API keys in the environment, and respects usage limits. Decided 2026-10-30 ([memo](research/providers-and-subscriptions.md)); it runs in its own session once the MVP slices are done.
+**Also done 2026-10-31:** opening and switching projects in one window, with recent projects and a welcome screen ([memo](research/opening-projects.md)); one Newjen per data folder; cancelling a Rift copy while it is made; a broken connection to the agent ends its session at once so the next message starts a fresh one.
+
+**Planned next:**
+
+- **Disk use per thread.** Show each thread's real disk cost (the space its Rift copy uses that isn't shared with the project, mostly build output), warn before making a Rift copy when disk is low, and offer "free this thread's build output" when a thread finishes. Making a copy costs about nothing; copies grow because agents change code and rebuild, and every rebuilt artifact takes new, unshared blocks (seven copies of this repo grew 2.5 to 5.9 GB each in one session). Worktree-based ADEs leave users to find this out on their own.
+- **Landing for Git-only projects and plain folders**, per the memos above.
+- **Switching a thread's provider with a context handoff**, as T3 Code does.
 
 ## Subscription safety
 
-Users run Newjen on their own Claude and ChatGPT subscriptions, so it must never put their accounts at risk. Newjen spawns only the user's own installed, unmodified CLIs; it never reads or stores credentials, never calls model APIs itself, never offers its own login and never retries around usage limits. It never disguises the CLI. Like T3 Code, it adds no Claude app label; Codex gets the `clientInfo` it requires. Switching a thread's provider with a context handoff, as T3 Code does, is planned for after the MVP. The rules and their sources are in [the memo](research/providers-and-subscriptions.md#2-subscription-safety) and in `CONTRIBUTING.md`.
+Users run Newjen on their own Claude and ChatGPT subscriptions, so it must never put their accounts at risk. Newjen spawns only the user's own installed, unmodified CLIs; it never reads or stores credentials, never calls model APIs itself, never offers its own login and never retries around usage limits: a rejected limit pauses sending until the reset the CLI reported. It never disguises the CLI. Like T3 Code, it adds no Claude app label; Codex gets the `clientInfo` it requires. Switching a thread's provider with a context handoff, as T3 Code does, is planned for after the MVP. The rules and their sources are in [the memo](research/providers-and-subscriptions.md#2-subscription-safety) and in `CONTRIBUTING.md`.
 
 ## Appearance
 
@@ -130,5 +140,5 @@ Kit's default light and dark themes follow the system appearance. Components kee
 
 ## Open questions
 
-- None blocking. Slices 1, 2 and 3 are built (2026-10-27, 2026-10-31, 2026-10-31). Ely was replaced with GPUI Kit on 2026-10-31. Next: slice 4, jj snapshots, diff view and landing.
-- **Rift gaps found in slice 3:** a copy folder deleted by hand, or removed directly after its `.rift` marker was lost (including `git clean -fdx`), stays in Rift's registry until the user runs `rift gc`. Newjen deletes its own trash entry instead of running `rift gc`. Rift keeps that trash row until the user runs `rift gc`. Hooks run with the app's `PATH`, which is minimal when Newjen is started from Finder.
+- None blocking. All five MVP slices and providers are built (2026-10-27 to 2026-10-31). Ely was replaced with GPUI Kit on 2026-10-31. Next: the planned items above.
+- **Rift gaps found in slice 3:** a copy folder deleted by hand, or removed directly after its `.rift` marker was lost (including `git clean -fdx`), stays in Rift's registry until the user runs `rift gc`. Newjen deletes its own trash entry instead of running `rift gc`. Rift keeps that trash row until the user runs `rift gc`.
