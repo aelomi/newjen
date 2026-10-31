@@ -120,3 +120,40 @@ fn snapshot(bucket: &str, value: &Value) -> LimitSnapshot {
             .into(),
     }
 }
+
+pub fn account_limit(report: &RateLimits) -> RateLimitEvent {
+    let mut windows = Vec::new();
+    let mut rejected = false;
+    let mut credits_paying = false;
+    for limit in std::iter::once(&report.rate_limits)
+        .chain(report.by_limit_id.iter().flat_map(|m| m.values()))
+    {
+        let value = serde_json::to_value(limit).expect("rate limit serialization");
+        windows.extend(snapshot(limit.limit_id.as_deref().unwrap_or("account"), &value).windows);
+        let reached = report.ordinary_usage_allowed == Some(false)
+            || limit.reached_type.as_ref().is_some_and(|s| !s.is_empty());
+        let credits = limit
+            .credits
+            .as_ref()
+            .is_some_and(|c| c.has_credits || c.unlimited);
+        rejected |= limit.spend_control_reached == Some(true) || (reached && !credits);
+        credits_paying |= reached && credits;
+    }
+    let snapshot = LimitSnapshot {
+        bucket: "account".into(),
+        windows,
+        explanation: if credits_paying {
+            "Plan limit reached. Credits on this account pay for turns."
+        } else {
+            "Account usage reported by the CLI."
+        }
+        .into(),
+    };
+    if rejected {
+        RateLimitEvent::Rejected(snapshot)
+    } else if credits_paying {
+        RateLimitEvent::Warning(snapshot)
+    } else {
+        RateLimitEvent::Updated(snapshot)
+    }
+}

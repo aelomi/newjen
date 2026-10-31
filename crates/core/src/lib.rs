@@ -38,3 +38,5 @@ pub use transcript::{Item, Status, ToolState, Transcript};
 pub use providers::claude::presentation::tool_disposition;
 
 pub use agent::{AgentConfig, AgentPresentation, ConversationState, EffortSelection, Speed};
+
+pub mod picker;

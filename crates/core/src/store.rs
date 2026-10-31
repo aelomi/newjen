@@ -121,6 +121,14 @@ const MIGRATIONS: &[&str] = &[
      UPDATE threads SET conversation_id = session_id,
          conversation_state = CASE WHEN session_started THEN 'established' ELSE 'reserved' END
          WHERE provider = 'claude';",
+    "CREATE TABLE project_agent_choices (
+         project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+         config TEXT NOT NULL
+     );
+     CREATE TABLE thread_limits (
+         thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+         report TEXT NOT NULL
+     );",
 ];
 
 /// The current time as Unix milliseconds, the unit every time in the store uses.
@@ -280,6 +288,14 @@ type UnsavedByThread = Arc<Mutex<HashMap<String, Unsaved>>>;
 
 /// One operation for the writer thread.
 enum Write {
+    RememberAgent {
+        project_id: i64,
+        config: String,
+    },
+    Limit {
+        thread_id: String,
+        report: String,
+    },
     SavePending {
         pending: PendingCopy,
         done: mpsc::Sender<Result<(), String>>,
@@ -360,6 +376,41 @@ struct Inner {
 }
 
 impl Store {
+    pub fn last_agent_choice(&self, project_id: i64) -> Result<Option<crate::AgentConfig>> {
+        let json: Option<String> = self
+            .reader()
+            .query_row(
+                "SELECT config FROM project_agent_choices WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(json.and_then(|json| serde_json::from_str(&json).ok()))
+    }
+    pub fn remember_agent_choice(&self, project_id: i64, config: &crate::AgentConfig) {
+        self.queue(Write::RememberAgent {
+            project_id,
+            config: serde_json::to_string(config).expect("agent config serialization"),
+        });
+    }
+    pub fn thread_limit(&self, id: &str) -> Result<Option<crate::agent::RateLimitEvent>> {
+        let json: Option<String> = self
+            .reader()
+            .query_row(
+                "SELECT report FROM thread_limits WHERE thread_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(json.and_then(|json| serde_json::from_str(&json).ok()))
+    }
+    pub fn save_thread_limit(&self, id: &str, report: &crate::agent::RateLimitEvent) {
+        self.queue(Write::Limit {
+            thread_id: id.into(),
+            report: serde_json::to_string(report).expect("limit serialization"),
+        });
+    }
+
     /// Opens (or creates) the database in [`default_dir`].
     pub fn open() -> Result<Store> {
         Store::open_in(&default_dir()?)
@@ -884,7 +935,9 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         ),
         // Not redone: the copy is removed again at the next launch, which finds nothing to do
         // and records it then.
-        Write::UpsertProject { .. }
+        Write::RememberAgent { .. }
+        | Write::Limit { .. }
+        | Write::UpsertProject { .. }
         | Write::Archive { .. }
         | Write::CopyRemoved { .. }
         | Write::SavePending { .. }
@@ -899,6 +952,13 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
 
 fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> {
     match write {
+        Write::RememberAgent { project_id, config } => {
+            connection.execute("INSERT INTO project_agent_choices (project_id, config) VALUES (?1, ?2) ON CONFLICT(project_id) DO UPDATE SET config=excluded.config", params![project_id, config])?;
+        }
+        Write::Limit { thread_id, report } => {
+            connection.execute("INSERT INTO thread_limits (thread_id, report) VALUES (?1, ?2) ON CONFLICT(thread_id) DO UPDATE SET report=excluded.report", params![thread_id, report])?;
+        }
+
         Write::SavePending { pending, done } => {
             let message = match pending.intent {
                 PendingIntent::Restore(message) => Some(message),
@@ -1209,7 +1269,7 @@ mod tests {
         migrate(&mut connection, &MIGRATIONS[..2]).unwrap();
         connection.execute_batch("INSERT INTO copies VALUES ('established', '/tmp/copy', '/tmp/copy', '/tmp/project', 'rift-id', 'base', 1, NULL);").unwrap();
         migrate(&mut connection, MIGRATIONS).unwrap();
-        assert_eq!(user_version(&connection), 3);
+        assert_eq!(user_version(&connection), 4);
         let mut query = connection.prepare(THREAD_COLUMNS).unwrap();
         let rows: Vec<_> = query
             .query_map([], thread_row)

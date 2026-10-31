@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::env::{self, Cli};
 use crate::probe::{self, Probe};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Provider {
     Claude,
     Codex,
@@ -62,7 +62,7 @@ impl Provider {
     fn install_hint(self) -> String {
         match self {
             Self::Claude => "Install the Claude CLI: https://code.claude.com/docs/en/setup",
-            Self::Codex => "Install the Codex CLI: https://developers.openai.com/codex/cli/. The ChatGPT/Codex desktop app does not put `codex` on PATH.",
+            Self::Codex => "Install the Codex CLI: https://developers.openai.com/codex/cli/. Newjen never uses the copy bundled in the ChatGPT desktop app.",
         }.into()
     }
     fn login_hint(self) -> String {
@@ -138,7 +138,7 @@ pub enum Warning {
     RateLimitsUnavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModelSelection {
     /// Omit model/effort/speed overrides and let the CLI choose.
     CliDefault,
@@ -162,6 +162,7 @@ pub struct ModelCatalog {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelOption {
+    pub description: Option<String>,
     pub id: String,
     pub label: String,
     pub efforts: Vec<String>,
@@ -195,7 +196,7 @@ pub struct RateLimits {
     pub upsell: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
 pub struct RateLimitSnapshot {
     #[serde(rename = "limitId")]
     pub limit_id: Option<String>,
@@ -216,7 +217,7 @@ pub struct RateLimitSnapshot {
     pub reached_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct RateLimitWindow {
     #[serde(rename = "usedPercent")]
     pub used_percent: i32,
@@ -226,7 +227,7 @@ pub struct RateLimitWindow {
     pub resets_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct Credits {
     #[serde(rename = "hasCredits")]
     pub has_credits: bool,
@@ -234,7 +235,7 @@ pub struct Credits {
     pub balance: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct SpendLimit {
     pub limit: String,
     pub used: String,
@@ -524,11 +525,18 @@ fn claude_catalog() -> ModelCatalog {
         .map(|(id, label)| ModelOption {
             id: id.into(),
             label: label.into(),
+            description: None,
             efforts: ["low", "medium", "high", "xhigh", "max"]
                 .map(str::to_owned)
                 .into(),
             default_effort: None,
-            fast: Some(ServiceTier { id: "fast".into(), label: "Fast (CLI checks availability)".into(), description: "May bill extra usage. Model and account eligibility are checked by the Claude CLI.".into() }),
+            fast: Some(ServiceTier {
+                id: "fast".into(),
+                label: "Fast (CLI checks availability)".into(),
+                description:
+                    "May bill extra usage. The Claude CLI checks whether your account can use it."
+                        .into(),
+            }),
             service_tiers: Vec::new(),
             default_service_tier: None,
         })
@@ -598,6 +606,8 @@ pub(crate) struct ModelPage {
 #[derive(Deserialize)]
 pub(crate) struct CodexModel {
     model: String,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(rename = "displayName")]
     display_name: String,
     pub(crate) hidden: bool,
@@ -627,6 +637,7 @@ impl From<CodexModel> for ModelOption {
         Self {
             id: model.model,
             label: model.display_name,
+            description: model.description,
             efforts: model
                 .efforts
                 .into_iter()
@@ -683,3 +694,35 @@ impl Rpc {
 
 #[cfg(test)]
 mod tests;
+
+impl Provider {
+    pub fn presentation(self) -> crate::agent::AgentPresentation {
+        crate::session::saved_presentation(self.id())
+    }
+    pub fn account_fallback(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude subscription",
+            Self::Codex => "ChatGPT account",
+        }
+    }
+}
+impl ProviderStatus {
+    pub fn limit_event(&self) -> Option<crate::agent::RateLimitEvent> {
+        let Availability::Ready {
+            rate_limits: Some(report),
+            ..
+        } = &self.availability
+        else {
+            return None;
+        };
+        Some(super::codex::account_limit(report))
+    }
+    pub fn clears_limit(&self) -> bool {
+        self.provider == Provider::Codex
+            && matches!(&self.availability, Availability::Ready { rate_limits: Some(report), .. } if report.ordinary_usage_allowed == Some(true))
+            && matches!(
+                self.limit_event(),
+                Some(crate::agent::RateLimitEvent::Updated(_))
+            )
+    }
+}

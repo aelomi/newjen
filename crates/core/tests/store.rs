@@ -245,7 +245,7 @@ fn reopening_keeps_everything_at_the_same_schema_version() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let journal: String = connection
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();

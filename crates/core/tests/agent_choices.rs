@@ -20,6 +20,7 @@ fn detected(provider: Provider) -> ProviderStatus {
                 models: vec![ModelOption {
                     id: "chosen".into(),
                     label: "Chosen".into(),
+                    description: None,
                     efforts: vec!["low".into()],
                     default_effort: None,
                     service_tiers: vec![],
@@ -160,4 +161,32 @@ fn saved_choices_survive_relaunch_and_unknown_providers_stay_unavailable() {
     assert!(unknown.send("must not launch Claude").is_err());
     assert!(!unknown.has_session());
     assert!(!unknown.transcript().items().is_empty());
+}
+
+#[test]
+fn remembered_project_choice_survives_reopen_and_ignores_invalid_boundary_data() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).unwrap();
+    let project = store.open_project(home.path()).unwrap();
+    assert_eq!(store.last_agent_choice(project.id).unwrap(), None);
+    let mut config = AgentConfig::cli_default(Provider::Codex);
+    config.model = ModelSelection::Model {
+        id: "chosen".into(),
+    };
+    config.effort = EffortSelection::Chosen("low".into());
+    store.remember_agent_choice(project.id, &config);
+    assert!(store.flush(std::time::Duration::from_secs(5)));
+    let reopened = Store::open_in(home.path()).unwrap();
+    assert_eq!(
+        reopened.last_agent_choice(project.id).unwrap(),
+        Some(config)
+    );
+    rusqlite::Connection::open(store.path())
+        .unwrap()
+        .execute(
+            "UPDATE project_agent_choices SET config = 'unknown future format'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(reopened.last_agent_choice(project.id).unwrap(), None);
 }

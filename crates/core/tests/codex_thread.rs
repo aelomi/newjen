@@ -360,6 +360,15 @@ fn rejected_limit_stops_without_opening_or_starting_a_turn_and_keeps_the_reset()
         thread.transcript().items()
     );
     assert!(!thread.has_session());
+    assert_eq!(thread.paused_until(1_700_000_000), Some(1_800_000_000));
+    assert!(
+        thread
+            .send("Bypass the UI")
+            .unwrap_err()
+            .to_string()
+            .contains("paused")
+    );
+
     std::thread::sleep(Duration::from_millis(200));
     let events = thread.events();
     while let Ok(event) = events.try_recv() {
@@ -374,6 +383,7 @@ fn rejected_limit_stops_without_opening_or_starting_a_turn_and_keeps_the_reset()
     lab.flush();
     let row = lab.store.thread(thread.id()).unwrap().unwrap();
     let loaded = Thread::load(lab.store.clone(), &lab.project, row, lab.config.clone()).unwrap();
+    assert_eq!(loaded.paused_until(1_700_000_000), Some(1_800_000_000));
     assert!(
         loaded.transcript().items().iter().any(
             |item| matches!(item, Item::Error { detail, .. } if detail.contains("1800000000"))

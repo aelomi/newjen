@@ -114,6 +114,7 @@ pub struct Thread {
     session_started: bool,
     transcript: Transcript,
     controller: crate::session::Controller,
+    limit: Option<crate::agent::RateLimitEvent>,
     /// The running `claude`, if any. Started on the first message that needs it.
     session: Option<Session>,
     /// The running `claude` has sent `system/init`, so it got past the start-up checks where
@@ -355,6 +356,7 @@ impl Thread {
             session_id: crate::session::reserved_id(base_config.agent.provider),
             session_started: false,
             transcript,
+            limit: None,
             controller: crate::session::Controller::new(base_config.agent.provider),
             session: None,
             stopping: Vec::new(),
@@ -473,6 +475,7 @@ impl Thread {
 
         let mut thread = Thread::new_draft(store, project, base_config);
         thread.base_config.restore_saved(&row);
+        thread.limit = thread.store.thread_limit(&row.id)?;
         thread.id = row.id;
         thread.cwd = row.workdir;
         thread.place = row.copy.map_or(Place::ProjectFolder, Place::Copy);
@@ -599,6 +602,31 @@ impl Thread {
     // What the app reads
     // -----------------------------------------------------------------------------------------
 
+    fn remember_agent(&self) {
+        if let Some(config) = self.agent_config() {
+            self.store.remember_agent_choice(self.project_id, config);
+        }
+    }
+    pub fn limit_event(&self) -> Option<&crate::agent::RateLimitEvent> {
+        self.limit.as_ref()
+    }
+    pub fn paused_until(&self, now: i64) -> Option<i64> {
+        crate::picker::paused_until(self.limit.as_ref(), now)
+    }
+    pub fn refresh_limits(&mut self, status: &crate::providers::ProviderStatus) {
+        if self
+            .agent_config()
+            .is_some_and(|a| a.provider == status.provider)
+            && status.clears_limit()
+        {
+            self.limit = status.limit_event();
+            if self.is_saved()
+                && let Some(report) = &self.limit
+            {
+                self.store.save_thread_limit(&self.id, report);
+            }
+        }
+    }
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -802,6 +830,13 @@ impl Thread {
     /// On an error nothing was sent, so the app can keep the text in the composer and show why
     /// (for example claude could not be started).
     pub fn send(&mut self, text: &str) -> Result<Sent> {
+        if let Some(reset) = self.paused_until(crate::store::now_ms() / 1000) {
+            bail!(
+                "{} usage limit reached; sending is paused until Unix time {reset}. Newjen won't retry or resume on its own",
+                self.presentation().label
+            );
+        }
+
         if text.trim().is_empty() {
             bail!("there is nothing to send");
         }
@@ -838,6 +873,7 @@ impl Thread {
                 main_repo: MainRepoStep::Snapshotting,
             });
             self.last_activity = Instant::now();
+            self.remember_agent();
             return Ok(Sent::MakingCopy(CopyJob {
                 project_dir: self.project_dir.clone(),
                 name,
@@ -934,6 +970,7 @@ impl Thread {
             return Err(error);
         }
         if self.is_draft() {
+            self.remember_agent();
             self.stage = Stage::Saved;
             self.title = title_from_message(text);
         }
@@ -1229,6 +1266,11 @@ impl Thread {
                 crate::agent::AgentEvent::RateLimit(crate::agent::RateLimitEvent::Rejected(_))
             )
         });
+        for event in &batch.events {
+            if let crate::agent::AgentEvent::RateLimit(report) = event {
+                self.limit = Some(report.clone());
+            }
+        }
         self.transcript.apply(&batch);
         let turn_ended = was_busy && !self.status().is_busy();
         // claude started a turn by itself (see `Transcript::apply`).
@@ -1259,6 +1301,9 @@ impl Thread {
         }
         if batch.checkpoint == crate::agent::Checkpoint::Save {
             self.save();
+            if let Some(report) = &self.limit {
+                self.store.save_thread_limit(&self.id, report);
+            }
         }
     }
 

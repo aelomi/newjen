@@ -28,7 +28,7 @@ fn newjen_home_holds_a_freshly_created_database() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let tables: Vec<String> = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .unwrap()
@@ -43,8 +43,10 @@ fn newjen_home_holds_a_freshly_created_database() {
             "copy_cleanup",
             "grants",
             "pending_copies",
+            "project_agent_choices",
             "projects",
             "thread_items",
+            "thread_limits",
             "threads"
         ]
     );
