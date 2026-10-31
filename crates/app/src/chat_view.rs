@@ -1183,10 +1183,7 @@ impl ChatView {
             return false;
         }
         if thread.read(cx).works_in() == WorksIn::ProjectFolder
-            && self
-                .slots
-                .iter()
-                .any(|slot| slot.thread != thread && slot.thread.read(cx).owns_project_work())
+            && self.project_work_owned_elsewhere(&thread, cx)
         {
             self.slots[self.active].notice = Some(Notice::held("Review the project thread first", "Land, discard, or keep the files and close the existing project-folder thread before starting another one here.".into()));
             cx.notify();
@@ -1238,6 +1235,26 @@ impl ChatView {
         self.sync_field(window, cx);
         cx.notify();
         went_out
+    }
+
+    /// Whether a thread other than `thread`, here or in a peer project sharing the repository,
+    /// owns work in the project folder, so only it may work there until it is reviewed.
+    pub(super) fn project_work_owned_elsewhere(&self, thread: &Entity<Thread>, cx: &App) -> bool {
+        let source = rift::project_root(&self.project.path).0;
+        let owned_in = |view: &ChatView| {
+            view.slots.iter().any(|slot| {
+                let other = slot.thread.read(cx);
+                slot.thread != *thread
+                    && other.owns_project_work()
+                    && same_repository(&source, &rift::project_root(other.cwd()).0)
+            })
+        };
+        owned_in(self)
+            || self
+                .copy_peers
+                .iter()
+                .filter_map(|peer| peer.upgrade())
+                .any(|peer| owned_in(peer.read(cx)))
     }
 
     /// Checked before `Thread::send`, which would hold the message and rename the thread.
@@ -2723,6 +2740,14 @@ fn archive_question(
 
 fn in_jj_repo(project: &Path) -> bool {
     project.ancestors().any(|dir| dir.join(".jj").exists())
+}
+
+/// Whether two project roots (`rift::project_root`) share a repository: the same root, or
+/// one inside the other where at least one is a jj or git repository. Plain folders that
+/// merely nest are not one repository: nothing snapshots them together.
+fn same_repository(a: &Path, b: &Path) -> bool {
+    let is_repo = |root: &Path| root.join(".jj").exists() || root.join(".git").exists();
+    inbox::overlaps(a, b) && (is_repo(a) || is_repo(b))
 }
 
 fn empty_caption(

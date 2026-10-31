@@ -1882,3 +1882,37 @@ fn a_terminal_keeps_its_draft_and_working_folder_until_closed(cx: &mut TestAppCo
     cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
     finish(&chat, path, cx);
 }
+
+/// The repository root and one of its subfolders are open as two projects. While a thread
+/// works in the root's project folder, a project-folder send in the subfolder is refused,
+/// as it would be in the same project.
+#[gpui::test]
+async fn a_second_project_folder_thread_in_the_same_repository_is_refused(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "two-projects-one-repo", true);
+    std::fs::create_dir_all(path.join(".git")).unwrap();
+    cx.simulate_input("thread A in the root");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).owns_project_work()));
+    let peer = peer_project("packages/web", true, vec![&chat], &path, cx);
+    cx.update(|_, cx| chat.update(cx, |view, _| view.set_copy_peers(vec![peer.downgrade()])));
+    let went_out = cx.update(|window, cx| {
+        peer.update(cx, |view, cx| {
+            view.send_text("thread B in the subfolder", window, cx)
+        })
+    });
+    assert!(
+        !went_out,
+        "the subfolder must wait for the root's project thread"
+    );
+    assert_eq!(
+        notice_title(&peer, cx).as_deref(),
+        Some("Review the project thread first")
+    );
+    assert!(cx.update(|_, cx| {
+        let thread = peer.read(cx).thread().read(cx);
+        !thread.has_session() && thread.preparing().is_none()
+    }));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    finish(&chat, path, cx);
+}

@@ -389,6 +389,6 @@ impl ChatView {
 }
 
 /// Whether two project roots are the same repository, or one lies in the other.
-fn overlaps(a: &Path, b: &Path) -> bool {
+pub(super) fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }

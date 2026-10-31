@@ -410,10 +410,12 @@ impl ChatView {
         let Some(ix) = self.index_of(&id, cx) else {
             return;
         };
-        if self.slots.iter().enumerate().any(|(other, slot)| {
-            slot.thread.read(cx).blocks_copy_creation()
-                || (other != ix && slot.thread.read(cx).owns_project_work())
-        }) {
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.thread.read(cx).blocks_copy_creation())
+            || self.project_work_owned_elsewhere(&self.slots[ix].thread, cx)
+        {
             self.review_panel.as_mut().unwrap().message =
                 "Land, discard, or keep the files and close the project-folder thread before landing copy work.".into();
             cx.notify();
