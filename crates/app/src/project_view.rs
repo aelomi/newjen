@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     AppContext, Context, Entity, FocusHandle, IntoElement, ParentElement, PathPromptOptions,
-    Render, Styled, Task, Window, div, prelude::*, px,
+    Render, Styled, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_kit::base::v_flex;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, TitleBar};
@@ -39,6 +39,7 @@ pub struct ProjectView {
     background_problem: Option<String>,
     focus: FocusHandle,
     _errors: Task<()>,
+    _focus: Subscription,
 }
 
 impl ProjectView {
@@ -89,6 +90,15 @@ impl ProjectView {
             background_problem: None,
             focus: cx.focus_handle(),
             _errors: listener,
+            _focus: cx.on_focus_lost(window, |view, window, cx| {
+                if view.active.is_none() {
+                    cx.defer_in(window, |view, window, cx| {
+                        if view.active.is_none() {
+                            window.focus(&view.focus, cx);
+                        }
+                    });
+                }
+            }),
         };
         window.focus(&view.focus, cx);
         view.remove_pending_copies(cx);
@@ -596,6 +606,38 @@ mod tests {
         assert!(list.bottom() <= px(480.), "{list:?}");
         assert!(list.size.height > px(100.), "{list:?}");
         assert!(row.right() <= px(640.), "{row:?}");
+        finish(&shell, path, cx);
+    }
+    #[gpui::test]
+    async fn confirmed_dialog_cannot_take_keyboard_from_the_project_chooser(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::component::WindowExt as _;
+        let (shell, path, cx) = setup(cx, "late-dialog-focus");
+        let project = path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        open(&shell, project, cx).await;
+        cx.update(|window, cx| {
+            window.open_alert_dialog(cx, |alert, _, _| {
+                alert.title("Confirm project action").confirm()
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("cmd-shift-o");
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| shell.read(cx).active.is_none()));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-o");
+        assert!(
+            cx.did_prompt_for_paths(),
+            "the welcome screen keeps its Open Project shortcut"
+        );
+        cx.simulate_path_prompt_response(|_| None);
+        cx.condition(&shell, |view, _| !view.picking).await;
         finish(&shell, path, cx);
     }
 }
