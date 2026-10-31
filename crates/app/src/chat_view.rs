@@ -490,6 +490,14 @@ impl ChatView {
         });
     }
 
+    /// The window hands the keyboard to this view: it goes to what the panel shows (see
+    /// `focus_panel`).
+    pub fn take_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible {
+            self.focus_panel(window, cx);
+        }
+    }
+
     /// The keyboard goes to what the panel shows: the composer (or the root while the dock
     /// replaces it), the terminal, or the root for the inbox.
     fn focus_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -540,6 +548,12 @@ impl ChatView {
     pub fn quit(&mut self, cx: &mut Context<Self>) {
         let quitting = self.begin_quit(cx);
         thread::finish_quit(&self.store, quitting);
+    }
+
+    /// The row on screen and its composer text, for the window's tests.
+    #[cfg(test)]
+    pub fn shown(&self, cx: &App) -> (usize, String) {
+        (self.active, self.composer_text(self.active, cx))
     }
 
     // -----------------------------------------------------------------------------------------
@@ -3093,4 +3107,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod input_tests;
+pub(crate) mod input_tests;

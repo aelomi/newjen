@@ -59,8 +59,11 @@ pub struct ProjectView {
     /// The badge count last shown, so AppKit is only asked when it changes.
     badge: usize,
     attention_note: Option<&'static str>,
+    /// The agent program every loaded project's threads start, for the tests.
+    #[cfg(test)]
+    stand_in: Option<PathBuf>,
     _errors: Task<()>,
-    _focus: Subscription,
+    _focus: [Subscription; 2],
     _attention_tasks: Vec<Task<()>>,
 }
 
@@ -97,6 +100,7 @@ impl ProjectView {
                 }
             }
         });
+        let focus = cx.focus_handle();
         let mut view = Self {
             store,
             home,
@@ -110,23 +114,32 @@ impl ProjectView {
             problem,
             save_problem_seen: false,
             background_problem: None,
-            focus: cx.focus_handle(),
+            focus: focus.clone(),
             attention: None,
             quit_guard: None,
             quit_phase: QuitPhase::Running,
             badge: 0,
             attention_note: None,
+            #[cfg(test)]
+            stand_in: None,
             _errors: listener,
             _attention_tasks: Vec::new(),
-            _focus: cx.on_focus_lost(window, |view, window, cx| {
-                if view.active.is_none() {
-                    cx.defer_in(window, |view, window, cx| {
-                        if view.active.is_none() {
-                            window.focus(&view.focus, cx);
-                        }
-                    });
-                }
-            }),
+            _focus: [
+                cx.on_focus_lost(window, |view, window, cx| {
+                    if view.active.is_none() {
+                        cx.defer_in(window, |view, window, cx| {
+                            if view.active.is_none() {
+                                window.focus(&view.focus, cx);
+                            }
+                        });
+                    }
+                }),
+                // The window's own handle is for the projects screen only: while a project
+                // is shown, its keys live under the chat view.
+                cx.on_focus(&focus, window, |view, window, cx| {
+                    view.hand_focus_to_project(window, cx);
+                }),
+            ],
         };
         window.focus(&view.focus, cx);
         view.remove_pending_copies(cx);
@@ -150,13 +163,24 @@ impl ProjectView {
             .iter()
             .map(|slot| slot.project.path.clone())
             .collect();
+        #[cfg(test)]
+        let stand_in = self.stand_in.clone();
         let loading = cx.background_spawn(async move {
             let path = project_folder(&path)?;
             let project = store.open_project(&path)?;
             let loaded = match opened.iter().position(|opened| *opened == path) {
                 Some(index) => LoadedProject::Cached(index),
                 None => {
-                    LoadedProject::New(Box::new(load_project(store.clone(), project, home, tools)?))
+                    let startup = load_project(store.clone(), project, home, tools)?;
+                    #[cfg(test)]
+                    let startup = {
+                        let mut startup = startup;
+                        if let Some(program) = stand_in {
+                            startup.base_config.program = program;
+                        }
+                        startup
+                    };
+                    LoadedProject::New(Box::new(startup))
                 }
             };
             Ok::<_, anyhow::Error>((loaded, store.projects()?))
@@ -250,11 +274,28 @@ impl ProjectView {
         self.projects[index]
             .chat
             .update(cx, |chat, cx| chat.set_visible(true, window, cx));
+        // Checked after the frame that shows the project: focus a listener moves in this
+        // frame is not drawn until the next one.
+        cx.defer_in(window, |view, window, cx| {
+            view.hand_focus_to_project(window, cx)
+        });
         window.set_window_title(&format!(
             "{} | Newjen",
             self.projects[index].project.path.display()
         ));
         cx.notify();
+    }
+
+    /// Gives the keyboard to the shown project if the window's own handle has it: the chat
+    /// view's shortcuts and approval keys only work with focus inside it.
+    fn hand_focus_to_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active) = self.active
+            && self.focus.is_focused(window)
+        {
+            self.projects[active]
+                .chat
+                .update(cx, |chat, cx| chat.take_focus(window, cx));
+        }
     }
 
     fn show_projects(&mut self, _: &ShowProjects, window: &mut Window, cx: &mut Context<Self>) {
@@ -785,6 +826,95 @@ mod tests {
                 .unwrap()
                 .contains("does not exist")
         }));
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn a_project_brought_back_from_the_projects_screen_has_the_keyboard(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::chat_view::input_tests::{answers, pending, script, wait_answers};
+        let (shell, path, cx) = setup(cx, "return-focus");
+        // Focus listeners only see focus paths of an active window, as in the app.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let program = script(&path);
+        cx.update(|_, cx| shell.update(cx, |view, _| view.stand_in = Some(program)));
+        let api = path.join("api");
+        let website = path.join("website");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::create_dir_all(&website).unwrap();
+        open(&shell, api.clone(), cx).await;
+        let first = cx.update(|_, cx| shell.read(cx).projects[0].chat.clone());
+        cx.simulate_input("first thread");
+        cx.simulate_keystrokes("cmd-n");
+        cx.simulate_input("second thread");
+        assert_eq!(cx.update(|_, cx| first.read(cx).shown(cx).0), 0);
+        open(&shell, website.clone(), cx).await;
+        cx.simulate_keystrokes("cmd-shift-o");
+        assert!(cx.update(|_, cx| shell.read(cx).active.is_none()));
+        let back = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                shell.update(cx, |view, cx| {
+                    view.open_recent(&OpenRecentProject(api.clone()), window, cx)
+                })
+            });
+        };
+        back(cx);
+        cx.condition(&shell, |view, _| view.opening.is_none()).await;
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| shell.read(cx).active), Some(0));
+        let field = cx.update(|_, cx| first.read(cx).field_focus(cx).unwrap());
+        assert!(
+            cx.update(|window, _| field.is_focused(window)),
+            "the composer of the returned project has the keyboard"
+        );
+        cx.simulate_keystrokes("cmd-2");
+        assert_eq!(
+            cx.update(|_, cx| first.read(cx).shown(cx).0),
+            1,
+            "⌘2 switches threads without a click first"
+        );
+        cx.simulate_input(" and typing lands in it");
+        assert_eq!(
+            cx.update(|_, cx| first.read(cx).shown(cx).1),
+            "first thread and typing lands in it"
+        );
+        // The same way back to a thread whose approval dock replaced the composer.
+        cx.simulate_keystrokes("enter");
+        pending(&first, cx).await;
+        open(&shell, website, cx).await;
+        cx.simulate_keystrokes("cmd-shift-o");
+        back(cx);
+        cx.condition(&shell, |view, _| view.opening.is_none()).await;
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.simulate_keystrokes("cmd-enter");
+        wait_answers(cx, &path, 1).await;
+        assert_eq!(
+            answers(&path)[0]["response"]["response"]["behavior"],
+            "allow"
+        );
+        cx.simulate_keystrokes("cmd-1");
+        assert_eq!(
+            cx.update(|_, cx| first.read(cx).shown(cx).0),
+            0,
+            "⌘1 switches threads from the dock without a click first"
+        );
+        // Focus that lands on the window's own handle while a project is shown (a click on
+        // the chrome outside the chat, a late focus restore) goes on into the project.
+        cx.update(|window, cx| {
+            let handle = shell.read(cx).focus.clone();
+            window.focus(&handle, cx);
+        });
+        cx.simulate_keystrokes("cmd-2");
+        assert_eq!(
+            cx.update(|_, cx| first.read(cx).shown(cx).0),
+            1,
+            "⌘2 works after the window's handle took the keyboard"
+        );
+        assert!(!cx.update(|window, cx| shell.read(cx).focus.is_focused(window)));
         finish(&shell, path, cx);
     }
 

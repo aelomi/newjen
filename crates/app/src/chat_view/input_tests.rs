@@ -161,7 +161,7 @@ esac
     program
 }
 
-fn script(path: &Path) -> PathBuf {
+pub(crate) fn script(path: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let records: Vec<serde_json::Value> = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -212,7 +212,7 @@ fn script(path: &Path) -> PathBuf {
     program
 }
 
-fn answers(path: &Path) -> Vec<serde_json::Value> {
+pub(crate) fn answers(path: &Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(path.join("answers.jsonl"))
         .unwrap_or_default()
         .lines()
@@ -221,7 +221,7 @@ fn answers(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-async fn wait_answers(cx: &VisualTestContext, path: &Path, count: usize) {
+pub(crate) async fn wait_answers(cx: &VisualTestContext, path: &Path, count: usize) {
     for _ in 0..300 {
         if answers(path).len() >= count {
             assert_eq!(answers(path).len(), count);
@@ -237,7 +237,7 @@ async fn wait_answers(cx: &VisualTestContext, path: &Path, count: usize) {
     );
 }
 
-async fn pending(chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
+pub(crate) async fn pending(chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
     cx.condition(chat, |view, cx| {
         view.thread()
             .read(cx)
