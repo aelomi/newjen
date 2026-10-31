@@ -31,7 +31,56 @@ pub enum EditPreview {
     Unavailable(String),
 }
 
+/// A preview together with the state of the file it was read against. Two reads are equal
+/// only if the file is still as it was, so an approval given on a stale read is caught even
+/// when the preview itself does not depend on the file (a provider-supplied patch, or an
+/// oversized edit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadEdit {
+    pub preview: EditPreview,
+    file: FileState,
+}
+
+/// The file's size and a hash of its bytes, or `None` when it does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileState(Option<(u64, u64)>);
+
+impl FileState {
+    fn read(path: &std::path::Path) -> FileState {
+        use std::hash::Hasher;
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return FileState(None);
+        };
+        let mut hasher = std::hash::DefaultHasher::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut length = 0u64;
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    hasher.write(&buffer[..n]);
+                    length += n as u64;
+                }
+                Err(error) => {
+                    hasher.write(error.to_string().as_bytes());
+                    break;
+                }
+            }
+        }
+        FileState(Some((length, hasher.finish())))
+    }
+}
+
 impl EditProposal {
+    /// The preview and the file as it is now; compare two of these to tell whether an
+    /// approval still applies to what was reviewed.
+    pub fn read(&self) -> ReadEdit {
+        ReadEdit {
+            preview: self.preview(),
+            file: FileState::read(&self.path),
+        }
+    }
+
     pub fn preview(&self) -> EditPreview {
         if let FileChange::Patch(patch) = &self.change {
             return if patch.len() > LIMIT {
@@ -179,5 +228,32 @@ mod tests {
             change: FileChange::Write("x".repeat(LIMIT + 1)),
         };
         assert_eq!(proposal.preview(), EditPreview::TooLarge);
+    }
+
+    #[test]
+    fn a_read_changes_with_the_file_even_when_the_preview_does_not() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::write(&path, "before\n").unwrap();
+        for change in [
+            FileChange::Patch("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-before\n+after\n".into()),
+            FileChange::Write("x".repeat(LIMIT + 1)),
+        ] {
+            let proposal = EditProposal {
+                path: path.clone(),
+                change,
+            };
+            let reviewed = proposal.read();
+            assert_eq!(
+                proposal.read(),
+                reviewed,
+                "an unchanged file reads the same"
+            );
+            std::fs::write(&path, "someone else's work\n").unwrap();
+            let now = proposal.read();
+            assert_eq!(now.preview, reviewed.preview);
+            assert_ne!(now, reviewed, "the changed file must need another review");
+            std::fs::write(&path, "before\n").unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

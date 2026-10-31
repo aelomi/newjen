@@ -1,14 +1,14 @@
 use super::*;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
-use newjen_core::edits::EditPreview;
+use newjen_core::edits::{EditPreview, ReadEdit};
 use newjen_core::landing::{self, Integration, LandingMode, Review};
 
 pub(super) struct ApprovalPreview {
     request: newjen_core::ApprovalKey,
     diff: Option<Entity<DiffState>>,
     message: String,
-    expected: Option<EditPreview>,
+    expected: Option<ReadEdit>,
     validating: bool,
 }
 
@@ -29,9 +29,9 @@ impl ApprovalPreview {
 
     /// The proposed edit as read from the disk: a diff to show, or why there is none. An
     /// oversized or unavailable preview still allows once, as the message says.
-    fn fill(&mut self, preview: EditPreview, cx: &mut App) {
-        self.expected = Some(preview.clone());
-        match preview {
+    fn fill(&mut self, read: ReadEdit, cx: &mut App) {
+        self.expected = Some(read.clone());
+        match read.preview {
             EditPreview::Patch(patch) => match DiffFile::parse(&patch) {
                 Ok(files) => {
                     self.diff = Some(cx.new(|cx| DiffState::new(files, cx)));
@@ -103,7 +103,7 @@ impl ChatView {
         let Some(proposal) = self.thread().read(cx).pending_edit() else {
             return;
         };
-        let task = cx.background_spawn(async move { proposal.preview() });
+        let task = cx.background_spawn(async move { proposal.read() });
         cx.spawn_in(window, async move |view, cx| {
             let current = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
@@ -147,7 +147,7 @@ impl ChatView {
         };
         let request = request.key();
         self.edit_preview = Some(ApprovalPreview::reading(request));
-        let task = cx.background_spawn(async move { proposal.preview() });
+        let task = cx.background_spawn(async move { proposal.read() });
         cx.spawn_in(window, async move |view, cx| {
             let preview = task.await;
             let _ = view.update_in(cx, |view, _, cx| {
@@ -188,7 +188,7 @@ impl ChatView {
         let request = request.key();
         let thread = self.slots[ix].thread.clone();
         self.slots[ix].preview = Some(ApprovalPreview::reading(request));
-        let task = cx.background_spawn(async move { proposal.preview() });
+        let task = cx.background_spawn(async move { proposal.read() });
         cx.spawn_in(window, async move |view, cx| {
             let preview = task.await;
             let _ = view.update_in(cx, |view, _, cx| {
@@ -245,7 +245,7 @@ impl ChatView {
         };
         self.slots[ix].preview.as_mut().expect("checked").validating = true;
         let thread = self.slots[ix].thread.clone();
-        let task = cx.background_spawn(async move { proposal.preview() });
+        let task = cx.background_spawn(async move { proposal.read() });
         cx.spawn_in(window, async move |view, cx| {
             let current = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
