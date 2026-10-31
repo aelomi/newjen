@@ -494,7 +494,7 @@ impl Store {
 
     /// Records that the project at `path` was opened (adding it the first time) and returns it.
     /// Unlike other writes this waits for the disk, because every thread row needs the
-    /// project's id; it runs once, at startup.
+    /// project's id. Run it off the UI thread when switching projects.
     pub fn open_project(&self, path: &Path) -> Result<Project> {
         let path_text = path_text(path);
         self.queue(Write::UpsertProject {
@@ -517,6 +517,23 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| anyhow!("could not save the project {}", path.display()))
+    }
+
+    pub fn projects(&self) -> Result<Vec<Project>> {
+        let read = self.reader();
+        let mut statement = read.prepare(
+            "SELECT id, path, created_at, last_opened_at FROM projects
+             ORDER BY last_opened_at DESC, id DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                created_at: row.get(2)?,
+                last_opened_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The project's threads that are not archived, newest first. Activity never reorders
@@ -1022,7 +1039,8 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
         }
         Write::UpsertProject { path, now } => {
             connection.execute(
-                "INSERT INTO projects (path, created_at, last_opened_at) VALUES (?1, ?2, ?2)
+                "INSERT INTO projects (path, created_at, last_opened_at)
+                 VALUES (?1, ?2, MAX(?2, COALESCE((SELECT MAX(last_opened_at) + 1 FROM projects), ?2)))
                  ON CONFLICT (path) DO UPDATE SET last_opened_at = excluded.last_opened_at",
                 params![path, now],
             )?;

@@ -359,3 +359,36 @@ fn archived_threads_copies_wait_to_be_removed_until_marked() {
         .unwrap();
     assert_eq!(removed_at, 20, "marking it again changes nothing");
 }
+
+#[test]
+fn recent_projects_survive_reopening_without_duplicate_rows() {
+    let home = tempfile::tempdir().unwrap();
+    let first_path = home.path().join("first");
+    let second_path = home.path().join("second");
+    let store = Store::open_in(home.path()).unwrap();
+    assert!(store.projects().unwrap().is_empty());
+    let first = store.open_project(&first_path).unwrap();
+    let second = store.open_project(&second_path).unwrap();
+    let projects = store.projects().unwrap();
+    assert_eq!(
+        projects
+            .iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>(),
+        [second.id, first.id]
+    );
+    drop(store);
+    let store = Store::open_in(home.path()).unwrap();
+    assert_eq!(store.projects().unwrap(), projects);
+    let opened = store.open_project(&first_path).unwrap();
+    assert_eq!(opened.id, first.id);
+    let projects = store.projects().unwrap();
+    assert_eq!(projects.len(), 2);
+    assert_eq!(projects[0].id, first.id);
+    assert!(
+        projects.windows(2).all(
+            |pair| (pair[0].last_opened_at, pair[0].id) >= (pair[1].last_opened_at, pair[1].id)
+        )
+    );
+    assert!(opened.last_opened_at >= first.last_opened_at);
+}
