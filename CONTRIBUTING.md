@@ -82,7 +82,7 @@ Checked against claude 2.1.310. `crates/core/tests/fixtures/` holds sanitized re
 - **Use `rift create --copy-all`.** Without it, Rift skips gitignored files (`node_modules`, `target/`), which defeats the purpose.
 - **Start the copy's work on a change the main repo no longer edits.** Otherwise the copy and the main repo share a jj change, and fetching the work back creates a divergent change. `crates/core/src/rift.rs` does it in three steps, checked with real Rift on 2026-10-31 (`crates/core/tests/rift.rs`):
   1. In the main repo, snapshot, and run `jj new` only if `@` has changes. The base is then `@-`.
-  2. Run `rift create --copy-all`.
+  2. Run `rift create --copy-all` with a fresh `newjen-<id8>-<6 random lowercase letters or digits>` name, saved with the held message before the job starts.
   3. In the copy, run `jj new <base>`. The copy's own copy of `@` is empty, so jj abandons it.
   Landing by fetch then has no divergent change, even after the main repo keeps editing. The older rule (describe, then `jj new` in both repos) also works but leaves two empty changes in the main repo per copy.
 - **Don't make a copy while an agent works in the project folder.** Step 1 snapshots the main repo, which would catch that agent's half-written files. Newjen refuses until the project-folder thread finishes.
@@ -91,7 +91,9 @@ Checked against claude 2.1.310. `crates/core/tests/fixtures/` holds sanitized re
 - **`rift init` once per project.** It writes a `.rift` marker at the root and adds it to `.git/info/exclude`, so jj never tracks it in a colocated repo.
 - **Hooks:** `.rift.toml` holds `version = 1` and `[[hooks.postcreate]]` tables with `run = "…"`. Hooks print to stderr, which Newjen shows while the copy is made, and see `RIFT_ID`, `RIFT_SOURCE`, `RIFT_DESTINATION` and `RIFT_PARENT_ID`. A failed `postcreate` leaves the copy registered, so Newjen removes it.
 - **`rift` on `PATH` is a Node script.** Newjen runs the native binary beside it (`prebuilds/darwin-<arch>/rift`), so apps started from Finder work without Node.
-- **Remove copies by path:** `rift remove <copy-path>` (not the name) moves the copy to `.trash` next to it. Newjen then deletes that one trash entry. Never run `rift gc` from Newjen: it empties every Rift trash on the Mac.
+- **Copy ownership:** the unique name proves ownership of the exact destination. Save the Rift id before `jj new` in the copy. Before sending the held message, acknowledge a sent pending row; recovery keeps sent copies even if the thread checkpoint failed. Recovery validates the project copy parent and the thread name.
+- **Copy jobs stop on quit:** `rift create` and its hooks run in their own process group, registered for crash recovery. Quit sends SIGTERM, then SIGKILL; a running jj finishes.
+- **Remove copies by path:** `rift remove <copy-path>` (not the name) moves the copy to `.trash` next to it. Newjen then deletes that one trash entry. A different Rift id at the destination is preserved; our own trash entry is still removed. A missing `.rift` marker means an owned half-made or cleaned copy, removed directly after checking its parent and refusing symlinks. Never run `rift gc` from Newjen: it empties every Rift trash on the Mac.
 - **UI reads of jj must pass `--ignore-working-copy`.** Without it, each read snapshots an agent's half-written files.
 - **jj does not run git hooks.** Run any checks they would have done from the harness.
 
