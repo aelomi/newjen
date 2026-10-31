@@ -44,7 +44,7 @@ Integrated onto the providers, open-project and slice 4 work, this is what is co
 
 The native adapter probe called `NSApplication.terminate`, observed cancellation into the app channel, armed quit, and read `TerminateNow` from the selector. It also set the real `NSDockTile` badge to 2, read it back, cleared it, and initialized the unbundled attention fallback. This used a synthetic delegate with GPUI's class name, so it checks AppKit integration without claiming a full Newjen window test.
 
-Sol and Astra independently reproduced a redirected background job surviving both shell exit and PTY EOF. The quit gate now treats every owned terminal session as a blocker. Their source reviews also found archive panel state and drawer focus issues. Both were corrected, with regression tests added. Fable review was unavailable because of the provider rate limit.
+Sol and Astra independently reproduced a redirected background job surviving both shell exit and PTY EOF. The quit gate now treats every owned terminal session as a blocker. Their source reviews also found archive panel state and drawer focus issues. Both were corrected, with regression tests added. Fable initially hit a provider rate limit, then completed its read-only review after the limit reset. It corroborated the evidence and flagged minimized-window quit handling for a live check.
 
 The real Newjen window was driven on a scratch database with recorded fake-agent fixtures. Two simultaneous waiting threads were answered from the inbox while the second thread stayed selected. Keep working preserved both pending approvals. A real shell printed its working folder and terminal size; its history survived a thread switch and resizing to 640 by 480. Confirmed Quit and stop ended the app and every recorded direct child process. No live provider usage was spent.
 
@@ -53,3 +53,13 @@ Both direct execution and LaunchServices launch of the temporary unsigned bundle
 `cargo fmt --all -- --check`, warning-denied all-target Clippy, `cargo test --workspace --locked`, and `cargo build --workspace --locked` passed. The workspace suite passed 317 tests and left three live-provider tests ignored. The existing turn-start model passed all twelve bounded properties in quick, repairs, and Rift modes. That model covers agent lifecycle, not terminal jobs or native notification delivery.
 
 Terminal mouse-report protocols and IME composition are not implemented. Explicit close, archive, and quit stop owned terminal sessions. Crash cleanup relies on PTY hangup, so deliberately detached daemons that ignore it can outlive a crash.
+
+## Late review follow-up
+
+A real-app check reproduced the minimized-window keyboard bug. With a pending approval and `AXMinimized=true`, Cmd-Q left the window minimized with no confirmation sheet. A polite native quit request through `NSRunningApplication.terminate()` reached Newjen's real GPUI delegate, restored the window, and showed the confirmation sheet. The keyboard/menu handlers now retain the opened window handle instead of depending on `App::active_window()`.
+
+The pinned GPUI notification API was inspected after the delayed architecture review. Its macOS delegate explicitly presents banners in the foreground. Newjen retains its adapter because the requested background-only rule also applies at delivery time, and its permission failure state is shown in the inbox. Newjen currently makes no calls to GPUI's system notification API, so there is only one notification-center delegate owner in this slice. A future shared platform implementation should preserve those rules.
+
+Terminal inheritance of agent-specific environment variables should use the providers session's shared cleanup code when merging. Terminal shutdown currently sends SIGKILL immediately; a bounded graceful shutdown is a follow-up. The per-thread ownership and app-local pure rules remain in place. The terminal tests and attention transition tests already run headlessly, so moving these modules into core is not required for testability.
+
+After the routing fix, live GUI checks of Cmd-Q, Cmd-W, and a polite native quit request from a minimized window each reported `AXMinimized=false` with one visible confirmation sheet. Choosing Keep working preserved the waiting approval in all three cases. After approving the request, Cmd-Q from the minimized idle window exited without a prompt. Formatting, Clippy, the locked build, and all 317 workspace tests passed again. The GUI lock and test processes were released.
