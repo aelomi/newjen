@@ -39,12 +39,13 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
   - Each tool call that needs approval arrives as `{"type":"control_request","request":{"subtype":"can_use_tool","tool_name":…,"input":…}}`.
   - Answer with `{"type":"control_response","response":{"subtype":"success","request_id":…,"response":{"behavior":"allow","updatedInput":…}}}`, or `"behavior":"deny"`.
   - No MCP server is needed. Keep stdin open for the whole session.
-- **Rift + jj work together**, with three rules:
+- **Rift + jj work together** (checked with real Rift on 2026-10-31, `crates/core/tests/rift.rs`):
   - **Use `rift create --copy-all`.** By default Rift skips gitignored files such as `node_modules` and build output, which removes the main benefit.
-  - **Run `jj new` in the copy before the agent starts.** Otherwise the copy keeps editing the same jj change as the original, and fetching it back creates a *divergent* change. With a new change first, the fetched work shows only the agent's diff, sitting on top of the original's uncommitted state.
+  - **Start the copy's work on a change the main repo no longer edits.** In the main repo, snapshot and run `jj new` only if `@` has changes; the base is `@-`. After `rift create`, run `jj new <base>` in the copy. Otherwise the copy keeps editing a change the original also edits, and fetching it back creates a *divergent* change. The fetched work then shows only the agent's diff, on top of the original's state when the copy was made. The first rule tried (describe, then `jj new` in both repos) also avoids divergence but leaves two empty changes in the main repo for every copy.
   - **Land work with fetch:** run `jj git remote add <thread> <copy path>` and `jj git fetch --remote <thread>` in the main repo, and the thread's bookmark appears as `thread/<id>@<thread>`. This was verified.
 - **Harmless jj warning:** jj notes "repo appears to have been copied" the first time it runs in a copy.
-- **`rift remove` takes the copy's path, not its name.** Run `rift gc` afterwards.
+- **`rift remove` takes the copy's path, not its name.** It moves the copy to a `.trash` folder beside it. `rift gc` empties every Rift trash on the Mac, so Newjen deletes only its own trash entry instead.
+- **Copy speed:** this repo (158,661 files, a 32 GB `target/`) copies in 4.3 s, so the copy is made off the UI thread with progress shown.
 
 ## Architecture
 
@@ -62,14 +63,14 @@ crates/
 
 ## Thread lifecycle
 
-1. **New thread:** works in the project folder unless you choose a Rift copy (decided 2026-10-30: Rift is a choice, like worktrees are elsewhere, and must be seamless when chosen). For a Rift copy: snapshot the original (`jj status`), run `rift create --copy-all`, then `jj new` in the copy. Rift `postcreate` hooks run per-copy setup, such as rebuilding venvs or starting services named with `$RIFT_ID`.
+1. **New thread:** works in the project folder unless you choose a Rift copy (decided 2026-10-30: Rift is a choice, like worktrees are elsewhere, and must be seamless when chosen). For a Rift copy, the copy is made when the first message is sent, and that message waits until it is ready: snapshot the original and `jj new` there only if `@` has changes, `rift create --copy-all` (copies go to `.rifts/<project>/newjen-<first 8 characters of the thread id>` beside the project, on the same disk, as copy-on-write needs), then `jj new <base>` in the copy. Rift `postcreate` hooks run per-copy setup, such as rebuilding venvs; `RIFT_ID` and `RIFT_SOURCE` are also set for claude, so dev servers can derive ports. A failed copy or hook gives the message back. Newjen refuses to make a copy while another thread works in the project folder. Each copy is saved with its thread (path, Rift id and the jj base commit), which is what landing needs.
 2. **Run:** spawn `claude` with the copy as its working directory, stream events, and surface approvals in the UI.
 3. **Land work** using one of two modes, chosen per thread with a project default:
    - **Harness-managed:** the agent is told not to commit. At the end of each turn the harness snapshots the copy with jj (`jj describe`/`jj new`). You review the diff in the app, then:
      - **Land:** fetch the copy's change into the main repo as bookmark `thread/<id>`, then rebase or merge.
      - **Discard:** remove the copy.
    - **Agent-managed:** the harness never writes to version control in the copy, and reads only with `--ignore-working-copy`. Landing fetches whatever bookmarks the agent created.
-4. **Close:** `rift remove <copy path>`, then `jj git remote remove <thread>` in the main repo, and later `rift gc`.
+4. **Close:** archiving a thread in a copy always asks first, then removes the copy in the background (`rift remove <copy path>` and its trash entry), and a removal Newjen quit before finishing is done at the next launch. Slice 4 adds `jj git remote remove <thread>` in the main repo and Land or Discard before this.
 
 ## Approvals and agent lifecycle
 
@@ -108,7 +109,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
    - **Grants:** "Always allow" rules are saved per thread and re-applied at every spawn with `--allowedTools`, so the dock says "for this thread". They can be listed and revoked.
    - **List:** new threads on top, a status per thread (needs approval, working, failed, stopped, unread), titles from the first message (no hidden model calls). ⌘N opens a draft that is saved only once its first message is sent, so empty threads never pile up. The sidebar hides below 760 px of window width (⌘B toggles it) and shows a dot when a hidden thread needs you. Mocks: `design/newjen.pen` screens 8–12.
    - **Deferred:** deny with a note. The approval dock replaces the composer, so it needs its own text field; it moves to slice 4 with the diff view.
-3. Rift copies, chosen per thread when you create it, with postcreate hooks. The default stays the project folder. Landing (slice 4) must handle both kinds of thread.
+3. **Done 2026-10-31.** Rift copies, chosen per thread when you create it, with postcreate hooks. The default stays the project folder. Landing (slice 4) must handle both kinds of thread. Every other ADE checked isolates with git worktrees; none uses copy-on-write copies. Their most common complaint is cleanup that deleted work ([memo](research/isolation.md)).
 4. jj snapshots, diff view (GPUI Kit `diff`), and both landing modes.
 5. Parallel threads, notifications (Dock badge), and a terminal panel (on a terminal crate such as `alacritty_terminal`; GPUI Kit has none).
 
@@ -129,4 +130,5 @@ Kit's default light and dark themes follow the system appearance. Components kee
 
 ## Open questions
 
-- None blocking. Slices 1 and 2 are built (2026-10-27, 2026-10-31). Ely was replaced with GPUI Kit on 2026-10-31. Next: slice 3, Rift copies chosen per thread.
+- None blocking. Slices 1, 2 and 3 are built (2026-10-27, 2026-10-31, 2026-10-31). Ely was replaced with GPUI Kit on 2026-10-31. Next: slice 4, jj snapshots, diff view and landing.
+- **Rift gaps found in slice 3:** quitting while a copy is being made leaves a half-made copy that nothing cleans up; a copy folder deleted by hand stays in Rift's registry until `rift gc`; hooks run with the app's `PATH`, which is minimal when Newjen is started from Finder.

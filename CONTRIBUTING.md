@@ -40,7 +40,7 @@ design/   # newjen.pen: pen.dev mocks of every UI state. Mock UI changes here fi
 docs/     # PLAN.md and research memos.
 ```
 
-Later slices add Rift and jj to `core`, and maybe a `cli/` crate that drives `core` from the terminal.
+`core/src/rift.rs` makes and removes Rift copies with jj. Later slices add jj snapshots and landing to `core`, and maybe a `cli/` crate that drives `core` from the terminal.
 
 ## Build order
 
@@ -48,7 +48,7 @@ Build one vertical slice first, and don't start wrappers for later steps before 
 
 1. `cargo run` opens a window. You type a prompt, Claude replies over stream-json, and the reply renders in the chat. Approve and deny work. One thread; no Rift, no jj. **Done (2026-10-27).**
 2. Thread list, SQLite persistence, resume. **Done (2026-10-31).**
-3. Rift copies, chosen per thread (the default stays the project folder).
+3. Rift copies, chosen per thread (the default stays the project folder). **Done (2026-10-31).**
 4. jj snapshots, diff view (GPUI Kit `diff`), and both landing modes (see the plan).
 5. Parallel threads, Dock badge notifications, and a terminal panel (GPUI Kit has none; build it on a terminal crate such as `alacritty_terminal`).
 
@@ -80,11 +80,18 @@ Checked against claude 2.1.310. `crates/core/tests/fixtures/` holds sanitized re
 ### Rift + jj
 
 - **Use `rift create --copy-all`.** Without it, Rift skips gitignored files (`node_modules`, `target/`), which defeats the purpose.
-- **Run `jj new` in a fresh copy before the agent starts.** Otherwise the copy and the main repo share a jj change, and fetching it back creates a divergent change.
-- **Don't let the main repo and the copy share a working-copy change at all.** In the main repo, describe `@` if it has edits and run `jj new` *before* `rift create`, then `jj new` again in both the main repo and the copy. Found on 2026-10-31 with an APFS clone standing in for Rift; confirm with real Rift in slice 3.
+- **Start the copy's work on a change the main repo no longer edits.** Otherwise the copy and the main repo share a jj change, and fetching the work back creates a divergent change. `crates/core/src/rift.rs` does it in three steps, checked with real Rift on 2026-10-31 (`crates/core/tests/rift.rs`):
+  1. In the main repo, snapshot, and run `jj new` only if `@` has changes. The base is then `@-`.
+  2. Run `rift create --copy-all`.
+  3. In the copy, run `jj new <base>`. The copy's own copy of `@` is empty, so jj abandons it.
+  Landing by fetch then has no divergent change, even after the main repo keeps editing. The older rule (describe, then `jj new` in both repos) also works but leaves two empty changes in the main repo per copy.
+- **Don't make a copy while an agent works in the project folder.** Step 1 snapshots the main repo, which would catch that agent's half-written files. Newjen refuses until the project-folder thread finishes.
 - **Land work** by running `jj git remote add <thread> <copy-path>` and then `jj git fetch --remote <thread>` in the main repo.
 - **Expect a harmless warning:** jj prints "repo appears to have been copied" the first time it runs in a copy.
-- **Remove copies by path:** `rift remove <copy-path>` (not the name), then `rift gc`.
+- **`rift init` once per project.** It writes a `.rift` marker at the root and adds it to `.git/info/exclude`, so jj never tracks it in a colocated repo.
+- **Hooks:** `.rift.toml` holds `version = 1` and `[[hooks.postcreate]]` tables with `run = "…"`. Hooks print to stderr, which Newjen shows while the copy is made, and see `RIFT_ID`, `RIFT_SOURCE`, `RIFT_DESTINATION` and `RIFT_PARENT_ID`. A failed `postcreate` leaves the copy registered, so Newjen removes it.
+- **`rift` on `PATH` is a Node script.** Newjen runs the native binary beside it (`prebuilds/darwin-<arch>/rift`), so apps started from Finder work without Node.
+- **Remove copies by path:** `rift remove <copy-path>` (not the name) moves the copy to `.trash` next to it. Newjen then deletes that one trash entry. Never run `rift gc` from Newjen: it empties every Rift trash on the Mac.
 - **UI reads of jj must pass `--ignore-working-copy`.** Without it, each read snapshots an agent's half-written files.
 - **jj does not run git hooks.** Run any checks they would have done from the harness.
 
@@ -122,7 +129,7 @@ Mock a change in `design/newjen.pen` with [pen.dev](https://pen.dev) first, incl
 
 ```sh
 cargo run -p app [-- <project dir>]   # launch the app (once crates/app exists)
-cargo test --workspace                # all tests; no network or Claude login needed
+cargo test --workspace                # all tests; no network or Claude login needed (Rift tests skip without rift and jj)
 cargo test -p newjen-core -- --ignored   # live test against the real claude CLI (uses your login)
 cargo build --release                 # optimized build
 ```
