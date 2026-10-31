@@ -337,3 +337,75 @@ fn a_copy_already_at_the_path_is_reported_with_its_id() {
     );
     assert!(first.path.exists(), "the existing copy is untouched");
 }
+
+#[test]
+fn review_remove_replacement() {
+    let lab = lab().expect("real tools required");
+    let project = lab.jj_repo("replacement");
+    let old = lab.create(&project, "same-name");
+    rift::remove(&lab.tools, &old.path, &old.rift_id).unwrap();
+    let replacement = lab.create(&project, "same-name");
+    write(&replacement.path, "valuable.txt", "replacement's work");
+    let result = rift::remove(&lab.tools, &old.path, &old.rift_id);
+    println!(
+        "stale removal: {result:?}; replacement exists: {}",
+        replacement.path.exists()
+    );
+    assert!(
+        replacement.path.exists(),
+        "stale removal removed a different Rift id"
+    );
+}
+
+#[test]
+fn review_symlink_trash() {
+    let lab = lab().expect("real tools required");
+    let parent = lab.folder("copies");
+    let unrelated = lab.folder("unrelated");
+    write(
+        &unrelated,
+        "abc123-newjen-thread/work.txt",
+        "unrelated work",
+    );
+    std::os::unix::fs::symlink(&unrelated, parent.join(".trash")).unwrap();
+    let result = rift::remove(&lab.tools, &parent.join("newjen-thread"), "abc123");
+    println!(
+        "removal: {result:?}; unrelated work exists: {}",
+        unrelated.join("abc123-newjen-thread/work.txt").exists()
+    );
+    assert!(
+        unrelated.join("abc123-newjen-thread/work.txt").exists(),
+        "cleanup followed .trash symlink"
+    );
+}
+
+#[test]
+fn review_retry_unowned_copy() {
+    use newjen_core::{
+        session::SessionConfig,
+        store::Store,
+        thread::{Sent, Thread, WorksIn},
+    };
+    let lab = lab().expect("real tools required");
+    let project = lab.jj_repo("retry");
+    let store = Store::open_in(&lab.folder("db")).unwrap();
+    let project = store.open_project(&project).unwrap();
+    let mut thread = Thread::new_draft(store, &project, SessionConfig::new(&project.path));
+    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    let name = format!("newjen-{}", &thread.id()[..8]);
+    let unrelated = lab.create(&project.path, &name);
+    write(&unrelated.path, "valuable.txt", "external copy work");
+    let Sent::MakingCopy(job) = thread.send("hello").unwrap() else {
+        panic!()
+    };
+    let result = job.run(&lab.tools, |_| {});
+    println!(
+        "job succeeded: {}; external work exists: {}",
+        result.is_ok(),
+        unrelated.path.join("valuable.txt").exists()
+    );
+    assert!(
+        unrelated.path.join("valuable.txt").exists(),
+        "retry destroyed a copy without ownership proof"
+    );
+}

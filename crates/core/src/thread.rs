@@ -239,7 +239,6 @@ pub enum Sent {
 pub struct CopyJob {
     project_dir: PathBuf,
     name: String,
-    store: Store,
 }
 
 impl std::fmt::Debug for CopyJob {
@@ -253,23 +252,13 @@ impl std::fmt::Debug for CopyJob {
 
 impl CopyJob {
     /// Makes the copy. Each line Rift and its hooks print goes to `on_line` (pass it on to
-    /// [`Thread::note_copy_line`]). A copy an earlier try of this thread left at its path is
-    /// removed first, but never one that belongs to a thread.
+    /// [`Thread::note_copy_line`]). An existing destination is never removed.
     pub fn run(
         self,
         tools: &Tools,
         mut on_line: impl FnMut(&str),
     ) -> Result<rift::Copy, CopyError> {
-        match rift::create(tools, &self.project_dir, &self.name, &mut on_line) {
-            Err(CopyError::Exists {
-                path,
-                rift_id: Some(rift_id),
-            }) if matches!(self.store.copy_owner(&path), Ok(None)) => {
-                rift::remove(tools, &path, &rift_id)?;
-                rift::create(tools, &self.project_dir, &self.name, on_line)
-            }
-            made => made,
-        }
+        rift::create(tools, &self.project_dir, &self.name, &mut on_line)
     }
 }
 
@@ -663,7 +652,6 @@ impl Thread {
             return Ok(Sent::MakingCopy(CopyJob {
                 project_dir: self.project_dir.clone(),
                 name: copy_name(&self.id),
-                store: self.store.clone(),
             }));
         }
         self.deliver(text)?;

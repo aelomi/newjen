@@ -284,7 +284,15 @@ pub fn remove(tools: &Tools, path: &Path, rift_id: &str) -> Result<(), CopyError
             format!("{rift_id:?} is not a Rift id"),
         ));
     }
-    if path.exists() {
+    let entry = parent
+        .join(TRASH)
+        .join(format!("{rift_id}-{}", name.to_string_lossy()));
+    check_trash(parent, &entry)?;
+    if path.symlink_metadata().is_ok() {
+        check_directory(path, parent)?;
+        if read_id(path).as_deref() != Some(rift_id) {
+            return Ok(());
+        }
         run(
             tools,
             &tools.rift,
@@ -293,9 +301,7 @@ pub fn remove(tools: &Tools, path: &Path, rift_id: &str) -> Result<(), CopyError
             |_| {},
         )?;
     }
-    let entry = parent
-        .join(TRASH)
-        .join(format!("{rift_id}-{}", name.to_string_lossy()));
+    check_trash(parent, &entry)?;
     if entry.symlink_metadata().is_ok() {
         std::fs::remove_dir_all(&entry).map_err(|error| {
             failure(
@@ -305,6 +311,34 @@ pub fn remove(tools: &Tools, path: &Path, rift_id: &str) -> Result<(), CopyError
         })?;
     }
     Ok(())
+}
+
+fn check_trash(parent: &Path, entry: &Path) -> Result<(), CopyError> {
+    let trash = parent.join(TRASH);
+    if trash.symlink_metadata().is_ok() {
+        check_directory(&trash, parent)?;
+        if entry.symlink_metadata().is_ok() {
+            check_directory(entry, &trash)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_directory(path: &Path, parent: &Path) -> Result<(), CopyError> {
+    let safe = || -> std::io::Result<bool> {
+        let metadata = path.symlink_metadata()?;
+        Ok(!metadata.file_type().is_symlink()
+            && metadata.is_dir()
+            && path.canonicalize()?.parent() == Some(parent.canonicalize()?.as_path()))
+    };
+    if safe().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(failure(
+            "rift remove",
+            format!("refusing unsafe folder {}", path.display()),
+        ))
+    }
 }
 
 /// The folder to copy for `project` (canonical), and whether it is a jj repo: the nearest
@@ -371,7 +405,11 @@ fn jj_args<'a>(args: &[&'a str]) -> Vec<&'a OsStr> {
 
 /// The Rift id in `copy`'s `.rift` file.
 fn read_id(copy: &Path) -> Option<String> {
-    let id = std::fs::read_to_string(copy.join(MARKER)).ok()?;
+    let marker = copy.join(MARKER);
+    if !marker.symlink_metadata().ok()?.is_file() {
+        return None;
+    }
+    let id = std::fs::read_to_string(marker).ok()?;
     Some(id.trim().to_string()).filter(|id| !id.is_empty())
 }
 
