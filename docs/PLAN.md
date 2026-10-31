@@ -15,9 +15,9 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Language | Rust (Cargo workspace) | Toolchain 1.98.1 installed; Ely needs ≥ 1.95 |
-| UI framework | GPUI: `gpui-pre =0.3.10`, `gpui-pre-platform =0.3.10` (`font-kit`) | Version fixed by Ely |
-| Components | Ely: `ely-gpui-component =0.1.1` | Plain pinned dependency; chat, agent, terminal, editor and git (diff) components |
+| Language | Rust (Cargo workspace) | Toolchain 1.98.1 installed |
+| UI framework | GPUI: `gpui-pre =0.3.10`, `gpui-pre-platform =0.3.10` (`font-kit`) | The version GPUI Kit pins |
+| Components | GPUI Kit (Longbridge): `gpui-kit =0.8.1` | Plain pinned dependency, Apache-2.0. Kit components with Kit's default theme, sizes and fonts: title bar, list items, Sheet, Popover, messages/scroller, markdown, input, buttons, tags and menus; diff in slice 4. Newjen hand-builds only the approval card, tool card and working-dot pulse, with thin behavior helpers. |
 | Agent | Claude Code CLI (`claude`) over stream-json; Codex CLI (`codex app-server`) next | Newjen detects which CLIs are installed; one provider per thread. API-key providers and ACP later |
 | Isolation | Rift (`rift-snapshot`), an APFS copy-on-write copy, opt-in per thread | Installed. By default a thread works in the project folder; no git worktrees for now |
 | Version control | jj 0.46.0, colocated with git | Installed |
@@ -27,7 +27,8 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 
 ## Verified on this Mac (2026-10-26)
 
-- **Ely and GPUI build and initialise.** The first debug build took 1m38s and the `target/` folder reached 3.5 GB. Later builds are incremental.
+- **GPUI builds and initialises.** The first debug build took 1m38s and the `target/` folder reached 3.5 GB. Later builds are incremental.
+- **GPUI Kit streams replies as smoothly as Ely did** (2026-10-31). A 7.7 KB Markdown reply streamed in 744 pieces, in release builds: the main thread spent 17% of the time drawing (Ely: 19%) at the same frame rate, with the same CPU and memory. Debug builds draw the same frames but keep the main thread busy; setting `opt-level = 2` for dependencies in the dev profile brings that to 23%, at the cost of a slower first build.
 - **Claude approvals work over stdio.** Launch the CLI like this:
 
   ```
@@ -50,12 +51,13 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 ```
 crates/
   core/      # no UI: agent sessions, Rift, jj, SQLite, events. Tested headlessly.
-  app/       # GPUI + Ely shell; renders core state, sends user intents to core.
+  app/       # GPUI + GPUI Kit shell; Kit's default themes and fonts follow system appearance.
+             # Renders core state, sends user intents to core; ui/ holds the two agent cards, pulse and thin helpers.
   cli/       # (optional) small CLI that drives core, used for testing and debugging
 ```
 
 - **Core owns state.** It runs one actor per thread, which owns the `claude` child process and emits typed events: text, tool use, approval needed, result, error.
-- **The app subscribes to those events** and renders them with Ely (`chat`, `agent` permissions, `git` diff viewer).
+- **The app subscribes to those events** and renders them with Kit's own components and default theme (`cx.theme()`). Newjen owns only the approval card, tool card, working-dot pulse and thin key/focus helpers (`crates/app/src/ui/`). Replies keep lazily built `TextViewState` entities; Kit draws markdown and highlighted code blocks, and `MessageScroller` follows the tail. No bundled fonts or separate palette. `diff` comes in slice 4.
 - **Thread model:** project → threads. Each thread has its own working folder (the project folder by default, or its own Rift copy when you choose one), one Claude process and one landing mode. A thread always runs from the same folder, because Claude ties `--resume` to the folder a conversation started in.
 
 ## Thread lifecycle
@@ -89,7 +91,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 - **UI reads must not snapshot the working copy.** Always pass `--ignore-working-copy` when the UI polls jj.
 - **Orphan processes.** Kill `claude` children on crash or quit, using process groups and a cleanup check at startup.
 - **No sandbox.** Rift copies isolate files, not permissions. Agents still have full access to your Mac.
-- **Ely is early.** Its README says it is 0.x and written by agents ("no crate is stable"). Pin exact versions and commit `Cargo.lock`.
+- **GPUI Kit is pre-1.0.** Pin exact versions and commit `Cargo.lock`. It has no terminal and no Mermaid diagrams: Mermaid fences show as code until diagrams are built separately.
 - **The "already in use" repair is timing-bound.** It needs claude's stderr line to arrive within the 500 ms drain after claude exits; a later line shows as a plain "Claude exited" error instead.
 - **⌘{ and ⌘} assume a US layout.** On layouts that type braces another way, previous/next thread may not fire.
 - **Reduce Motion is polled every second.** Listening for NSWorkspace's accessibility display options notification would apply it at once.
@@ -97,7 +99,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 
 ## Build order (one vertical slice first)
 
-1. **Slice (done 2026-10-27):** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in Ely chat, with approve/deny working. One thread, no Rift, no jj.
+1. **Slice (done 2026-10-27):** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in the chat, with approve/deny working. One thread, no Rift, no jj.
 2. **Done 2026-10-31.** Threads list, SQLite persistence, resume. Decided 2026-10-30 ([memo](research/threads-and-persistence.md)):
    - **Store:** `~/Library/Application Support/Newjen/newjen.db` (`NEWJEN_HOME` overrides it), WAL, migrations by `user_version`. Tables: projects, threads (with `provider`, the Claude session id and an unread flag), rendered transcript items, and grants. Writes run off the UI thread, at checkpoints only, never per streamed token.
    - **Resume:** the Claude session id is allocated when the thread is created: `--session-id` until `init` arrives, `--resume` after. Each thread stores its own working folder and always spawns from it, so slice 3 only has to set it to a Rift copy.
@@ -107,8 +109,8 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
    - **List:** new threads on top, a status per thread (needs approval, working, failed, stopped, unread), titles from the first message (no hidden model calls). ⌘N opens a draft that is saved only once its first message is sent, so empty threads never pile up. The sidebar hides below 760 px of window width (⌘B toggles it) and shows a dot when a hidden thread needs you. Mocks: `design/newjen.pen` screens 8–12.
    - **Deferred:** deny with a note. The approval dock replaces the composer, so it needs its own text field; it moves to slice 4 with the diff view.
 3. Rift copies, chosen per thread when you create it, with postcreate hooks. The default stays the project folder. Landing (slice 4) must handle both kinds of thread.
-4. jj snapshots, diff view (`ely-git`), and both landing modes.
-5. Parallel threads, notifications (Dock badge), and a terminal panel (`ely-terminal`).
+4. jj snapshots, diff view (GPUI Kit `diff`), and both landing modes.
+5. Parallel threads, notifications (Dock badge), and a terminal panel (on a terminal crate such as `alacritty_terminal`; GPUI Kit has none).
 
 **After the MVP slices: providers.** Newjen detects the installed agent CLIs (`claude`, `codex`) and drives whichever one a thread uses. Detection must not spend usage, the core gets one event model with a Claude adapter and a Codex adapter, and Codex approvals keep the exact-scope rule. This step also shows the account and plan, warns about API keys in the environment, and respects usage limits. Decided 2026-10-30 ([memo](research/providers-and-subscriptions.md)); it runs in its own session once the MVP slices are done.
 
@@ -118,7 +120,7 @@ Users run Newjen on their own Claude and ChatGPT subscriptions, so it must never
 
 ## Appearance
 
-Dark only. Light mode waits until users ask for it (decided 2026-10-30).
+Kit's default light and dark themes follow the system appearance. Components keep Kit's default sizes and fonts.
 
 ## Testing
 
@@ -127,4 +129,4 @@ Dark only. Light mode waits until users ask for it (decided 2026-10-30).
 
 ## Open questions
 
-- None blocking. Slices 1 and 2 are built (2026-10-27, 2026-10-31). Next: replace Ely with GPUI Kit (decided 2026-10-31), then slice 3, Rift copies chosen per thread.
+- None blocking. Slices 1 and 2 are built (2026-10-27, 2026-10-31). Ely was replaced with GPUI Kit on 2026-10-31. Next: slice 3, Rift copies chosen per thread.

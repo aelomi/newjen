@@ -19,7 +19,7 @@ The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](doc
 | Platform | **macOS only**. Don't add Linux or Windows code paths. |
 | Language | Rust, in a Cargo workspace. Toolchain 1.98+. |
 | UI | GPUI via `gpui = { package = "gpui-pre", version = "=0.3.10" }` and `gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }`. |
-| Components | **Ely**: `ely-gpui-component = "=0.1.1"`, a plain crates.io dependency. **Do not fork or vendor it.** If an Ely bug blocks work, use a temporary `[patch.crates-io]` entry and report the bug upstream. |
+| Components | **GPUI Kit** (Longbridge): `gpui-kit = "=0.8.1"`, a plain crates.io dependency built on the same GPUI. Use Kit's own components with Kit's default theme, sizes and fonts. **Do not fork or vendor it.** Newjen hand-builds only the approval card, tool card and working-dot pulse, from Kit pieces; `crates/app/src/ui/` also holds thin behavior helpers. If a Kit bug blocks work, use a temporary `[patch.crates-io]` entry and report it upstream. |
 | Agents | Claude Code CLI over stream-json now; Codex CLI (`codex app-server`) after the MVP slices. Newjen detects which CLIs are installed and uses one provider per thread. API-key providers and ACP agents come later. |
 | Isolation | **Rift** copy-on-write copies, **opt-in per thread**: by default a thread works in the project folder, and you choose a Rift copy when you want one. When chosen, it must be seamless. No git worktrees for now. |
 | Version control | **jj (Jujutsu)**, colocated with git. |
@@ -33,7 +33,9 @@ The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](doc
 ```
 crates/
   core/   # package `newjen-core`. No UI: Claude sessions, protocol, transcript state, SQLite store. Tested headlessly.
-  app/    # package `app`, binary `newjen`. The GPUI shell. Renders core state and sends user intents to core.
+  app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
+          #   src/theme.rs: the sidebar width. src/ui/: approval card, tool card, pulse and thin Kit helpers.
+          #   src/assets.rs: extra Kit icons. THIRD-PARTY-NOTICES.md: embedded Lucide icon licenses.
 design/   # newjen.pen: pen.dev mocks of every UI state. Mock UI changes here first.
 docs/     # PLAN.md and research memos.
 ```
@@ -44,11 +46,11 @@ Later slices add Rift and jj to `core`, and maybe a `cli/` crate that drives `co
 
 Build one vertical slice first, and don't start wrappers for later steps before it works end to end.
 
-1. `cargo run` opens a window. You type a prompt, Claude replies over stream-json, and the reply renders in Ely chat. Approve and deny work. One thread; no Rift, no jj. **Done (2026-10-27).**
+1. `cargo run` opens a window. You type a prompt, Claude replies over stream-json, and the reply renders in the chat. Approve and deny work. One thread; no Rift, no jj. **Done (2026-10-27).**
 2. Thread list, SQLite persistence, resume. **Done (2026-10-31).**
 3. Rift copies, chosen per thread (the default stays the project folder).
-4. jj snapshots, diff view (Ely `git` components), and both landing modes (see the plan).
-5. Parallel threads, Dock badge notifications, and a terminal panel (Ely `terminal`).
+4. jj snapshots, diff view (GPUI Kit `diff`), and both landing modes (see the plan).
+5. Parallel threads, Dock badge notifications, and a terminal panel (GPUI Kit has none; build it on a terminal crate such as `alacritty_terminal`).
 
 ## Verified facts (tested on macOS)
 
@@ -98,16 +100,19 @@ Users run Newjen on their own Claude and ChatGPT subscriptions. **Never do anyth
 - **Say which account pays.** Show the account and plan from the CLI's own report (`claude auth status --json`, Codex `account/read`), and warn when `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` will bill the API instead.
 - **No "Claude Code" in Newjen's name or UI labels.** Prose such as the README may say it "runs Claude Code".
 
-## GPUI and Ely: don't guess APIs
+## GPUI and GPUI Kit: don't guess APIs
 
 Models often invent GPUI APIs because there is little public documentation and the API changes between versions. Before writing UI code:
 
-- **Read the real Ely and GPUI source.** After the first `cargo build`, it's in `~/.cargo/registry/src/*/ely-gpui-component-0.1.1/`, `~/.cargo/registry/src/*/gpui-pre-0.3.10/` and the other `ely-*` and `gpui-pre-*` folders.
-- **Ely's guidance:**
-  - Its README and docs: https://elygpui.com
-  - Its source repository: https://github.com/ELY-Open-Source/Ely-GPUI-Components (read only)
-- **Ely setup:** call `ely_gpui_component::init(cx)` and pass `Assets` to `gpui_platform::application().with_assets(...)`. Without the `font-kit` feature, no text renders on macOS.
-- **Match existing patterns.** Use Ely components rather than building custom widgets when Ely has one.
+- **Read the real GPUI Kit and GPUI source.** After the first `cargo build`, it's in `~/.cargo/registry/src/*/` under `gpui-kit-0.8.1/` (the facade), `gpui-component-0.8.1/` (styled components), `gpui-base-0.8.1/` (text view, input, popover, motion), `gpui-kit-assets-0.8.1/` (icons) and the `gpui-pre-*-0.3.10/` folders.
+- **GPUI Kit's guidance:**
+  - Its guides: https://gpui-kit.com
+  - Its source repository: https://github.com/longbridge/gpui-kit (read only)
+- **Setup** (`crates/app/src/main.rs`): call `gpui_kit::init(cx)`, then follow system appearance with `Theme::change(window.appearance(), Some(window), cx)` when opening the window and in its appearance observer. Use Kit's default fonts; no font assets or registration are needed. Open windows with `gpui_kit::open_window`, which wraps the view in Kit's `Root`: without it tooltips never show and menus lose focus tracking. Without the `font-kit` platform feature, no text renders on macOS.
+- **Colors and sizes come from Kit's theme.** Read `cx.theme()` and use Kit variants, sizes, fonts and text styles. `theme.rs` keeps only app layout dimensions; do not introduce another palette or restyle Kit to match an earlier design.
+- **Reduce Motion belongs to GPUI.** The app re-reads the system setting every second through GPUI Kit; never call `cx.set_reduce_motion` from the app, or the system setting stops applying.
+- **Use Kit's components.** Read a component's source before using it. Buttons use `.label(..)`, `.icon(..)` and `.tooltip(..)`; messages use `MessageScroller`, `Message`/`Bubble` and default `TextView` markdown. Inputs, status tags, overlays and window chrome also come from Kit. Add only the small behavior wrappers needed for Newjen's keys and focus paths.
+- **Markdown highlighting:** the pinned Kit dependency enables tree-sitter with Bash, Rust, JavaScript/TypeScript, TSX, Python and TOML; JSON is included by tree-sitter. Mermaid fences remain code. Reply states are app-owned and built lazily. Kit's `test-support` feature currently conflicts with GPUI's taffy dependency; headless tests use GPUI's `test-support` dev-dependency.
 
 ## UI work
 

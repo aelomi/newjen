@@ -77,7 +77,7 @@ A comparison of how other agent development environments handle tool approvals a
 - **Slice 4:** a real diff before approving:
   - For Edit, build it from old/new against the file on disk.
   - For Write, compare against the existing file (MonoCode only shows the new content).
-  - Render with Ely `git` components. A diff too large to show means once only.
+  - Render with GPUI Kit's `diff` (Ely's `git` components when this was written). A diff too large to show means once only.
   - After the turn, a per-turn jj diff with line comments sent back to Claude (Vibe Kanban, Zeron).
 - **Slice 5:**
   - One approvals inbox across threads (Zed's global FIFO; Codex's thread label plus jump key; Synara's ⌘⌥A).
