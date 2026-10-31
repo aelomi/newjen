@@ -188,6 +188,9 @@ pub struct Startup {
 }
 
 pub struct ChatView {
+    project_chooser: Option<OnPress>,
+    visible: bool,
+    copy_peers: Vec<gpui::WeakEntity<ChatView>>,
     store: Store,
     project: Project,
     base_config: SessionConfig,
@@ -208,12 +211,7 @@ pub struct ChatView {
     drawer_open: bool,
     drawer_focus: FocusHandle,
     list_scroll: UniformListScrollHandle,
-    /// A problem reading the saved threads at launch, or the first failed save, shown as a
-    /// quiet line until dismissed (see `after_write_error`).
     save_problem: Option<String>,
-    /// A failed save has been shown. Later ones are not: the next save writes their rows
-    /// again anyway.
-    save_problem_seen: bool,
     /// Focus target while an approval is pending (the dock replaces the composer, so the field
     /// is not on screen), so ⌘↵ and Esc reach us.
     root: FocusHandle,
@@ -255,7 +253,7 @@ impl ChatView {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| project.path.display().to_string());
         let project_label = tilde(&project.path, home.as_deref());
-        let tasks = vec![clock(cx), save_problems(&store, cx)];
+        let tasks = vec![clock(cx)];
         let grants_focus = cx.focus_handle();
         let focus = [
             cx.on_focus_lost(window, |view, window, cx| view.reclaim_focus(window, cx)),
@@ -265,6 +263,9 @@ impl ChatView {
             }),
         ];
         let mut view = ChatView {
+            project_chooser: None,
+            visible: true,
+            copy_peers: vec![],
             store,
             project,
             base_config,
@@ -280,8 +281,6 @@ impl ChatView {
             drawer_open: false,
             drawer_focus: cx.focus_handle(),
             list_scroll: UniformListScrollHandle::new(),
-            // A load problem is not a save problem: the first failed save still gets shown.
-            save_problem_seen: false,
             save_problem: problem,
             root: cx.focus_handle(),
             grants_open: false,
@@ -303,14 +302,6 @@ impl ChatView {
         // The newest thread is on screen at launch. Nothing is started: a thread's `claude`
         // starts with the first message sent to it.
         view.enter(window, cx);
-        match thread::Removal::pending(&view.store) {
-            Ok(pending) => view.remove_copies(pending, cx),
-            Err(error) => {
-                view.save_problem.get_or_insert(format!(
-                    "Couldn't list the Rift copies to remove: {error:#}"
-                ));
-            }
-        }
         view.restore_pending_copies(window, cx);
         #[cfg(not(test))]
         view.refresh_providers(window, cx);
@@ -400,15 +391,49 @@ impl ChatView {
         cx.notify();
     }
 
+    pub fn set_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.visible = visible;
+        if visible {
+            self.enter(window, cx);
+        } else {
+            self.thread()
+                .clone()
+                .update(cx, |thread, _| thread.set_active(false));
+            if self.drawer_open {
+                window.close_sheet(cx);
+            }
+            self.drawer_open = false;
+            self.grants_open = false;
+            window.close_all_dialogs(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn set_copy_peers(&mut self, peers: Vec<gpui::WeakEntity<ChatView>>) {
+        self.copy_peers = peers;
+    }
+
+    pub fn set_project_chooser(&mut self, chooser: OnPress) {
+        self.project_chooser = Some(chooser);
+    }
+
     /// When the focused element leaves the window (an overlay closed without handing focus
     /// back, say): the composer takes it, or the root while the dock replaces the composer, so
     /// the shortcuts keep working.
     fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
         // Deferred: GPUI draws no new frame for focus that a focus-lost listener moves, so the
         // composer would not show its focus until the next redraw.
-        cx.defer_in(window, |view, window, cx| match view.field_focus(cx) {
-            Some(field) if view.composer_has_keys() => window.focus(&field, cx),
-            _ => window.focus(&view.root, cx),
+        cx.defer_in(window, |view, window, cx| {
+            if !view.visible {
+                return;
+            }
+            match view.field_focus(cx) {
+                Some(field) if view.composer_has_keys() => window.focus(&field, cx),
+                _ => window.focus(&view.root, cx),
+            }
         });
     }
 
@@ -426,17 +451,21 @@ impl ChatView {
     /// At quit (⌘Q, or the window closed): settles and saves every thread and stops every
     /// `claude`, all at once (see `newjen_core::thread::finish_quit`). GPUI gives the whole app
     /// about 200 ms; this takes about as long as the slowest `claude` takes to stop.
-    pub fn quit(&mut self, cx: &mut Context<Self>) {
+    pub fn begin_quit(&mut self, cx: &mut Context<Self>) -> Vec<Quitting> {
         for (ix, slot) in self.slots.iter().enumerate() {
             if let Err(error) = slot.thread.read(cx).save_draft(&self.composer_text(ix, cx)) {
                 self.save_problem = Some(format!("Couldn't save the draft: {error:#}"));
             }
         }
-        let quitting: Vec<Quitting> = self
-            .slots
+        self.slots
             .iter()
             .map(|slot| slot.thread.update(cx, |thread, _| thread.begin_quit()))
-            .collect();
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn quit(&mut self, cx: &mut Context<Self>) {
+        let quitting = self.begin_quit(cx);
         thread::finish_quit(&self.store, quitting);
     }
 
@@ -608,6 +637,9 @@ impl ChatView {
     /// Makes the thread at `active` the one on screen: clears its unread flag, gives its
     /// composer (or its approval dock) the keyboard, and scrolls the list to it.
     fn enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
         self.sync_replies(self.active, cx);
         // No `notify` on the thread: this view redraws itself below. (It also runs while the
         // view is being built, when nothing can observe the thread yet.)
@@ -802,17 +834,6 @@ impl ChatView {
         }
     }
 
-    /// A write to the store failed. The first one is shown once, quietly; the thread it
-    /// belonged to writes it again at its next save.
-    fn save_failed(&mut self, problem: String, cx: &mut Context<Self>) {
-        let first = !self.save_problem_seen;
-        (self.save_problem, self.save_problem_seen) =
-            after_write_error(self.save_problem.take(), self.save_problem_seen, problem);
-        if first {
-            cx.notify();
-        }
-    }
-
     // -----------------------------------------------------------------------------------------
     // The thread on screen
     // -----------------------------------------------------------------------------------------
@@ -847,6 +868,9 @@ impl ChatView {
     /// while an approval is pending (so ⌘↵ and Esc reach `on_key_down`), back in the field
     /// afterwards, and a placeholder that fits the moment.
     fn sync_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
         let field = self.ensure_field(window, cx);
         let (front, outside, status, empty, making_copy) = {
             let thread = self.thread().read(cx);
@@ -1021,48 +1045,75 @@ impl ChatView {
     }
 
     /// Checked before `Thread::send`, which would hold the message and rename the thread.
+    /// Why `thread` cannot send yet, if it can't: a draft that wants a Rift copy waits for
+    /// threads busy in the project folder (and for another copy being made), and a
+    /// project-folder send waits while a copy's jj snapshot of the project runs. Threads of
+    /// other open projects count when they share the repository.
     fn copy_hold(&self, thread: &Entity<Thread>, cx: &App) -> Option<Notice> {
-        if thread.read(cx).works_in() == WorksIn::ProjectFolder {
-            if let Some(blocker) = self
-                .slots
-                .iter()
-                .filter(|slot| slot.thread != *thread)
-                .map(|slot| slot.thread.read(cx))
-                .find(|other| other.blocks_project_send())
-            {
-                return Some(Notice {
+        let (project_folder, wants_copy) = {
+            let thread = thread.read(cx);
+            (
+                thread.works_in() == WorksIn::ProjectFolder,
+                thread.is_draft()
+                    && thread.works_in() == WorksIn::RiftCopy
+                    && thread.copy().is_none(),
+            )
+        };
+        if !project_folder && !wants_copy {
+            return None;
+        }
+        let source = rift::project_root(thread.read(cx).cwd()).0;
+        let jj_repo = in_jj_repo(&source);
+        if wants_copy && let Some(missing) = missing_tool(&self.tools, jj_repo) {
+            return Some(missing);
+        }
+        let blocks_send = |other: &Thread| {
+            let busy = if project_folder {
+                other.blocks_project_send()
+            } else {
+                other.preparing().is_some()
+                    || other.status().is_busy()
+                    || !other.background_tasks().is_empty()
+            };
+            if !busy {
+                return false;
+            }
+            let other_source = rift::project_root(other.cwd()).0;
+            source.starts_with(&other_source) || other_source.starts_with(&source)
+        };
+        let hold = |blocker: &Thread| {
+            if project_folder {
+                Notice {
                     kind: NoticeKind::Snapshot,
                     title: "Wait a moment".to_string(),
                     detail: format!(
                         "Newjen is taking a jj snapshot of the project to make the Rift copy for “{}”.",
                         blocker.title()
                     ),
-                });
+                }
+            } else {
+                refusal(blocker.title(), blocker.preparing().is_some(), jj_repo)
             }
-            return None;
-        }
-        let wants_copy = {
-            let thread = thread.read(cx);
-            thread.is_draft() && thread.works_in() == WorksIn::RiftCopy && thread.copy().is_none()
         };
-        if !wants_copy {
-            return None;
-        }
-        let jj_repo = in_jj_repo(&self.project.path);
-        if let Some(missing) = missing_tool(&self.tools, jj_repo) {
-            return Some(missing);
-        }
-        let blocker = self
+        if let Some(blocker) = self
             .slots
             .iter()
             .filter(|slot| slot.thread != *thread)
             .map(|slot| slot.thread.read(cx))
-            .find(|other| other.blocks_copy_creation())?;
-        Some(refusal(
-            blocker.title(),
-            blocker.preparing().is_some(),
-            jj_repo,
-        ))
+            .find(|other| blocks_send(other))
+        {
+            return Some(hold(blocker));
+        }
+        for peer in &self.copy_peers {
+            let Some(peer) = peer.upgrade() else { continue };
+            for slot in &peer.read(cx).slots {
+                let other = slot.thread.read(cx);
+                if blocks_send(other) {
+                    return Some(hold(other));
+                }
+            }
+        }
+        None
     }
 
     fn gone_copy(&self, thread: &Thread) -> Option<String> {
@@ -1940,7 +1991,21 @@ impl ChatView {
             .into_any_element()
         };
         vec![
-            sidebar::project_row(&self.project_name, &self.project_label, room, window, cx),
+            div()
+                .id("switch-project")
+                .debug_selector(|| "switch-project".to_string())
+                .cursor_pointer()
+                .when_some(self.project_chooser.clone(), |row, chooser| {
+                    row.on_click(move |_, window, cx| chooser(window, cx))
+                })
+                .child(sidebar::project_row(
+                    &self.project_name,
+                    &self.project_label,
+                    room,
+                    window,
+                    cx,
+                ))
+                .into_any_element(),
             sidebar::new_thread_row(empty, new_thread, cx),
             // The gap under "New thread", as in the mock.
             div().flex_none().h(px(6.0)).into_any_element(),
@@ -2051,7 +2116,11 @@ impl Render for ChatView {
                     })
             });
             let focus = self.drawer_focus.clone();
-            cx.defer_in(window, move |_, window, cx| focus.focus(window, cx));
+            cx.defer_in(window, move |view, window, cx| {
+                if view.visible && view.drawer_open {
+                    focus.focus(window, cx);
+                }
+            });
         } else if placement != Placement::Drawer && window.has_active_sheet(cx) {
             window.close_sheet(cx);
             match self.field_focus(cx) {
@@ -2151,19 +2220,6 @@ fn clock(cx: &mut Context<ChatView>) -> Task<()> {
     })
 }
 
-/// Listens for failed writes to the store (it has one listener: each error is delivered once).
-fn save_problems(store: &Store, cx: &mut Context<ChatView>) -> Task<()> {
-    let errors = store.write_errors();
-    cx.spawn(async move |view, cx| {
-        while let Ok(error) = errors.recv().await {
-            let shown = view.update(cx, |view, cx| view.save_failed(error.to_string(), cx));
-            if shown.is_err() {
-                break;
-            }
-        }
-    })
-}
-
 /// What a thread's row in the list needs to know about it at `now`.
 fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
     let transcript = thread.transcript();
@@ -2192,18 +2248,6 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
         stopped_on_quit: matches!(transcript.items().last(), Some(Item::Stopped { .. })),
         background_tasks: thread.background_tasks().len(),
         updated_at: thread.updated_at(),
-    }
-}
-
-/// The quiet problem line after a failed write, given the `line` now shown (if any) and whether
-/// a failed write was already shown (`seen`). The first failed write takes the line, even over
-/// a "Couldn't load threads" line, which says nothing about saving. Later ones change nothing:
-/// the next save writes their rows again anyway. Returns the new line and `seen`.
-fn after_write_error(line: Option<String>, seen: bool, error: String) -> (Option<String>, bool) {
-    if seen {
-        (line, true)
-    } else {
-        (Some(error), true)
     }
 }
 
@@ -2284,9 +2328,7 @@ fn refusal(blocker: &str, blocker_making_copy: bool, jj_repo: bool) -> Notice {
     if blocker_making_copy {
         return Notice::held(
             "Another Rift copy is being made",
-            format!(
-                "Newjen makes one Rift copy at a time, so wait until “{blocker}” has its copy."
-            ),
+            format!("Wait until “{blocker}” has its copy before starting work in this folder."),
         );
     }
     let snapshot = if jj_repo {
@@ -2411,26 +2453,6 @@ mod tests {
             sent_answer(ApprovalIntent::Deny, true),
             ApprovalIntent::Deny
         );
-    }
-
-    #[test]
-    fn a_load_problem_does_not_hide_the_first_failed_save() {
-        let load = Some("Couldn't load threads: bad row".to_string());
-        let full = "Couldn't save threads: disk full".to_string();
-        // Launched with a load problem on screen; the first failed save still shows.
-        let (line, seen) = after_write_error(load, false, full.clone());
-        assert_eq!(line.as_deref(), Some(full.as_str()));
-        assert!(seen);
-        // Later failures change nothing, whether the line is still up or was dismissed.
-        let later = "Couldn't save threads: again".to_string();
-        assert_eq!(
-            after_write_error(line, seen, later.clone()),
-            (Some(full), true)
-        );
-        assert_eq!(after_write_error(None, true, later), (None, true));
-        // With nothing on screen, the first failure shows.
-        let (line, _) = after_write_error(None, false, "Couldn't save threads: x".to_string());
-        assert_eq!(line.as_deref(), Some("Couldn't save threads: x"));
     }
 
     #[test]
@@ -2586,11 +2608,7 @@ mod tests {
         );
         let making = refusal("Fix the parser", true, true);
         assert_eq!(making.title, "Another Rift copy is being made");
-        assert!(
-            making
-                .detail
-                .ends_with("wait until “Fix the parser” has its copy.")
-        );
+        assert!(making.detail.contains("“Fix the parser” has its copy"));
     }
 
     #[test]

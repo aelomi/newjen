@@ -1267,3 +1267,254 @@ fn provider_menu_fits_the_smallest_window_and_keeps_refresh_visible(cx: &mut Tes
     cx.simulate_keystrokes("escape");
     finish(&chat, path, cx);
 }
+
+#[gpui::test]
+async fn hidden_project_events_keep_the_other_projects_focus_and_unread(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "hidden-project", true);
+    cx.simulate_input("approval after hiding the project");
+    cx.simulate_keystrokes("enter");
+    let other_focus = cx.update(|window, cx| {
+        chat.update(cx, |view, cx| view.set_visible(false, window, cx));
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        focus
+    });
+    pending(&chat, cx).await;
+    assert!(cx.update(|window, _| other_focus.is_focused(window)));
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_unread()));
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.set_visible(true, window, cx)));
+    assert!(cx.update(|window, cx| chat.read(cx).root.is_focused(window)));
+    assert!(!cx.update(|_, cx| chat.read(cx).thread().read(cx).is_unread()));
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_busy_project_in_the_same_repository_blocks_a_peers_copy(cx: &mut TestAppContext) {
+    let (busy, path, cx) = setup(cx, "copy-peer", true);
+    std::fs::create_dir_all(path.join(".git")).unwrap();
+    let sibling = path.join("subproject");
+    std::fs::create_dir_all(&sibling).unwrap();
+    let peer = cx.update(|window, cx| {
+        let store = busy.read(cx).store.clone();
+        let project = store.open_project(&sibling).unwrap();
+        let startup = Startup {
+            store,
+            project,
+            base_config: SessionConfig::new(&sibling),
+            threads: vec![],
+            problem: None,
+            home: None,
+            tools: Tools {
+                rift: PathBuf::from("/bin/rift"),
+                jj: PathBuf::from("/bin/jj"),
+                env: vec![],
+            },
+        };
+        let peer = cx.new(|cx| ChatView::new(startup, window, cx));
+        peer.update(cx, |view, cx| {
+            view.set_copy_peers(vec![busy.downgrade()]);
+            view.thread().clone().update(cx, |thread, _| {
+                thread.set_works_in(WorksIn::RiftCopy).unwrap()
+            });
+            view.set_visible(false, window, cx);
+        });
+        busy.update(cx, |view, cx| view.set_visible(true, window, cx));
+        peer
+    });
+    cx.simulate_input("work in the repository");
+    cx.simulate_keystrokes("enter");
+    pending(&busy, cx).await;
+    assert!(cx.update(|_, cx| {
+        peer.read(cx)
+            .copy_hold(peer.read(cx).thread(), cx)
+            .is_some()
+    }));
+    std::fs::remove_dir_all(path.join(".git")).unwrap();
+    assert!(cx.update(|_, cx| {
+        peer.read(cx)
+            .copy_hold(peer.read(cx).thread(), cx)
+            .is_some()
+    }));
+    let unrelated_path = path.with_extension("unrelated");
+    std::fs::create_dir_all(&unrelated_path).unwrap();
+    let unrelated = cx.update(|window, cx| {
+        let store = busy.read(cx).store.clone();
+        let project = store.open_project(&unrelated_path).unwrap();
+        let tools = peer.read(cx).tools.clone();
+        let unrelated = cx.new(|cx| {
+            ChatView::new(
+                Startup {
+                    store,
+                    project,
+                    base_config: SessionConfig::new(&unrelated_path),
+                    threads: vec![],
+                    problem: None,
+                    home: None,
+                    tools,
+                },
+                window,
+                cx,
+            )
+        });
+        unrelated.update(cx, |view, cx| {
+            view.set_copy_peers(vec![busy.downgrade()]);
+            view.thread().clone().update(cx, |thread, _| {
+                thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            });
+        });
+        unrelated
+    });
+    assert!(cx.update(|_, cx| {
+        unrelated
+            .read(cx)
+            .copy_hold(unrelated.read(cx).thread(), cx)
+            .is_none()
+    }));
+    cx.update(|_, cx| unrelated.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    finish(&busy, path, cx);
+    std::fs::remove_dir_all(unrelated_path).unwrap();
+}
+
+#[gpui::test]
+fn a_project_folder_send_waits_for_an_overlapping_copy_job(cx: &mut TestAppContext) {
+    let (copying, path, cx) = setup(cx, "review-copy-first", true);
+    let child = path.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let (peer, job) = cx.update(|window, cx| {
+        let store = copying.read(cx).store.clone();
+        let project = store.open_project(&child).unwrap();
+        let mut config = SessionConfig::new(&child);
+        config.program = copying.read(cx).base_config.program.clone();
+        let peer = cx.new(|cx| {
+            ChatView::new(
+                Startup {
+                    store,
+                    project,
+                    base_config: config,
+                    threads: vec![],
+                    problem: None,
+                    home: None,
+                    tools: Tools::find(),
+                },
+                window,
+                cx,
+            )
+        });
+        copying.update(cx, |view, cx| view.set_visible(false, window, cx));
+        let job = copying.read(cx).thread().clone().update(cx, |thread, _| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            match thread.send("create isolated copy").unwrap() {
+                Sent::MakingCopy(job) => job,
+                _ => panic!("expected copy preparation"),
+            }
+        });
+        peer.update(cx, |view, cx| {
+            view.set_copy_peers(vec![copying.downgrade()]);
+            view.set_visible(true, window, cx);
+        });
+        (peer, job)
+    });
+    let (preparing, allowed, started) = cx.update(|window, cx| {
+        let preparing = copying.read(cx).thread().read(cx).preparing().is_some();
+        let allowed = peer
+            .read(cx)
+            .copy_hold(peer.read(cx).thread(), cx)
+            .is_none();
+        let started = peer.update(cx, |view, cx| {
+            view.send_text("edit the source now", window, cx)
+        });
+        (preparing, allowed, started)
+    });
+    assert!(preparing);
+    assert!(!allowed);
+    drop(job);
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    finish(&copying, path, cx);
+    assert!(
+        !started,
+        "source writer must wait for overlapping copy preparation"
+    );
+}
+
+#[gpui::test]
+async fn switching_projects_cancels_the_archive_dialog(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "review-hidden-archive", true, Some(CREATE_COPY));
+    choose(1, cx);
+    cx.simulate_input("prepare isolated work");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.ask_to_archive(&id, window, cx)));
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    cx.run_until_parked();
+    let dialog_focus = cx.update(|window, cx| window.focused(cx).unwrap());
+    let other = cx.update(|window, cx| {
+        chat.update(cx, |view, cx| view.set_visible(false, window, cx));
+        let other = cx.focus_handle();
+        window.focus(&other, cx);
+        other
+    });
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    drop(dialog_focus);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let (visible, draft, kept_focus) = cx.update(|window, cx| {
+        (
+            chat.read(cx).visible,
+            chat.read(cx).thread().read(cx).is_draft(),
+            other.is_focused(window),
+        )
+    });
+    assert!(!visible);
+    finish(&chat, path, cx);
+    assert!(!draft, "switching cancels the archive confirmation");
+    assert!(kept_focus, "hidden archive completion must not take focus");
+}
+
+#[gpui::test]
+async fn a_busy_rift_folder_cannot_be_copied_as_another_project(cx: &mut TestAppContext) {
+    let (busy, path, cx) = setup_in(cx, "review-rift-peer", true, Some(CREATE_COPY));
+    choose(1, cx);
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&busy, cx).await;
+    let peer = cx.update(|window, cx| {
+        let view = busy.read(cx);
+        let thread = view.thread().read(cx);
+        assert!(thread.status().is_busy());
+        let cwd = thread.cwd().to_path_buf();
+        let store = view.store.clone();
+        let tools = view.tools.clone();
+        let project = store.open_project(&cwd).unwrap();
+        let startup = Startup {
+            store,
+            project,
+            base_config: SessionConfig::new(&cwd),
+            threads: vec![],
+            problem: None,
+            home: None,
+            tools,
+        };
+        let peer = cx.new(|cx| ChatView::new(startup, window, cx));
+        peer.update(cx, |view, cx| {
+            view.set_copy_peers(vec![busy.downgrade()]);
+            view.thread().clone().update(cx, |thread, _| {
+                thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            });
+        });
+        peer
+    });
+    let blocked = cx.update(|_, cx| {
+        let view = peer.read(cx);
+        let running = busy.read(cx).thread().read(cx);
+        assert_eq!(rift::project_root(&view.project.path).0, running.cwd());
+        view.copy_hold(view.thread(), cx).is_some()
+    });
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    finish(&busy, path, cx);
+    assert!(
+        blocked,
+        "must block copying a folder with a busy peer working in it"
+    );
+}

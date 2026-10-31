@@ -21,6 +21,8 @@ actions!(
         HideOthers,
         Minimize,
         CloseWindow,
+        OpenProject,
+        ShowProjects,
         Stop,
         NewThread,
         PreviousThread,
@@ -34,6 +36,10 @@ actions!(
 #[derive(Clone, Debug, PartialEq, Action)]
 #[action(namespace = newjen, no_json)]
 pub struct JumpToThread(pub usize);
+
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = newjen, no_json)]
+pub struct OpenRecentProject(pub std::path::PathBuf);
 
 /// ⌘1 to ⌘9: `JumpToThread(0)` to `JumpToThread(8)`.
 pub const JUMP_KEYS: [&str; 9] = [
@@ -54,6 +60,8 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-o", OpenProject, None),
+        KeyBinding::new("cmd-shift-o", ShowProjects, None),
         // Works from the text field too: it stops the running turn.
         KeyBinding::new("cmd-.", Stop, Some(CONTEXT)),
         KeyBinding::new("cmd-n", NewThread, Some(CONTEXT)),

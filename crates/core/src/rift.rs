@@ -528,7 +528,7 @@ fn check_directory(path: &Path, parent: &Path) -> Result<(), CopyError> {
 
 /// The folder to copy for `project` (canonical), and whether it is a jj repo: the nearest
 /// folder with a `.jj` in it, else the nearest with a `.git`, else `project`.
-fn project_root(project: &Path) -> (PathBuf, bool) {
+pub fn project_root(project: &Path) -> (PathBuf, bool) {
     let nearest = |marker: &str| {
         project
             .ancestors()
