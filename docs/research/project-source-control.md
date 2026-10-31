@@ -2,7 +2,7 @@
 
 Research date 2026-10-31. This is a design memo, not an application implementation.
 
-The owner wants a source-control choice when adding a project. Newjen must support Git, Jujutsu, and both with jj primary. This memo proposes Git fallback as the meaning of "backup," pending the clarification below. Settings must show both installed tools, refresh their status, check for updates, and support an appropriate update action.
+The owner wants a source-control choice when adding a project. Newjen must support Git, Jujutsu, and both with jj primary. The owner clarified that "Git as backup" means using Git for operations jj does not implement, against the same history. Settings must show both installed tools, refresh their status, check for updates, and support an appropriate update action.
 
 This request supersedes the earlier blanket choice to initialize jj in every plain-Git Rift copy. Git mode must work without jj installed. The [landing memo](git-only-landing.md) retains the transfer experiments and protection requirements. Its automatic apply requirement for folders without version control still applies.
 
@@ -18,7 +18,7 @@ Offer three choices during Add project:
 
 Call the combined option **Jujutsu + Git**, with the description "Use jj primarily, with Git compatibility." Both tools share one backing store. This provides a fallback, not an independent backup. A scratch Git clone preserved an exported commit but did not contain `.jj` metadata. jj's operation log records repository views and recovery operations beyond ordinary Git branch history. [jj operation log](https://docs.jj-vcs.dev/latest/operation-log/).
 
-The owner's meaning of "backup" needs one clarification. The current proposal treats it as Git fallback on shared history. If an independent recoverable backup is also required, it needs a destination, scope, retention, and a restore test. Colocation alone must not claim that promise.
+The owner confirmed Git fallback on shared history. Independent backup storage is outside this requirement. The combined mode must expose Git operations where jj has no native equivalent while keeping jj as the primary workflow.
 
 ## Add a project without hiding a conversion
 
@@ -115,7 +115,7 @@ A successful jj operation can leave conflicts recorded in its result. Model conf
 
 jj fetch and import can abandon revisions that became unreachable, and replacing an abandoned working-copy commit can create a new change. A reviewer probe fetched a rewritten local remote and reproduced abandonment, descendant rebasing, and removal of a working file in both layouts. A rerun with `--ignore-working-copy` preserved the file bytes but still changed revision history. The flag alone is not a remote-read safety guarantee. Treat remote synchronization as an intentional repository operation with preflight, coordination with active writers, and result checks. Keep it out of installed-tool discovery and passive observers. The CLI reference documents these effects. [jj fetch](https://docs.jj-vcs.dev/latest/cli-reference/#jj-git-fetch).
 
-Colocation imports and exports Git state automatically during ordinary jj operations. It does not preserve Git's staging workflow. Background Git writers can therefore affect a jj-primary project. Keep ordinary Newjen mutations jj-driven in both jj modes. Expose a deliberate Git fallback rather than two simultaneous writers. Git compatibility has documented limitations, including hooks and attributes, so unsupported projects need a reason and an available Git mode. [Git compatibility](https://docs.jj-vcs.dev/latest/git-compatibility/).
+Colocation imports and exports Git state automatically during ordinary jj operations. It does not preserve Git's staging workflow. Background Git writers can therefore affect a jj-primary project. Keep ordinary Newjen mutations jj-driven in both jj modes. In the combined mode, expose a deliberate Git action for operations jj does not implement. Coordinate that action with jj operations, then reconcile and refresh the resulting jj state. Do not run both as simultaneous writers. Select fallback by operation capability, not by retrying every failed jj command through Git. Authentication errors, conflicts, or an unsupported tool version are not evidence that Git should retry the operation. Git compatibility has documented limitations, including hooks and attributes, so unsupported projects need a reason and an available Git mode. [Git compatibility](https://docs.jj-vcs.dev/latest/git-compatibility/).
 
 Use the documented `jj --ignore-working-copy git root` to discover backing storage. The scratch probe verified it for non-colocated and colocated layouts. Do not hardcode `.jj/repo/store/git` in production. The earlier landing probe used that internal path only to establish binary export mechanics.
 
@@ -160,4 +160,4 @@ The new memo received a clean review from GPT 6.1 Sol. GPT 6 Astra reproduced on
 
 Implementation is outside this discussion session. The open-project session owns onboarding, slice 4 owns snapshots and landing, and the merge pass owns coordinated schema changes. Native tool settings and updating need a separately assigned implementation if they do not fit an existing lane.
 
-The remaining product question is whether "Git as backup" means compatibility and fallback alone, or also an independent recoverable backup. The former is fully described here. The latter is a separate persistence and recovery requirement, not a property of colocation.
+The owner resolved the final product question. "Git as backup" means Git operations fill gaps in jj's native capabilities on the same repository history. It does not require a separate recovery copy. This clarification changes no repository or application code.
