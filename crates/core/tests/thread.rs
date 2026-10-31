@@ -3458,6 +3458,52 @@ fn closing_project_tracking_after_user_jj_changes_keeps_files_and_history() {
 }
 
 #[test]
+fn landing_instructions_are_sent_only_where_landing_is_available() {
+    let fixture = Fixture::new();
+    let mut thread = fixture.draft();
+    let told = |thread: &Thread| {
+        flag(&thread.session_config().args(), "--append-system-prompt").map(str::to_string)
+    };
+    assert_eq!(
+        told(&thread),
+        None,
+        "a plain folder is never snapshotted, so claude must not be told it is"
+    );
+    std::fs::create_dir(fixture.project.path.join(".git")).unwrap();
+    assert_eq!(
+        told(&thread),
+        None,
+        "a git-only folder is never snapshotted"
+    );
+    thread
+        .set_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
+        .unwrap();
+    assert_eq!(told(&thread), None);
+    thread
+        .set_landing_mode(newjen_core::landing::LandingMode::HarnessManaged)
+        .unwrap();
+    std::fs::remove_dir(fixture.project.path.join(".git")).unwrap();
+    thread.send("hello").unwrap();
+    finish_turn(&mut thread);
+    assert!(
+        fixture
+            .spawns()
+            .iter()
+            .all(|args| flag(args, "--append-system-prompt").is_none())
+    );
+    assert!(thread.review_base().is_none());
+    assert!(!thread.work_pending());
+
+    let other = Fixture::new();
+    let Some(_tools) = init_thread_jj(&other) else {
+        return;
+    };
+    let colocated = other.draft();
+    let instructions = told(&colocated).expect("a colocated jj repo gets the instructions");
+    assert!(instructions.contains("Newjen snapshots the folder after each turn"));
+}
+
+#[test]
 fn agent_managed_threads_are_told_to_record_and_bookmark_their_work_with_jj() {
     let fixture = Fixture::new();
     let Some(tools) = init_thread_jj(&fixture) else {

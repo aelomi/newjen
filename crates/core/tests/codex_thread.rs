@@ -213,13 +213,41 @@ fn command_allow_deny_and_exact_session_grants_use_the_right_decision() {
             .into_iter()
             .find(|m| m["method"] == "thread/start")
             .unwrap();
-        assert_eq!(
-            opened["params"]["developerInstructions"],
-            thread.landing_mode().instructions(),
-            "Newjen's instructions reach Codex as developer instructions: {opened}"
+        assert!(
+            opened["params"].get("developerInstructions").is_none(),
+            "a plain folder is never snapshotted, so Codex gets no landing instructions: {opened}"
         );
         assert!(!opened.to_string().contains("--append-system-prompt"));
     }
+}
+
+#[test]
+fn landing_instructions_reach_codex_as_developer_instructions_in_a_jj_repo() {
+    let lab = Lab::new("reply");
+    let tools = lab.rift_tools();
+    let output = std::process::Command::new(&tools.jj)
+        .args(["git", "init", "--colocate"])
+        .current_dir(&lab.project.path)
+        .envs(tools.env.iter().map(|(key, value)| (key, value)))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let mut thread = lab.draft();
+    let Sent::PreparingProject(job) = thread.send("Say hello").unwrap() else {
+        panic!("project preparation expected");
+    };
+    thread.finish_project(job.run(&tools)).unwrap();
+    finish(&mut thread);
+    let opened = lab
+        .input()
+        .into_iter()
+        .find(|m| m["method"] == "thread/start")
+        .unwrap();
+    assert_eq!(
+        opened["params"]["developerInstructions"],
+        thread.landing_mode().instructions(),
+        "Newjen's instructions reach Codex as developer instructions: {opened}"
+    );
 }
 
 #[test]

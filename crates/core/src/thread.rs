@@ -941,7 +941,9 @@ impl Thread {
         let mut config = self.base_config.clone();
         config.bind(&self.session_id, self.session_started, &rules);
         config.cwd = self.cwd.clone();
-        if self.landing_mode == LandingMode::HarnessManaged || landing::available(&self.cwd) {
+        // Only where Newjen (or the agent) can record work with jj: a git-only or plain
+        // folder is never snapshotted, so the agent must not be told it is.
+        if landing::available(&self.cwd) {
             config.instructions = Some(self.landing_mode.instructions().to_string());
         }
         if let Place::Copy(copy) = &self.place {
