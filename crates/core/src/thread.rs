@@ -941,8 +941,8 @@ impl Thread {
         let mut config = self.base_config.clone();
         config.bind(&self.session_id, self.session_started, &rules);
         config.cwd = self.cwd.clone();
-        if self.landing_mode == LandingMode::HarnessManaged {
-            config.instructions = Some("Newjen manages version control for this thread. Do not commit, describe, rebase, merge, create bookmarks or branches, or otherwise write version-control metadata. Make file changes only. Newjen snapshots the folder after each turn.".to_string());
+        if self.landing_mode == LandingMode::HarnessManaged || landing::available(&self.cwd) {
+            config.instructions = Some(self.landing_mode.instructions().to_string());
         }
         if let Place::Copy(copy) = &self.place {
             config.env.extend(copy.env());
@@ -1049,6 +1049,42 @@ impl Thread {
         if matches!(self.snapshot, SnapshotState::Failed(_)) {
             self.snapshot = SnapshotState::Pending;
         }
+    }
+
+    pub fn can_release_project_tracking(&self) -> bool {
+        self.owns_project_work()
+            && !self.is_draft()
+            && self.preparing().is_none()
+            && !self.status().is_busy()
+            && self.background_tasks().is_empty()
+            && matches!(
+                self.snapshot,
+                SnapshotState::Clean | SnapshotState::Failed(_)
+            )
+    }
+
+    pub fn release_project_tracking(&mut self) -> Result<()> {
+        if self.landing_resolved && self.place == Place::ProjectFolder {
+            return Ok(());
+        }
+        if !self.can_release_project_tracking() {
+            bail!(
+                "Wait for the turn and any snapshot to finish before keeping the files and closing"
+            );
+        }
+        if self.session.is_some() || self.stopping.iter().any(|job| !job.is_finished()) {
+            bail!("Stop the agent before releasing project tracking");
+        }
+        self.snapshot = SnapshotState::Clean;
+        self.landing_resolved = true;
+        self.save();
+        Ok(())
+    }
+
+    pub fn snapshot_waits_for_background(&self) -> bool {
+        matches!(self.snapshot, SnapshotState::Pending)
+            && !self.status().is_busy()
+            && !self.background_tasks().is_empty()
     }
 
     pub fn finish_landing(&mut self) {
@@ -1391,6 +1427,10 @@ impl Thread {
             return self.answer(None, crate::agent::ApprovalIntent::DenyAndStop);
         }
         if !self.status().is_busy() {
+            if !self.background_tasks().is_empty() {
+                self.end_session();
+                self.save();
+            }
             return Ok(());
         }
         self.last_activity = Instant::now();

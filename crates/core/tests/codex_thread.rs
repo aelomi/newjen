@@ -213,10 +213,9 @@ fn command_allow_deny_and_exact_session_grants_use_the_right_decision() {
             .into_iter()
             .find(|m| m["method"] == "thread/start")
             .unwrap();
-        assert!(
-            opened["params"]["developerInstructions"]
-                .as_str()
-                .is_some_and(|text| text.contains("version control")),
+        assert_eq!(
+            opened["params"]["developerInstructions"],
+            thread.landing_mode().instructions(),
             "Newjen's instructions reach Codex as developer instructions: {opened}"
         );
         assert!(!opened.to_string().contains("--append-system-prompt"));

@@ -586,3 +586,25 @@ fn unsupported_repositories_decline_landing_without_preparing_a_change() {
     assert_eq!(landing::head(&lab.tools, &repo).unwrap(), before);
     assert!(landing::review(&lab.tools, &repo, &before).is_err());
 }
+
+#[test]
+fn removing_the_thread_remote_does_not_snapshot_project_files() {
+    let Some(lab) = Lab::new() else {
+        return;
+    };
+    let repo = lab.repo();
+    let remote = format!("thread-{THREAD}");
+    lab.jj(
+        &repo,
+        &["git", "remote", "add", &remote, repo.to_str().unwrap()],
+    );
+    std::fs::write(repo.join("in-progress.txt"), "still writing\n").unwrap();
+    let head = landing::head(&lab.tools, &repo).unwrap();
+    landing::cleanup_remote(&lab.tools, &repo, THREAD).unwrap();
+    assert_eq!(landing::head(&lab.tools, &repo).unwrap(), head);
+    assert!(
+        lab.jj(&repo, &["git", "remote", "list", "--ignore-working-copy"])
+            .is_empty()
+    );
+    landing::cleanup_remote(&lab.tools, &repo, THREAD).unwrap();
+}

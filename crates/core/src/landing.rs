@@ -23,6 +23,17 @@ pub enum LandingMode {
 }
 
 impl LandingMode {
+    pub fn instructions(self) -> &'static str {
+        match self {
+            Self::HarnessManaged => {
+                "Newjen manages version control for this thread. Do not commit, describe, rebase, merge, create bookmarks or branches, or otherwise write version-control metadata. Make file changes only. Newjen snapshots the folder after each turn."
+            }
+            Self::AgentManaged => {
+                "Use jj, not git, to manage version control in this thread. Snapshot your changes with jj and create or update a jj bookmark covering all your work before finishing each turn. Newjen reads recorded jj state only; it does not import git commits or snapshot this thread for you. Do not push unless the user explicitly asks."
+            }
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::HarnessManaged => "harness_managed",
@@ -325,7 +336,11 @@ pub fn discard_project(
 pub fn cleanup_remote(tools: &Tools, source: &Path, thread_id: &str) -> Result<()> {
     let remote = remote(thread_id)?;
     if remote_url(tools, source, &remote)?.is_some() {
-        jj(tools, source, &["git", "remote", "remove", &remote])?;
+        jj(
+            tools,
+            source,
+            &["git", "remote", "remove", &remote, "--ignore-working-copy"],
+        )?;
     }
     Ok(())
 }

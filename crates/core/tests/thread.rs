@@ -3192,11 +3192,11 @@ fn agent_managed_project_prepares_a_baseline_but_does_not_schedule_turn_snapshot
         .set_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
         .unwrap();
     assert!(
-        !thread
+        thread
             .session_config()
             .args()
             .iter()
-            .any(|arg| arg == "--append-system-prompt")
+            .any(|arg| arg.contains("Use jj, not git"))
     );
     let Sent::PreparingProject(job) = thread.send("Manage changes yourself").unwrap() else {
         panic!("prepare project");
@@ -3335,4 +3335,142 @@ fn graceful_quit_keeps_the_snapshot_requirement_for_partial_work() {
     let review =
         newjen_core::landing::review(&tools, loaded.cwd(), loaded.review_base().unwrap()).unwrap();
     assert!(review.patch.contains("partial.txt"));
+}
+
+#[test]
+fn idle_background_tasks_can_be_stopped_to_finish_the_pending_snapshot() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    fixture.switch("background", true);
+    let mut thread = fixture.draft();
+    let Sent::PreparingProject(job) = thread.send("Start a dev server").unwrap() else {
+        panic!("prepare");
+    };
+    thread.finish_project(job.run(&tools)).unwrap();
+    finish_turn(&mut thread);
+    fixture.switch("background", false);
+    assert!(!thread.background_tasks().is_empty());
+    assert!(thread.work_pending());
+    assert!(thread.take_snapshot_job().is_none());
+    thread.stop().unwrap();
+    assert!(thread.background_tasks().is_empty());
+    let job = thread
+        .take_snapshot_job()
+        .expect("snapshot after explicit stop");
+    thread.finish_snapshot(job.run(&tools));
+    assert!(!thread.work_pending());
+    thread.send("Continue after saving").unwrap();
+    finish_turn(&mut thread);
+    assert_eq!(
+        fixture.messages_received(),
+        ["Start a dev server", "Continue after saving"]
+    );
+}
+
+#[test]
+fn closing_project_tracking_after_user_jj_changes_keeps_files_and_history() {
+    for move_away in [false, true] {
+        let fixture = Fixture::new();
+        let Some(tools) = init_thread_jj(&fixture) else {
+            return;
+        };
+        std::fs::write(fixture.project.path.join("owner.txt"), "owner work\n").unwrap();
+        let mut thread = fixture.draft();
+        let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
+            panic!("prepare");
+        };
+        thread.finish_project(job.run(&tools)).unwrap();
+        assert!(!thread.can_release_project_tracking());
+        finish_turn(&mut thread);
+        std::fs::write(fixture.project.path.join("agent.txt"), "agent work\n").unwrap();
+        let job = thread.take_snapshot_job().unwrap();
+        assert!(!thread.can_release_project_tracking());
+        thread.finish_snapshot(job.run(&tools));
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new(&tools.jj)
+                .args(args)
+                .current_dir(&fixture.project.path)
+                .envs(tools.env.iter().cloned())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        if move_away {
+            run(&["new", "root()"]);
+        } else {
+            std::fs::write(fixture.project.path.join("agent.txt"), "my tweak\n").unwrap();
+            run(&["commit", "-m", "My own commit"]);
+        }
+        let operation = run(&[
+            "op",
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-n",
+            "1",
+            "-T",
+            "id",
+        ]);
+        let files = ["owner.txt", "agent.txt"]
+            .map(|file| std::fs::read(fixture.project.path.join(file)).ok());
+        assert!(thread.can_release_project_tracking());
+        thread.release_project_tracking().unwrap();
+        thread.release_project_tracking().unwrap();
+        assert!(thread.archive().is_none());
+        assert!(!thread.owns_project_work());
+        assert_eq!(
+            ["owner.txt", "agent.txt"]
+                .map(|file| std::fs::read(fixture.project.path.join(file)).ok()),
+            files
+        );
+        assert_eq!(
+            run(&[
+                "op",
+                "log",
+                "--ignore-working-copy",
+                "--no-graph",
+                "-n",
+                "1",
+                "-T",
+                "id"
+            ]),
+            operation
+        );
+        assert!(fixture.store.flush(FLUSH));
+        let row = fixture.store.thread(thread.id()).unwrap().unwrap();
+        assert!(row.archived_at.is_some());
+        assert!(row.landing_resolved);
+        let reloaded = fixture.reload(thread.id());
+        assert!(!reloaded.owns_project_work());
+        assert!(!reloaded.work_pending());
+    }
+}
+
+#[test]
+fn agent_managed_threads_are_told_to_record_and_bookmark_their_work_with_jj() {
+    let fixture = Fixture::new();
+    let Some(tools) = init_thread_jj(&fixture) else {
+        return;
+    };
+    let mut thread = fixture.draft();
+    thread
+        .set_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
+        .unwrap();
+    let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
+        panic!("prepare");
+    };
+    thread.finish_project(job.run(&tools)).unwrap();
+    finish_turn(&mut thread);
+    let spawns = fixture.spawns();
+    let instructions = flag(spawns.last().unwrap(), "--append-system-prompt").unwrap();
+    assert!(instructions.contains("Use jj, not git"));
+    assert!(instructions.contains("bookmark covering all your work"));
+    assert!(!thread.work_pending());
 }
