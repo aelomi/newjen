@@ -26,8 +26,9 @@ use gpui::{
 };
 use gpui_kit::base::input::{InputAccessibility, TextareaState};
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::Side;
+use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::{Side, WindowExt as _};
 use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::store::now_ms;
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
@@ -533,6 +534,39 @@ impl ChatView {
             }
         }
         self.enter(window, cx);
+    }
+
+    /// A thread in a Rift copy asks first: archiving it deletes the copy with Claude's work.
+    fn ask_to_archive(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let question = {
+            let thread = self.slots[ix].thread.read(cx);
+            thread.copy().map(|copy| {
+                archive_question(thread.title(), &tilde(&copy.path, self.home.as_deref()))
+            })
+        };
+        let Some((title, body)) = question else {
+            self.archive(thread_id, window, cx);
+            return;
+        };
+        let view = cx.weak_entity();
+        let id = thread_id.to_string();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let id = id.clone();
+            alert
+                .title(SharedString::from(title.clone()))
+                .description(SharedString::from(body.clone()))
+                .confirm()
+                .ok_text("Archive and delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let _ = view.update(cx, |view, cx| view.archive(&id, window, cx));
+                    true
+                })
+        });
     }
 
     fn render_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1583,8 +1617,9 @@ impl ChatView {
                 let on_press = self.press(cx, move |view, window, cx| {
                     view.show_thread(&shown, window, cx)
                 });
-                let on_archive =
-                    self.press(cx, move |view, window, cx| view.archive(&id, window, cx));
+                let on_archive = self.press(cx, move |view, window, cx| {
+                    view.ask_to_archive(&id, window, cx)
+                });
                 Some(sidebar::thread_row(row, on_press, on_archive, cx))
             })
             .collect()
@@ -1945,6 +1980,16 @@ fn missing_tool(tools: &Tools, jj_repo: bool) -> Option<Notice> {
     None
 }
 
+fn archive_question(title: &str, path: &str) -> (String, String) {
+    (
+        format!("Archive “{title}”?"),
+        format!(
+            "This deletes its Rift copy at {path}. Changes Claude made there that aren't in your \
+             project are lost."
+        ),
+    )
+}
+
 fn in_jj_repo(project: &Path) -> bool {
     project.ancestors().any(|dir| dir.join(".jj").exists())
 }
@@ -2202,6 +2247,19 @@ mod tests {
         // A plain folder is copied without jj.
         assert!(missing_tool(&tools("/bin/rift", "jj"), false).is_none());
         assert!(missing_tool(&tools("/bin/rift", "/bin/jj"), true).is_none());
+    }
+
+    #[test]
+    fn archiving_a_copy_says_what_is_deleted() {
+        assert_eq!(
+            archive_question("Fix the parser", "~/.rifts/Newjen/newjen-1a2b3c4d"),
+            (
+                "Archive “Fix the parser”?".to_string(),
+                "This deletes its Rift copy at ~/.rifts/Newjen/newjen-1a2b3c4d. Changes Claude \
+                 made there that aren't in your project are lost."
+                    .to_string()
+            )
+        );
     }
 
     #[test]

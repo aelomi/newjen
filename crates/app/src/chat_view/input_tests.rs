@@ -1,5 +1,3 @@
-use gpui_kit::component::WindowExt as _;
-
 use super::*;
 use gpui::{AppContext, TestAppContext, VisualTestContext, size};
 use gpui_kit::base::Root;
@@ -715,5 +713,76 @@ fn while_its_copy_is_made_the_thread_shows_it_and_cannot_be_archived(cx: &mut Te
     assert_eq!(notice_title(&chat, cx).as_deref(), Some(COPY_FAILED));
     assert!(composer_focused(&chat, cx));
     assert!(cx.debug_bounds("works-in").is_some());
+    finish(&chat, path, cx);
+}
+
+/// Right click on the thread on screen's row, then "Archive thread".
+fn archive_from_menu(cx: &mut VisualTestContext) {
+    let bounds = cx.debug_bounds("thread-row").unwrap();
+    for event in [true, false] {
+        if event {
+            cx.simulate_mouse_down(
+                bounds.center(),
+                gpui::MouseButton::Right,
+                gpui::Modifiers::default(),
+            );
+        } else {
+            cx.simulate_mouse_up(
+                bounds.center(),
+                gpui::MouseButton::Right,
+                gpui::Modifiers::default(),
+            );
+        }
+    }
+    cx.simulate_keystrokes("down enter");
+}
+
+#[gpui::test]
+async fn archiving_a_rift_thread_asks_then_deletes_its_copy(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "rift-archive", true, Some(CREATE_COPY));
+    choose(1, cx);
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let copy = cx
+        .update(|_, cx| chat.read(cx).thread().read(cx).copy().cloned())
+        .unwrap();
+
+    archive_from_menu(cx);
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).copy().is_some()));
+    assert!(copy.path.exists());
+
+    archive_from_menu(cx);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
+    for _ in 0..300 {
+        if !copy.path.exists() {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+    assert!(!copy.path.exists(), "the copy was deleted");
+    assert!(cx.update(|_, cx| chat.read(cx).save_problem.is_none()));
+    assert!(composer_focused(&chat, cx));
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_project_folder_thread_archives_without_asking(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "plain-archive", true);
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    archive_from_menu(cx);
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
     finish(&chat, path, cx);
 }
