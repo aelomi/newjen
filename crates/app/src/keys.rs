@@ -7,7 +7,9 @@
 //! The approval keys (⌘↵ allow once, Esc deny) and Esc closing the thread drawer are the
 //! exception: they are read as raw key presses, see `approval_key` and `key_route`.
 
-use gpui::{Action, App, KeyBinding, KeyDownEvent, actions};
+use std::rc::Rc;
+
+use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, KeyDownEvent, NoAction, actions};
 use newjen_core::PermissionAnswer;
 
 // Each name becomes a unit struct, e.g. `pub struct Stop;`.
@@ -42,10 +44,10 @@ pub const JUMP_KEYS: [&str; 9] = [
 /// while focus is inside the chat view.
 pub const CONTEXT: &str = "Newjen";
 
-/// Registers every shortcut. Call once at startup, after `ely_gpui_component::init`.
+/// Registers every shortcut. Call once at startup, after `gpui_kit::init`.
 pub fn bind(cx: &mut App) {
     cx.bind_keys([
-        // Global, the standard Mac app and window keys: GPUI and Ely install none of them.
+        // Global, the standard Mac app and window keys: GPUI and Kit install none of them.
         // The menu bar shows these next to its items.
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
@@ -67,6 +69,21 @@ pub fn bind(cx: &mut App) {
             .enumerate()
             .map(|(place, keys)| KeyBinding::new(keys, JumpToThread(place), Some(CONTEXT))),
     );
+    // Kit's text field adds a cursor on ⌘⌥↑ and ⌘⌥↓; the composer keeps one cursor.
+    cx.bind_keys(
+        ["cmd-alt-up", "cmd-alt-down"].map(|keys| KeyBinding::new(keys, NoAction, Some("Input"))),
+    );
+    // F6 moves focus like Tab, out of a field that keeps Tab. Kit's window root owns Tab; its
+    // actions aren't exported, so they are built by name.
+    let root = Rc::new(KeyBindingContextPredicate::parse("Root").expect("a valid context"));
+    let f6 = [("f6", "root::Tab"), ("shift-f6", "root::TabPrev")].map(|(keys, name)| {
+        let action = cx
+            .build_action(name, None)
+            .unwrap_or_else(|error| panic!("Kit registers {name}: {error}"));
+        KeyBinding::load(keys, action, Some(root.clone()), false, None, cx)
+            .expect("a valid keystroke")
+    });
+    cx.bind_keys(f6);
 }
 
 /// What a key press on the approval dock means.

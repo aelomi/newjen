@@ -8,23 +8,20 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use ely_gpui_component::buttons::IconButton;
-use ely_gpui_component::layout::v_stack;
-use ely_gpui_component::lists::ListItem;
-use ely_gpui_component::menus::{ContextMenu, Menu, MenuItem};
-use ely_gpui_component::motion::{self, Pulse};
-use ely_gpui_component::primitives::{Backdrop, Icon, IconName, Place};
-use ely_gpui_component::shell::drag_region;
-use ely_gpui_component::theme::{ActiveTheme, ControlSize, Elevation, IconSize, TextSize};
-use ely_gpui_component::typography::{Ellipsis, MiddleEllipsis};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Div, ElementId, Font, FontWeight, IntoElement,
-    ParentElement, Pixels, SharedString, Styled, TextRun, Window, div, font, prelude::*, px,
+    AnyElement, App, ElementId, Font, FontWeight, IntoElement, ParentElement, Pixels, SharedString,
+    Styled, TextRun, Window, div, font, prelude::*, px,
 };
+use gpui_kit::base::v_flex;
+use gpui_kit::component::TitleBar;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use newjen_core::Status;
 use newjen_core::transcript::STOPPED_ON_QUIT;
 
 use crate::format::{elapsed, relative_time, short_path};
+use crate::theme::SIDEBAR;
+use crate::ui::{self, IconName, ListRow, Pulse};
+use gpui_kit::component::ActiveTheme as _;
 
 /// Below this window width the list hides, so the chat keeps the whole window (screen 11). ⌘B
 /// then opens it as a drawer over the chat.
@@ -288,6 +285,9 @@ fn measured(text: &str, font: Font, size: Pixels, window: &Window) -> f32 {
 // Elements
 // -------------------------------------------------------------------------------------------
 
+/// The narrowest a thread row's menu gets.
+const MENU_WIDTH: Pixels = px(200.);
+
 /// The size of a row's dot, and of the box that keeps every title lined up whether or not it
 /// has a dot.
 const DOT: f32 = 7.0;
@@ -301,20 +301,20 @@ pub fn dot(dot: Dot, id: ElementId, cx: &App) -> AnyElement {
         Dot::None => None,
         Dot::Approval => Some(solid(colors.warning).into_any_element()),
         Dot::Failed => Some(solid(colors.danger).into_any_element()),
-        Dot::Unread => Some(solid(colors.fg).into_any_element()),
+        Dot::Unread => Some(solid(colors.foreground).into_any_element()),
         Dot::Stopped => Some(
             div()
                 .size(px(DOT))
                 .rounded_full()
                 .border_1()
-                .border_color(colors.fg_subtle)
+                .border_color(colors.muted_foreground)
                 .into_any_element(),
         ),
-        // Ely's pulse: a thin ring that widens and fades, and none under reduced motion.
+        // A thin ring that widens and fades, and none under Reduce Motion.
         Dot::Working => Some(
             Pulse::new(id)
                 .size(px(DOT))
-                .child(solid(colors.focus))
+                .child(solid(colors.ring))
                 .into_any_element(),
         ),
     };
@@ -331,44 +331,36 @@ pub fn dot(dot: Dot, id: ElementId, cx: &App) -> AnyElement {
 /// full screen, where they hide), then the button that hides the list. Drags the window like
 /// a title bar.
 pub fn header(on_toggle: OnPress, window: &mut Window, cx: &mut App) -> AnyElement {
-    let theme = cx.theme();
-    let inset = theme.traffic_light_inset();
-    let height = theme.titlebar_height();
-    let fullscreen = window.is_fullscreen();
-    drag_region("sidebar-header", window, cx)
-        .flex_none()
-        .h(height)
-        .flex()
-        .items_center()
-        .justify_end()
-        .when(!fullscreen, |header| header.pl(inset))
-        .pr_2()
-        .child(toggle_button("sidebar-hide", "Hide sidebar", on_toggle))
+    let _ = window;
+    TitleBar::new()
+        .child(toggle_button("sidebar-hide", "Hide sidebar", on_toggle, cx))
         .into_any_element()
 }
 
 /// The panel-left button that hides or shows the list (⌘B).
-pub fn toggle_button(id: &'static str, tooltip: &'static str, on_toggle: OnPress) -> IconButton {
-    IconButton::new(id, IconName::PanelLeft)
-        .size(ControlSize::Sm)
-        .tooltip(tooltip)
+pub fn toggle_button(
+    id: &'static str,
+    tooltip: &'static str,
+    on_toggle: OnPress,
+    cx: &App,
+) -> AnyElement {
+    ui::icon_button(id, IconName::PanelLeft, tooltip, cx)
+        .debug_selector(|| "sidebar-toggle".to_string())
         .on_click(move |_, window, cx| on_toggle(window, cx))
+        .into_any_element()
 }
 
 /// The project: a folder icon, its name and, when there is room after it, its `~/path`.
 /// `room` is the width its text has.
 pub fn project_row(name: &str, path: &str, room: f32, window: &Window, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let rem = window.rem_size();
-    let name_size = theme.text_size(TextSize::Base);
-    let path_size = theme.text_size(TextSize::Xs);
-    let mut name_font = font(theme.font_family.clone());
+    let colors = &cx.theme().colors;
+    let mut name_font = font(cx.theme().font_family.clone());
     name_font.weight = FontWeight::SEMIBOLD;
-    let name_width = measured(name, name_font, name_size.to_pixels(rem), window);
+    let name_width = measured(name, name_font, cx.theme().font_size, window);
     let path_char = measured(
         "0",
-        font(theme.mono_family.clone()),
-        path_size.to_pixels(rem),
+        font(cx.theme().mono_font_family.clone()),
+        gpui::rems(0.75).to_pixels(window.rem_size()),
         window,
     );
     let path = project_path(path, name_width, path_char, room);
@@ -379,104 +371,84 @@ pub fn project_row(name: &str, path: &str, room: f32, window: &Window, cx: &App)
         .px_2p5()
         .pt_2()
         .pb_2p5()
-        .child(
-            Icon::new(IconName::Folder)
-                .size(IconSize::Sm)
-                .color(theme.colors.fg_muted),
-        )
+        .child(ui::icon(
+            IconName::Folder,
+            gpui_kit::component::Size::Small,
+            colors.muted_foreground,
+        ))
         .child(
             // The name keeps its width; only a name wider than the whole row is cut.
             div()
                 .flex_none()
                 .max_w(px(room.max(0.0)))
-                .text_size(name_size)
+                .text_base()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.colors.fg)
-                .child(Ellipsis::new(name.to_string())),
+                .text_color(colors.foreground)
+                .child(ui::ellipsis(name.to_string())),
         )
         .children(path.map(|path| {
             // The path gives way instead: if its characters are wider than estimated (say
             // Japanese folder names), the row cuts it further in its middle.
             div()
                 .min_w_0()
-                .font_family(theme.mono_family.clone())
-                .text_size(path_size)
-                .text_color(theme.colors.fg_subtle)
-                .child(MiddleEllipsis::new(path))
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_xs()
+                .text_color(colors.muted_foreground)
+                .child(ui::middle_ellipsis(path))
         }))
         .into_any_element()
 }
 
-/// The thread list's column, `header` over `list` on the sunken color of the mock. Docked
-/// beside the chat, and the same column as the drawer over it in narrow windows. A 240 px
-/// column like Ely's `Sidebar`, which cannot be used as it is: it folds to an icon rail with an
-/// animated width, and this list hides at once (⌘B).
-pub fn column(header: AnyElement, list: Vec<AnyElement>, cx: &App) -> Div {
+pub fn column(header: AnyElement, list: Vec<AnyElement>, cx: &App) -> gpui::Div {
     let theme = cx.theme();
-    let colors = &theme.colors;
-    v_stack()
+    v_flex()
         .flex_none()
-        .w(theme.sidebar_width(false))
+        .w(SIDEBAR)
         .h_full()
-        .bg(colors.sunken)
+        .bg(theme.sidebar)
+        .text_color(theme.sidebar_foreground)
         .border_r_1()
-        .border_color(colors.border)
+        .border_color(theme.sidebar_border)
         .child(header)
-        .child(
-            v_stack()
-                .flex_1()
-                .min_h_0()
-                .px_2()
-                .pb_2()
-                .gap_0p5()
-                .children(list),
-        )
-}
-
-/// The list as a drawer over the chat in narrow windows: the docked `column`, sliding in from
-/// the left over Ely's scrim exactly as Ely's `Sheet` slides (same time and curve, none under
-/// Reduce Motion). A click on the scrim calls `on_close`. Not Ely's `Sheet` itself: its
-/// "Threads" heading sits at the top where the window's traffic lights are, with no room kept
-/// for them, while this column's header keeps that room as the docked list does.
-pub fn drawer(column: Div, on_close: OnPress, window: &Window, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let travel = theme.sidebar_width(false).to_pixels(window.rem_size());
-    let slide =
-        Animation::new(motion::duration(motion::BASE, cx)).with_easing(motion::ease_out_cubic);
-    let panel = column
-        .shadow(theme.elevation(Elevation::Modal))
-        .with_animation("drawer-in", slide, move |panel, t| {
-            panel.ml(-(travel * (1.0 - t)))
-        });
-    Backdrop::new("threads-drawer")
-        .place(Place::Left)
-        .on_dismiss(move |window, cx| on_close(window, cx))
-        .child(panel)
-        .into_any_element()
+        .child(v_flex().flex_1().min_h_0().px_2().children(list))
 }
 
 /// "+ New thread ⌘N", in the quiet color. Highlighted (in the text color) while the empty
 /// list's draft is on screen.
 pub fn new_thread_row(selected: bool, on_press: OnPress, cx: &App) -> AnyElement {
     let colors = &cx.theme().colors;
-    let ink = if selected { colors.fg } else { colors.fg_muted };
-    ListItem::new("new-thread", "New thread")
-        .quiet(!selected)
-        .leading(Icon::new(IconName::Plus).size(IconSize::Xs).color(ink))
-        .trailing("⌘N")
-        .selected(selected)
-        .on_click(move |_, window, cx| on_press(window, cx))
-        .into_any_element()
+    let ink = if selected {
+        colors.foreground
+    } else {
+        colors.muted_foreground
+    };
+    let row = ListRow {
+        title: "New thread".into(),
+        detail: None,
+        leading: Some(
+            ui::icon(IconName::Plus, gpui_kit::component::Size::XSmall, ink).into_any_element(),
+        ),
+        trailing: Some("⌘N".into()),
+        strong: false,
+        quiet: !selected,
+        selected,
+    };
+    ui::list_row(
+        "new-thread",
+        row,
+        move |_, window, cx| on_press(window, cx),
+        cx,
+    )
+    .into_any_element()
 }
 
 /// "No threads yet. Your first message starts one."
 pub fn empty_caption(cx: &App) -> AnyElement {
-    let theme = cx.theme();
     div()
         .px_2p5()
         .py_2()
-        .text_size(theme.text_size(TextSize::Sm))
-        .text_color(theme.colors.fg_subtle)
+        .text_sm()
+        .text_color(cx.theme().colors.muted_foreground)
         .child(EMPTY_LIST)
         .into_any_element()
 }
@@ -499,23 +471,31 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
         (ElementId::from("pulse"), row.id.clone()).into(),
         cx,
     );
-    // Ely's `detail` line is in the subtle color, as the mock's detail line is (its
-    // `description` line is brighter, close to the title).
-    let item = ListItem::new((ElementId::from("thread-row"), row.id.clone()), row.title)
-        .detail(row.look.detail)
-        .leading(lead)
-        .strong(row.look.strong)
-        .selected(row.selected)
-        .on_click(move |_, window, cx| on_press(window, cx));
-    let menu = Menu::new().item(
-        MenuItem::new("Archive thread")
-            .icon(IconName::Archive)
-            .on_click(move |window, cx| on_archive(window, cx)),
-    );
-    ContextMenu::new((ElementId::from("thread-menu"), row.id), menu)
-        .w_full()
-        .child(item)
-        .into_any_element()
+    let look = ListRow {
+        title: row.title,
+        detail: Some(row.look.detail),
+        leading: Some(lead),
+        trailing: None,
+        strong: row.look.strong,
+        quiet: false,
+        selected: row.selected,
+    };
+    ui::list_row(
+        (ElementId::from("thread-row"), row.id),
+        look,
+        move |_, window, cx| on_press(window, cx),
+        cx,
+    )
+    .debug_selector(|| "thread-row".to_string())
+    .context_menu(move |menu, _, _| {
+        let on_archive = on_archive.clone();
+        menu.min_w(MENU_WIDTH).item(
+            PopupMenuItem::new("Archive thread")
+                .icon(IconName::Archive)
+                .on_click(move |_, window, cx| on_archive(window, cx)),
+        )
+    })
+    .into_any_element()
 }
 
 #[cfg(test)]

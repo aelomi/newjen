@@ -1,6 +1,6 @@
 [package]
 name = "app"
-description = "Newjen's macOS window: GPUI + Ely, rendering newjen-core's state."
+description = "Newjen's macOS window: GPUI and GPUI Kit, rendering newjen-core's state."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,9 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-ely-gpui-component.workspace = true
 gpui.workspace = true
+gpui-kit.workspace = true
 gpui_platform.workspace = true
 newjen-core.workspace = true
-objc2-app-kit.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

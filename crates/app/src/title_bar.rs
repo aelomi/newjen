@@ -3,32 +3,25 @@
 //! right; and, while the thread list is out of sight, the button that brings it back on the
 //! left.
 //!
-//! Ely's `TitleBar` centers one plain string, and the mock wants a semibold title beside a mono
-//! path, so the bar is built from Ely's `drag_region` (which gives it window dragging and
-//! double-click zoom) the way `TitleBar` builds itself.
-
 use std::rc::Rc;
 
-use ely_gpui_component::agent::{AgentState, AgentStatus};
-use ely_gpui_component::buttons::{Button, ButtonVariant};
-use ely_gpui_component::data_display::{Badge, Tone};
-use ely_gpui_component::layout::{h_stack, v_stack};
-use ely_gpui_component::overlays::Popover;
-use ely_gpui_component::primitives::{Icon, IconName};
-use ely_gpui_component::shell::drag_region;
-use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
-use ely_gpui_component::typography::{Ellipsis, MiddleEllipsis};
 use gpui::{
-    AnyElement, App, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::*, px,
+    Anchor, AnyElement, App, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, RenderOnce, SharedString, Styled, Window, div, prelude::*, px,
 };
-use newjen_core::{Grant, PermissionAnswer, Status};
+use gpui_kit::base::{FocusTrapElement as _, Selectable, h_flex, v_flex};
+use gpui_kit::component::popover::Popover;
+use newjen_core::{Grant, Status};
 
-use crate::keys::{self, ApprovalKey};
 use crate::sidebar::{self, OnPress};
+use crate::ui::{self, AgentState, IconName, Look, Tone, ellipsis, middle_ellipsis};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::TITLE_BAR_HEIGHT;
+use gpui_kit::component::{
+    TitleBar,
+    button::{Button, ButtonVariants as _},
+};
 
-/// The bar's side padding, as in the mock.
-const BAR_PADDING: f32 = 14.0;
 /// About how wide one character of the path (12 px mono) is, and the share of the chat's
 /// width the path may take beside the title.
 const PATH_CHAR: f32 = 7.2;
@@ -49,9 +42,21 @@ const GRANTS_FOOTER_LINE: f32 = 18.0;
 const GRANTS_MARGIN: f32 = 16.0;
 /// The rows always get at least this much, about two rules.
 const GRANT_ROWS_MIN: f32 = 100.0;
-
 /// Called with a grant's rule when its Revoke button is pressed.
 pub type OnRevoke = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// Called when the grants popover opens (`true`) or closes.
+pub type OnGrantsOpen = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+
+/// The grants popover's state, which the chat view owns so it can close the popover when focus
+/// leaves it.
+pub struct Grants {
+    pub open: bool,
+    /// Focused while the popover is open.
+    pub focus: FocusHandle,
+    pub on_open: OnGrantsOpen,
+    pub on_revoke: OnRevoke,
+}
 
 /// What the bar shows.
 pub struct Bar {
@@ -70,7 +75,7 @@ pub struct Bar {
 }
 
 /// The most height the grants popover's rows may take in a window `viewport_height` pixels
-/// tall. The popover hangs from the title bar; Ely does not limit its height, so without this
+/// tall. The popover hangs from the title bar and sizes to its rows, so without this
 /// a long list would run off the bottom of the window with its Revoke buttons. Past this the
 /// rows scroll, and the header and footer stay put.
 pub fn grant_rows_max_height(
@@ -106,65 +111,54 @@ pub fn path_budget(main_width: f32) -> usize {
 }
 
 /// Draws the bar.
-pub fn render(bar: Bar, on_revoke: OnRevoke, window: &mut Window, cx: &mut App) -> AnyElement {
-    let theme = cx.theme();
-    let colors = theme.colors.clone();
-    let height = theme.titlebar_height();
-    let inset = f32::from(theme.traffic_light_inset().to_pixels(window.rem_size()));
-    let title_size = theme.text_size(TextSize::Base);
-    let path_size = theme.text_size(TextSize::Sm);
-    let mono = theme.mono_family.clone();
-    let fullscreen = window.is_fullscreen();
+pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> AnyElement {
+    let colors = cx.theme().colors;
+    let lights_over_bar = bar.show_list.is_some();
 
-    // Left: room for the traffic lights, which sit over this bar while the list is hidden, then
-    // the button that shows the list.
-    let left = div().flex_1().flex().items_center().when_some(
-        bar.show_list,
-        |left, (on_press, attention)| {
-            left.when(!fullscreen, |left| left.pl(px(inset - BAR_PADDING)))
-                .child(show_list_button(on_press, attention, cx))
-        },
-    );
-    let middle = h_stack()
+    // Left: Kit's room for the traffic lights, which sit over this bar while the list is
+    // hidden, then the button that shows the list.
+    let left = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .when_some(bar.show_list, |left, (on_press, attention)| {
+            left.child(show_list_button(on_press, attention, cx))
+        });
+    let middle = h_flex()
+        .flex_1()
+        .w_0()
         .min_w_0()
         .gap_2()
         .child(
-            div()
+            gpui_kit::component::label::Label::new(bar.title)
+                .flex_1()
                 .min_w_0()
-                .text_size(title_size)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.fg)
-                .child(Ellipsis::new(bar.title)),
+                .text_ellipsis(),
         )
         .when(!bar.path.is_empty(), |middle| {
             middle.child(
                 div()
                     .flex_none()
                     .whitespace_nowrap()
-                    .font_family(mono)
-                    .text_size(path_size)
-                    .text_color(colors.fg_subtle)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_sm()
+                    .text_color(colors.muted_foreground)
                     .child(bar.path),
             )
         });
-    let right = div().flex_1().flex().justify_end().child(
+    let right = div().flex_none().flex().justify_end().pl_2().pr_3().child(
         // Over the drag region, so a press here is the control's, not a window drag.
-        h_stack()
+        h_flex()
+            .debug_selector(|| "title-bar-right".to_string())
             .gap_1p5()
             .occlude()
             .when(!bar.grants.is_empty(), |right| {
-                right.child(grants_chip(bar.grants, bar.background_tasks, on_revoke, cx))
+                right.child(grants_popover(bar.grants, bar.background_tasks, grants))
             })
             .children(status_pill(bar.status, bar.background_tasks)),
     );
-    drag_region("title-bar", window, cx)
-        .flex_none()
-        .h(height)
-        .flex()
-        .items_center()
-        .gap_2()
-        .px(px(BAR_PADDING))
-        .bg(colors.bg)
+    TitleBar::new()
+        .when(!lights_over_bar, |bar| bar.pl_4())
         .child(left)
         .child(middle)
         .child(right)
@@ -181,6 +175,7 @@ fn show_list_button(on_press: OnPress, attention: bool, cx: &App) -> AnyElement 
             "sidebar-show",
             "Show sidebar",
             on_press,
+            cx,
         ))
         .when(attention, |button| {
             button.child(
@@ -192,7 +187,7 @@ fn show_list_button(on_press: OnPress, attention: bool, cx: &App) -> AnyElement 
                     .rounded_full()
                     .bg(colors.warning)
                     .border_1()
-                    .border_color(colors.bg),
+                    .border_color(colors.background),
             )
         })
         .into_any_element()
@@ -201,7 +196,7 @@ fn show_list_button(on_press: OnPress, attention: bool, cx: &App) -> AnyElement 
 /// How the status pill looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pill {
-    /// Ely's agent pill (with its spinner while working).
+    /// The agent status tag.
     Agent(AgentState),
     /// A badge with a dot: this word, in this tone.
     Badge(&'static str, Tone),
@@ -212,7 +207,8 @@ pub enum Pill {
 /// The pill for a thread's status, worded as the mocks and the thread list word it (screens
 /// 8–11): "Needs approval" in amber, a quiet "Idle" once a turn is done, a quiet "Stopped",
 /// and "Background task running" instead of those (and of failed) while a command Claude
-/// started still runs. Ely's agent pill stays for working (its spinner shows life) and failed.
+/// started still runs. The agent tag stays for working and
+/// failed.
 /// A thread with no message yet has none.
 pub fn pill(status: Status, background_tasks: usize) -> Option<Pill> {
     Some(match status {
@@ -230,57 +226,63 @@ pub fn pill(status: Status, background_tasks: usize) -> Option<Pill> {
 
 fn status_pill(status: Status, background_tasks: usize) -> Option<AnyElement> {
     Some(match pill(status, background_tasks)? {
-        Pill::Agent(state) => AgentStatus::new("agent-status", state).into_any_element(),
-        Pill::Badge(label, tone) => Badge::new(label).dot().tone(tone).into_any_element(),
-        Pill::Background(count) => Badge::new(sidebar::background_detail(count))
-            .dot()
-            .tone(Tone::Info)
-            .into_any_element(),
+        Pill::Agent(state) => ui::agent_pill(state).into_any_element(),
+        Pill::Badge(label, tone) => ui::status_badge(label, tone).into_any_element(),
+        Pill::Background(count) => {
+            ui::status_badge(sidebar::background_detail(count), Tone::Info).into_any_element()
+        }
     })
 }
 
-/// "🛡 2 allowed": opens the list of the thread's remembered rules.
-fn grants_chip(
-    grants: Vec<Grant>,
-    background_tasks: usize,
-    on_revoke: OnRevoke,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let colors = theme.colors.clone();
-    let label_size = theme.text_size(TextSize::Xs);
+/// "🛡 2 allowed": opens the list of the thread's remembered rules. Tab stays inside it; Esc, a
+/// press outside or focus moving elsewhere closes it.
+fn grants_popover(grants: Vec<Grant>, background_tasks: usize, state: Grants) -> AnyElement {
     let label = format!("{} allowed", grants.len());
-    Popover::with_opener(
-        "grants",
-        move |toggle| {
+    let on_open = state.on_open;
+    let on_revoke = state.on_revoke;
+    let focus = state.focus.clone();
+    Popover::new("grants")
+        .anchor(Anchor::TopLeft)
+        .trigger(GrantsChip { label })
+        .overlay_closable(false)
+        .open(state.open)
+        .on_open_change(move |open, window, cx| on_open(*open, window, cx))
+        .track_focus(&state.focus)
+        .content(move |_, window, cx| {
+            let dismiss = cx.listener(|state, _, window, cx| state.dismiss(window, cx));
+            let panel = grants_panel(&grants, background_tasks, &on_revoke, window, cx);
             div()
-                .id("grants-chip")
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .px(px(9.0))
-                .py(px(3.0))
-                .rounded(px(10.0))
-                .bg(colors.hover)
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .on_click(move |_, window, cx| toggle(window, cx))
-                .child(
-                    Icon::new(IconName::Shield)
-                        .size(IconSize::Xs)
-                        .color(colors.fg_muted),
-                )
-                .child(
-                    div()
-                        .text_size(label_size)
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(colors.fg_muted)
-                        .child(label),
-                )
-        },
-        move |_close, window, cx| grants_panel(&grants, background_tasks, &on_revoke, window, cx),
-    )
-    .into_any_element()
+                .child(panel)
+                .on_mouse_down_out(dismiss)
+                .focus_trap("grants-trap", &focus)
+        })
+        .into_any_element()
+}
+
+/// The chip that opens the popover.
+#[derive(IntoElement)]
+struct GrantsChip {
+    label: String,
+}
+
+impl Selectable for GrantsChip {
+    fn selected(self, _: bool) -> Self {
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        false
+    }
+}
+
+impl RenderOnce for GrantsChip {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        Button::new("grants-chip")
+            .label(self.label)
+            .icon(IconName::Shield)
+            .ghost()
+            .debug_selector(|| "grants-chip".to_string())
+    }
 }
 
 /// The popover's content (the "Allowed rules popover" frame of the mock).
@@ -291,38 +293,36 @@ fn grants_panel(
     window: &Window,
     cx: &App,
 ) -> AnyElement {
-    let theme = cx.theme();
-    let colors = &theme.colors;
-    let small = theme.text_size(TextSize::Xs);
-    let rem = window.rem_size();
+    let colors = &cx.theme().colors;
+    let small = gpui::rems(0.75);
     let rows_height = grant_rows_max_height(
         f32::from(window.viewport_size().height),
-        f32::from(theme.titlebar_height().to_pixels(rem)),
+        f32::from(TITLE_BAR_HEIGHT),
         background_tasks,
     );
-    let header = v_stack()
+    let header = v_flex()
         .gap_0p5()
         .px_2()
         .pt_1p5()
         .pb_2()
         .child(
             div()
-                .text_size(theme.text_size(TextSize::Base))
+                .text_base()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.fg)
+                .text_color(colors.foreground)
                 .child("Always allowed in this thread"),
         )
         .child(
             div()
                 .text_size(small)
-                .text_color(colors.fg_subtle)
+                .text_color(colors.muted_foreground)
                 .child("Claude runs these without asking, until you revoke them."),
         );
     let rows = grants.iter().enumerate().map(|(ix, grant)| {
         let parts = grant_parts(&grant.rule, &grant.label);
         let rule = grant.rule.clone();
         let on_revoke = on_revoke.clone();
-        h_stack()
+        h_flex()
             .gap_2()
             .px_2()
             .py_1p5()
@@ -331,33 +331,31 @@ fn grants_panel(
                     .flex_none()
                     .text_size(small)
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(colors.fg_muted)
+                    .text_color(colors.muted_foreground)
                     .child(parts.tool),
             )
             .child(
-                v_stack()
+                v_flex()
                     .flex_1()
                     .min_w_0()
                     .child(
                         div()
                             .min_w_0()
-                            .font_family(theme.mono_family.clone())
-                            .text_size(theme.text_size(TextSize::Sm))
-                            .text_color(colors.fg)
-                            .child(MiddleEllipsis::new(parts.shown)),
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_sm()
+                            .text_color(colors.foreground)
+                            .child(middle_ellipsis(parts.shown)),
                     )
                     .children(parts.note.map(|note| {
                         div()
                             .min_w_0()
                             .text_size(small)
-                            .text_color(colors.fg_subtle)
-                            .child(Ellipsis::new(note))
+                            .text_color(colors.muted_foreground)
+                            .child(ellipsis(note))
                     })),
             )
             .child(
-                Button::new(("revoke", ix), "Revoke")
-                    .variant(ButtonVariant::Outline)
-                    .size(ControlSize::Sm)
+                ui::button(("revoke", ix), "Revoke", Look::Outline, ui::Size::Sm, cx)
                     .on_click(move |_, window, cx| on_revoke(&rule, window, cx)),
             )
     });
@@ -369,26 +367,18 @@ fn grants_panel(
         .border_t_1()
         .border_color(colors.border)
         .text_size(small)
-        .text_color(colors.fg_subtle)
+        .text_color(colors.muted_foreground)
         .child(grants_footer(background_tasks));
     // Only the rows scroll (it needs an id to keep its scroll position).
-    let rows = v_stack()
+    let rows = v_flex()
         .id("grant-rows")
         .max_h(px(rows_height))
         .overflow_y_scroll()
         .gap_0p5()
         .children(rows);
-    v_stack()
+    v_flex()
         .w(px(GRANTS_WIDTH))
         .gap_0p5()
-        // ⌘↵ allows the pending request (see `keys::key_route`), but not from in here, even
-        // with Tab on a Revoke button: someone reading the allowed rules is not looking at the
-        // request. Esc goes on, so the popover still closes.
-        .on_key_down(|event, _, cx| {
-            if keys::approval_key(event) == Some(ApprovalKey::Answer(PermissionAnswer::AllowOnce)) {
-                cx.stop_propagation();
-            }
-        })
         .child(header)
         .child(rows)
         .child(footer)
@@ -449,6 +439,48 @@ mod tests {
     fn parts(rule: &str, label: &str) -> (String, String, Option<String>) {
         let parts = grant_parts(rule, label);
         (parts.tool, parts.shown, parts.note)
+    }
+
+    struct Narrow {
+        focus: FocusHandle,
+    }
+
+    impl gpui::Render for Narrow {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let bar = Bar {
+                title: "Reconcile the billing data for the partial reversal handler and every \
+                        currency pair"
+                    .into(),
+                path: "…/verify-project".into(),
+                show_list: Some((Rc::new(|_, _| {}), false)),
+                grants: vec![],
+                status: Status::Waiting,
+                background_tasks: 0,
+            };
+            let grants = Grants {
+                open: false,
+                focus: self.focus.clone(),
+                on_open: Rc::new(|_, _, _| {}),
+                on_revoke: Rc::new(|_, _, _| {}),
+            };
+            div().w_full().child(render(bar, grants, window, cx))
+        }
+    }
+
+    #[gpui::test]
+    fn a_long_title_gives_way_to_the_status_pill(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|_, cx| Narrow {
+            focus: cx.focus_handle(),
+        });
+        cx.simulate_resize(gpui::size(px(640.), px(480.)));
+        cx.run_until_parked();
+        let right = cx.debug_bounds("title-bar-right").unwrap();
+        assert!(right.right() <= px(640.), "{right:?}");
     }
 
     #[test]

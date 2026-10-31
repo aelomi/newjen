@@ -1,0 +1,278 @@
+#[cfg(test)]
+use std::rc::Rc;
+
+use gpui::{
+    App, Context, Entity, IntoElement, ParentElement, RenderOnce, Styled, Window, div, prelude::*,
+};
+use gpui_kit::base::input::{Enter, TextareaState};
+use gpui_kit::component::{ActiveTheme as _, input::Textarea};
+
+use super::button::icon_button_with_look;
+use super::{IconName, Look, key_caps};
+use crate::sidebar::OnPress;
+
+pub fn composer_field(window: &mut Window, cx: &mut Context<TextareaState>) -> TextareaState {
+    TextareaState::new(window, cx).auto_grow(1, 8)
+}
+
+#[derive(IntoElement)]
+pub struct Composer {
+    field: Entity<TextareaState>,
+    busy: bool,
+    send: OnPress,
+    stop: OnPress,
+}
+
+impl Composer {
+    pub fn new(field: Entity<TextareaState>, busy: bool, send: OnPress, stop: OnPress) -> Self {
+        Self {
+            field,
+            busy,
+            send,
+            stop,
+        }
+    }
+}
+
+impl RenderOnce for Composer {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let ready = !self.field.read(cx).value().trim().is_empty();
+        let name = self.field.read(cx).presentation().placeholder().clone();
+        let send = self.send.clone();
+        let busy = self.busy;
+        let hint = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground);
+        let (hint, button) = if busy {
+            let stop = self.stop;
+            (
+                hint.child(key_caps("cmd-.", cx)).child("to stop"),
+                icon_button_with_look("stop", IconName::Square, "Stop", Look::Secondary, false, cx)
+                    .on_click(move |_, window, cx| stop(window, cx)),
+            )
+        } else {
+            let send = self.send;
+            (
+                hint.child(key_caps("enter", cx))
+                    .child("to send ·")
+                    .child(key_caps("shift-enter", cx))
+                    .child("for a new line"),
+                icon_button_with_look("send", IconName::ArrowUp, "Send", Look::Primary, !ready, cx)
+                    .on_click(move |_, window, cx| send(window, cx)),
+            )
+        };
+        div()
+            .id("composer")
+            .debug_selector(|| "composer".to_string())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .capture_action(move |action: &Enter, window, cx| {
+                        if action.shift {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        if !action.secondary && ready && !busy {
+                            send(window, cx);
+                        }
+                    })
+                    .child(Textarea::new(&self.field).aria_label(name)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(hint)
+                    .child(div().flex_1())
+                    .child(button),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys;
+    use gpui::{
+        AppContext, FocusHandle, Focusable as _, Render, TestAppContext, VisualTestContext,
+    };
+    use gpui_kit::base::Root;
+
+    struct Example {
+        field: Entity<TextareaState>,
+        root: FocusHandle,
+        busy: bool,
+        sent: Vec<String>,
+        stopped: bool,
+    }
+
+    impl Render for Example {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let view = cx.entity();
+            let send: OnPress = Rc::new(move |window, cx| {
+                view.update(cx, |view, cx| {
+                    view.sent.push(view.field.read(cx).value().to_string());
+                    view.field.update(cx, |field, cx| field.clean(window, cx));
+                    cx.notify();
+                })
+            });
+            let view = cx.entity();
+            let stop: OnPress = Rc::new(move |_, cx| {
+                view.update(cx, |view, cx| {
+                    view.stopped = true;
+                    cx.notify();
+                })
+            });
+            div()
+                .key_context(keys::CONTEXT)
+                .track_focus(&self.root)
+                .w(gpui::px(600.))
+                .on_action(cx.listener(|view, _: &keys::Stop, _, cx| {
+                    view.stopped = true;
+                    cx.notify();
+                }))
+                .child(Composer::new(self.field.clone(), self.busy, send, stop))
+        }
+    }
+
+    fn setup(cx: &mut TestAppContext) -> (Entity<Example>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+
+            keys::bind(cx);
+        });
+        let mut example = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let field = cx.new(|cx| composer_field(window, cx));
+                field.read(cx).focus_handle(cx).focus(window, cx);
+                Example {
+                    field,
+                    root: cx.focus_handle(),
+                    busy: false,
+                    sent: vec![],
+                    stopped: false,
+                }
+            });
+            example = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        (example.unwrap(), cx)
+    }
+
+    fn value(view: &Entity<Example>, cx: &mut VisualTestContext) -> String {
+        cx.update(|_, cx| view.read(cx).field.read(cx).value().to_string())
+    }
+
+    #[gpui::test]
+    fn enter_sends_and_clean_is_undoable(cx: &mut TestAppContext) {
+        let (view, cx) = setup(cx);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(value(&view, cx), "");
+        assert!(cx.update(|_, cx| view.read(cx).sent.is_empty()));
+        cx.simulate_input("hello");
+        cx.simulate_keystrokes("cmd-enter");
+        assert_eq!(value(&view, cx), "hello");
+        assert!(cx.update(|_, cx| view.read(cx).sent.is_empty()));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(value(&view, cx), "");
+        assert_eq!(cx.update(|_, cx| view.read(cx).sent.clone()), ["hello"]);
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(value(&view, cx), "hello");
+    }
+
+    #[gpui::test]
+    fn shift_enter_edits_and_busy_enter_never_edits(cx: &mut TestAppContext) {
+        let (view, cx) = setup(cx);
+        cx.simulate_input("hello");
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(value(&view, cx), "hello\n");
+        assert!(cx.update(|_, cx| view.read(cx).sent.is_empty()));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.busy = true;
+                cx.notify();
+            })
+        });
+        cx.simulate_keystrokes("enter cmd-enter");
+        assert_eq!(value(&view, cx), "hello\n");
+        assert!(cx.update(|_, cx| view.read(cx).sent.is_empty()));
+        cx.simulate_keystrokes("cmd-.");
+        assert!(cx.update(|_, cx| view.read(cx).stopped));
+    }
+
+    #[gpui::test]
+    fn cmd_alt_arrows_never_add_a_second_cursor(cx: &mut TestAppContext) {
+        let (view, cx) = setup(cx);
+        cx.simulate_input("alpha");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("beta");
+        cx.simulate_keystrokes("cmd-alt-up");
+        cx.simulate_input("X");
+        cx.simulate_keystrokes("cmd-alt-down");
+        cx.simulate_input("Y");
+        assert_eq!(value(&view, cx), "alpha\nbetaXY");
+    }
+
+    #[gpui::test]
+    fn tab_leaves_the_field_without_inserting_text(cx: &mut TestAppContext) {
+        let (view, cx) = setup(cx);
+        cx.simulate_input("hello");
+        cx.simulate_keystrokes("tab");
+        assert_eq!(value(&view, cx), "hello");
+        assert!(!cx.update(|window, cx| {
+            view.read(cx)
+                .field
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        }));
+    }
+
+    #[gpui::test]
+    fn kit_edit_actions_keep_cut_copy_paste_and_redo(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+        let (view, cx) = setup(cx);
+        cx.simulate_input("draft text");
+        cx.dispatch_action(SelectAll);
+        cx.dispatch_action(Copy);
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            "draft text"
+        );
+        cx.dispatch_action(Cut);
+        assert_eq!(value(&view, cx), "");
+        cx.dispatch_action(Paste);
+        assert_eq!(value(&view, cx), "draft text");
+        cx.dispatch_action(Undo);
+        assert_eq!(value(&view, cx), "");
+        cx.dispatch_action(Redo);
+        assert_eq!(value(&view, cx), "draft text");
+    }
+
+    #[gpui::test]
+    fn grows_to_eight_rows_then_scrolls(cx: &mut TestAppContext) {
+        let (view, cx) = setup(cx);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let one = cx.debug_bounds("composer").unwrap().size.height;
+        for _ in 1..8 {
+            cx.simulate_keystrokes("shift-enter");
+        }
+        let eight = cx.debug_bounds("composer").unwrap().size.height;
+        assert!(eight > one * 2.);
+        cx.simulate_keystrokes("shift-enter shift-enter shift-enter");
+        assert_eq!(cx.debug_bounds("composer").unwrap().size.height, eight);
+        assert_ne!(
+            cx.update(|_, cx| view.read(cx).field.read(cx).scroll_offset().y),
+            gpui::px(0.)
+        );
+    }
+}

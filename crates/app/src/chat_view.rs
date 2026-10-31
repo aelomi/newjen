@@ -19,20 +19,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ely_gpui_component::agent::{Permission, PermissionPrompt};
-use ely_gpui_component::buttons::IconButton;
-use ely_gpui_component::chat::{InputHint, MessageList, PromptInput};
-use ely_gpui_component::forms::TextInput;
-use ely_gpui_component::layout::{h_stack, v_stack};
-use ely_gpui_component::motion;
-use ely_gpui_component::primitives::{FocusScope, Icon, IconName, lent};
-use ely_gpui_component::theme::{ActiveTheme, ControlSize, Elevation, IconSize, Radius, TextSize};
-use ely_gpui_component::typography::{Caption, Ellipsis, Kbd, Title};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled,
-    Subscription, Task, UniformListScrollHandle, Window, div, font, prelude::*, px, uniform_list,
+    AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, font, prelude::*, px, uniform_list,
 };
+use gpui_kit::base::input::{InputAccessibility, TextareaState};
+use gpui_kit::base::{h_flex, v_flex};
 use newjen_core::store::now_ms;
 use newjen_core::thread::{self, Quitting, keeps_draft};
 use newjen_core::transcript::display_name;
@@ -45,16 +38,19 @@ use crate::format::{fit_rows, short_path, text_rows, tilde};
 use crate::keys::{
     self, JumpToThread, KeyRoute, NewThread, NextThread, PreviousThread, Stop, ToggleSidebar,
 };
-use crate::reduce_motion;
+use crate::reply;
 use crate::rows::{self, OnRestart};
 use crate::sidebar::{self, OnPress, Placement, RowFacts};
-use crate::title_bar::{self, Bar, OnRevoke};
+use crate::theme::SIDEBAR;
+use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
+use crate::ui;
+use crate::ui::DOCK_METRICS;
+use crate::ui::MessageList;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::TITLE_BAR_HEIGHT;
 
 /// The conversation column is capped at this width and centered, as in the mocks.
 const COLUMN_WIDTH: Pixels = px(720.0);
-
-/// How far the approval dock slides up as it appears.
-const DOCK_RISE: f32 = 6.0;
 
 /// ⌘↵ and Esc are ignored for this long after a new approval appears, and for this long after
 /// each ignored press. Without it a quick double-tap could answer the next queued request
@@ -62,34 +58,10 @@ const DOCK_RISE: f32 = 6.0;
 /// answer anything, see `keys::approval_key`.) Mouse clicks are not affected.
 const KEY_ANSWER_DELAY: Duration = Duration::from_millis(300);
 
-// Sizes used to work out how much of an approval's detail fits above the dock's buttons (see
-// `dock_room`). Ely's PermissionPrompt has no height limit, so without this a long command at
-// the smallest window size (640x480) pushes Allow and Deny below the window's edge.
-/// Left and right padding around the bottom column (`px_4`).
-const PAGE_PADDING: f32 = 32.0;
-/// Space above and below the dock (`pt_2` + `pb_4`).
-const BOTTOM_PADDING: f32 = 24.0;
-/// The prompt's border (1 px each side) and padding (`p_4`), plus the detail box's side
-/// padding (`px_2`) or the title's icon and gap, whichever is wider.
-const DETAIL_INSET: f32 = 2.0 + 32.0 + 22.0;
-/// The prompt's border and padding, its two gaps (`gap_3`) and the detail box's own padding
-/// (`py_1p5`), top to bottom. The button row and the text rows are added on top.
-const PROMPT_CHROME: f32 = 2.0 + 32.0 + 24.0 + 12.0;
-/// The scope row under the dock ("Always allow remembers …"): one line plus the gap above it
-/// (`gap_2`). The "Couldn't save threads" line above the dock takes the same.
-const SCOPE_GAP: f32 = 8.0;
-/// Height kept for the conversation above the dock, so you still see what Claude is doing.
-const CONVERSATION_RESERVE: f32 = 80.0;
-/// GPUI's default line height: the golden ratio times the font size.
-const LINE_HEIGHT: f32 = 1.618;
-/// The title wraps to at most this many rows (a deep file path is cut in its middle).
-const TITLE_ROWS: usize = 2;
-/// The detail never takes more rows than this, nor fewer (the conversation shrinks instead).
-const DETAIL_ROWS_MAX: usize = 9;
-const DETAIL_ROWS_MIN: usize = 3;
-
 /// The list column's side padding (`px_2`, see `sidebar::column`).
 const LIST_PADDING: f32 = 16.0;
+/// The drawer's side padding: Kit's `Sheet` pads its body 16 px a side.
+const DRAWER_PADDING: f32 = 32.0;
 /// The project row's side padding (`px_2p5`) and its folder icon with the gap after it: what
 /// its text has left of the list's width.
 const PROJECT_ROW_CHROME: f32 = 20.0 + 14.0 + 8.0;
@@ -121,7 +93,8 @@ struct Slot {
     thread: Entity<Thread>,
     /// Its composer, made the first time the thread is shown. Each thread has its own, so
     /// half-typed text (and its undo history) stays with its thread.
-    field: Option<Entity<TextInput>>,
+    field: Option<Entity<TextareaState>>,
+    replies: reply::Replies,
     /// The placeholder currently set on that field, to avoid resetting it every event.
     placeholder: SharedString,
     notice: Option<Notice>,
@@ -160,6 +133,7 @@ pub struct ChatView {
     sidebar_hidden: bool,
     /// The list floats over the chat (narrow windows, after ⌘B).
     drawer_open: bool,
+    drawer_focus: FocusHandle,
     list_scroll: UniformListScrollHandle,
     /// A problem reading the saved threads at launch, or the first failed save, shown as a
     /// quiet line until dismissed (see `after_write_error`).
@@ -170,6 +144,9 @@ pub struct ChatView {
     /// Focus target while an approval is pending (the dock replaces the composer, so the field
     /// is not on screen), so ⌘↵ and Esc reach us.
     root: FocusHandle,
+    /// The "N allowed" popover is open, and the focus it takes while it is.
+    grants_open: bool,
+    grants_focus: FocusHandle,
     /// The approval the dock is showing, to notice when a new one takes its place.
     dock_request: Option<String>,
     /// That approval's path outside the thread's folder, if any (`approval::outside_path`).
@@ -178,15 +155,11 @@ pub struct ChatView {
     dock_outside: Option<String>,
     /// Keyboard answers (⌘↵, Esc) are ignored until this moment; see `KEY_ANSWER_DELAY`.
     keys_ready_at: Option<Instant>,
-    /// The approval that was already waiting when its thread came on screen. Its dock just
-    /// appears: switching threads is instant, so only a request that arrives while you watch
-    /// slides in.
-    dock_without_entrance: Option<String>,
-    /// The reply that was already streaming when its thread came on screen (`rows::live_reply`).
-    /// Its first frame shows it whole, for the same reason; it is cleared once drawn.
-    reveal_whole: Option<u64>,
     /// The clock and the save-problem listener.
     _tasks: Vec<Task<()>>,
+    /// Taking focus back when its element leaves the window, and closing the grants popover
+    /// when focus leaves it.
+    _focus: [Subscription; 2],
 }
 
 impl ChatView {
@@ -206,6 +179,14 @@ impl ChatView {
             .unwrap_or_else(|| project.path.display().to_string());
         let project_label = tilde(&project.path, home.as_deref());
         let tasks = vec![clock(cx), save_problems(&store, cx)];
+        let grants_focus = cx.focus_handle();
+        let focus = [
+            cx.on_focus_lost(window, |view, window, cx| view.reclaim_focus(window, cx)),
+            cx.on_focus_out(&grants_focus, window, |view, _, _, cx| {
+                view.grants_open = false;
+                cx.notify();
+            }),
+        ];
         let mut view = ChatView {
             store,
             project,
@@ -217,17 +198,19 @@ impl ChatView {
             active: 0,
             sidebar_hidden: false,
             drawer_open: false,
+            drawer_focus: cx.focus_handle(),
             list_scroll: UniformListScrollHandle::new(),
             // A load problem is not a save problem: the first failed save still gets shown.
             save_problem_seen: false,
             save_problem: problem,
             root: cx.focus_handle(),
+            grants_open: false,
+            grants_focus,
             dock_request: None,
             dock_outside: None,
             keys_ready_at: None,
-            dock_without_entrance: None,
-            reveal_whole: None,
             _tasks: tasks,
+            _focus: focus,
         };
         for thread in threads {
             let at = view.slots.len();
@@ -240,6 +223,18 @@ impl ChatView {
         // starts with the first message sent to it.
         view.enter(window, cx);
         view
+    }
+
+    /// When the focused element leaves the window (an overlay closed without handing focus
+    /// back, say): the composer takes it, or the root while the dock replaces the composer, so
+    /// the shortcuts keep working.
+    fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Deferred: GPUI draws no new frame for focus that a focus-lost listener moves, so the
+        // composer would not show its focus until the next redraw.
+        cx.defer_in(window, |view, window, cx| match view.field_focus(cx) {
+            Some(field) if view.dock_request.is_none() => window.focus(&field, cx),
+            _ => window.focus(&view.root, cx),
+        });
     }
 
     /// The composer's focus handle of the thread on screen, so `main` can focus it when the
@@ -290,12 +285,15 @@ impl ChatView {
         let slot = Slot {
             thread,
             field: None,
+            replies: Default::default(),
             placeholder: SharedString::default(),
             notice: None,
             _pump: pump,
             _changes: changes,
         };
-        self.slots.insert(at.min(self.slots.len()), slot);
+        let at = at.min(self.slots.len());
+        self.slots.insert(at, slot);
+        self.sync_replies(at, cx);
     }
 
     /// A new, unsaved thread at the top of the list. Not shown yet; see `new_thread`.
@@ -312,6 +310,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(ix) = self.slots.iter().position(|slot| slot.thread == *thread) {
+            self.sync_replies(ix, cx);
+        }
         if self
             .slots
             .get(self.active)
@@ -320,6 +321,13 @@ impl ChatView {
             self.sync_field(window, cx);
         }
         cx.notify();
+    }
+
+    fn sync_replies(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let slot = &mut self.slots[ix];
+        slot.thread.clone().update(cx, |thread, cx| {
+            reply::sync(&mut slot.replies, thread.transcript().items(), cx)
+        })
     }
 
     /// The thread on screen.
@@ -390,6 +398,7 @@ impl ChatView {
     /// Makes the thread at `active` the one on screen: clears its unread flag, gives its
     /// composer (or its approval dock) the keyboard, and scrolls the list to it.
     fn enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_replies(self.active, cx);
         // No `notify` on the thread: this view redraws itself below. (It also runs while the
         // view is being built, when nothing can observe the thread yet.)
         self.thread()
@@ -399,8 +408,6 @@ impl ChatView {
         // gets the short key delay) exactly as a new one would.
         self.dock_request = None;
         self.sync_field(window, cx);
-        self.dock_without_entrance = self.dock_request.clone();
-        self.reveal_whole = rows::live_reply(self.thread().read(cx).transcript().items());
         if self.dock_request.is_none() {
             let field = self.ensure_field(window, cx);
             let handle = field.read(cx).focus_handle(cx);
@@ -440,6 +447,35 @@ impl ChatView {
         self.enter(window, cx);
     }
 
+    fn render_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let list = self.render_list(
+            f32::from(SIDEBAR) - DRAWER_PADDING - PROJECT_ROW_CHROME,
+            window,
+            cx,
+        );
+        v_flex()
+            .size_full()
+            .key_context(keys::CONTEXT)
+            .track_focus(&self.drawer_focus)
+            .capture_action(
+                cx.listener(|view, _: &gpui_kit::base::actions::Cancel, _, cx| {
+                    view.drawer_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .capture_key_down(cx.listener(Self::on_key_capture))
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(cx.listener(Self::on_stop))
+            .on_action(cx.listener(Self::on_new_thread))
+            .on_action(cx.listener(Self::on_previous))
+            .on_action(cx.listener(Self::on_next))
+            .on_action(cx.listener(Self::on_jump))
+            .on_action(cx.listener(Self::on_toggle_sidebar))
+            .children(list)
+            .into_any_element()
+    }
+
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let width = f32::from(window.viewport_size().width);
         (self.sidebar_hidden, self.drawer_open) =
@@ -451,7 +487,7 @@ impl ChatView {
     /// counting ("Working · 1m 12s") or once a minute ("4m ago"). Also follows macOS's Reduce
     /// Motion setting, which has no change notice of its own here.
     fn tick(&mut self, ticks: u64, cx: &mut Context<Self>) {
-        reduce_motion::sync(cx);
+        gpui_kit::base::apply_system_reduce_motion(cx);
         let minute = ticks.is_multiple_of(MINUTE_TICKS);
         if minute {
             let now = Instant::now();
@@ -488,12 +524,16 @@ impl ChatView {
     // -----------------------------------------------------------------------------------------
 
     /// The composer of the thread on screen, made the first time it is needed.
-    fn ensure_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextInput> {
+    fn ensure_field(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextareaState> {
         let slot = &mut self.slots[self.active];
         if let Some(field) = &slot.field {
             return field.clone();
         }
-        let field = cx.new(|cx| TextInput::new(window, cx).multi_line(1, 8));
+        let field = cx.new(|cx| ui::composer_field(window, cx));
         slot.field = Some(field.clone());
         // A new field has no placeholder yet; `sync_field` sets it.
         slot.placeholder = SharedString::default();
@@ -505,7 +545,7 @@ impl ChatView {
         self.slots
             .get(ix)
             .and_then(|slot| slot.field.as_ref())
-            .map(|field| field.read(cx).text().to_string())
+            .map(|field| field.read(cx).value().to_string())
             .unwrap_or_default()
     }
 
@@ -529,7 +569,9 @@ impl ChatView {
         };
         if front != self.dock_request {
             // A new request is on the dock: give the user a moment to see it.
-            self.keys_ready_at = front.as_ref().map(|_| Instant::now() + KEY_ANSWER_DELAY);
+            self.keys_ready_at = front
+                .as_ref()
+                .map(|_| cx.background_executor().now() + KEY_ANSWER_DELAY);
             match (&self.dock_request, &front) {
                 // The dock appears in place of the composer.
                 (None, Some(_)) => window.focus(&self.root, cx),
@@ -553,7 +595,13 @@ impl ChatView {
         let slot = &mut self.slots[self.active];
         if placeholder != slot.placeholder {
             slot.placeholder = placeholder.clone();
-            field.update(cx, |field, cx| field.set_placeholder(placeholder, cx));
+            field.update(cx, |field, cx| {
+                field.set_accessibility(
+                    InputAccessibility::new(Some(gpui::Role::TextInput))
+                        .with_label(Some(placeholder.clone())),
+                );
+                field.set_placeholder(placeholder.clone(), window, cx);
+            });
         }
     }
 
@@ -564,13 +612,12 @@ impl ChatView {
     /// Sends the composer's text as the next message (Enter or the send button).
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let field = self.ensure_field(window, cx);
-        let text = field.read(cx).text().trim().to_string();
+        let text = field.read(cx).value().trim().to_string();
         if text.is_empty() || self.is_busy(cx) {
             return;
         }
         if self.send_text(&text, window, cx) {
-            // Ely's composer leaves clearing the field to its owner.
-            field.update(cx, |field, cx| field.set_text("", cx));
+            field.update(cx, |field, cx| field.clean(window, cx));
         }
     }
 
@@ -682,8 +729,8 @@ impl ChatView {
     /// Whether a keyboard answer may go through now. A press that comes too soon is ignored
     /// and pushes the moment back, so tapping quickly never answers a request you have not
     /// seen yet.
-    fn keys_ready(&mut self) -> bool {
-        let now = Instant::now();
+    fn keys_ready(&mut self, cx: &App) -> bool {
+        let now = cx.background_executor().now();
         match self.keys_ready_at {
             Some(ready_at) if now < ready_at => {
                 self.keys_ready_at = Some(now + KEY_ANSWER_DELAY);
@@ -701,10 +748,7 @@ impl ChatView {
             .transcript()
             .pending_approval()
             .is_some();
-        // Ely's own check that one of its popovers or menus holds the keyboard. Hidden from
-        // its docs but exported; fine at the exact Ely version this workspace pins.
-        let overlay = lent(window, cx);
-        keys::key_route(event, self.drawer_open, overlay, pending)
+        keys::key_route(event, self.drawer_open, overlay_focused(window), pending)
     }
 
     /// Esc closes the thread drawer. GPUI calls this for every key press inside the view
@@ -731,7 +775,7 @@ impl ChatView {
             KeyRoute::Answer(answer) => {
                 // An approval key while the dock is up is ours, even when it is ignored below.
                 cx.stop_propagation();
-                if self.keys_ready() {
+                if self.keys_ready(cx) {
                     self.answer(None, answer, false, window, cx);
                 }
             }
@@ -777,7 +821,7 @@ impl ChatView {
         self.toggle_sidebar(window, cx);
     }
 
-    /// A click handler for Ely's buttons and rows, which receive `&mut App` rather than our
+    /// A click handler for buttons and rows, which receive `&mut App` rather than our
     /// `Context`, so it goes back through the entity.
     fn press(
         &self,
@@ -803,21 +847,17 @@ impl ChatView {
     ) -> AnyElement {
         let on_restart: OnRestart = self.press(cx, |view, window, cx| view.restart(window, cx));
         let on_continue: OnRestart = self.press(cx, |view, window, cx| view.resume(window, cx));
-        // The reply that was streaming when its thread came on screen is drawn whole once:
-        // that first draw is when Ely starts counting what it has shown. Rows are drawn while
-        // the frame is laid out, after `render`, so this is the place to let it go.
-        let whole = match self.slots[self.active]
-            .thread
-            .read(cx)
-            .transcript()
-            .items()
-            .get(ix)
-        {
-            Some(Item::Assistant { id, .. }) => self.reveal_whole == Some(*id),
-            _ => false,
+        let unbuilt = {
+            let slot = &self.slots[self.active];
+            match slot.thread.read(cx).transcript().items().get(ix) {
+                Some(Item::Assistant { id, text, .. }) if !slot.replies.contains(id) => {
+                    Some((*id, text.clone()))
+                }
+                _ => None,
+            }
         };
-        if whole {
-            self.reveal_whole = None;
+        if let Some((id, text)) = unbuilt {
+            self.slots[self.active].replies.ensure(id, &text, cx);
         }
         let slot = &self.slots[self.active];
         let cx: &App = cx;
@@ -833,17 +873,16 @@ impl ChatView {
             rows::continue_label(thread.continue_resends()),
         ));
         let row = if let Some(item) = items.get(ix) {
-            let typing = ix + 1 == items.len() && !whole;
             rows::item(
                 item,
-                typing,
+                slot.replies.get(&item.id()).map(|reply| reply.view(cx)),
                 retry,
                 resume,
                 rows::stopped_resends(items, ix),
                 cx,
             )
         } else if let Some(notice) = notice {
-            rows::error("notice".into(), &notice.title, &notice.detail, retry)
+            rows::error("notice".into(), &notice.title, &notice.detail, retry, cx)
         } else {
             div().into_any_element()
         };
@@ -899,27 +938,42 @@ impl ChatView {
                 cx.notify();
             });
         });
-        title_bar::render(bar, on_revoke, window, cx)
+        let view = cx.weak_entity();
+        let on_open: OnGrantsOpen = Rc::new(move |open, _, cx| {
+            let _ = view.update(cx, |view, cx| {
+                view.grants_open = open;
+                cx.notify();
+            });
+        });
+        let grants = Grants {
+            open: self.grants_open,
+            focus: self.grants_focus.clone(),
+            on_open,
+            on_revoke,
+        };
+        title_bar::render(bar, grants, window, cx)
     }
 
     fn render_empty_state(&self, cx: &App) -> impl IntoElement {
-        let theme = cx.theme();
-        v_stack()
+        v_flex()
             .flex_1()
             .min_h_0()
             .items_center()
             .justify_center()
             .gap_2()
             .px_4()
-            .child(Title::new("What should Claude work on?"))
+            .child(ui::title("What should Claude work on?", cx))
             .child(
                 // Centered and kept to the column, so a long path wraps under the title.
                 div().max_w(COLUMN_WIDTH).text_center().child(
-                    Caption::new(format!(
-                        "Claude Code runs in {}. You approve each tool call before it runs.",
-                        self.project_label
-                    ))
-                    .text_size(theme.text_size(TextSize::Base)),
+                    ui::caption(
+                        format!(
+                            "Claude Code runs in {}. You approve each tool call before it runs.",
+                            self.project_label
+                        ),
+                        cx,
+                    )
+                    .text_base(),
                 ),
             )
     }
@@ -928,54 +982,56 @@ impl ChatView {
         let slot = &self.slots[self.active];
         let count =
             slot.thread.read(cx).transcript().items().len() + usize::from(slot.notice.is_some());
-        div().flex_1().min_h_0().child(MessageList::new(
-            "conversation",
-            count,
-            cx.processor(|view, ix: usize, window, cx| view.render_row(ix, window, cx)),
-        ))
+        div()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .child(MessageList::new(
+                "conversation",
+                count,
+                cx.processor(|view, ix: usize, window, cx| view.render_row(ix, window, cx)),
+            ))
     }
 
     /// How much of an approval fits in the dock at the current window size. Returns the title
-    /// cut to `TITLE_ROWS` and the room left for the detail: columns from the dock's width (in
+    /// cut to the dock metrics’ title row limit and the room left for the detail: columns from the dock's width (in
     /// a chat `main_width` wide) and the mono font's character width, rows from the window
     /// height minus the title bar, the dock's padding, buttons and title, the scope row under
     /// it, the save-problem line if shown, and a strip of conversation.
     fn dock_room(&self, title: &str, main_width: f32, window: &Window, cx: &App) -> (String, Room) {
-        let theme = cx.theme();
-        let rem = window.rem_size();
-        // Ely's prompt draws its text at the small size, the detail in the mono font.
-        let font_size = theme.text_size(TextSize::Sm).to_pixels(rem);
+        let m = &DOCK_METRICS;
+        let font_size = gpui::rems(0.875).to_pixels(window.rem_size());
         let text_system = window.text_system();
-        let mono = text_system.resolve_font(&font(theme.mono_family.clone()));
+        let mono = text_system.resolve_font(&font(cx.theme().mono_font_family.clone()));
         let char_width = text_system
             .advance(mono, font_size, '0')
             .map(|size| f32::from(size.width))
             .unwrap_or(f32::from(font_size) * 0.6)
             .max(1.0);
         let viewport = window.viewport_size();
-        let dock_width = (main_width - PAGE_PADDING).min(f32::from(COLUMN_WIDTH));
+        let dock_width = (main_width - m.page_padding * 2.).min(f32::from(COLUMN_WIDTH));
         // One column spare: real wrapping is a little less tidy than the estimate.
-        let cols = ((dock_width - DETAIL_INSET) / char_width).max(0.0) as usize;
+        let cols = ((dock_width - m.detail_inset()) / char_width).max(0.0) as usize;
         let cols = cols.saturating_sub(1);
 
-        let title = fit_rows(title, cols, TITLE_ROWS);
-        let line_height = f32::from(font_size) * LINE_HEIGHT;
+        let title = fit_rows(title, cols, m.title_rows);
+        let line_height = f32::from(gpui::phi().to_pixels(font_size.into(), window.rem_size()));
         let problem = if self.save_problem.is_some() {
-            SCOPE_GAP + line_height
+            m.scope_gap + line_height
         } else {
             0.0
         };
-        let used = f32::from(theme.titlebar_height().to_pixels(rem))
-            + BOTTOM_PADDING
-            + PROMPT_CHROME
-            + f32::from(theme.control_height(ControlSize::Md).to_pixels(rem))
+        let used = f32::from(TITLE_BAR_HEIGHT)
+            + m.top_padding
+            + m.bottom_padding
+            + m.chrome_height(f32::from(window.rem_size()) * 2.)
             + text_rows(&title, cols) as f32 * line_height
-            + SCOPE_GAP
+            + m.scope_gap
             + line_height
             + problem
-            + CONVERSATION_RESERVE;
+            + m.conversation_reserve;
         let free = (f32::from(viewport.height) - used).max(0.0);
-        let rows = ((free / line_height) as usize).clamp(DETAIL_ROWS_MIN, DETAIL_ROWS_MAX);
+        let rows = ((free / line_height) as usize).clamp(m.detail_rows_min, m.detail_rows_max);
         (title, Room { cols, rows })
     }
 
@@ -1024,75 +1080,24 @@ impl ChatView {
         let request_id = SharedString::from(request.request_id.clone());
         let view = cx.weak_entity();
         let answered_id = request_id.clone();
-        let prompt = PermissionPrompt::new(
+        let card = ui::ApprovalCard::new(
             (ElementId::from("approval"), request_id.clone()),
             title,
-            move |permission, window, cx| {
-                let answer = match permission {
-                    Permission::Once => PermissionAnswer::AllowOnce,
-                    Permission::Always => PermissionAnswer::AllowForSession,
-                    Permission::Deny => PermissionAnswer::Deny,
-                };
+            detail.text,
+            move |answer, window, cx| {
                 let _ = view.update(cx, |view, cx| {
                     view.answer(Some(answered_id.as_ref()), answer, rule_cut, window, cx)
                 });
             },
-        )
-        .detail(detail.text);
-
-        let theme = cx.theme();
-        // Ely's prompt draws its own surface, border and 8 px corners; this adds the floating
-        // shadow on the same shape.
-        let card = div()
-            .rounded(theme.radius(Radius::Lg))
-            .shadow(theme.elevation(Elevation::Floating))
-            .child(prompt);
-        // Ely's prompt has no slot between its detail and its buttons, so the scope row sits
-        // just under the card. `dock_room` counts it, so the buttons stay on screen.
-        let dock = v_stack()
-            .relative()
-            .gap_2()
-            .child(card)
-            .child(rows::scope(&scope, cx));
-        if self.dock_without_entrance.as_deref() == Some(request.request_id.as_str()) {
-            return Some(dock.into_any_element());
-        }
-        // Enters once per request: fade in while rising 6 px, 120 ms, ease-out. Ely shortens
-        // it to 1 ms under macOS's Reduce Motion setting (see `reduce_motion.rs`).
-        let enter =
-            Animation::new(motion::duration(motion::FAST, cx)).with_easing(motion::ease_out_cubic);
-        Some(
-            dock.with_animation((ElementId::from("dock"), request_id), enter, |dock, t| {
-                dock.opacity(t).top(px(DOCK_RISE * (1.0 - t)))
-            })
-            .into_any_element(),
-        )
+        );
+        Some(ui::approval_dock(card, rows::scope(&scope, cx)))
     }
 
     fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let field = self.ensure_field(window, cx);
-        let view = cx.weak_entity();
-        let composer = PromptInput::new("composer", &field, move |window, cx| {
-            let _ = view.update(cx, |view, cx| view.send(window, cx));
-        });
-        if self.is_busy(cx) {
-            let view = cx.weak_entity();
-            let theme = cx.theme();
-            let hint = h_stack()
-                .gap_1()
-                .text_size(theme.text_size(TextSize::Xs))
-                .text_color(theme.colors.fg_subtle)
-                .child(Kbd::new("cmd-."))
-                .child("to stop");
-            composer
-                .tool(hint)
-                .busy(move |window, cx| {
-                    let _ = view.update(cx, |view, cx| view.stop(window, cx));
-                })
-                .into_any_element()
-        } else {
-            composer.tool(InputHint).into_any_element()
-        }
+        let send = self.press(cx, |view, window, cx| view.send(window, cx));
+        let stop = self.press(cx, |view, window, cx| view.stop(window, cx));
+        ui::Composer::new(field, self.is_busy(cx), send, stop).into_any_element()
     }
 
     /// "Couldn't save threads: …", once, quietly, above the composer, until dismissed.
@@ -1104,27 +1109,25 @@ impl ChatView {
         });
         let theme = cx.theme();
         Some(
-            h_stack()
+            h_flex()
                 .gap_1p5()
                 .px_1()
                 .min_w_0()
-                .child(
-                    Icon::new(IconName::TriangleAlert)
-                        .size(IconSize::Xs)
-                        .color(theme.colors.warning),
-                )
+                .child(ui::icon(
+                    ui::IconName::TriangleAlert,
+                    gpui_kit::component::Size::XSmall,
+                    theme.colors.warning,
+                ))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_size(theme.text_size(TextSize::Xs))
-                        .text_color(theme.colors.fg_subtle)
-                        .child(Ellipsis::new(problem)),
+                        .text_xs()
+                        .text_color(theme.colors.muted_foreground)
+                        .child(ui::ellipsis(problem)),
                 )
                 .child(
-                    IconButton::new("dismiss-save-problem", IconName::X)
-                        .size(ControlSize::Sm)
-                        .tooltip("Dismiss")
+                    ui::icon_button("dismiss-save-problem", ui::IconName::Close, "Dismiss", cx)
                         .on_click(dismiss),
                 )
                 .into_any_element(),
@@ -1203,8 +1206,12 @@ impl Render for ChatView {
         if width >= sidebar::NARROW_WINDOW {
             self.drawer_open = false;
         }
+        // Revoking the last rule takes the chip, and its popover, away.
+        if self.thread().read(cx).grants().is_empty() {
+            self.grants_open = false;
+        }
         let placement = sidebar::placement(width, self.sidebar_hidden, self.drawer_open);
-        let sidebar_px = f32::from(cx.theme().sidebar_width(false).to_pixels(window.rem_size()));
+        let sidebar_px = f32::from(SIDEBAR);
         // The drawer floats over the chat, so only the docked list takes width from it.
         let main_width = match placement {
             Placement::Docked => width - sidebar_px,
@@ -1231,33 +1238,53 @@ impl Render for ChatView {
         };
         let problem = self.render_save_problem(cx);
 
-        // The list's column: docked beside the chat, or the same column as a drawer over it.
-        // Its header's panel-left button hides the docked list or closes the drawer (⌘B).
-        let column = (placement != Placement::Hidden).then(|| {
+        let docked = (placement == Placement::Docked).then(|| {
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
             let header = sidebar::header(toggle, window, cx);
             let room = sidebar_px - LIST_PADDING - PROJECT_ROW_CHROME;
             let list = self.render_list(room, window, cx);
             sidebar::column(header, list, cx)
         });
-        let (docked, drawer) = match (placement, column) {
-            (Placement::Docked, column) => (column, None),
-            (Placement::Drawer, Some(column)) => {
-                let close = self.press(cx, |view, _, cx| {
-                    view.drawer_open = false;
-                    cx.notify();
-                });
-                (None, Some(sidebar::drawer(column, close, window, cx)))
+        use gpui_kit::component::{Placement as SheetPlacement, WindowExt as _};
+        if placement == Placement::Drawer && !window.has_active_sheet(cx) {
+            let view = cx.entity().downgrade();
+            let closed = view.clone();
+            window.open_sheet_at(SheetPlacement::Left, cx, move |sheet, window, cx| {
+                let content = view
+                    .update(cx, |view, cx| view.render_drawer(window, cx))
+                    .ok();
+                let closed = closed.clone();
+                sheet
+                    .size(SIDEBAR)
+                    .resizable(false)
+                    .children(content)
+                    .on_close(move |_, _, cx| {
+                        let _ = closed.update(cx, |view, cx| {
+                            view.drawer_open = false;
+                            cx.notify();
+                        });
+                    })
+            });
+            let focus = self.drawer_focus.clone();
+            cx.defer_in(window, move |_, window, cx| focus.focus(window, cx));
+        } else if placement != Placement::Drawer && window.has_active_sheet(cx) {
+            window.close_sheet(cx);
+            match self.field_focus(cx) {
+                Some(field) if self.dock_request.is_none() => field.focus(window, cx),
+                _ => self.root.focus(window, cx),
             }
-            _ => (None, None),
-        };
+        }
 
         let theme = cx.theme();
-        let (bg, fg, font) = (theme.colors.bg, theme.colors.fg, theme.font_family.clone());
+        let (bg, fg, font) = (
+            theme.background,
+            theme.foreground,
+            theme.font_family.clone(),
+        );
         // Everything that belongs to one thread sits under an id made from the thread's id,
         // so per-element state (a tool card left open, the scroll position, a streaming reply)
         // can never carry over to another thread whose rows have the same numbers.
-        let main = v_stack()
+        let main = v_flex()
             .id((ElementId::from("thread"), thread_id))
             .flex_1()
             .min_w_0()
@@ -1270,24 +1297,34 @@ impl Render for ChatView {
                     .w_full()
                     .flex()
                     .justify_center()
-                    .px_4()
-                    .pt_2()
-                    .pb_4()
+                    .px(px(DOCK_METRICS.page_padding))
+                    .pt(px(DOCK_METRICS.top_padding))
+                    .pb(px(DOCK_METRICS.bottom_padding))
                     .child(
-                        v_stack()
+                        v_flex()
                             .w_full()
                             .max_w(COLUMN_WIDTH)
-                            .gap_2()
+                            .gap(px(DOCK_METRICS.scope_gap))
                             .children(problem)
                             .child(bottom),
                     ),
             );
 
-        // The outer div carries our key context and shortcut handlers; Ely's root FocusScope
-        // inside it handles Tab and takes focus back when the focused element disappears.
+        // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
+        // falls out of the window comes back through `reclaim_focus`.
         div()
             .key_context(keys::CONTEXT)
+            .track_focus(&self.root)
             .size_full()
+            .capture_action(
+                cx.listener(|view, _: &gpui_kit::base::input::Escape, _, cx| {
+                    if view.drawer_open {
+                        view.drawer_open = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
             .capture_key_down(cx.listener(Self::on_key_capture))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::on_stop))
@@ -1296,19 +1333,22 @@ impl Render for ChatView {
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_jump))
             .on_action(cx.listener(Self::on_toggle_sidebar))
-            .child(
-                FocusScope::new(&self.root)
-                    .root()
-                    .size_full()
-                    .flex()
-                    .bg(bg)
-                    .text_color(fg)
-                    .font_family(font)
-                    .children(docked)
-                    .child(main)
-                    .children(drawer),
-            )
+            .flex()
+            .bg(bg)
+            .text_color(fg)
+            .font_family(font)
+            .children(docked)
+            .child(main)
     }
+}
+
+/// Whether a Kit menu or popover holds the keyboard (a row's "Archive thread", the "N allowed"
+/// list). Then Esc closes it, and ⌘↵ must not allow a request the user is not looking at.
+fn overlay_focused(window: &Window) -> bool {
+    window
+        .context_stack()
+        .iter()
+        .any(|context| context.contains("PopupMenu") || context.contains("PopoverContent"))
 }
 
 /// Ticks every `TICK` for as long as the view lives (see `ChatView::tick`).
@@ -1572,3 +1612,6 @@ mod tests {
         assert!(!other.detail.contains("Install Claude Code"));
     }
 }
+
+#[cfg(test)]
+mod input_tests;

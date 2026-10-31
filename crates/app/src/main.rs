@@ -2,37 +2,40 @@
 //!
 //! This file only starts things: it cleans up `claude` processes a crashed Newjen left behind,
 //! picks the project folder, opens the thread database and loads the project's threads, starts
-//! GPUI with Ely's theme and fonts, and opens the window. The window's content lives in
+//! GPUI with Kit's default theme and fonts, and opens the window. The window's content lives in
 //! `chat_view.rs`.
 //!
 //! Usage: `newjen [project-dir]` (or set `NEWJEN_PROJECT`). Defaults to the current directory.
 //! Threads are saved in `~/Library/Application Support/Newjen` (or `$NEWJEN_HOME`).
 
 mod approval;
+mod assets;
 mod chat_view;
 mod format;
 mod keys;
-mod reduce_motion;
+mod reply;
 mod rows;
 mod sidebar;
+mod theme;
 mod title_bar;
+mod ui;
 
 use std::path::{Path, PathBuf};
 
-use ely_gpui_component::Assets;
-use ely_gpui_component::forms::{Copy, Cut, Paste, Redo, SelectAll, Undo};
-use ely_gpui_component::theme::{ActiveTheme, Mode, Theme};
 use gpui::{
     App, AppContext, Bounds, Context, IntoElement, Menu, MenuItem, OsAction, PromptLevel, QuitMode,
     Render, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
 };
+use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use newjen_core::{SessionConfig, Store, Thread, orphans, store};
 
+use crate::assets::AppAssets;
 use crate::chat_view::{ChatView, Startup};
 use crate::keys::{
     CloseWindow, Hide, HideOthers, JumpToThread, Minimize, NewThread, NextThread, PreviousThread,
     Quit, ToggleSidebar,
 };
+use gpui_kit::component::ActiveTheme as _;
 
 fn main() {
     // Kill `claude` processes whose Newjen crashed, before starting new ones.
@@ -55,19 +58,15 @@ fn main() {
     });
 
     gpui_platform::application()
-        .with_assets(Assets)
+        .with_assets(AppAssets(gpui_kit::assets::Assets))
         // Closing the window quits the app (on macOS GPUI otherwise keeps running).
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx: &mut App| {
-            if let Err(error) = ely_gpui_component::init(cx) {
-                eprintln!("newjen: Ely failed to start: {error:#}");
-                cx.quit();
-                return;
-            }
+            gpui_kit::init(cx);
             // Match the system's light/dark mode from the first frame (no flash).
-            Theme::set_mode_now(Mode::from(cx.window_appearance()), cx);
+            gpui_kit::component::Theme::change(cx.window_appearance(), None, cx);
             // And its Reduce Motion setting; the chat view's clock keeps it in step.
-            reduce_motion::sync(cx);
+            gpui_kit::base::apply_system_reduce_motion(cx);
 
             keys::bind(cx);
             install_menus(cx);
@@ -129,7 +128,7 @@ fn install_menus(cx: &mut App) {
                 })),
             ),
         ]),
-        // Ely's text field handles these actions; the OS variant lets macOS route them too.
+        // The Kit text field handles these actions; the OS variant lets macOS route them too.
         Menu::new("Edit").items([
             MenuItem::os_action("Undo", Undo, OsAction::Undo),
             MenuItem::os_action("Redo", Redo, OsAction::Redo),
@@ -261,7 +260,7 @@ struct Blank;
 
 impl Render for Blank {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().bg(cx.theme().colors.bg)
+        div().size_full().bg(cx.theme().colors.background)
     }
 }
 
@@ -272,21 +271,19 @@ fn open_window(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
             size(px(1200.0), px(760.0)),
             cx,
         ))),
-        // A transparent title bar: the thread list's header and the chat's title bar draw it,
-        // around the system traffic lights (see `sidebar::header` and `title_bar.rs`).
-        titlebar: Some(TitlebarOptions {
+        titlebar: Some(gpui::TitlebarOptions {
             title: Some("Newjen".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(cx.theme().traffic_light_origin()),
+            ..gpui_kit::component::TitleBar::title_bar_options()
         }),
+        app_owns_titlebar_drag: true,
         window_min_size: Some(size(px(640.0), px(480.0))),
         ..Default::default()
     };
-    let window = cx.open_window(options, |window, cx| {
+    let (_, view) = gpui_kit::open_window(options, cx, |window, cx| {
         // Follow the system when it switches between light and dark.
         window
             .observe_window_appearance(|window, cx| {
-                Theme::set_mode(Mode::from(window.appearance()), cx);
+                gpui_kit::component::Theme::change(window.appearance(), Some(window), cx);
             })
             .detach();
         let view = cx.new(|cx| ChatView::new(startup, window, cx));
@@ -298,7 +295,6 @@ fn open_window(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
     // Quitting (⌘Q, or closing the window, which quits) settles and saves every thread and
     // stops every `claude`. GPUI allows about 200 ms for this. The hook keeps the view alive
     // itself: closing the window drops the window's hold on it before the app quits.
-    let view = window.update(cx, |_, _, cx| cx.entity())?;
     cx.on_app_quit(move |cx| {
         view.update(cx, |view, cx| view.quit(cx));
         async {}

@@ -12,7 +12,7 @@ rust-version = "1.98"
 publish = false
 
 # Every dependency is pinned to an exact version (`=x.y.z`) so builds are reproducible.
-# Crates opt in with `name.workspace = true`. These versions match what GPUI and Ely already
+# Crates opt in with `name.workspace = true`. These versions match what GPUI Kit already
 # pull in, so the whole workspace shares one copy of each and builds offline.
 [workspace.dependencies]
 anyhow = "=1.0.104"
@@ -26,10 +26,7 @@ tempfile = "=3.27.0"
 uuid = { version = "=1.29.0", features = ["v4"] }
 
 # UI (crates/app only; `core` must never use these).
-ely-gpui-component = "=0.1.1"
 gpui = { package = "gpui-pre", version = "=0.3.10" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }
+gpui-kit = { version = "=0.8.1", features = ["tree-sitter", "tree-sitter-bash", "tree-sitter-rust", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-tsx", "tree-sitter-python", "tree-sitter-toml"] }
 newjen-core = { path = "crates/core" }
-# macOS's own API, for the one setting GPUI and Ely do not read themselves (Reduce Motion).
-# GPUI already builds this crate, so it adds nothing new to the build.
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
