@@ -672,6 +672,9 @@ impl ChatView {
         if self.slots[ix].thread.read(cx).preparing().is_some() {
             return;
         }
+        if self.hold_archive(ix, cx) {
+            return;
+        }
         let len = self.slots.len();
         let slot = self.slots.remove(ix);
         let removal = slot.thread.update(cx, |thread, cx| {
@@ -700,6 +703,9 @@ impl ChatView {
         let Some(ix) = self.index_of(thread_id, cx) else {
             return;
         };
+        if self.hold_archive(ix, cx) {
+            return;
+        }
         let question = {
             let thread = self.slots[ix].thread.read(cx);
             thread.copy().map(|copy| {
@@ -748,6 +754,53 @@ impl ChatView {
                         ),
                 )
         });
+    }
+
+    fn hold_archive(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
+        let Some(problem) = self.archive_blocker(ix, cx) else {
+            return false;
+        };
+        self.save_problem = Some(problem);
+        cx.notify();
+        true
+    }
+
+    fn archive_blocker(&self, ix: usize, cx: &App) -> Option<String> {
+        let target = &self.slots[ix].thread;
+        let folder = &target.read(cx).copy()?.path;
+        let thread_using_folder = |view: &ChatView| {
+            view.slots.iter().find_map(|slot| {
+                if slot.thread == *target {
+                    return None;
+                }
+                let thread = slot.thread.read(cx);
+                thread.cwd().starts_with(folder).then(|| {
+                    format!(
+                        "Couldn't archive this thread. Its Rift copy is used by thread “{}”. \
+                         Archive that thread before deleting this copy.",
+                        thread.title()
+                    )
+                })
+            })
+        };
+        if let Some(problem) = thread_using_folder(self) {
+            return Some(problem);
+        }
+        for peer in &self.copy_peers {
+            let Some(peer) = peer.upgrade() else { continue };
+            let peer = peer.read(cx);
+            if peer.project.path.starts_with(folder) {
+                return Some(format!(
+                    "Couldn't archive this thread. Its Rift copy is open as project {}. \
+                     Quit Newjen and reopen only the original project before archiving this copy.",
+                    tilde(&peer.project.path, self.home.as_deref())
+                ));
+            }
+            if let Some(problem) = thread_using_folder(peer) {
+                return Some(problem);
+            }
+        }
+        None
     }
 
     fn render_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

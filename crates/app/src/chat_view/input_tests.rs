@@ -1518,3 +1518,99 @@ async fn a_busy_rift_folder_cannot_be_copied_as_another_project(cx: &mut TestApp
         "must block copying a folder with a busy peer working in it"
     );
 }
+
+fn open_copy_as_project(
+    owner: &Entity<ChatView>,
+    folder: &Path,
+    cx: &mut VisualTestContext,
+) -> Entity<ChatView> {
+    cx.update(|window, cx| {
+        let view = owner.read(cx);
+        let store = view.store.clone();
+        let tools = view.tools.clone();
+        let mut config = SessionConfig::new(folder);
+        config.program = view.base_config.program.clone();
+        let project = store.open_project(folder).unwrap();
+        let peer = cx.new(|cx| {
+            ChatView::new(
+                Startup {
+                    store,
+                    project,
+                    base_config: config,
+                    threads: vec![],
+                    problem: None,
+                    home: None,
+                    tools,
+                },
+                window,
+                cx,
+            )
+        });
+        peer.update(cx, |view, cx| {
+            view.set_copy_peers(vec![owner.downgrade()]);
+            view.set_visible(false, window, cx);
+        });
+        owner.update(cx, |view, cx| {
+            view.set_copy_peers(vec![peer.downgrade()]);
+            view.set_visible(true, window, cx);
+        });
+        peer
+    })
+}
+
+#[gpui::test]
+async fn archive_preserves_a_copy_used_by_another_loaded_project(cx: &mut TestAppContext) {
+    let (owner, path, cx) = setup_in(cx, "archive-copy-in-use", true, Some(CREATE_COPY));
+    choose(1, cx);
+    cx.simulate_input("prepare work in a copy");
+    cx.simulate_keystrokes("enter");
+    pending(&owner, cx).await;
+    let (copy, id) = cx.update(|_, cx| {
+        let thread = owner.read(cx).thread().read(cx);
+        (thread.copy().cloned().unwrap(), thread.id().to_string())
+    });
+    let peer = open_copy_as_project(&owner, &copy.workdir, cx);
+    cx.update(|window, cx| owner.update(cx, |view, cx| view.ask_to_archive(&id, window, cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "an idle loaded project keeps its folder"
+    );
+    cx.update(|window, cx| peer.update(cx, |view, cx| view.send_text("use the copy", window, cx)));
+    pending(&peer, cx).await;
+    cx.update(|window, cx| owner.update(cx, |view, cx| view.archive(&id, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| owner.read(cx).thread().read(cx).id().to_string()),
+        id
+    );
+    assert!(copy.path.is_dir());
+    assert!(cx.update(|_, cx| peer.read(cx).thread().read(cx).status().is_busy()));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    finish(&owner, path, cx);
+}
+
+#[gpui::test]
+async fn archive_rechecks_copy_users_before_deleting(cx: &mut TestAppContext) {
+    let (owner, path, cx) = setup_in(cx, "archive-copy-race", true, Some(CREATE_COPY));
+    choose(1, cx);
+    cx.simulate_input("prepare work in a copy");
+    cx.simulate_keystrokes("enter");
+    pending(&owner, cx).await;
+    let (copy, id) = cx.update(|_, cx| {
+        let thread = owner.read(cx).thread().read(cx);
+        (thread.copy().cloned().unwrap(), thread.id().to_string())
+    });
+    cx.update(|window, cx| owner.update(cx, |view, cx| view.ask_to_archive(&id, window, cx)));
+    cx.run_until_parked();
+    let peer = open_copy_as_project(&owner, &copy.workdir, cx);
+    cx.update(|window, cx| owner.update(cx, |view, cx| view.archive(&id, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| owner.read(cx).thread().read(cx).id().to_string()),
+        id
+    );
+    assert!(copy.path.is_dir());
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    finish(&owner, path, cx);
+}
