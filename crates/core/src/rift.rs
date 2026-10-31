@@ -165,14 +165,97 @@ impl fmt::Display for CopyError {
 
 impl std::error::Error for CopyError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    MainRepoReady,
+    Line(String),
+}
+
+pub fn destination(project_dir: &Path, name: &str) -> Result<PathBuf, CopyError> {
+    let project = std::fs::canonicalize(project_dir)
+        .map_err(|error| failure("rift create", format!("{}: {error}", project_dir.display())))?;
+    let (root, _) = project_root(&project);
+    let (Some(parent), Some(root_name)) = (root.parent(), root.file_name()) else {
+        return Err(failure(
+            "rift create",
+            "Newjen won't copy the whole disk".to_string(),
+        ));
+    };
+    Ok(parent.join(".rifts").join(root_name).join(name))
+}
+
+pub fn check_destination(path: &Path) -> Result<(), CopyError> {
+    if path.symlink_metadata().is_ok() {
+        return Err(CopyError::Exists {
+            path: path.to_path_buf(),
+            rift_id: read_id(path),
+        });
+    }
+    Ok(())
+}
+
+pub fn remove_pending(tools: &Tools, path: &Path) -> Result<(), CopyError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| failure("rift remove", "missing parent".to_string()))?;
+    if path.symlink_metadata().is_ok() {
+        check_directory(path, parent)?;
+        if let Some(id) = read_id(path) {
+            remove(tools, path, &id)?;
+        }
+    }
+    for entry in pending_trash(path)? {
+        check_directory(&entry, &parent.join(TRASH))?;
+        if let Some(id) = read_id(&entry)
+            && entry.file_name()
+                == Some(OsStr::new(&format!(
+                    "{id}-{}",
+                    path.file_name().expect("copy name").to_string_lossy()
+                )))
+        {
+            remove(tools, path, &id)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn pending_is_gone(path: &Path) -> bool {
+    matches!(path.symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && pending_trash(path).is_ok_and(|entries| entries.is_empty())
+}
+
+fn pending_trash(path: &Path) -> Result<Vec<PathBuf>, CopyError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| failure("rift remove", "missing parent".to_string()))?;
+    let trash = parent.join(TRASH);
+    if matches!(trash.symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(Vec::new());
+    }
+    check_directory(&trash, parent)?;
+    let suffix = format!(
+        "-{}",
+        path.file_name().expect("copy name").to_string_lossy()
+    );
+    let entries = std::fs::read_dir(&trash)
+        .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+        .map_err(|error| failure("rift remove", format!("{}: {error}", trash.display())))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(&suffix))
+        .map(|entry| entry.path())
+        .collect())
+}
+
 /// Makes a Rift copy of the project at `project_dir` named `name` (see the module docs).
 /// Blocking: it can take seconds, more with Rift hooks. Each line Rift and its hooks print on
-/// stderr goes to `on_line` as it arrives.
+/// stderr is reported as [`Progress::Line`], after [`Progress::MainRepoReady`].
 pub fn create(
     tools: &Tools,
     project_dir: &Path,
     name: &str,
-    mut on_line: impl FnMut(&str),
+    mut on_progress: impl FnMut(Progress),
 ) -> Result<Copy, CopyError> {
     let project = std::fs::canonicalize(project_dir)
         .map_err(|error| failure("rift create", format!("{}: {error}", project_dir.display())))?;
@@ -195,13 +278,8 @@ pub fn create(
         .expect("the root contains the project")
         .to_path_buf();
     let into = parent.join(".rifts").join(root_name);
-    let path = into.join(name);
-    if path.exists() {
-        return Err(CopyError::Exists {
-            rift_id: read_id(&path),
-            path,
-        });
-    }
+    let path = destination(&project, name)?;
+    check_destination(&path)?;
 
     if !root.join(MARKER).exists() {
         run(
@@ -217,6 +295,7 @@ pub fn create(
     } else {
         None
     };
+    on_progress(Progress::MainRepoReady);
     let created = run(
         tools,
         &tools.rift,
@@ -230,7 +309,7 @@ pub fn create(
             root.as_os_str(),
         ],
         &root,
-        &mut on_line,
+        |line| on_progress(Progress::Line(line.to_string())),
     );
     if let Err(error) = created {
         if path.exists() {
@@ -287,12 +366,12 @@ pub fn remove(tools: &Tools, path: &Path, rift_id: &str) -> Result<(), CopyError
     let entry = parent
         .join(TRASH)
         .join(format!("{rift_id}-{}", name.to_string_lossy()));
-    check_trash(parent, &entry)?;
     if path.symlink_metadata().is_ok() {
         check_directory(path, parent)?;
         if read_id(path).as_deref() != Some(rift_id) {
             return Ok(());
         }
+        check_trash(parent, &entry)?;
         run(
             tools,
             &tools.rift,
@@ -302,7 +381,7 @@ pub fn remove(tools: &Tools, path: &Path, rift_id: &str) -> Result<(), CopyError
         )?;
     }
     check_trash(parent, &entry)?;
-    if entry.symlink_metadata().is_ok() {
+    if entry.symlink_metadata().is_ok() && read_id(&entry).as_deref() == Some(rift_id) {
         std::fs::remove_dir_all(&entry).map_err(|error| {
             failure(
                 "rift remove",

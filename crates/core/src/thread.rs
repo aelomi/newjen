@@ -30,7 +30,8 @@
 //! The copy is the thread's folder from then on, because Claude ties `--resume` to the folder.
 //! Archiving the thread hands back a [`Removal`] that deletes the copy.
 //!
-//! **Saving.** A thread is a *draft* until its first message is sent; drafts are never saved.
+//! **Saving.** A thread is a *draft* until its first message is sent; drafts have no thread row.
+//! A pending copy's message and destination are durable before its job runs.
 //! After that, the row and the changed transcript rows are saved at checkpoints only (a
 //! message sent, a reply or tool call finished, an approval asked or answered, the turn's end,
 //! an error), never for each streamed word. If a write fails, the store remembers what it
@@ -58,7 +59,10 @@ use async_channel::{Receiver, Sender};
 use crate::protocol::{BackgroundTask, Incoming, PermissionAnswer, ResultMessage, session_rules};
 use crate::rift::{self, CopyError, Tools};
 use crate::session::{Conversation, Session, SessionConfig, SessionEvent};
-use crate::store::{Grant, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow, now_ms};
+use crate::store::{
+    Grant, PendingCopy, PendingIntent, PendingState, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow,
+    now_ms,
+};
 use crate::transcript::{Item, Status, Transcript};
 
 /// The provider a thread runs on. Only Claude for now (see `docs/PLAN.md`).
@@ -204,6 +208,13 @@ pub struct Preparing {
     message: String,
     started_at: Instant,
     last_line: Option<String>,
+    main_repo: MainRepoStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainRepoStep {
+    Snapshotting,
+    Ready,
 }
 
 impl Preparing {
@@ -217,7 +228,7 @@ impl Preparing {
         self.started_at
     }
 
-    /// The last line Rift or its hooks printed (see [`Thread::note_copy_line`]).
+    /// The last line Rift or its hooks printed (see [`Thread::note_copy_progress`]).
     pub fn last_line(&self) -> Option<&str> {
         self.last_line.as_deref()
     }
@@ -251,14 +262,14 @@ impl std::fmt::Debug for CopyJob {
 }
 
 impl CopyJob {
-    /// Makes the copy. Each line Rift and its hooks print goes to `on_line` (pass it on to
-    /// [`Thread::note_copy_line`]). An existing destination is never removed.
+    /// Makes the copy, reporting progress to [`Thread::note_copy_progress`]. An existing
+    /// destination is never removed.
     pub fn run(
         self,
         tools: &Tools,
-        mut on_line: impl FnMut(&str),
+        on_progress: impl FnMut(rift::Progress),
     ) -> Result<rift::Copy, CopyError> {
-        rift::create(tools, &self.project_dir, &self.name, &mut on_line)
+        rift::create(tools, &self.project_dir, &self.name, on_progress)
     }
 }
 
@@ -268,6 +279,7 @@ pub struct NotSent {
     /// Empty when nothing was held.
     pub message: String,
     pub error: anyhow::Error,
+    pub copy_to_remove: Option<Box<rift::Copy>>,
 }
 
 /// Removes an archived thread's Rift copy, once its `claude` has stopped, and records that it
@@ -446,6 +458,41 @@ impl Thread {
             .collect()
     }
 
+    pub fn recovered_draft(
+        store: Store,
+        project: &Project,
+        base_config: SessionConfig,
+        pending: &PendingCopy,
+    ) -> Thread {
+        let mut thread = Thread::new_draft(store, project, base_config);
+        thread.id = pending.thread_id.clone();
+        thread.created_at = pending.created_at;
+        thread.place = Place::NewCopy;
+        thread
+    }
+
+    pub fn recover_pending_copy(
+        store: &Store,
+        project: &Project,
+        pending: &PendingCopy,
+        tools: &Tools,
+    ) -> Result<()> {
+        let expected = rift::destination(&project.path, &copy_name(&pending.thread_id))?;
+        if pending.project_id != project.id || pending.path != expected {
+            bail!("the pending Rift copy is outside its destination");
+        }
+        if pending.state == PendingState::MakingCopy {
+            rift::remove_pending(tools, &pending.path)?;
+            let mut recovered = pending.clone();
+            recovered.state = PendingState::Composer;
+            store.save_pending_copy(recovered)?;
+        }
+        if pending.intent == PendingIntent::Discard {
+            store.delete_pending_copy(&pending.thread_id);
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------------------------
     // What the app reads
     // -----------------------------------------------------------------------------------------
@@ -538,6 +585,10 @@ impl Thread {
             }
             (_, Place::NewCopy | Place::Copy(_)) => false,
         }
+    }
+
+    pub fn blocks_project_send(&self) -> bool {
+        matches!(&self.stage, Stage::Preparing(preparing) if preparing.main_repo == MainRepoStep::Snapshotting)
     }
 
     /// True while a `claude` process runs for this thread.
@@ -642,11 +693,22 @@ impl Thread {
             bail!("Claude is still working on the last message");
         }
         if self.place == Place::NewCopy {
+            let path = rift::destination(&self.project_dir, &copy_name(&self.id))?;
+            rift::check_destination(&path)?;
+            self.store.save_pending_copy(PendingCopy {
+                thread_id: self.id.clone(),
+                project_id: self.project_id,
+                path,
+                intent: PendingIntent::Restore(text.to_string()),
+                state: PendingState::MakingCopy,
+                created_at: self.created_at,
+            })?;
             self.title = title_from_message(text);
             self.stage = Stage::Preparing(Preparing {
                 message: text.to_string(),
                 started_at: Instant::now(),
                 last_line: None,
+                main_repo: MainRepoStep::Snapshotting,
             });
             self.last_activity = Instant::now();
             return Ok(Sent::MakingCopy(CopyJob {
@@ -654,16 +716,31 @@ impl Thread {
                 name: copy_name(&self.id),
             }));
         }
+        if self.is_draft()
+            && let Some(copy) = self.copy()
+        {
+            self.store.save_pending_copy(PendingCopy {
+                thread_id: self.id.clone(),
+                project_id: self.project_id,
+                path: copy.path.clone(),
+                intent: PendingIntent::Restore(text.to_string()),
+                state: PendingState::MakingCopy,
+                created_at: self.created_at,
+            })?;
+        }
         self.deliver(text)?;
         Ok(Sent::Started)
     }
 
-    /// Records the latest line Rift or its hooks printed while the copy is made.
-    pub fn note_copy_line(&mut self, line: &str) {
-        if let Stage::Preparing(preparing) = &mut self.stage
-            && !line.trim().is_empty()
-        {
-            preparing.last_line = Some(line.to_string());
+    pub fn note_copy_progress(&mut self, progress: rift::Progress) {
+        if let Stage::Preparing(preparing) = &mut self.stage {
+            match progress {
+                rift::Progress::MainRepoReady => preparing.main_repo = MainRepoStep::Ready,
+                rift::Progress::Line(line) if !line.trim().is_empty() => {
+                    preparing.last_line = Some(line)
+                }
+                rift::Progress::Line(_) => {}
+            }
         }
     }
 
@@ -680,10 +757,22 @@ impl Thread {
                 return Err(NotSent {
                     message: String::new(),
                     error: anyhow!("this thread was not waiting for a Rift copy"),
+                    copy_to_remove: made
+                        .ok()
+                        .filter(|copy| self.copy() != Some(copy))
+                        .map(Box::new),
                 });
             }
         };
         let message = preparing.message;
+        if made.is_err() {
+            let path = rift::destination(&self.project_dir, &copy_name(&self.id));
+            if matches!(&made, Err(CopyError::Exists { .. }))
+                || path.is_ok_and(|path| rift::pending_is_gone(&path))
+            {
+                self.store.delete_pending_copy(&self.id);
+            }
+        }
         let sent = made.map_err(anyhow::Error::from).and_then(|copy| {
             self.end_session();
             self.cwd = copy.workdir.clone();
@@ -693,7 +782,11 @@ impl Thread {
         });
         sent.map_err(|error| {
             self.title = NEW_THREAD_TITLE.to_string();
-            NotSent { message, error }
+            NotSent {
+                message,
+                error,
+                copy_to_remove: None,
+            }
         })
     }
 
@@ -862,8 +955,7 @@ impl Thread {
     /// thread with a Rift copy hands back the [`Removal`] that deletes it.
     ///
     /// A first message held for a Rift copy is dropped, so a later [`Thread::finish_copy`]
-    /// sends nothing; the copy being made is left behind, so the app should not archive a
-    /// thread while it is [`Thread::preparing`].
+    /// sends nothing and returns its copy for removal.
     pub fn archive(&mut self) -> Option<Removal> {
         if self.session.is_some() {
             self.transcript.apply(&SessionEvent::Exited {
@@ -875,8 +967,11 @@ impl Thread {
         self.save();
         match self.stage {
             Stage::Saved => self.store.archive(&self.id, now_ms()),
-            Stage::Preparing(_) => self.stage = Stage::Draft,
-            Stage::Draft => {}
+            Stage::Preparing(_) => {
+                self.store.discard_pending_copy(&self.id);
+                self.stage = Stage::Draft;
+            }
+            Stage::Draft => self.store.discard_pending_copy(&self.id),
         }
         let copy = self.copy()?.clone();
         Some(Removal {
@@ -904,6 +999,9 @@ impl Thread {
     /// starts stopping its `claude`, without waiting for either. Pass what it returns for
     /// every thread to one [`finish_quit`] call.
     pub fn begin_quit(&mut self) -> Quitting {
+        if self.preparing().is_some() {
+            self.stage = Stage::Draft;
+        }
         if self.status().is_busy() || !self.background_tasks().is_empty() {
             self.transcript.normalize_after_relaunch();
         }

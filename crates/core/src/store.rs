@@ -95,6 +95,14 @@ const MIGRATIONS: &[&str] = &[
          base TEXT,
          created_at INTEGER NOT NULL,
          removed_at INTEGER
+     );
+     CREATE TABLE pending_copies (
+         thread_id TEXT PRIMARY KEY,
+         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+         path TEXT NOT NULL UNIQUE,
+         message TEXT,
+         state TEXT NOT NULL,
+         created_at INTEGER NOT NULL
      );",
 ];
 
@@ -161,6 +169,28 @@ pub struct ThreadRow {
     pub copy: Option<Copy>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingIntent {
+    Restore(String),
+    Discard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingState {
+    MakingCopy,
+    Composer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCopy {
+    pub thread_id: String,
+    pub project_id: i64,
+    pub path: PathBuf,
+    pub intent: PendingIntent,
+    pub state: PendingState,
+    pub created_at: i64,
+}
+
 /// One saved transcript row (the `thread_items` table). Read it with `Item::from_saved`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedItem {
@@ -224,6 +254,12 @@ type UnsavedByThread = Arc<Mutex<HashMap<String, Unsaved>>>;
 
 /// One operation for the writer thread.
 enum Write {
+    SavePending {
+        pending: PendingCopy,
+        done: mpsc::Sender<Result<(), String>>,
+    },
+    DeletePending(String),
+    DiscardPending(String),
     UpsertProject {
         path: String,
         now: i64,
@@ -469,6 +505,46 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    pub fn pending_copies(&self, project_id: i64) -> Result<Vec<PendingCopy>> {
+        let read = self.reader();
+        let mut statement = read.prepare(
+            "SELECT thread_id, project_id, path, message, created_at, state FROM pending_copies
+             WHERE project_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([project_id], |row| {
+            Ok(PendingCopy {
+                thread_id: row.get(0)?,
+                project_id: row.get(1)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                intent: row
+                    .get::<_, Option<String>>(3)?
+                    .map_or(PendingIntent::Discard, PendingIntent::Restore),
+                created_at: row.get(4)?,
+                state: match row.get::<_, String>(5)?.as_str() {
+                    "making_copy" => PendingState::MakingCopy,
+                    _ => PendingState::Composer,
+                },
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn save_pending_copy(&self, pending: PendingCopy) -> Result<()> {
+        let (done, wait) = mpsc::channel();
+        self.queue(Write::SavePending { pending, done });
+        wait.recv_timeout(OPEN_PROJECT_TIMEOUT)
+            .context("could not save the message before making a Rift copy")?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub fn delete_pending_copy(&self, thread_id: &str) {
+        self.queue(Write::DeletePending(thread_id.to_string()));
+    }
+
+    pub fn discard_pending_copy(&self, thread_id: &str) {
+        self.queue(Write::DiscardPending(thread_id.to_string()));
     }
 
     /// A thread's grants, oldest first.
@@ -726,6 +802,9 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         Write::UpsertProject { .. }
         | Write::Archive { .. }
         | Write::CopyRemoved { .. }
+        | Write::SavePending { .. }
+        | Write::DeletePending(_)
+        | Write::DiscardPending(_)
         | Write::Flush(_) => return None,
     };
     Some((thread_id.clone(), lost))
@@ -733,6 +812,42 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
 
 fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> {
     match write {
+        Write::SavePending { pending, done } => {
+            let message = match pending.intent {
+                PendingIntent::Restore(message) => Some(message),
+                PendingIntent::Discard => None,
+            };
+            let result = connection.execute(
+                "INSERT INTO pending_copies (thread_id, project_id, path, message, created_at, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (thread_id) DO UPDATE SET message = excluded.message, state = excluded.state",
+                params![
+                    pending.thread_id,
+                    pending.project_id,
+                    path_text(&pending.path),
+                    message,
+                    pending.created_at,
+                    match pending.state {
+                        PendingState::MakingCopy => "making_copy",
+                        PendingState::Composer => "composer",
+                    },
+                ],
+            );
+            let _ = done.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+            result?;
+        }
+        Write::DeletePending(thread_id) => {
+            connection.execute(
+                "DELETE FROM pending_copies WHERE thread_id = ?1",
+                [thread_id],
+            )?;
+        }
+        Write::DiscardPending(thread_id) => {
+            connection.execute(
+                "UPDATE pending_copies SET message = NULL WHERE thread_id = ?1",
+                [thread_id],
+            )?;
+        }
         Write::UpsertProject { path, now } => {
             connection.execute(
                 "INSERT INTO projects (path, created_at, last_opened_at) VALUES (?1, ?2, ?2)
@@ -864,6 +979,7 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
             ],
         )?;
     }
+    connection.execute("DELETE FROM pending_copies WHERE thread_id = ?1", [&row.id])?;
     Ok(())
 }
 

@@ -1988,7 +1988,9 @@ fn a_rift_draft_holds_its_first_message_until_its_copy_is_ready_then_sends_it_on
         "busy while the copy is made"
     );
     assert!(thread.set_works_in(WorksIn::ProjectFolder).is_err());
-    thread.note_copy_line("installing deps");
+    thread.note_copy_progress(newjen_core::rift::Progress::Line(
+        "installing deps".to_string(),
+    ));
     assert_eq!(
         thread.preparing().unwrap().last_line(),
         Some("installing deps")
@@ -2034,6 +2036,13 @@ fn a_rift_draft_holds_its_first_message_until_its_copy_is_ready_then_sends_it_on
     assert_eq!(fixture.spawns().len(), 1);
 
     let row = fixture.store.thread(thread.id()).unwrap().unwrap();
+    assert!(
+        fixture
+            .store
+            .pending_copies(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(row.workdir, copy.workdir);
     assert_eq!(row.copy.as_ref(), Some(&copy));
     let loaded = fixture.reload(thread.id());
@@ -2190,4 +2199,196 @@ fn a_new_copy_waits_for_agents_busy_in_the_project_folder_and_for_another_copy()
 
     let background = thread_with_a_background_task(&fixture);
     assert!(background.blocks_copy_creation(), "a background task runs");
+}
+
+#[test]
+fn a_held_first_message_is_durable_before_the_copy_job_runs() {
+    let fixture = Fixture::new();
+    let (thread, job) = fixture.preparing("keep my message");
+    let saved: String = fixture
+        .database()
+        .query_row(
+            "SELECT message FROM pending_copies WHERE thread_id = ?1",
+            [thread.id()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, "keep my message");
+    drop(job);
+}
+
+#[test]
+fn quit_before_copy_completion_recovers_the_message_without_a_send() {
+    enum Exit {
+        Quit,
+        Crash,
+    }
+    for exit in [Exit::Quit, Exit::Crash] {
+        let fixture = Fixture::new();
+        let Some(tools) = fixture.rift_tools() else {
+            return;
+        };
+        let (mut thread, job) = fixture.preparing("Fix the login bug");
+        let copy = job.run(&tools, |_| {}).unwrap();
+        match exit {
+            Exit::Quit => thread.shutdown_for_quit(),
+            Exit::Crash => {}
+        }
+        drop(thread);
+        let store = Store::open_in(fixture.store.path().parent().unwrap()).unwrap();
+        let pending = store.pending_copies(fixture.project.id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].intent,
+            newjen_core::store::PendingIntent::Restore("Fix the login bug".to_string())
+        );
+        Thread::recover_pending_copy(&store, &fixture.project, &pending[0], &tools).unwrap();
+        let recovered = Thread::recovered_draft(
+            store.clone(),
+            &fixture.project,
+            fixture.config.clone(),
+            &pending[0],
+        );
+        assert!(!copy.path.exists());
+        assert!(recovered.is_draft());
+        assert_eq!(recovered.works_in(), WorksIn::RiftCopy);
+        assert!(!recovered.has_session());
+        assert!(recovered.transcript().items().is_empty());
+        assert!(fixture.spawns().is_empty());
+        assert!(store.threads(fixture.project.id).unwrap().is_empty());
+        assert!(store.flush(FLUSH));
+        assert_eq!(
+            store.pending_copies(fixture.project.id).unwrap().len(),
+            1,
+            "another quit preserves the composer message"
+        );
+    }
+}
+
+#[test]
+fn quit_after_a_failed_first_send_cleans_the_copy_and_restores_the_message() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let mut config = fixture.config.clone();
+    config.program = fixture.path("no-such-claude");
+    let mut thread = Thread::new_draft(fixture.store.clone(), &fixture.project, config);
+    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    let Sent::MakingCopy(job) = thread.send("hello").unwrap() else {
+        panic!()
+    };
+    let copy = job.run(&tools, |_| {}).unwrap();
+    assert_eq!(
+        thread.finish_copy(Ok(copy.clone())).unwrap_err().message,
+        "hello"
+    );
+    assert!(thread.is_draft());
+    assert!(thread.send("edited retry").is_err());
+    thread.shutdown_for_quit();
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    assert_eq!(
+        pending[0].intent,
+        newjen_core::store::PendingIntent::Restore("edited retry".to_string())
+    );
+    assert_eq!(pending.len(), 1);
+    Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending[0], &tools).unwrap();
+    assert!(!copy.path.exists());
+    assert!(fixture.spawns().is_empty());
+}
+
+#[test]
+fn an_archived_copy_job_returns_its_copy_for_removal_and_never_sends() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let (mut thread, job) = fixture.preparing("hello");
+    let copy = job.run(&tools, |_| {}).unwrap();
+    assert!(thread.archive().is_none());
+    let not_sent = thread.finish_copy(Ok(copy.clone())).unwrap_err();
+    assert_eq!(not_sent.copy_to_remove.as_deref(), Some(&copy));
+    newjen_core::rift::remove(&tools, &copy.path, &copy.rift_id).unwrap();
+    assert!(!copy.path.exists());
+    assert!(not_sent.message.is_empty());
+    assert!(fixture.spawns().is_empty());
+    assert!(fixture.store.flush(FLUSH));
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    assert_eq!(
+        pending[0].intent,
+        newjen_core::store::PendingIntent::Discard
+    );
+    Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending[0], &tools).unwrap();
+    assert!(fixture.store.flush(FLUSH));
+    assert!(
+        fixture
+            .store
+            .pending_copies(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_failed_pending_write_does_not_start_a_copy_or_hold_the_message() {
+    let fixture = Fixture::new();
+    fixture.database().execute_batch("CREATE TRIGGER refuse_pending BEFORE INSERT ON pending_copies BEGIN SELECT RAISE(ABORT, 'disk full'); END;").unwrap();
+    let mut thread = fixture.draft();
+    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    assert!(thread.send("keep this").is_err());
+    assert!(thread.is_draft());
+    assert!(thread.preparing().is_none());
+    assert!(fixture.spawns().is_empty());
+}
+
+#[test]
+fn sending_a_recovered_draft_in_the_project_folder_clears_its_pending_record() {
+    let fixture = Fixture::new();
+    let (_thread, job) = fixture.preparing("first message");
+    drop(job);
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    let mut recovered = Thread::recovered_draft(
+        fixture.store.clone(),
+        &fixture.project,
+        fixture.config.clone(),
+        &pending[0],
+    );
+    recovered.set_works_in(WorksIn::ProjectFolder).unwrap();
+    recovered.send("edited message").unwrap();
+    assert!(fixture.store.flush(FLUSH));
+    assert!(
+        fixture
+            .store
+            .pending_copies(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+    recovered.shutdown_for_quit();
+}
+
+#[test]
+fn recovering_again_never_removes_a_replacement_after_the_original_was_cleaned() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let (thread, job) = fixture.preparing("keep my message");
+    let copy = job.run(&tools, |_| {}).unwrap();
+    drop(thread);
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending[0], &tools).unwrap();
+    let replacement = newjen_core::rift::create(
+        &tools,
+        &fixture.project.path,
+        copy.path.file_name().unwrap().to_str().unwrap(),
+        |_| {},
+    )
+    .unwrap();
+    std::fs::write(replacement.path.join("work.txt"), "unrelated work").unwrap();
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending[0], &tools).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(replacement.path.join("work.txt")).unwrap(),
+        "unrelated work"
+    );
 }

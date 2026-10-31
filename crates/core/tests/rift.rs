@@ -246,7 +246,9 @@ fn a_failing_hook_leaves_no_copy_and_its_output_is_in_the_error() {
 
     let mut seen = Vec::new();
     let error = rift::create(&lab.tools, &project, "newjen-hook", |line| {
-        seen.push(line.to_string())
+        if let rift::Progress::Line(line) = line {
+            seen.push(line)
+        }
     })
     .unwrap_err();
     let CopyError::Failed { detail, output, .. } = &error else {
@@ -390,14 +392,14 @@ fn review_retry_unowned_copy() {
     let project = lab.jj_repo("retry");
     let store = Store::open_in(&lab.folder("db")).unwrap();
     let project = store.open_project(&project).unwrap();
-    let mut thread = Thread::new_draft(store, &project, SessionConfig::new(&project.path));
+    let mut thread = Thread::new_draft(store.clone(), &project, SessionConfig::new(&project.path));
     thread.set_works_in(WorksIn::RiftCopy).unwrap();
     let name = format!("newjen-{}", &thread.id()[..8]);
-    let unrelated = lab.create(&project.path, &name);
-    write(&unrelated.path, "valuable.txt", "external copy work");
     let Sent::MakingCopy(job) = thread.send("hello").unwrap() else {
         panic!()
     };
+    let unrelated = lab.create(&project.path, &name);
+    write(&unrelated.path, "valuable.txt", "external copy work");
     let result = job.run(&lab.tools, |_| {});
     println!(
         "job succeeded: {}; external work exists: {}",
@@ -408,4 +410,76 @@ fn review_retry_unowned_copy() {
         unrelated.path.join("valuable.txt").exists(),
         "retry destroyed a copy without ownership proof"
     );
+    assert!(matches!(&result, Err(CopyError::Exists { .. })));
+    assert_eq!(thread.finish_copy(result).unwrap_err().message, "hello");
+    let refused = thread.send("retry").unwrap_err();
+    assert!(matches!(
+        refused.downcast_ref::<CopyError>(),
+        Some(CopyError::Exists { .. })
+    ));
+    assert!(store.flush(std::time::Duration::from_secs(5)));
+    assert!(store.pending_copies(project.id).unwrap().is_empty());
+    assert_eq!(read(&unrelated.path, "valuable.txt"), "external copy work");
+}
+
+#[test]
+fn cleanup_refuses_a_symlink_trash_entry() {
+    let Some(lab) = lab() else { return };
+    let parent = lab.folder("entry-parent");
+    let outside = lab.folder("outside");
+    write(&outside, "work.txt", "keep this");
+    std::fs::create_dir(parent.join(".trash")).unwrap();
+    let entry = parent.join(".trash/abc123-newjen-thread");
+    std::os::unix::fs::symlink(&outside, &entry).unwrap();
+    assert!(rift::remove(&lab.tools, &parent.join("newjen-thread"), "abc123").is_err());
+    assert_eq!(read(&outside, "work.txt"), "keep this");
+    assert!(entry.symlink_metadata().unwrap().file_type().is_symlink());
+}
+
+#[test]
+fn removal_leaves_an_unmarked_replacement_folder_untouched() {
+    let Some(lab) = lab() else { return };
+    let folder = lab.folder("replacement-folder");
+    write(&folder, "work.txt", "keep this");
+    rift::remove(&lab.tools, &folder, "abc123").unwrap();
+    assert_eq!(read(&folder, "work.txt"), "keep this");
+}
+
+#[test]
+fn main_repo_ready_is_reported_before_the_copy_hooks_start() {
+    let Some(lab) = lab() else { return };
+    let repo = lab.jj_repo("progress");
+    write(&repo, "wip.txt", "work");
+    write(
+        &repo,
+        ".rift.toml",
+        "version = 1\n[[hooks.postcreate]]\nrun = \"echo hook-started\"\n",
+    );
+    let mut progress = Vec::new();
+    let copy = rift::create(&lab.tools, &repo, "newjen-progress", |step| {
+        if step == rift::Progress::MainRepoReady {
+            assert_eq!(lab.show(&repo, "@", "empty"), "true");
+        }
+        progress.push(step);
+    })
+    .unwrap();
+    assert_eq!(progress.first(), Some(&rift::Progress::MainRepoReady));
+    assert!(progress.contains(&rift::Progress::Line("hook-started".to_string())));
+    rift::remove(&lab.tools, &copy.path, &copy.rift_id).unwrap();
+}
+
+#[test]
+fn pending_cleanup_finishes_only_its_own_trash_entry() {
+    let Some(lab) = lab() else { return };
+    let project = lab.folder("pending-trash");
+    let own = lab.create(&project, "newjen-own");
+    let other = lab.create(&project, "other");
+    lab.rift(&project, &["remove", own.path.to_str().unwrap()]);
+    lab.rift(&project, &["remove", other.path.to_str().unwrap()]);
+    let trash = own.path.parent().unwrap().join(".trash");
+    let others_entry = trash.join(format!("{}-other", other.rift_id));
+    assert!(!rift::pending_is_gone(&own.path));
+    rift::remove_pending(&lab.tools, &own.path).unwrap();
+    assert!(rift::pending_is_gone(&own.path));
+    assert!(others_entry.exists());
 }

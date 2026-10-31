@@ -38,6 +38,13 @@ fn newjen_home_holds_a_freshly_created_database() {
         .unwrap();
     assert_eq!(
         tables,
-        ["copies", "grants", "projects", "thread_items", "threads"]
+        [
+            "copies",
+            "grants",
+            "pending_copies",
+            "projects",
+            "thread_items",
+            "threads"
+        ]
     );
 }
