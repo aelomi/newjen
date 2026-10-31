@@ -46,7 +46,7 @@ impl Composer {
 }
 
 impl RenderOnce for Composer {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let ready = !self.field.read(cx).value().trim().is_empty();
         let name = self.field.read(cx).presentation().placeholder().clone();
         let send = match &self.footer {
@@ -102,7 +102,9 @@ impl RenderOnce for Composer {
                 .gap_1()
                 .child(picker)
                 .child(div().flex_1())
-                .child(hint),
+                .when(window.viewport_size().width >= gpui::px(1040.), |r| {
+                    r.child(hint)
+                }),
             None => div()
                 .flex()
                 .items_center()

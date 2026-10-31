@@ -13,6 +13,8 @@
 //! calls on the thread on screen and draws what the threads say. Every change ends with
 //! `cx.notify()`, which asks GPUI to call `render` again.
 
+mod picker;
+
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -185,6 +187,8 @@ pub struct ChatView {
     store: Store,
     project: Project,
     base_config: SessionConfig,
+    picker: picker::Picker,
+    picker_focus: FocusHandle,
     /// The project folder's name and its path for display, e.g. `Newjen` and `~/Newjen`.
     project_name: SharedString,
     project_label: SharedString,
@@ -260,6 +264,8 @@ impl ChatView {
             store,
             project,
             base_config,
+            picker: picker::Picker::default(),
+            picker_focus: cx.focus_handle(),
             project_name: project_name.into(),
             project_label: project_label.into(),
             home,
@@ -302,6 +308,8 @@ impl ChatView {
             }
         }
         view.restore_pending_copies(window, cx);
+        #[cfg(not(test))]
+        view.refresh_providers(window, cx);
         view
     }
 
@@ -471,7 +479,9 @@ impl ChatView {
 
     /// A new, unsaved thread at the top of the list. Not shown yet; see `new_thread`.
     fn add_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = Thread::new_draft(self.store.clone(), &self.project, self.base_config.clone());
+        let mut draft =
+            Thread::new_draft(self.store.clone(), &self.project, self.base_config.clone());
+        self.restore_draft_agent(&mut draft);
         self.add_slot(draft, 0, window, cx);
     }
 
@@ -860,7 +870,14 @@ impl ChatView {
             }
         }
 
+        let no_agent = self.picker.checked.is_some()
+            && !self
+                .picker
+                .statuses
+                .iter()
+                .any(|s| !newjen_core::picker::model_rows(s).is_empty());
         let placeholder = SharedString::from(match status {
+            _ if no_agent && self.thread().read(cx).is_draft() => "No agent to send to yet".into(),
             _ if making_copy => self
                 .thread()
                 .read(cx)
@@ -1533,6 +1550,12 @@ impl ChatView {
 
     fn render_empty_state(&self, cx: &App) -> impl IntoElement {
         let works_in = self.thread().read(cx).works_in();
+        let no_agent = self.picker.checked.is_some()
+            && !self
+                .picker
+                .statuses
+                .iter()
+                .any(|s| !newjen_core::picker::model_rows(s).is_empty());
         v_flex()
             .flex_1()
             .min_h_0()
@@ -1541,18 +1564,18 @@ impl ChatView {
             .gap_2()
             .px_4()
             .child(ui::title(
-                self.thread().read(cx).presentation().empty_title,
+                if no_agent { "Install an agent to start" } else { self.thread().read(cx).presentation().empty_title },
                 cx,
             ))
             .child(
                 // Centered and kept to the column, so a long path wraps under the title.
                 div().max_w(COLUMN_WIDTH).text_center().child(
                     ui::caption(
-                        empty_caption(
+                        if no_agent { "Newjen drives the Claude or Codex CLI installed and signed in on this Mac with your own account. Install one, then Refresh.".into() } else { empty_caption(
                             works_in,
                             &self.project_label,
                             self.thread().read(cx).presentation(),
-                        ),
+                        ) },
                         cx,
                     )
                     .text_base(),
@@ -1688,7 +1711,18 @@ impl ChatView {
                 choosing,
             )
         };
-        let footer = if making_copy {
+        let no_agent = self.picker.checked.is_some()
+            && !self
+                .picker
+                .statuses
+                .iter()
+                .any(|s| !newjen_core::picker::model_rows(s).is_empty());
+        let checking = self.picker.refreshing && self.picker.statuses.is_empty();
+        let footer = if no_agent {
+            ui::Footer::Wait("Install an agent, then Refresh")
+        } else if checking {
+            ui::Footer::Wait("Checking agents…")
+        } else if making_copy {
             ui::Footer::Wait(COPY_WAIT)
         } else if busy {
             ui::Footer::Stop(self.press(cx, |view, window, cx| view.stop(window, cx)))
@@ -1696,7 +1730,50 @@ impl ChatView {
             ui::Footer::Send(self.press(cx, |view, window, cx| view.send(window, cx)))
         };
         let focus = field.read(cx).focus_handle(cx);
-        let picker = choosing.map(|works_in| self.render_works_in(works_in, focus, cx));
+        let picker = if let Some(works_in) = choosing {
+            Some(
+                h_flex()
+                    .gap_1()
+                    .min_w_0()
+                    .child(self.render_works_in(
+                        works_in,
+                        focus,
+                        window.viewport_size().width < px(760.),
+                        cx,
+                    ))
+                    .child(self.render_agent_chips(window, cx))
+                    .into_any_element(),
+            )
+        } else {
+            let thread = self.thread().read(cx);
+            let config = thread.agent_config();
+            let status = config.and_then(|a| {
+                self.picker
+                    .statuses
+                    .iter()
+                    .find(|s| s.provider == a.provider)
+            });
+            Some(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .when(newjen_core::picker::is_fast(config), |r| {
+                        r.child(ui::icon(
+                            ui::IconName::Zap,
+                            gpui_kit::component::Size::Small,
+                            cx.theme().warning,
+                        ))
+                    })
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(newjen_core::picker::frozen_label(config, status)),
+                    )
+                    .into_any_element(),
+            )
+        };
         ui::Composer::new(field, footer)
             .picker(picker)
             .into_any_element()
@@ -1708,31 +1785,40 @@ impl ChatView {
         &self,
         works_in: WorksIn,
         composer: FocusHandle,
+        compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (icon, label) = works_in_label(works_in);
         let view = cx.weak_entity();
-        ui::button_with_icon("works-in", label, icon, ui::Look::Ghost, ui::Size::Sm, cx)
-            .dropdown_caret(true)
-            .debug_selector(|| "works-in".to_string())
-            .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
-                let item = |choice: WorksIn| {
-                    let (icon, label) = works_in_label(choice);
-                    let view = view.clone();
-                    PopupMenuItem::new(label)
-                        .icon(icon)
-                        .checked(choice == works_in)
-                        .on_click(move |_, window, cx| {
-                            let _ = view
-                                .update(cx, |view, cx| view.choose_works_in(choice, window, cx));
-                        })
-                };
-                menu.action_context(composer.clone())
-                    .check_side(Side::Right)
-                    .item(item(WorksIn::ProjectFolder))
-                    .item(item(WorksIn::RiftCopy))
-            })
-            .into_any_element()
+        ui::button_with_icon(
+            "works-in",
+            if compact { "" } else { label },
+            icon,
+            ui::Look::Ghost,
+            ui::Size::Sm,
+            cx,
+        )
+        .tooltip(label)
+        .dropdown_caret(true)
+        .debug_selector(|| "works-in".to_string())
+        .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
+            let item = |choice: WorksIn| {
+                let (icon, label) = works_in_label(choice);
+                let view = view.clone();
+                PopupMenuItem::new(label)
+                    .icon(icon)
+                    .checked(choice == works_in)
+                    .on_click(move |_, window, cx| {
+                        let _ =
+                            view.update(cx, |view, cx| view.choose_works_in(choice, window, cx));
+                    })
+            };
+            menu.action_context(composer.clone())
+                .check_side(Side::Right)
+                .item(item(WorksIn::ProjectFolder))
+                .item(item(WorksIn::RiftCopy))
+        })
+        .into_any_element()
     }
 
     /// "Couldn't save threads: …", once, quietly, above the composer, until dismissed.

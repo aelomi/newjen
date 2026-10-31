@@ -1091,3 +1091,121 @@ async fn an_emptied_recovered_draft_is_discarded_on_quit(cx: &mut TestAppContext
     assert_eq!(notice_title(&third, cx), None);
     finish(&third, path, cx);
 }
+
+fn picker_status(
+    provider: newjen_core::providers::Provider,
+    binary: PathBuf,
+) -> newjen_core::providers::ProviderStatus {
+    use newjen_core::providers::*;
+    ProviderStatus {
+        provider,
+        availability: Availability::Ready {
+            binary,
+            version: "0.166.0".into(),
+            account: Account {
+                billing: Billing::Subscription,
+                plan: Some("plus".into()),
+                email: Some("hidden@example.com".into()),
+            },
+            catalog: ModelCatalog {
+                source: CatalogSource::AccountModels,
+                models: vec![ModelOption {
+                    id: "sol".into(),
+                    label: "GPT-6.1-Sol".into(),
+                    description: Some(
+                        "Latest workhorse model for coding and everyday work.".into(),
+                    ),
+                    efforts: vec!["low".into(), "high".into(), "xhigh".into()],
+                    default_effort: Some("low".into()),
+                    service_tiers: vec![],
+                    default_service_tier: None,
+                    fast: Some(ServiceTier {
+                        id: "fast".into(),
+                        label: "Fast".into(),
+                        description: "2x speed, increased usage".into(),
+                    }),
+                }],
+            },
+            rate_limits: None,
+            warnings: vec![],
+        },
+    }
+}
+
+#[gpui::test]
+fn agent_picker_keys_switch_tabs_choose_effort_and_return_focus(cx: &mut TestAppContext) {
+    use newjen_core::providers::Provider;
+    let (chat, path, cx) = setup(cx, "agent-picker", true);
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.picker.statuses = vec![
+                picker_status(Provider::Claude, view.base_config.program.clone()),
+                picker_status(Provider::Codex, view.base_config.program.clone()),
+            ];
+            view.picker.checked = Some(Instant::now());
+            cx.notify();
+        })
+    });
+    click(cx, "agent-picker");
+    assert!(cx.debug_bounds("provider-menu").is_some());
+    cx.simulate_keystrokes("right down enter");
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        let thread = view.thread().read(cx);
+        let config = thread.agent_config().unwrap();
+        assert_eq!(config.provider, Provider::Codex);
+        assert_eq!(
+            config.model,
+            newjen_core::providers::ModelSelection::Model { id: "sol".into() }
+        );
+    });
+    assert!(cx.debug_bounds("provider-menu").is_none());
+    click(cx, "effort-picker");
+    cx.simulate_keystrokes("down down enter");
+    assert_eq!(
+        cx.update(|_, cx| chat
+            .read(cx)
+            .thread()
+            .read(cx)
+            .agent_config()
+            .unwrap()
+            .effort
+            .clone()),
+        newjen_core::EffortSelection::Chosen("high".into())
+    );
+    click(cx, "agent-picker");
+    cx.simulate_keystrokes("escape");
+    assert!(cx.debug_bounds("provider-menu").is_none());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn provider_menu_fits_the_smallest_window_and_keeps_refresh_visible(cx: &mut TestAppContext) {
+    use newjen_core::providers::Provider;
+    let (chat, path, cx) = setup(cx, "agent-menu-room", false);
+    cx.simulate_resize(size(px(640.), px(480.)));
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            let mut status = picker_status(Provider::Codex, view.base_config.program.clone());
+            if let newjen_core::providers::Availability::Ready { catalog, .. } =
+                &mut status.availability
+            {
+                catalog.models[0].label = "GPT-6.1-Sol-Codex-Max-Preview-2026-10-28".into();
+                for ix in 0..30 {
+                    let mut model = catalog.models[0].clone();
+                    model.id = format!("model-{ix}");
+                    catalog.models.push(model);
+                }
+            }
+            view.picker.statuses = vec![status];
+            view.picker.checked = Some(Instant::now());
+            cx.notify();
+        })
+    });
+    click(cx, "agent-picker");
+    let menu = cx.debug_bounds("provider-menu").unwrap();
+    assert!(menu.top() >= px(0.));
+    assert!(menu.bottom() <= px(480.));
+    cx.simulate_keystrokes("escape");
+    finish(&chat, path, cx);
+}

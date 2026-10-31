@@ -21,6 +21,18 @@ use serde_json::Value;
 const MISMATCH: u8 = 3;
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        println!("2.1.316 (Claude)");
+        return ExitCode::SUCCESS;
+    }
+    if args == ["auth", "status", "--json"] {
+        println!(
+            "{}",
+            serde_json::json!({"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","email":"user@example.com"})
+        );
+        return ExitCode::SUCCESS;
+    }
     let Some(path) = std::env::var_os("NEWJEN_FAKE_FIXTURE") else {
         eprintln!("newjen-fake-claude: set NEWJEN_FAKE_FIXTURE to a fixture .jsonl file");
         return ExitCode::from(2);
