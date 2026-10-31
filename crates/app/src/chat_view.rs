@@ -26,16 +26,18 @@ use gpui::{
 };
 use gpui_kit::base::input::{InputAccessibility, TextareaState};
 use gpui_kit::base::{h_flex, v_flex};
-use newjen_core::rift::Tools;
+use gpui_kit::component::Side;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::store::now_ms;
-use newjen_core::thread::{self, Quitting, keeps_draft};
+use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
 use newjen_core::transcript::display_name;
 use newjen_core::{
     Item, PermissionAnswer, Project, SessionConfig, Status, Store, Thread, ToolState, session_scope,
 };
 
 use crate::approval::{self, Room};
-use crate::format::{fit_rows, short_path, text_rows, tilde};
+use crate::format::{elapsed, fit_rows, short_path, text_rows, tilde};
 use crate::keys::{
     self, JumpToThread, KeyRoute, NewThread, NextThread, PreviousThread, Stop, ToggleSidebar,
 };
@@ -73,20 +75,78 @@ const TICK: Duration = Duration::from_secs(1);
 /// and "4m ago" moves on.
 const MINUTE_TICKS: u64 = 60;
 
+/// While a Rift copy is made, a hook line redraws the window at most this often. The clock
+/// redraws it every second anyway.
+const LINE_REDRAW: Duration = Duration::from_millis(100);
+const COPY_WAIT: &str = "You can write once the copy is ready";
+const COPY_OUTPUT_LINES: usize = 8;
+const COPY_FAILED: &str = "Couldn't create the Rift copy";
+
 /// A message from the app itself (not reported by Claude), shown as the thread's last row. It
 /// is cleared by the next message, answer or stop that reaches Claude.
 struct Notice {
+    kind: NoticeKind,
     title: String,
     detail: String,
+}
+
+enum NoticeKind {
+    /// Try again starts a fresh `claude`.
+    Error,
+    /// Try again sends the composer's text again: the message went back there.
+    CopyFailed { output: Vec<String> },
+    /// Nothing failed and nothing was sent, so no Try again.
+    Held,
 }
 
 impl Notice {
     fn error(title: &str, detail: String) -> Notice {
         Notice {
+            kind: NoticeKind::Error,
             title: title.to_string(),
             detail,
         }
     }
+
+    fn held(title: &str, detail: String) -> Notice {
+        Notice {
+            kind: NoticeKind::Held,
+            title: title.to_string(),
+            detail,
+        }
+    }
+}
+
+/// What one row of the message list shows: the transcript's items, then, while the thread's
+/// Rift copy is made, the message waiting for it and the row that says so, then the notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    Item(usize),
+    HeldMessage,
+    MakingCopy,
+    Notice,
+}
+
+impl Entry {
+    fn at(ix: usize, items: usize, making_copy: bool, notice: bool) -> Option<Entry> {
+        let held = if making_copy { 2 } else { 0 };
+        match ix.checked_sub(items) {
+            None => Some(Entry::Item(ix)),
+            Some(0) if making_copy => Some(Entry::HeldMessage),
+            Some(1) if making_copy => Some(Entry::MakingCopy),
+            Some(after) if after == held && notice => Some(Entry::Notice),
+            Some(_) => None,
+        }
+    }
+
+    fn count(items: usize, making_copy: bool, notice: bool) -> usize {
+        items + if making_copy { 2 } else { 0 } + usize::from(notice)
+    }
+}
+
+enum CopyProgress {
+    Line(String),
+    Made(Result<rift::Copy, CopyError>),
 }
 
 /// One thread and what the window keeps for it.
@@ -152,6 +212,9 @@ pub struct ChatView {
     grants_focus: FocusHandle,
     /// The approval the dock is showing, to notice when a new one takes its place.
     dock_request: Option<String>,
+    /// The root has the keyboard while the thread on screen waits for its Rift copy: the
+    /// composer is disabled until then.
+    making_copy_shown: bool,
     /// That approval's path outside the thread's folder, if any (`approval::outside_path`).
     /// Worked out once when the request reaches the dock, because it reads the disk and
     /// `render` runs on every streamed frame.
@@ -212,6 +275,7 @@ impl ChatView {
             grants_open: false,
             grants_focus,
             dock_request: None,
+            making_copy_shown: false,
             dock_outside: None,
             keys_ready_at: None,
             _tasks: tasks,
@@ -245,9 +309,13 @@ impl ChatView {
         // Deferred: GPUI draws no new frame for focus that a focus-lost listener moves, so the
         // composer would not show its focus until the next redraw.
         cx.defer_in(window, |view, window, cx| match view.field_focus(cx) {
-            Some(field) if view.dock_request.is_none() => window.focus(&field, cx),
+            Some(field) if view.composer_has_keys() => window.focus(&field, cx),
             _ => window.focus(&view.root, cx),
         });
+    }
+
+    fn composer_has_keys(&self) -> bool {
+        self.dock_request.is_none() && !self.making_copy_shown
     }
 
     /// The composer's focus handle of the thread on screen, so `main` can focus it when the
@@ -421,8 +489,9 @@ impl ChatView {
         // As if no dock was up: a waiting approval on this thread then takes the keyboard (and
         // gets the short key delay) exactly as a new one would.
         self.dock_request = None;
+        self.making_copy_shown = false;
         self.sync_field(window, cx);
-        if self.dock_request.is_none() {
+        if self.composer_has_keys() {
             let field = self.ensure_field(window, cx);
             let handle = field.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
@@ -439,6 +508,10 @@ impl ChatView {
         let Some(ix) = self.index_of(thread_id, cx) else {
             return;
         };
+        // Archiving now would leave the copy being made behind with no thread.
+        if self.slots[ix].thread.read(cx).preparing().is_some() {
+            return;
+        }
         let len = self.slots.len();
         let slot = self.slots.remove(ix);
         let removal = slot.thread.update(cx, |thread, cx| {
@@ -514,10 +587,10 @@ impl ChatView {
                 });
             }
         }
-        let busy = self
-            .slots
-            .iter()
-            .any(|slot| slot.thread.read(cx).status().is_busy());
+        let busy = self.slots.iter().any(|slot| {
+            let thread = slot.thread.read(cx);
+            thread.status().is_busy() || thread.preparing().is_some()
+        });
         if minute || busy {
             cx.notify();
         }
@@ -591,7 +664,7 @@ impl ChatView {
     /// afterwards, and a placeholder that fits the moment.
     fn sync_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let field = self.ensure_field(window, cx);
-        let (front, outside, status, empty) = {
+        let (front, outside, status, empty, making_copy) = {
             let thread = self.thread().read(cx);
             let request = thread.transcript().pending_approval();
             let front = request.map(|request| request.request_id.clone());
@@ -602,7 +675,8 @@ impl ChatView {
                 self.dock_outside.clone()
             };
             let empty = thread.transcript().items().is_empty();
-            (front, outside, thread.status(), empty)
+            let making_copy = thread.preparing().is_some();
+            (front, outside, thread.status(), empty, making_copy)
         };
         if front != self.dock_request {
             // A new request is on the dock: give the user a moment to see it.
@@ -623,8 +697,20 @@ impl ChatView {
             self.dock_request = front;
         }
         self.dock_outside = outside;
+        if making_copy != self.making_copy_shown {
+            self.making_copy_shown = making_copy;
+            if self.dock_request.is_none() {
+                if making_copy {
+                    window.focus(&self.root, cx);
+                } else {
+                    let handle = field.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+            }
+        }
 
         let placeholder = SharedString::from(match status {
+            _ if making_copy => "Reply to Claude…".to_string(),
             Status::Working | Status::Waiting => "Claude is working…".to_string(),
             _ if empty => format!("Ask Claude to work on {}…", self.project_label),
             _ => "Reply to Claude…".to_string(),
@@ -643,7 +729,8 @@ impl ChatView {
     }
 
     fn is_busy(&self, cx: &App) -> bool {
-        is_busy(self.thread().read(cx).status())
+        let thread = self.thread().read(cx);
+        is_busy(thread.status()) || thread.preparing().is_some()
     }
 
     /// Sends the composer's text as the next message (Enter or the send button).
@@ -674,9 +761,15 @@ impl ChatView {
     /// composer stays usable and keeps its text) and a notice says why.
     fn send_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let thread = self.thread().clone();
-        let (had_claude, program) = {
+        if let Some(held) = self.copy_hold(&thread, cx) {
+            self.slots[self.active].notice = Some(held);
+            cx.notify();
+            return false;
+        }
+        let (had_claude, program, gone) = {
             let thread = thread.read(cx);
-            (thread.has_session(), thread.session_config().program)
+            let gone = self.gone_copy(thread);
+            (thread.has_session(), thread.session_config().program, gone)
         };
         let sent = thread.update(cx, |thread, cx| {
             let sent = thread.send(text);
@@ -684,16 +777,169 @@ impl ChatView {
             sent
         });
         let went_out = sent.is_ok();
-        self.slots[self.active].notice = match sent {
+        let notice = match sent {
             // Writing worked, so an older "could not reach Claude" notice is out of date.
-            Ok(_) => None,
+            Ok(Sent::Started) => None,
+            Ok(Sent::MakingCopy(job)) => {
+                self.make_copy(&thread, job, window, cx);
+                None
+            }
             Err(error) if had_claude => notice_after(Err(error), "Could not reach Claude"),
             // No claude was running, so the error is from starting one.
-            Err(error) => Some(spawn_notice(&error, &program)),
+            Err(error) => Some(spawn_notice(&error, &program, gone.as_deref())),
         };
+        self.slots[self.active].notice = notice;
         self.sync_field(window, cx);
         cx.notify();
         went_out
+    }
+
+    /// Checked before `Thread::send`, which would hold the message and rename the thread.
+    fn copy_hold(&self, thread: &Entity<Thread>, cx: &App) -> Option<Notice> {
+        let wants_copy = {
+            let thread = thread.read(cx);
+            thread.is_draft() && thread.works_in() == WorksIn::RiftCopy && thread.copy().is_none()
+        };
+        if !wants_copy {
+            return None;
+        }
+        let jj_repo = in_jj_repo(&self.project.path);
+        if let Some(missing) = missing_tool(&self.tools, jj_repo) {
+            return Some(missing);
+        }
+        let blocker = self
+            .slots
+            .iter()
+            .filter(|slot| slot.thread != *thread)
+            .map(|slot| slot.thread.read(cx))
+            .find(|other| other.blocks_copy_creation())?;
+        Some(refusal(
+            blocker.title(),
+            blocker.preparing().is_some(),
+            jj_repo,
+        ))
+    }
+
+    fn gone_copy(&self, thread: &Thread) -> Option<String> {
+        thread
+            .copy()
+            .filter(|copy| !copy.workdir.exists())
+            .map(|copy| tilde(&copy.path, self.home.as_deref()))
+    }
+
+    fn make_copy(
+        &mut self,
+        thread: &Entity<Thread>,
+        job: CopyJob,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tools = self.tools.clone();
+        let (progress, updates) = async_channel::unbounded();
+        let lines = progress.clone();
+        cx.background_spawn(async move {
+            let made = job.run(&tools, |line| {
+                let _ = lines.send_blocking(CopyProgress::Line(line.to_string()));
+            });
+            let _ = progress.send_blocking(CopyProgress::Made(made));
+        })
+        .detach();
+        let thread = thread.downgrade();
+        cx.spawn_in(window, async move |view, cx| {
+            let mut redrawn: Option<Instant> = None;
+            let made = loop {
+                match updates.recv().await {
+                    Ok(CopyProgress::Line(line)) => {
+                        let now = Instant::now();
+                        let redraw = redrawn.is_none_or(|at| now - at >= LINE_REDRAW);
+                        if redraw {
+                            redrawn = Some(now);
+                        }
+                        let noted = thread.update(cx, |thread, cx| {
+                            thread.note_copy_line(&line);
+                            if redraw {
+                                cx.notify();
+                            }
+                        });
+                        if noted.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(CopyProgress::Made(made)) => break made,
+                    Err(_) => {
+                        break Err(CopyError::Failed {
+                            command: "rift create".to_string(),
+                            detail: "Newjen stopped before the copy was made".to_string(),
+                            output: Vec::new(),
+                        });
+                    }
+                }
+            };
+            let Some(thread) = thread.upgrade() else {
+                return;
+            };
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.copy_made(&thread, made, window, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn copy_made(
+        &mut self,
+        thread: &Entity<Thread>,
+        made: Result<rift::Copy, CopyError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let program = thread.read(cx).session_config().program;
+        let finished = thread.update(cx, |thread, cx| {
+            let finished = thread.finish_copy(made);
+            cx.notify();
+            finished
+        });
+        let Some(ix) = self.slots.iter().position(|slot| slot.thread == *thread) else {
+            return;
+        };
+        let notice = match finished {
+            Ok(()) => None,
+            Err(NotSent { message, error }) => {
+                if let Some(field) = self.slots[ix].field.clone().filter(|_| !message.is_empty()) {
+                    field.update(cx, |field, cx| field.set_value(message, window, cx));
+                }
+                Some(match error.downcast_ref::<CopyError>() {
+                    Some(failed) => copy_failed(failed, self.home.as_deref()),
+                    None => {
+                        let gone = self.gone_copy(thread.read(cx));
+                        spawn_notice(&error, &program, gone.as_deref())
+                    }
+                })
+            }
+        };
+        self.slots[ix].notice = notice;
+        if ix == self.active {
+            self.sync_field(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn choose_works_in(&mut self, works_in: WorksIn, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.thread().clone();
+        if thread
+            .update(cx, |thread, _| thread.set_works_in(works_in))
+            .is_err()
+        {
+            return;
+        }
+        let missing = match works_in {
+            WorksIn::RiftCopy => missing_tool(&self.tools, in_jj_repo(&self.project.path)),
+            WorksIn::ProjectFolder => None,
+        };
+        self.slots[self.active].notice = missing;
+        if let Some(field) = self.field_focus(cx) {
+            window.focus(&field, cx);
+        }
+        cx.notify();
     }
 
     /// Answers the pending approval. `request_id` is the request the button belonged to; a
@@ -752,13 +998,18 @@ impl ChatView {
     /// whether it resumes or starts over).
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = self.thread().clone();
-        let program = thread.read(cx).session_config().program;
+        let (program, gone) = {
+            let thread = thread.read(cx);
+            (thread.session_config().program, self.gone_copy(thread))
+        };
         let started = thread.update(cx, |thread, cx| {
             let started = thread.restart();
             cx.notify();
             started
         });
-        self.slots[self.active].notice = started.err().map(|error| spawn_notice(&error, &program));
+        self.slots[self.active].notice = started
+            .err()
+            .map(|error| spawn_notice(&error, &program, gone.as_deref()));
         self.sync_field(window, cx);
         cx.notify();
     }
@@ -884,6 +1135,7 @@ impl ChatView {
     ) -> AnyElement {
         let on_restart: OnRestart = self.press(cx, |view, window, cx| view.restart(window, cx));
         let on_continue: OnRestart = self.press(cx, |view, window, cx| view.resume(window, cx));
+        let on_send_again: OnRestart = self.press(cx, |view, window, cx| view.send(window, cx));
         let unbuilt = {
             let slot = &self.slots[self.active];
             match slot.thread.read(cx).transcript().items().get(ix) {
@@ -899,7 +1151,8 @@ impl ChatView {
         let slot = &self.slots[self.active];
         let cx: &App = cx;
         let thread = slot.thread.read(cx);
-        let busy = is_busy(thread.status());
+        let preparing = thread.preparing();
+        let busy = is_busy(thread.status()) || preparing.is_some();
         let items = thread.transcript().items();
         let notice = slot.notice.as_ref();
         let retry = offers_retry(ix, items.len(), notice, busy).then_some(&on_restart);
@@ -909,19 +1162,55 @@ impl ChatView {
             &on_continue,
             rows::continue_label(thread.continue_resends()),
         ));
-        let row = if let Some(item) = items.get(ix) {
-            rows::item(
-                item,
-                slot.replies.get(&item.id()).map(|reply| reply.view(cx)),
-                retry,
-                resume,
-                rows::stopped_resends(items, ix),
-                cx,
-            )
-        } else if let Some(notice) = notice {
-            rows::error("notice".into(), &notice.title, &notice.detail, retry, cx)
-        } else {
-            div().into_any_element()
+        let row = match Entry::at(ix, items.len(), preparing.is_some(), notice.is_some()) {
+            Some(Entry::Item(ix)) => {
+                let item = &items[ix];
+                rows::item(
+                    item,
+                    slot.replies.get(&item.id()).map(|reply| reply.view(cx)),
+                    retry,
+                    resume,
+                    rows::stopped_resends(items, ix),
+                    cx,
+                )
+            }
+            Some(Entry::HeldMessage) => preparing.map_or_else(
+                || div().into_any_element(),
+                |preparing| ui::user(preparing.message().to_string(), cx).into_any_element(),
+            ),
+            Some(Entry::MakingCopy) => preparing.map_or_else(
+                || div().into_any_element(),
+                |preparing| {
+                    let took = Instant::now().saturating_duration_since(preparing.started_at());
+                    rows::making_copy(&elapsed(took.as_secs()), preparing.last_line(), cx)
+                },
+            ),
+            Some(Entry::Notice) => match notice {
+                Some(Notice {
+                    kind: NoticeKind::Error,
+                    title,
+                    detail,
+                }) => rows::error("notice".into(), title, detail, &[], retry, cx),
+                Some(Notice {
+                    kind: NoticeKind::CopyFailed { output },
+                    title,
+                    detail,
+                }) => rows::error(
+                    "notice".into(),
+                    title,
+                    detail,
+                    output,
+                    Some(&on_send_again),
+                    cx,
+                ),
+                Some(Notice {
+                    kind: NoticeKind::Held,
+                    title,
+                    detail,
+                }) => rows::held("notice".into(), title, detail, cx),
+                None => div().into_any_element(),
+            },
+            None => div().into_any_element(),
         };
         let first = ix == 0;
         // Center each row in the column, like the composer below it.
@@ -957,13 +1246,28 @@ impl ChatView {
         let entity = self.thread().clone();
         let bar = {
             let thread = entity.read(cx);
-            let path = tilde(thread.cwd(), self.home.as_deref());
+            let making_copy = thread.preparing().is_some();
+            // While the copy is made its folder is not known yet, and the project folder would
+            // read as the copy's.
+            let path = if making_copy {
+                String::new()
+            } else {
+                short_path(
+                    &tilde(thread.cwd(), self.home.as_deref()),
+                    title_bar::path_budget(main_width),
+                )
+            };
             Bar {
                 title: thread.title().to_string().into(),
-                path: short_path(&path, title_bar::path_budget(main_width)),
+                path,
+                copy: making_copy || thread.copy().is_some(),
                 show_list,
                 grants: thread.grants().to_vec(),
-                status: thread.status(),
+                pill: if making_copy {
+                    Some(title_bar::STARTING)
+                } else {
+                    title_bar::pill(thread.status(), thread.background_tasks().len())
+                },
                 background_tasks: thread.background_tasks().len(),
             }
         };
@@ -992,6 +1296,7 @@ impl ChatView {
     }
 
     fn render_empty_state(&self, cx: &App) -> impl IntoElement {
+        let works_in = self.thread().read(cx).works_in();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -1003,22 +1308,19 @@ impl ChatView {
             .child(
                 // Centered and kept to the column, so a long path wraps under the title.
                 div().max_w(COLUMN_WIDTH).text_center().child(
-                    ui::caption(
-                        format!(
-                            "Claude Code runs in {}. You approve each tool call before it runs.",
-                            self.project_label
-                        ),
-                        cx,
-                    )
-                    .text_base(),
+                    ui::caption(empty_caption(works_in, &self.project_label), cx).text_base(),
                 ),
             )
     }
 
     fn render_messages(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let slot = &self.slots[self.active];
-        let count =
-            slot.thread.read(cx).transcript().items().len() + usize::from(slot.notice.is_some());
+        let thread = slot.thread.read(cx);
+        let count = Entry::count(
+            thread.transcript().items().len(),
+            thread.preparing().is_some(),
+            slot.notice.is_some(),
+        );
         div()
             .flex_1()
             .min_h_0()
@@ -1132,9 +1434,61 @@ impl ChatView {
 
     fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let field = self.ensure_field(window, cx);
-        let send = self.press(cx, |view, window, cx| view.send(window, cx));
-        let stop = self.press(cx, |view, window, cx| view.stop(window, cx));
-        ui::Composer::new(field, self.is_busy(cx), send, stop).into_any_element()
+        let (making_copy, busy, choosing) = {
+            let thread = self.thread().read(cx);
+            let choosing =
+                (thread.is_draft() && thread.copy().is_none()).then(|| thread.works_in());
+            (
+                thread.preparing().is_some(),
+                is_busy(thread.status()),
+                choosing,
+            )
+        };
+        let footer = if making_copy {
+            ui::Footer::Wait(COPY_WAIT)
+        } else if busy {
+            ui::Footer::Stop(self.press(cx, |view, window, cx| view.stop(window, cx)))
+        } else {
+            ui::Footer::Send(self.press(cx, |view, window, cx| view.send(window, cx)))
+        };
+        let focus = field.read(cx).focus_handle(cx);
+        let picker = choosing.map(|works_in| self.render_works_in(works_in, focus, cx));
+        ui::Composer::new(field, footer)
+            .picker(picker)
+            .into_any_element()
+    }
+
+    /// Bottom-left: Kit's corner anchors clamp rather than flip, so a menu hung below the
+    /// composer would cover its own button.
+    fn render_works_in(
+        &self,
+        works_in: WorksIn,
+        composer: FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (icon, label) = works_in_label(works_in);
+        let view = cx.weak_entity();
+        ui::button_with_icon("works-in", label, icon, ui::Look::Ghost, ui::Size::Sm, cx)
+            .dropdown_caret(true)
+            .debug_selector(|| "works-in".to_string())
+            .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
+                let item = |choice: WorksIn| {
+                    let (icon, label) = works_in_label(choice);
+                    let view = view.clone();
+                    PopupMenuItem::new(label)
+                        .icon(icon)
+                        .checked(choice == works_in)
+                        .on_click(move |_, window, cx| {
+                            let _ = view
+                                .update(cx, |view, cx| view.choose_works_in(choice, window, cx));
+                        })
+                };
+                menu.action_context(composer.clone())
+                    .check_side(Side::Right)
+                    .item(item(WorksIn::ProjectFolder))
+                    .item(item(WorksIn::RiftCopy))
+            })
+            .into_any_element()
     }
 
     /// "Couldn't save threads: …", once, quietly, above the composer, until dismissed.
@@ -1221,6 +1575,7 @@ impl ChatView {
                         title: thread.title().to_string().into(),
                         look: sidebar::row_look(&row_facts(thread, now), now_ms),
                         selected: ix == self.active,
+                        archivable: thread.preparing().is_none(),
                     };
                     (id, row)
                 };
@@ -1260,7 +1615,9 @@ impl Render for ChatView {
             let thread = slot.thread.read(cx);
             (
                 SharedString::from(thread.id().to_string()),
-                thread.transcript().items().is_empty() && slot.notice.is_none(),
+                thread.transcript().items().is_empty()
+                    && slot.notice.is_none()
+                    && thread.preparing().is_none(),
             )
         };
         let title_bar = self.render_title_bar(placement, main_width, window, cx);
@@ -1307,7 +1664,7 @@ impl Render for ChatView {
         } else if placement != Placement::Drawer && window.has_active_sheet(cx) {
             window.close_sheet(cx);
             match self.field_focus(cx) {
-                Some(field) if self.dock_request.is_none() => field.focus(window, cx),
+                Some(field) if self.composer_has_keys() => field.focus(window, cx),
                 _ => self.root.focus(window, cx),
             }
         }
@@ -1428,9 +1785,15 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
             })
         })
         .flatten();
+    let folder = match (thread.preparing(), thread.works_in()) {
+        (Some(_), _) => sidebar::Folder::MakingRiftCopy,
+        (None, WorksIn::RiftCopy) => sidebar::Folder::RiftCopy,
+        (None, WorksIn::ProjectFolder) => sidebar::Folder::Project,
+    };
     RowFacts {
         status,
         draft: thread.is_draft(),
+        folder,
         unread: thread.is_unread(),
         waiting_tool: transcript
             .pending_approval()
@@ -1468,7 +1831,16 @@ fn is_empty_draft(draft: bool, composer_text: &str) -> bool {
 }
 
 /// The error row shown when `claude` could not be started, worded by what went wrong.
-fn spawn_notice(error: &anyhow::Error, program: &Path) -> Notice {
+fn spawn_notice(error: &anyhow::Error, program: &Path, gone_copy: Option<&str>) -> Notice {
+    if let Some(copy) = gone_copy {
+        return Notice::error(
+            "Could not start Claude Code",
+            format!(
+                "This thread's Rift copy at {copy} is gone, so Claude has nowhere to work. \
+                 Archive the thread and start a new one."
+            ),
+        );
+    }
     let program = program.display();
     let kind = error
         .chain()
@@ -1488,6 +1860,108 @@ fn spawn_notice(error: &anyhow::Error, program: &Path) -> Notice {
         _ => format!("{error:#}.\n\nCheck that `{program}` runs in a terminal, then try again."),
     };
     Notice::error("Could not start Claude Code", detail)
+}
+
+/// Rift's own message is the last line it printed, so it is not shown twice.
+fn copy_failed(error: &CopyError, home: Option<&Path>) -> Notice {
+    let (detail, output) = match error {
+        CopyError::Failed { detail, output, .. } => {
+            let mut lines: Vec<String> = output
+                .iter()
+                .map(|line| line.trim_end().to_string())
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            if lines.last().map(|line| line.trim()) == Some(detail.trim()) {
+                lines.pop();
+            }
+            let skip = lines.len().saturating_sub(COPY_OUTPUT_LINES);
+            (detail.clone(), lines.split_off(skip))
+        }
+        CopyError::Exists { path, .. } => (
+            format!(
+                "Something is already at {}. Move it out of the way, then try again.",
+                tilde(path, home)
+            ),
+            Vec::new(),
+        ),
+        CopyError::Registered(path) => (
+            format!(
+                "Rift still lists a copy at {}, but its folder is gone. Run `rift gc` in a \
+                 terminal to make Rift forget it (it also empties every Rift trash on this \
+                 Mac), then try again.",
+                tilde(path, home)
+            ),
+            Vec::new(),
+        ),
+    };
+    Notice {
+        kind: NoticeKind::CopyFailed { output },
+        title: COPY_FAILED.to_string(),
+        detail,
+    }
+}
+
+/// A copy starts from the project folder, which `blocker`'s agent may be editing, and making
+/// one runs `jj new` there.
+fn refusal(blocker: &str, blocker_making_copy: bool, jj_repo: bool) -> Notice {
+    if blocker_making_copy {
+        return Notice::held(
+            "Another Rift copy is being made",
+            format!(
+                "Newjen makes one Rift copy at a time, so wait until “{blocker}” has its copy."
+            ),
+        );
+    }
+    let snapshot = if jj_repo {
+        "a jj snapshot of the project"
+    } else {
+        "the project folder as it is"
+    };
+    Notice::held(
+        "Another thread is working in the project folder",
+        format!(
+            "A Rift copy starts from {snapshot}, so wait until “{blocker}” finishes, or stop it."
+        ),
+    )
+}
+
+fn missing_tool(tools: &Tools, jj_repo: bool) -> Option<Notice> {
+    if !tools.rift.is_absolute() {
+        return Some(Notice::held(
+            "Rift isn't installed",
+            "Newjen makes Rift copies with `rift`. Install it with `npm i -g rift-snapshot`, then \
+             quit and reopen Newjen."
+                .to_string(),
+        ));
+    }
+    if jj_repo && !tools.jj.is_absolute() {
+        return Some(Notice::held(
+            "jj isn't installed",
+            "This project is a jj repo, and a Rift copy of it needs `jj`. Install it with \
+             `brew install jj`, then quit and reopen Newjen."
+                .to_string(),
+        ));
+    }
+    None
+}
+
+fn in_jj_repo(project: &Path) -> bool {
+    project.ancestors().any(|dir| dir.join(".jj").exists())
+}
+
+fn empty_caption(works_in: WorksIn, project: &str) -> String {
+    let place = match works_in {
+        WorksIn::ProjectFolder => project.to_string(),
+        WorksIn::RiftCopy => format!("a new Rift copy of {project}"),
+    };
+    format!("Claude Code runs in {place}. You approve each tool call before it runs.")
+}
+
+fn works_in_label(works_in: WorksIn) -> (ui::IconName, &'static str) {
+    match works_in {
+        WorksIn::ProjectFolder => (ui::IconName::Folder, "Project folder"),
+        WorksIn::RiftCopy => (ui::IconName::Copy, "Rift copy"),
+    }
 }
 
 /// While Claude is working or waiting on an approval, the composer shows the stop button and
@@ -1638,6 +2112,129 @@ mod tests {
         assert!(offers_retry(last, items.len(), None, busy));
     }
 
+    #[test]
+    fn rows_are_the_items_then_the_waiting_message_then_the_notice() {
+        let at = |ix| Entry::at(ix, 2, true, true);
+        assert_eq!(at(1), Some(Entry::Item(1)));
+        assert_eq!(at(2), Some(Entry::HeldMessage));
+        assert_eq!(at(3), Some(Entry::MakingCopy));
+        assert_eq!(at(4), Some(Entry::Notice));
+        assert_eq!(at(5), None);
+        assert_eq!(Entry::count(2, true, true), 5);
+        assert_eq!(Entry::at(2, 2, false, true), Some(Entry::Notice));
+        assert_eq!(Entry::at(2, 2, false, false), None);
+        assert_eq!(Entry::count(0, false, false), 0);
+    }
+
+    #[test]
+    fn a_failed_copy_shows_rifts_message_once_and_the_lines_before_it() {
+        let mut output: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+        output.insert(3, "   ".to_string());
+        output.push("postcreate hook failed (exit 1)  ".to_string());
+        let failed = CopyError::Failed {
+            command: "rift create --copy-all".to_string(),
+            detail: "postcreate hook failed (exit 1)".to_string(),
+            output,
+        };
+        let notice = copy_failed(&failed, None);
+        assert_eq!(notice.title, "Couldn't create the Rift copy");
+        assert_eq!(notice.detail, "postcreate hook failed (exit 1)");
+        let NoticeKind::CopyFailed { output } = notice.kind else {
+            panic!("not a copy failure");
+        };
+        let last: Vec<String> = (5..=12).map(|n| format!("line {n}")).collect();
+        assert_eq!(output, last);
+
+        let home = Path::new("/Users/someone");
+        let exists = CopyError::Exists {
+            path: home.join(".rifts/app/newjen-1a2b3c4d"),
+            rift_id: None,
+        };
+        assert!(
+            copy_failed(&exists, Some(home))
+                .detail
+                .starts_with("Something is already at ~/.rifts/app/newjen-1a2b3c4d.")
+        );
+        let listed = CopyError::Registered(home.join(".rifts/app/newjen-1a2b3c4d"));
+        let detail = copy_failed(&listed, Some(home)).detail;
+        assert!(detail.contains("`rift gc`"), "{detail}");
+    }
+
+    #[test]
+    fn a_refused_copy_names_the_thread_to_wait_for() {
+        let busy = refusal("Fix the parser", false, true);
+        assert!(matches!(busy.kind, NoticeKind::Held));
+        assert_eq!(
+            busy.title,
+            "Another thread is working in the project folder"
+        );
+        assert_eq!(
+            busy.detail,
+            "A Rift copy starts from a jj snapshot of the project, so wait until “Fix the \
+             parser” finishes, or stop it."
+        );
+        assert!(
+            refusal("Fix the parser", false, false)
+                .detail
+                .starts_with("A Rift copy starts from the project folder as it is,")
+        );
+        let making = refusal("Fix the parser", true, true);
+        assert_eq!(making.title, "Another Rift copy is being made");
+        assert!(
+            making
+                .detail
+                .ends_with("wait until “Fix the parser” has its copy.")
+        );
+    }
+
+    #[test]
+    fn a_missing_tool_says_how_to_install_it() {
+        let tools = |rift: &str, jj: &str| Tools {
+            rift: PathBuf::from(rift),
+            jj: PathBuf::from(jj),
+            env: Vec::new(),
+        };
+        let rift = missing_tool(&tools("rift", "/bin/jj"), false).unwrap();
+        assert_eq!(rift.title, "Rift isn't installed");
+        assert!(rift.detail.contains("`npm i -g rift-snapshot`"));
+        let jj = missing_tool(&tools("/bin/rift", "jj"), true).unwrap();
+        assert!(jj.detail.contains("`brew install jj`"));
+        // A plain folder is copied without jj.
+        assert!(missing_tool(&tools("/bin/rift", "jj"), false).is_none());
+        assert!(missing_tool(&tools("/bin/rift", "/bin/jj"), true).is_none());
+    }
+
+    #[test]
+    fn the_empty_state_says_where_claude_will_work() {
+        assert_eq!(
+            empty_caption(WorksIn::ProjectFolder, "~/Newjen"),
+            "Claude Code runs in ~/Newjen. You approve each tool call before it runs."
+        );
+        assert_eq!(
+            empty_caption(WorksIn::RiftCopy, "~/Newjen"),
+            "Claude Code runs in a new Rift copy of ~/Newjen. You approve each tool call before \
+             it runs."
+        );
+    }
+
+    #[test]
+    fn a_vanished_copy_is_named_instead_of_the_program() {
+        let notice = spawn_notice(
+            &failed(io::ErrorKind::NotFound),
+            Path::new("/opt/bin/claude"),
+            Some("~/.rifts/app/newjen-1a2b3c4d"),
+        );
+        assert_eq!(notice.title, "Could not start Claude Code");
+        assert!(
+            notice
+                .detail
+                .starts_with("This thread's Rift copy at ~/.rifts/app/newjen-1a2b3c4d is gone"),
+            "{}",
+            notice.detail
+        );
+        assert!(!notice.detail.contains("Install Claude Code"));
+    }
+
     fn failed(kind: io::ErrorKind) -> anyhow::Error {
         // The same shape `Session::spawn` returns: the OS error with context around it.
         anyhow::Error::new(io::Error::from(kind)).context("could not start `claude` in /work")
@@ -1646,15 +2243,15 @@ mod tests {
     #[test]
     fn spawn_notice_names_the_actual_problem() {
         let program = Path::new("/opt/bin/claude");
-        let missing = spawn_notice(&failed(io::ErrorKind::NotFound), program);
+        let missing = spawn_notice(&failed(io::ErrorKind::NotFound), program, None);
         assert!(missing.detail.contains("could not find `/opt/bin/claude`"));
         assert!(missing.detail.contains("Install Claude Code"));
 
-        let denied = spawn_notice(&failed(io::ErrorKind::PermissionDenied), program);
+        let denied = spawn_notice(&failed(io::ErrorKind::PermissionDenied), program, None);
         assert!(denied.detail.contains("not allowed to run"));
         assert!(!denied.detail.contains("Install Claude Code"));
 
-        let other = spawn_notice(&failed(io::ErrorKind::OutOfMemory), program);
+        let other = spawn_notice(&failed(io::ErrorKind::OutOfMemory), program, None);
         assert!(
             other
                 .detail

@@ -1,4 +1,4 @@
-use super::ellipsis;
+use super::{IconName, ellipsis};
 use gpui::{
     AnyElement, App, ClickEvent, ElementId, FontWeight, MouseButton, SharedString, Window, div,
     prelude::*,
@@ -10,6 +10,7 @@ pub struct ListRow {
     pub title: SharedString,
     /// The quiet line under the title.
     pub detail: Option<String>,
+    pub detail_icon: Option<IconName>,
     pub leading: Option<AnyElement>,
     /// Quiet text at the right end, such as a shortcut.
     pub trailing: Option<SharedString>,
@@ -57,9 +58,19 @@ pub fn list_row(
                                 }),
                         )
                         .children(row.detail.map(|detail| {
-                            ellipsis(detail)
+                            let color = cx.theme().muted_foreground;
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .min_w_0()
                                 .text_sm()
-                                .text_color(cx.theme().muted_foreground)
+                                .text_color(color)
+                                .children(row.detail_icon.map(|icon| {
+                                    super::icon(icon, gpui_kit::component::Size::XSmall, color)
+                                        .flex_none()
+                                }))
+                                .child(ellipsis(detail))
                         })),
                 )
                 .children(row.trailing.map(|text| {

@@ -11,6 +11,7 @@ use gpui::{
 };
 use gpui_kit::base::{FocusTrapElement as _, Selectable, h_flex, v_flex};
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::{Sizable as _, tag::Tag};
 use newjen_core::{Grant, Status};
 
 use crate::sidebar::{self, OnPress};
@@ -64,12 +65,13 @@ pub struct Bar {
     pub title: SharedString,
     /// The folder the thread's claude works in, as `~/…`, already cut to fit.
     pub path: String,
+    pub copy: bool,
     /// Set while the thread list is out of sight: the button that shows it, and whether
     /// another thread waits for an approval (an amber dot on the button).
     pub show_list: Option<(OnPress, bool)>,
     /// The thread's "Always allow" rules.
     pub grants: Vec<Grant>,
-    pub status: Status,
+    pub pill: Option<Pill>,
     /// How many commands Claude keeps running in the background.
     pub background_tasks: usize,
 }
@@ -135,15 +137,22 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
                 .min_w_0()
                 .text_ellipsis(),
         )
-        .when(!bar.path.is_empty(), |middle| {
+        .when(bar.copy, |middle| {
             middle.child(
                 div()
                     .flex_none()
-                    .whitespace_nowrap()
+                    .debug_selector(|| "rift-copy-tag".to_string())
+                    .child(Tag::secondary().small().child("Rift copy")),
+            )
+        })
+        .when(!bar.path.is_empty(), |middle| {
+            middle.child(
+                div()
+                    .min_w_0()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_sm()
                     .text_color(colors.muted_foreground)
-                    .child(bar.path),
+                    .child(middle_ellipsis(bar.path)),
             )
         });
     let right = div().flex_none().flex().justify_end().pl_2().pr_3().child(
@@ -155,7 +164,7 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
             .when(!bar.grants.is_empty(), |right| {
                 right.child(grants_popover(bar.grants, bar.background_tasks, grants))
             })
-            .children(status_pill(bar.status, bar.background_tasks)),
+            .children(bar.pill.map(status_pill)),
     );
     TitleBar::new()
         .when(!lights_over_bar, |bar| bar.pl_4())
@@ -204,6 +213,8 @@ pub enum Pill {
     Background(usize),
 }
 
+pub const STARTING: Pill = Pill::Badge("Starting", Tone::Info);
+
 /// The pill for a thread's status, worded as the mocks and the thread list word it (screens
 /// 8–11): "Needs approval" in amber, a quiet "Idle" once a turn is done, a quiet "Stopped",
 /// and "Background task running" instead of those (and of failed) while a command Claude
@@ -224,14 +235,14 @@ pub fn pill(status: Status, background_tasks: usize) -> Option<Pill> {
     })
 }
 
-fn status_pill(status: Status, background_tasks: usize) -> Option<AnyElement> {
-    Some(match pill(status, background_tasks)? {
+fn status_pill(pill: Pill) -> AnyElement {
+    match pill {
         Pill::Agent(state) => ui::agent_pill(state).into_any_element(),
         Pill::Badge(label, tone) => ui::status_badge(label, tone).into_any_element(),
         Pill::Background(count) => {
             ui::status_badge(sidebar::background_detail(count), Tone::Info).into_any_element()
         }
-    })
+    }
 }
 
 /// "🛡 2 allowed": opens the list of the thread's remembered rules. Tab stays inside it; Esc, a
@@ -456,9 +467,10 @@ mod tests {
                         currency pair"
                     .into(),
                 path: "…/verify-project".into(),
+                copy: true,
                 show_list: Some((Rc::new(|_, _| {}), false)),
                 grants: vec![],
-                status: Status::Waiting,
+                pill: pill(Status::Waiting, 0),
                 background_tasks: 0,
             };
             let grants = Grants {
@@ -481,6 +493,9 @@ mod tests {
         cx.run_until_parked();
         let right = cx.debug_bounds("title-bar-right").unwrap();
         assert!(right.right() <= px(640.), "{right:?}");
+        let tag = cx.debug_bounds("rift-copy-tag").unwrap();
+        assert!(tag.size.width > px(40.), "the tag keeps its width: {tag:?}");
+        assert!(tag.right() <= right.left(), "{tag:?} {right:?}");
     }
 
     #[test]

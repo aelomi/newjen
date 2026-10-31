@@ -2,7 +2,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, Context, Entity, IntoElement, ParentElement, RenderOnce, Styled, Window, div, prelude::*,
+    AnyElement, App, Context, Entity, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
+    prelude::*,
 };
 use gpui_kit::base::input::{Enter, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, input::Textarea};
@@ -15,22 +16,32 @@ pub fn composer_field(window: &mut Window, cx: &mut Context<TextareaState>) -> T
     TextareaState::new(window, cx).auto_grow(1, 8)
 }
 
+pub enum Footer {
+    Send(OnPress),
+    Stop(OnPress),
+    /// Disabled, with this hint.
+    Wait(&'static str),
+}
+
 #[derive(IntoElement)]
 pub struct Composer {
     field: Entity<TextareaState>,
-    busy: bool,
-    send: OnPress,
-    stop: OnPress,
+    footer: Footer,
+    picker: Option<AnyElement>,
 }
 
 impl Composer {
-    pub fn new(field: Entity<TextareaState>, busy: bool, send: OnPress, stop: OnPress) -> Self {
+    pub fn new(field: Entity<TextareaState>, footer: Footer) -> Self {
         Self {
             field,
-            busy,
-            send,
-            stop,
+            footer,
+            picker: None,
         }
+    }
+
+    pub fn picker(mut self, picker: Option<AnyElement>) -> Self {
+        self.picker = picker;
+        self
     }
 }
 
@@ -38,8 +49,11 @@ impl RenderOnce for Composer {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let ready = !self.field.read(cx).value().trim().is_empty();
         let name = self.field.read(cx).presentation().placeholder().clone();
-        let send = self.send.clone();
-        let busy = self.busy;
+        let send = match &self.footer {
+            Footer::Send(send) => Some(send.clone()),
+            Footer::Stop(_) | Footer::Wait(_) => None,
+        };
+        let waiting = matches!(self.footer, Footer::Wait(_));
         let hint = div()
             .flex()
             .items_center()
@@ -47,23 +61,54 @@ impl RenderOnce for Composer {
             .gap_1()
             .text_xs()
             .text_color(cx.theme().muted_foreground);
-        let (hint, button) = if busy {
-            let stop = self.stop;
-            (
+        let (hint, button) = match self.footer {
+            Footer::Stop(stop) => (
                 hint.child(key_caps("cmd-.", cx)).child("to stop"),
-                icon_button_with_look("stop", IconName::Square, "Stop", Look::Secondary, false, cx)
+                Some(
+                    icon_button_with_look(
+                        "stop",
+                        IconName::Square,
+                        "Stop",
+                        Look::Secondary,
+                        false,
+                        cx,
+                    )
                     .on_click(move |_, window, cx| stop(window, cx)),
-            )
-        } else {
-            let send = self.send;
-            (
+                ),
+            ),
+            Footer::Send(send) => (
                 hint.child(key_caps("enter", cx))
                     .child("to send ·")
                     .child(key_caps("shift-enter", cx))
                     .child("for a new line"),
-                icon_button_with_look("send", IconName::ArrowUp, "Send", Look::Primary, !ready, cx)
+                Some(
+                    icon_button_with_look(
+                        "send",
+                        IconName::ArrowUp,
+                        "Send",
+                        Look::Primary,
+                        !ready,
+                        cx,
+                    )
                     .on_click(move |_, window, cx| send(window, cx)),
-            )
+                ),
+            ),
+            Footer::Wait(why) => (hint.child(why), None),
+        };
+        let footer = match self.picker {
+            Some(picker) => div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(picker)
+                .child(div().flex_1())
+                .child(hint),
+            None => div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(hint)
+                .child(div().flex_1()),
         };
         div()
             .id("composer")
@@ -78,21 +123,17 @@ impl RenderOnce for Composer {
                             return;
                         }
                         cx.stop_propagation();
-                        if !action.secondary && ready && !busy {
+                        if let Some(send) = send.as_ref().filter(|_| !action.secondary && ready) {
                             send(window, cx);
                         }
                     })
-                    .child(Textarea::new(&self.field).aria_label(name)),
+                    .child(
+                        Textarea::new(&self.field)
+                            .aria_label(name)
+                            .disabled(waiting),
+                    ),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(hint)
-                    .child(div().flex_1())
-                    .child(button),
-            )
+            .child(footer.children(button))
     }
 }
 
@@ -138,7 +179,14 @@ mod tests {
                     view.stopped = true;
                     cx.notify();
                 }))
-                .child(Composer::new(self.field.clone(), self.busy, send, stop))
+                .child(Composer::new(
+                    self.field.clone(),
+                    if self.busy {
+                        Footer::Stop(stop)
+                    } else {
+                        Footer::Send(send)
+                    },
+                ))
         }
     }
 

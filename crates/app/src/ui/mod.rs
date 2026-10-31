@@ -36,7 +36,7 @@ mod message_list;
 pub use message_list::MessageList;
 
 mod composer;
-pub use composer::{Composer, composer_field};
+pub use composer::{Composer, Footer, composer_field};
 
 mod approval_card;
 pub use approval_card::{ApprovalCard, DOCK_METRICS, approval_dock};

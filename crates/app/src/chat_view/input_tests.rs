@@ -9,6 +9,17 @@ fn setup<'a>(
     name: &str,
     with_approvals: bool,
 ) -> (Entity<ChatView>, PathBuf, &'a mut VisualTestContext) {
+    setup_in(cx, name, with_approvals, None)
+}
+
+/// `rift` is a script that runs `create` as `rift_create` says (see `fake_rift`), and the
+/// project is `<path>/project`, so its copies go to `<path>/.rifts/project/`.
+fn setup_in<'a>(
+    cx: &'a mut TestAppContext,
+    name: &str,
+    with_approvals: bool,
+    rift_create: Option<&str>,
+) -> (Entity<ChatView>, PathBuf, &'a mut VisualTestContext) {
     cx.update(|cx| {
         gpui_kit::init(cx);
 
@@ -20,8 +31,20 @@ fn setup<'a>(
         now_ms()
     ));
     let store = Store::open_in(&path).unwrap();
-    let project = store.open_project(&path).unwrap();
-    let mut base_config = SessionConfig::new(&path);
+    let mut tools = Tools::find();
+    let project_dir = match rift_create {
+        Some(create) => {
+            // The copy job runs rift on threads of its own.
+            cx.executor().allow_parking();
+            tools.rift = fake_rift(&path, create);
+            let project = path.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            project.canonicalize().unwrap()
+        }
+        None => path.clone(),
+    };
+    let project = store.open_project(&project_dir).unwrap();
+    let mut base_config = SessionConfig::new(&project_dir);
     if with_approvals {
         base_config.program = script(&path);
         cx.executor().allow_parking();
@@ -34,7 +57,7 @@ fn setup<'a>(
         threads: vec![],
         problem: None,
         home: None,
-        tools: Tools::find(),
+        tools,
     };
     let mut chat = None;
     let (_, cx) = cx.add_window_view(|window, cx| {
@@ -99,6 +122,45 @@ fn early_approval_keys_back_off_from_the_latest_press(cx: &mut TestAppContext) {
     assert!(cx.update(|_, cx| chat.update(cx, |view, cx| view.keys_ready(cx))));
     cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)));
     std::fs::remove_dir_all(path).unwrap();
+}
+
+/// What the fake `rift create` does: make the copy after printing two lines.
+const CREATE_COPY: &str = r#"echo "copying files" >&2
+    echo "postcreate: npm install" >&2
+    mkdir -p "$into/$name" && printf 'copy01\n' > "$into/$name/.rift""#;
+/// A `rift create` whose postcreate hook fails.
+const FAIL_HOOK: &str = r#"echo "npm ERR! code ERESOLVE" >&2
+    echo "postcreate hook failed (exit 1)" >&2
+    exit 1"#;
+
+/// A stand-in for `rift`: `init` marks the root, `create` runs `create`, and `remove` moves the
+/// copy into the `.trash` folder beside it, as Rift does.
+fn fake_rift(path: &Path, create: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let program = path.join("rift-test");
+    std::fs::write(
+        &program,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  init) printf 'root01
+' > "$2/.rift" ;;
+  create)
+    while [ $# -gt 1 ]; do
+      case "$1" in --name) name=$2; shift ;; --into) into=$2; shift ;; esac
+      shift
+    done
+    {create} ;;
+  remove)
+    trash="$(dirname "$2")/.trash"
+    mkdir -p "$trash" && mv "$2" "$trash/$(cat "$2/.rift")-$(basename "$2")" ;;
+esac
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    program
 }
 
 fn script(path: &Path) -> PathBuf {
@@ -430,5 +492,228 @@ async fn reply_copy_and_chrome_clicks_preserve_keyboard_behavior(cx: &mut TestAp
     click(cx, "thread-row");
     assert!(focused(cx));
     assert!(!cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
+    finish(&chat, path, cx);
+}
+
+fn works_in(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> WorksIn {
+    cx.update(|_, cx| chat.read(cx).thread().read(cx).works_in())
+}
+
+fn notice_title(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> Option<String> {
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        view.slots[view.active]
+            .notice
+            .as_ref()
+            .map(|notice| notice.title.clone())
+    })
+}
+
+fn composer_focused(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window))
+}
+
+/// Opens the composer's "Project folder" menu and picks its `nth` item with the keys.
+fn choose(nth: usize, cx: &mut VisualTestContext) {
+    click(cx, "works-in");
+    assert!(cx.update(|window, _| overlay_focused(window)));
+    for _ in 0..=nth {
+        cx.simulate_keystrokes("down");
+    }
+    cx.simulate_keystrokes("enter");
+}
+
+#[gpui::test]
+fn the_picker_chooses_a_rift_copy_and_hands_the_keys_back(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "picker", false, Some(CREATE_COPY));
+    cx.simulate_input("half typed");
+    click(cx, "works-in");
+    assert!(cx.update(|window, _| overlay_focused(window)));
+    cx.simulate_keystrokes("escape");
+    assert!(!cx.update(|window, _| overlay_focused(window)));
+    assert!(composer_focused(&chat, cx));
+    assert_eq!(works_in(&chat, cx), WorksIn::ProjectFolder);
+
+    choose(1, cx);
+    assert!(!cx.update(|window, _| overlay_focused(window)));
+    assert_eq!(works_in(&chat, cx), WorksIn::RiftCopy);
+    assert!(composer_focused(&chat, cx));
+    cx.simulate_input(", still typing");
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "half typed, still typing"
+    );
+    choose(0, cx);
+    assert_eq!(works_in(&chat, cx), WorksIn::ProjectFolder);
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_rift_draft_sends_its_first_message_from_its_new_copy(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "rift-send", true, Some(CREATE_COPY));
+    choose(1, cx);
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let (copy, cwd, first, draft) = cx.update(|_, cx| {
+        let thread = chat.read(cx).thread().read(cx);
+        (
+            thread.copy().cloned(),
+            thread.cwd().to_path_buf(),
+            thread.transcript().items().first().cloned(),
+            thread.is_draft(),
+        )
+    });
+    let copy = copy.expect("the thread works in its copy");
+    let rifts = path.canonicalize().unwrap().join(".rifts/project");
+    assert!(copy.path.starts_with(rifts), "{copy:?}");
+    assert_eq!(cwd, copy.workdir);
+    assert!(!draft);
+    assert!(matches!(first, Some(Item::User { text, .. }) if text == "two approvals"));
+    assert_eq!(cx.update(|_, cx| chat.read(cx).composer_text(0, cx)), "");
+    assert!(cx.debug_bounds("rift-copy-tag").is_some());
+    assert!(cx.debug_bounds("works-in").is_none());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_failed_copy_puts_the_message_back_and_try_again_sends_it(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "rift-fail", false, Some(FAIL_HOOK));
+    choose(1, cx);
+    cx.simulate_input("add a benchmark");
+    cx.simulate_keystrokes("enter");
+    cx.condition(&chat, |view, cx| {
+        view.thread().read(cx).preparing().is_none() && view.slots[view.active].notice.is_some()
+    })
+    .await;
+    assert_eq!(notice_title(&chat, cx).as_deref(), Some(COPY_FAILED));
+    let (detail, output) = cx.update(|_, cx| {
+        let view = chat.read(cx);
+        let notice = view.slots[view.active].notice.as_ref().unwrap();
+        let NoticeKind::CopyFailed { output } = &notice.kind else {
+            panic!("not a copy failure");
+        };
+        (notice.detail.clone(), output.clone())
+    });
+    assert_eq!(detail, "postcreate hook failed (exit 1)");
+    assert_eq!(output, ["npm ERR! code ERESOLVE"]);
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "add a benchmark"
+    );
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
+    assert_eq!(works_in(&chat, cx), WorksIn::RiftCopy);
+    assert!(composer_focused(&chat, cx));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, _| {
+            view.tools.rift = fake_rift(&path, CREATE_COPY);
+        })
+    });
+    cx.run_until_parked();
+    click(cx, "retry");
+    cx.condition(&chat, |view, cx| view.thread().read(cx).copy().is_some())
+        .await;
+    assert_eq!(notice_title(&chat, cx), None);
+    assert_eq!(cx.update(|_, cx| chat.read(cx).composer_text(0, cx)), "");
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_copy_waits_while_another_thread_works_in_the_project_folder(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "rift-refused", true, Some(CREATE_COPY));
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    cx.simulate_keystrokes("cmd-n");
+    choose(1, cx);
+    cx.simulate_input("rename the keys");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        notice_title(&chat, cx).as_deref(),
+        Some("Another thread is working in the project folder")
+    );
+    let (preparing, text) = cx.update(|_, cx| {
+        let view = chat.read(cx);
+        (
+            view.thread().read(cx).preparing().is_some(),
+            view.composer_text(view.active, cx),
+        )
+    });
+    assert!(!preparing);
+    assert_eq!(text, "rename the keys");
+    assert!(!path.join(".rifts").exists());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn choosing_a_rift_copy_without_rift_says_how_to_install_it(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "rift-missing", false);
+    cx.update(|_, cx| chat.update(cx, |view, _| view.tools.rift = PathBuf::from("rift")));
+    choose(1, cx);
+    assert_eq!(works_in(&chat, cx), WorksIn::RiftCopy);
+    assert_eq!(
+        notice_title(&chat, cx).as_deref(),
+        Some("Rift isn't installed")
+    );
+    cx.simulate_input("go");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(cx.update(|_, cx| chat.read(cx).composer_text(0, cx)), "go");
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
+    choose(0, cx);
+    assert_eq!(notice_title(&chat, cx), None);
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn while_its_copy_is_made_the_thread_shows_it_and_cannot_be_archived(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "making-copy", false);
+    let thread = cx.update(|_, cx| chat.read(cx).thread().clone());
+    let job = cx.update(|_, cx| {
+        thread.update(cx, |thread, cx| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            let sent = thread.send("fix the parser");
+            cx.notify();
+            match sent {
+                Ok(Sent::MakingCopy(job)) => job,
+                other => panic!("expected a copy job, got {other:?}"),
+            }
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("making-copy").is_some());
+    assert!(cx.debug_bounds("rift-copy-tag").is_some());
+    assert!(cx.debug_bounds("works-in").is_none());
+    assert!(cx.update(|window, cx| chat.read(cx).root.is_focused(window)));
+    let look =
+        cx.update(|_, cx| sidebar::row_look(&row_facts(thread.read(cx), Instant::now()), now_ms()));
+    assert_eq!(look.detail, sidebar::MAKING_COPY_DETAIL);
+    cx.simulate_input("more");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(cx.update(|_, cx| chat.read(cx).composer_text(0, cx)), "");
+
+    let id = cx.update(|_, cx| thread.read(cx).id().to_string());
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.archive(&id, window, cx)));
+    assert_eq!(cx.update(|_, cx| chat.read(cx).slots.len()), 1);
+
+    drop(job);
+    let failed = CopyError::Failed {
+        command: "rift create".to_string(),
+        detail: "postcreate hook failed (exit 1)".to_string(),
+        output: vec!["postcreate hook failed (exit 1)".to_string()],
+    };
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.copy_made(&thread, Err(failed), window, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "fix the parser"
+    );
+    assert_eq!(notice_title(&chat, cx).as_deref(), Some(COPY_FAILED));
+    assert!(composer_focused(&chat, cx));
+    assert!(cx.debug_bounds("works-in").is_some());
     finish(&chat, path, cx);
 }

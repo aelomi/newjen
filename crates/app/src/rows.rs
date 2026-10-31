@@ -96,7 +96,7 @@ pub fn item(
         ),
         Item::Error {
             id, title, detail, ..
-        } => error(("error", *id).into(), title, detail, retry, cx),
+        } => error(("error", *id).into(), title, detail, &[], retry, cx),
         Item::Stopped { id } => stopped_notice(*id, resume, resends, cx),
         Item::FreshStart { .. } => fresh_start(cx),
         Item::Unreadable { .. } => caption_row(ui::IconName::Info, UNREADABLE_NOTE.to_string(), cx),
@@ -288,6 +288,7 @@ pub fn error(
     id: ElementId,
     title: &str,
     detail: &str,
+    output: &[String],
     retry: Option<&OnRestart>,
     cx: &App,
 ) -> AnyElement {
@@ -296,11 +297,52 @@ pub fn error(
             id,
             title: title.to_string().into(),
             detail: detail.to_string().into(),
+            output: output.iter().cloned().map(Into::into).collect(),
             retry: retry.cloned(),
         },
         cx,
     )
     .into_any_element()
+}
+
+pub fn held(id: ElementId, title: &str, detail: &str, cx: &App) -> AnyElement {
+    ui::assistant(
+        gpui_kit::component::alert::Alert::info(id, detail.to_string()).title(title.to_string()),
+        cx,
+    )
+    .into_any_element()
+}
+
+pub fn making_copy(took: &str, last_line: Option<&str>, cx: &App) -> AnyElement {
+    use gpui_kit::component::Sizable as _;
+    let color = cx.theme().colors.muted_foreground;
+    h_flex()
+        .debug_selector(|| "making-copy".to_string())
+        .items_start()
+        .gap_2()
+        .child(
+            div().flex_none().pt_0p5().child(
+                gpui_kit::component::spinner::Spinner::new()
+                    .small()
+                    .color(color),
+            ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(ui::caption(format!("Creating a Rift copy · {took}"), cx))
+                .children(last_line.map(|line| {
+                    div()
+                        .min_w_0()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_xs()
+                        .text_color(color)
+                        .child(ui::ellipsis(line.to_string()))
+                })),
+        )
+        .into_any_element()
 }
 
 /// Whether an error row gets a "Try again" button. Restarting kills the running `claude`, so

@@ -34,6 +34,8 @@ pub const DRAFT_DETAIL: &str = "No messages yet";
 /// bar's pill on the same screen.
 pub const NEEDS_APPROVAL: &str = "Needs approval";
 
+pub const MAKING_COPY_DETAIL: &str = "Creating a Rift copy…";
+
 /// What the list says when it has no thread yet (screen 12, "Empty").
 pub const EMPTY_LIST: &str = "No threads yet. Your first message starts one.";
 
@@ -70,6 +72,14 @@ pub struct RowLook {
     pub detail: String,
     /// The title in the semibold weight: something happened there that you have not seen.
     pub strong: bool,
+    pub copy: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Folder {
+    Project,
+    RiftCopy,
+    MakingRiftCopy,
 }
 
 /// What a row needs to know about its thread. The chat view reads it from the thread.
@@ -78,6 +88,7 @@ pub struct RowFacts {
     pub status: Status,
     /// No message sent yet.
     pub draft: bool,
+    pub folder: Folder,
     pub unread: bool,
     /// The tool waiting for an approval, named as its card names it ("Bash").
     pub waiting_tool: Option<String>,
@@ -111,11 +122,21 @@ pub fn row_look(facts: &RowFacts, now_ms: i64) -> RowLook {
         Some(tail) => format!("{head} · {tail}"),
         None => head.to_string(),
     };
+    let copy = facts.folder != Folder::Project;
     if facts.draft {
         return RowLook {
             dot: Dot::None,
             detail: DRAFT_DETAIL.to_string(),
             strong: false,
+            copy,
+        };
+    }
+    if facts.folder == Folder::MakingRiftCopy {
+        return RowLook {
+            dot: Dot::Working,
+            detail: MAKING_COPY_DETAIL.to_string(),
+            strong: false,
+            copy,
         };
     }
     let ago = relative_time(facts.updated_at, now_ms);
@@ -144,6 +165,7 @@ pub fn row_look(facts: &RowFacts, now_ms: i64) -> RowLook {
         dot,
         detail,
         strong: facts.unread,
+        copy,
     }
 }
 
@@ -425,6 +447,7 @@ pub fn new_thread_row(selected: bool, on_press: OnPress, cx: &App) -> AnyElement
     let row = ListRow {
         title: "New thread".into(),
         detail: None,
+        detail_icon: None,
         leading: Some(
             ui::icon(IconName::Plus, gpui_kit::component::Size::XSmall, ink).into_any_element(),
         ),
@@ -461,6 +484,7 @@ pub struct Row {
     pub look: RowLook,
     /// The thread on screen.
     pub selected: bool,
+    pub archivable: bool,
 }
 
 /// One thread: its dot, its title (cut with "…") and its detail line. A click shows it; a
@@ -471,9 +495,11 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
         (ElementId::from("pulse"), row.id.clone()).into(),
         cx,
     );
+    let archivable = row.archivable;
     let look = ListRow {
         title: row.title,
         detail: Some(row.look.detail),
+        detail_icon: row.look.copy.then_some(IconName::Copy),
         leading: Some(lead),
         trailing: None,
         strong: row.look.strong,
@@ -492,6 +518,7 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
         menu.min_w(MENU_WIDTH).item(
             PopupMenuItem::new("Archive thread")
                 .icon(IconName::Archive)
+                .disabled(!archivable)
                 .on_click(move |_, window, cx| on_archive(window, cx)),
         )
     })
@@ -508,6 +535,7 @@ mod tests {
         RowFacts {
             status,
             draft: false,
+            folder: Folder::Project,
             unread: false,
             waiting_tool: None,
             working_for: None,
@@ -651,8 +679,34 @@ mod tests {
                 dot: Dot::None,
                 detail: DRAFT_DETAIL.to_string(),
                 strong: false,
+                copy: false,
             }
         );
+    }
+
+    #[test]
+    fn a_thread_in_a_rift_copy_shows_a_copy_icon_and_says_while_it_is_made() {
+        let mut making = facts(Status::Idle);
+        making.folder = Folder::MakingRiftCopy;
+        assert_eq!(
+            row_look(&making, NOW),
+            RowLook {
+                dot: Dot::Working,
+                detail: "Creating a Rift copy…".to_string(),
+                strong: false,
+                copy: true,
+            }
+        );
+        let mut working = facts(Status::Working);
+        working.folder = Folder::RiftCopy;
+        working.working_for = Some(Duration::from_secs(48));
+        let look = row_look(&working, NOW);
+        assert_eq!((look.detail.as_str(), look.copy), ("Working · 48s", true));
+        let mut draft = facts(Status::Idle);
+        draft.draft = true;
+        draft.folder = Folder::RiftCopy;
+        assert!(row_look(&draft, NOW).copy);
+        assert!(!row_look(&facts(Status::Done), NOW).copy);
     }
 
     #[test]
