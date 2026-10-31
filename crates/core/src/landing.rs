@@ -178,18 +178,22 @@ pub fn land_copy(
         return Ok(());
     }
     ensure_remote(tools, &copy.source, &remote, &copy.path)?;
-    jj(
-        tools,
-        &copy.source,
-        &[
-            "git",
-            "fetch",
-            "--remote",
-            &remote,
-            "--config",
-            "git.auto-local-bookmark=false",
-        ],
-    )?;
+    // Only the thread's own bookmarks: a full fetch brings the copy's inherited bookmarks,
+    // and with them old versions of changes the project has since rewritten.
+    let mut fetch = vec![
+        "git".to_string(),
+        "fetch".to_string(),
+        "--remote".to_string(),
+        remote.clone(),
+        "--config".to_string(),
+        "git.auto-local-bookmark=false".to_string(),
+    ];
+    for name in work_bookmarks(tools, &copy.path, base, &target)? {
+        fetch.push("--branch".to_string());
+        fetch.push(name);
+    }
+    let fetch: Vec<&str> = fetch.iter().map(String::as_str).collect();
+    jj(tools, &copy.source, &fetch)?;
     ensure!(
         revision(tools, &copy.source, &target)? == target,
         "The agent's reviewed commit was not exported by a bookmark"
@@ -200,6 +204,8 @@ pub fn land_copy(
         &copy.source,
         &["bookmark", "set", &bookmark, "-r", &target],
     )?;
+    let (base, target) = reconcile_rewritten_base(tools, &copy.source, base, &bookmark)?;
+    let base = base.as_str();
     let main = head(tools, &copy.source)?;
     if !log(
         tools,
@@ -504,6 +510,84 @@ fn track_work_refs(
         jj(tools, source, &["bookmark", "track", &name])?;
     }
     Ok(())
+}
+
+/// The copy's bookmarks on the thread's work (`base..target`), the ones landing fetches.
+fn work_bookmarks(tools: &Tools, copy: &Path, base: &str, target: &str) -> Result<Vec<String>> {
+    let listed = jj(
+        tools,
+        copy,
+        &[
+            "bookmark",
+            "list",
+            "--ignore-working-copy",
+            "-T",
+            "if(!remote, name ++ \"\\t\" ++ normal_target.commit_id() ++ \"\\n\")",
+        ],
+    )?;
+    let mut names = Vec::new();
+    for line in listed.lines() {
+        let Some((name, commit)) = line.split_once('\t') else {
+            continue;
+        };
+        validate_commit(commit)?;
+        if !log(
+            tools,
+            copy,
+            &format!("{commit} & ({base}..{target})"),
+            "commit_id",
+        )?
+        .is_empty()
+        {
+            names.push(name.to_string());
+        }
+    }
+    ensure!(
+        !names.is_empty(),
+        "The reviewed work has no bookmark in the copy to fetch"
+    );
+    Ok(names)
+}
+
+/// If the project rewrote the thread's base change while the copy worked on the old version,
+/// the fetch brought that old version back. Move the work onto the current version and hide
+/// the old one, so `divergent()` stays empty. Returns the base and the bookmark's commit to
+/// land from, after the move.
+fn reconcile_rewritten_base(
+    tools: &Tools,
+    source: &Path,
+    base: &str,
+    bookmark: &str,
+) -> Result<(String, String)> {
+    let change = log(tools, source, base, "change_id")?;
+    let current = log(
+        tools,
+        source,
+        &format!("change_id({change}) ~ {base}"),
+        "commit_id ++ \"\\n\"",
+    )?;
+    let current: Vec<&str> = current.lines().filter(|line| !line.is_empty()).collect();
+    if current.is_empty() {
+        return Ok((base.to_string(), revision(tools, source, bookmark)?));
+    }
+    ensure!(
+        current.len() == 1,
+        "The thread's base change has several versions in the project. Resolve that before landing"
+    );
+    validate_commit(current[0])?;
+    jj(
+        tools,
+        source,
+        &[
+            "rebase",
+            "-s",
+            &format!("roots({base}..{bookmark})"),
+            "-d",
+            current[0],
+        ],
+    )?;
+    jj(tools, source, &["abandon", base])?;
+    Ok((current[0].to_string(), revision(tools, source, bookmark)?))
 }
 
 fn ensure_ancestor(tools: &Tools, cwd: &Path, base: &str, head: &str) -> Result<()> {

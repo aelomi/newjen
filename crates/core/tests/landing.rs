@@ -608,3 +608,75 @@ fn removing_the_thread_remote_does_not_snapshot_project_files() {
     );
     landing::cleanup_remote(&lab.tools, &repo, THREAD).unwrap();
 }
+
+#[test]
+fn landing_a_copy_after_the_project_rewrote_its_base_leaves_no_divergent_change() {
+    let Some(lab) = Lab::new() else { return };
+    let repo = lab.repo();
+    lab.jj(&repo, &["bookmark", "set", "owner-topic", "-r", "@-"]);
+    let copy = rift::create(&lab.tools, &repo, "rewritten-base", |_| {}).unwrap();
+    std::fs::write(copy.workdir.join("agent.txt"), "agent work\n").unwrap();
+    lab.snap(&copy.workdir);
+    let base = copy.base.as_deref().unwrap();
+    lab.jj(&repo, &["describe", "-r", base, "-m", "Owner rewrote base"]);
+    let reviewed = landing::review(&lab.tools, &copy.path, base).unwrap();
+    landing::land_copy(
+        &lab.tools,
+        &copy,
+        LandingMode::HarnessManaged,
+        THREAD,
+        Integration::Rebase,
+        &reviewed,
+    )
+    .unwrap();
+    let divergent = lab.jj(
+        &repo,
+        &[
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            "divergent()",
+            "-T",
+            "change_id",
+        ],
+    );
+    assert_eq!(divergent, "", "landing revived the rewritten base");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("agent.txt")).unwrap(),
+        "agent work\n"
+    );
+    let graph = lab.jj(
+        &repo,
+        &[
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            "::@",
+            "-T",
+            "description.first_line() ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        graph.contains("Owner rewrote base") && !graph.contains("\nbase\n"),
+        "the work landed on the rewritten base: {graph}"
+    );
+    let inherited = lab.jj(
+        &repo,
+        &[
+            "bookmark",
+            "list",
+            "--ignore-working-copy",
+            "--all-remotes",
+            "-T",
+            "if(remote, name ++ \"@\" ++ remote ++ \"\\n\")",
+        ],
+    );
+    assert!(
+        !inherited.contains("owner-topic@thread-"),
+        "landing fetched an inherited bookmark: {inherited}"
+    );
+    landing::cleanup_remote(&lab.tools, &repo, THREAD).unwrap();
+    rift::remove(&lab.tools, &copy.source, &copy.path, &copy.rift_id).unwrap();
+}
