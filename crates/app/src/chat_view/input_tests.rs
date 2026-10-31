@@ -1614,3 +1614,35 @@ async fn archive_rechecks_copy_users_before_deleting(cx: &mut TestAppContext) {
     cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
     finish(&owner, path, cx);
 }
+
+#[gpui::test]
+async fn a_denial_note_is_sent_from_its_own_field_and_cleared_for_the_next_request(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "denial-note", true);
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    cx.update(|window, cx| {
+        let field = chat.read(cx).denial_note.clone().expect("denial field");
+        field.read(cx).focus_handle(cx).focus(window, cx);
+    });
+    cx.simulate_input("Use a temporary folder instead.");
+    click(cx, "deny");
+    wait_answers(cx, &path, 1).await;
+    assert_eq!(
+        answers(&path)[0]["response"]["response"]["message"],
+        "Use a temporary folder instead."
+    );
+    assert_eq!(request_id(&chat, cx), "second-tool");
+    assert!(cx.update(|_, cx| {
+        chat.read(cx)
+            .denial_note
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .value()
+            .is_empty()
+    }));
+    finish(&chat, path, cx);
+}

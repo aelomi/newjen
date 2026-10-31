@@ -311,7 +311,7 @@ pub fn held(id: ElementId, title: &str, detail: &str, cx: &App) -> AnyElement {
     ui::assistant(alert, cx).into_any_element()
 }
 
-pub fn making_copy(took: &str, last_line: Option<&str>, cx: &App) -> AnyElement {
+pub fn preparing_work(label: &str, took: &str, last_line: Option<&str>, cx: &App) -> AnyElement {
     use gpui_kit::component::Sizable as _;
     let color = cx.theme().colors.muted_foreground;
     h_flex()
@@ -330,7 +330,7 @@ pub fn making_copy(took: &str, last_line: Option<&str>, cx: &App) -> AnyElement 
                 .flex_1()
                 .min_w_0()
                 .gap_0p5()
-                .child(ui::caption(format!("Creating a Rift copy · {took}"), cx))
+                .child(ui::caption(format!("{label} · {took}"), cx))
                 .children(last_line.map(|line| {
                     div()
                         .min_w_0()

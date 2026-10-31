@@ -15,6 +15,7 @@
 
 mod limits;
 mod picker;
+mod review;
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Side, WindowExt as _};
+use newjen_core::agent::NoteDelivery;
 use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
@@ -218,6 +220,12 @@ pub struct ChatView {
     grants_focus: FocusHandle,
     /// The approval the dock is showing, to notice when a new one takes its place.
     dock_request: Option<newjen_core::ApprovalKey>,
+    /// The optional reason for a denial, typed under the approval card (see
+    /// `review::prepare_approval`).
+    denial_note: Option<Entity<TextareaState>>,
+    edit_preview: Option<review::ApprovalPreview>,
+    review_panel: Option<review::ReviewPanel>,
+    review_loading: bool,
     /// The root has the keyboard while the thread on screen waits for its Rift copy: the
     /// composer is disabled until then.
     making_copy_shown: bool,
@@ -284,6 +292,10 @@ impl ChatView {
             grants_open: false,
             grants_focus,
             dock_request: None,
+            denial_note: None,
+            edit_preview: None,
+            review_panel: None,
+            review_loading: false,
             making_copy_shown: false,
             dock_outside: None,
             keys_ready_at: None,
@@ -506,6 +518,8 @@ impl ChatView {
         let at = at.min(self.slots.len());
         self.slots.insert(at, slot);
         self.sync_replies(at, cx);
+        let thread = self.slots[at].thread.clone();
+        self.run_snapshot(&thread, window, cx);
     }
 
     /// A new, unsaved thread at the top of the list. Not shown yet; see `new_thread`.
@@ -548,6 +562,7 @@ impl ChatView {
         }
         if let Some(ix) = self.slots.iter().position(|slot| slot.thread == *thread) {
             self.sync_replies(ix, cx);
+            self.run_snapshot(thread, window, cx);
         }
         if self
             .slots
@@ -596,6 +611,10 @@ impl ChatView {
     /// can become unread again), and a draft left with an empty composer is dropped: it was
     /// never saved, and empty threads should not pile up.
     fn show(&mut self, target: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review_loading || self.review_panel.as_ref().is_some_and(|panel| panel.busy) {
+            return;
+        }
+        self.review_panel = None;
         self.drawer_open = false;
         if target >= self.slots.len() {
             return;
@@ -702,6 +721,13 @@ impl ChatView {
             return;
         };
         if self.hold_archive(ix, cx) {
+            return;
+        }
+        if self.slots[ix].thread.read(cx).review_base().is_some()
+            && !self.slots[ix].thread.read(cx).landing_finished()
+        {
+            self.show_thread(thread_id, window, cx);
+            self.open_review(window, cx);
             return;
         }
         let question = {
@@ -938,6 +964,7 @@ impl ChatView {
             (front, outside, thread.status(), empty, making_copy)
         };
         if front != self.dock_request {
+            self.prepare_approval(window, cx);
             // A new request is on the dock: give the user a moment to see it.
             self.keys_ready_at = front
                 .as_ref()
@@ -1020,7 +1047,11 @@ impl ChatView {
 
     fn is_busy(&self, cx: &App) -> bool {
         let thread = self.thread().read(cx);
-        is_busy(thread.status()) || thread.preparing().is_some()
+        is_busy(thread.status())
+            || thread.preparing().is_some()
+            || thread.work_pending()
+            || self.review_loading
+            || self.review_panel.is_some()
     }
 
     /// Sends the composer's text as the next message (Enter or the send button).
@@ -1051,6 +1082,19 @@ impl ChatView {
     /// composer stays usable and keeps its text) and a notice says why.
     fn send_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let thread = self.thread().clone();
+        if self.review_loading || self.review_panel.is_some() {
+            return false;
+        }
+        if thread.read(cx).works_in() == WorksIn::ProjectFolder
+            && self
+                .slots
+                .iter()
+                .any(|slot| slot.thread != thread && slot.thread.read(cx).owns_project_work())
+        {
+            self.slots[self.active].notice = Some(Notice::held("Review the project thread first", "Land or discard the existing project-folder work before starting another thread here.".into()));
+            cx.notify();
+            return false;
+        }
         if let Some(held) = self.copy_hold(&thread, cx) {
             self.slots[self.active].notice = Some(held);
             cx.notify();
@@ -1070,12 +1114,12 @@ impl ChatView {
         let notice = match sent {
             // Writing worked, so an older "could not reach Claude" notice is out of date.
             Ok(Sent::Started) => None,
-            Ok(Sent::MakingCopy(job)) => {
-                self.make_copy(&thread, job, window, cx);
-                None
-            }
             Ok(Sent::PreparingProject(job)) => {
                 self.prepare_project(&thread, job, window, cx);
+                None
+            }
+            Ok(Sent::MakingCopy(job)) => {
+                self.make_copy(&thread, job, window, cx);
                 None
             }
             Err(error) if error.downcast_ref::<CopyError>().is_some() => Some(copy_failed(
@@ -1230,49 +1274,6 @@ impl ChatView {
         .detach();
     }
 
-    /// Runs the [`thread::ProjectJob`] from `Thread::send` off the UI thread and hands what it
-    /// returns to `Thread::finish_project`, which sends the held message. If that fails the
-    /// message comes back to the composer with a notice.
-    fn prepare_project(
-        &mut self,
-        thread: &Entity<Thread>,
-        job: thread::ProjectJob,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let tools = self.tools.clone();
-        let task = cx.background_spawn(async move { job.run(&tools) });
-        let thread = thread.downgrade();
-        cx.spawn_in(window, async move |view, cx| {
-            let result = task.await;
-            let Some(thread) = thread.upgrade() else {
-                return;
-            };
-            let _ = view.update_in(cx, |view, window, cx| {
-                let result = thread.update(cx, |thread, cx| {
-                    let result = thread.finish_project(result);
-                    cx.notify();
-                    result
-                });
-                if let Err(error) = result
-                    && let Some(ix) = view.slots.iter().position(|slot| slot.thread == thread)
-                {
-                    view.slots[ix].notice = Some(Notice::held(
-                        "Couldn't prepare the project",
-                        error.error.to_string(),
-                    ));
-                    if ix == view.active {
-                        let field = view.ensure_field(window, cx);
-                        field.update(cx, |field, cx| field.set_value(error.message, window, cx));
-                    }
-                }
-                view.sync_field(window, cx);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn copy_made(
         &mut self,
         thread: &Entity<Thread>,
@@ -1361,7 +1362,7 @@ impl ChatView {
     /// stale click (that request was already answered) does nothing. `rule_cut` says the dock
     /// could not show the remembered rule in full (`ScopeRow::once`), so "Always allow" is sent
     /// as allow once (see `sent_answer`).
-    fn answer(
+    fn send_answer(
         &mut self,
         request_id: Option<newjen_core::ApprovalKey>,
         choice: ApprovalIntent,
@@ -1371,15 +1372,31 @@ impl ChatView {
     ) {
         let answer = sent_answer(choice, rule_cut);
         let thread = self.thread().clone();
+        let note = self
+            .denial_note
+            .as_ref()
+            .map(|field| field.read(cx).value().to_string());
         let sent = thread.update(cx, |thread, cx| {
-            let sent = thread.answer(request_id, answer);
+            let sent = thread.answer_with_note(request_id, answer, note.as_deref());
             cx.notify();
             sent
         });
         // No note after the click when "Always allow" acts once: the scope row under the dock
         // already said so before the click.
-        self.slots[self.active].notice =
-            notice_after(sent, thread.read(cx).presentation().answer_failed);
+        self.slots[self.active].notice = match sent {
+            Ok(NoteDelivery::Delivered) => None,
+            // The provider's denial carries no text: the note waits in the composer instead.
+            Ok(NoteDelivery::Kept(note)) => {
+                let label = thread.read(cx).presentation().label;
+                let field = self.ensure_field(window, cx);
+                field.update(cx, |field, cx| field.set_value(note, window, cx));
+                Some(Notice::held(
+                    "The note was not sent",
+                    format!("{label} can't take a note with a denial; send it as a message."),
+                ))
+            }
+            Err(error) => notice_after(Err(error), thread.read(cx).presentation().answer_failed),
+        };
         self.sync_field(window, cx);
         cx.notify();
     }
@@ -1397,6 +1414,10 @@ impl ChatView {
             )
         };
         if !pending && !busy {
+            return;
+        }
+        if pending {
+            self.answer(None, ApprovalIntent::DenyAndStop, false, window, cx);
             return;
         }
         let sent = thread.update(cx, |thread, cx| {
@@ -1622,7 +1643,16 @@ impl ChatView {
                 || div().into_any_element(),
                 |preparing| {
                     let took = Instant::now().saturating_duration_since(preparing.started_at());
-                    rows::making_copy(&elapsed(took.as_secs()), preparing.last_line(), cx)
+                    rows::preparing_work(
+                        if thread.works_in() == WorksIn::RiftCopy {
+                            "Creating a Rift copy"
+                        } else {
+                            "Preparing the project"
+                        },
+                        &elapsed(took.as_secs()),
+                        preparing.last_line(),
+                        cx,
+                    )
                 },
             ),
             Some(Entry::Notice) => match notice {
@@ -1707,7 +1737,8 @@ impl ChatView {
             Bar {
                 title: thread.title().to_string().into(),
                 path,
-                copy: making_copy || thread.copy().is_some(),
+                copy: (making_copy && thread.works_in() == WorksIn::RiftCopy)
+                    || thread.copy().is_some(),
                 show_list,
                 grants: thread.grant_views(),
                 grants_detail: thread.presentation().grants_detail,
@@ -1836,7 +1867,13 @@ impl ChatView {
             + m.scope_gap
             + line_height
             + problem
-            + m.conversation_reserve;
+            + m.conversation_reserve
+            + if self.edit_preview.is_some() {
+                160.
+            } else {
+                0.
+            }
+            + 50.;
         let free = (f32::from(viewport.height) - used).max(0.0);
         let rows = ((free / line_height) as usize).clamp(m.detail_rows_min, m.detail_rows_max);
         (title, Room { cols, rows })
@@ -1893,6 +1930,18 @@ impl ChatView {
                 });
             },
         );
+        let card = card.preview(
+            self.render_edit_preview(f32::from(window.viewport_size().height), cx),
+            !self
+                .edit_preview
+                .as_ref()
+                .is_some_and(|preview| preview.loading()),
+        );
+        let card = if let Some(note) = &self.denial_note {
+            card.note(note.clone())
+        } else {
+            card
+        };
         Some(ui::approval_dock(card, rows::scope(&scope, cx)))
     }
 
@@ -1930,8 +1979,14 @@ impl ChatView {
             ui::Footer::Disabled("Install an agent, then Refresh")
         } else if checking {
             ui::Footer::Disabled("Checking agents…")
+        } else if self.thread().read(cx).work_pending() {
+            ui::Footer::Wait("Saving a jj snapshot…")
+        } else if self.thread().read(cx).landing_finished() {
+            ui::Footer::Wait("Work resolved. Start a new thread to continue.")
         } else if cancelling {
             ui::Footer::Wait(COPY_CANCELLING)
+        } else if making_copy && self.thread().read(cx).works_in() == WorksIn::ProjectFolder {
+            ui::Footer::Wait("Preparing the project…")
         } else if making_copy {
             ui::Footer::Cancel(self.press(cx, |view, window, cx| view.stop(window, cx)))
         } else if busy {
@@ -2176,13 +2231,16 @@ impl Render for ChatView {
             )
         };
         let title_bar = self.render_title_bar(placement, main_width, window, cx);
-        let body = if empty {
+        let body = if self.review_panel.is_some() {
+            self.render_review(cx)
+        } else if empty {
             self.render_empty_state(cx).into_any_element()
         } else {
             self.render_messages(cx).into_any_element()
         };
         let bottom = match self.render_dock(main_width, window, cx) {
             Some(dock) => dock,
+            None if self.review_panel.is_some() => div().into_any_element(),
             None => self.render_composer(window, cx),
         };
         let problem = self.render_save_problem(cx);
@@ -2244,6 +2302,11 @@ impl Render for ChatView {
             .min_w_0()
             .h_full()
             .child(title_bar)
+            .children(
+                self.dock_request
+                    .is_none()
+                    .then(|| self.render_review_toolbar(cx)),
+            )
             .child(body)
             .child(
                 div()
@@ -2329,7 +2392,8 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
         .then(|| thread.failure_summary())
         .flatten();
     let folder = match (thread.preparing(), thread.works_in()) {
-        (Some(_), _) => sidebar::Folder::MakingRiftCopy,
+        (Some(_), WorksIn::RiftCopy) => sidebar::Folder::MakingRiftCopy,
+        (Some(_), WorksIn::ProjectFolder) => sidebar::Folder::Project,
         (None, WorksIn::RiftCopy) => sidebar::Folder::RiftCopy,
         (None, WorksIn::ProjectFolder) => sidebar::Folder::Project,
     };

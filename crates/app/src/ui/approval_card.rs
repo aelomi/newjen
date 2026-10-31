@@ -1,13 +1,13 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    AnyElement, App, ElementId, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
     RenderOnce, SharedString, Styled, Window, div, px,
 };
 use newjen_core::ApprovalIntent;
 
 use super::{IconName, Look, Size, button, icon};
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _};
 
 pub struct DockMetrics {
     pub page_padding: f32,
@@ -61,6 +61,10 @@ pub struct ApprovalCard {
     title: SharedString,
     detail: SharedString,
     on_answer: OnAnswer,
+    preview: Option<AnyElement>,
+    edit: bool,
+    ready: bool,
+    note: Option<Entity<gpui_kit::base::input::TextareaState>>,
 }
 
 impl ApprovalCard {
@@ -75,7 +79,21 @@ impl ApprovalCard {
             title: title.into(),
             detail: detail.into(),
             on_answer: Rc::new(on_answer),
+            preview: None,
+            edit: false,
+            ready: true,
+            note: None,
         }
+    }
+    pub fn preview(mut self, preview: Option<AnyElement>, ready: bool) -> Self {
+        self.edit = preview.is_some();
+        self.preview = preview;
+        self.ready = ready;
+        self
+    }
+    pub fn note(mut self, note: Entity<gpui_kit::base::input::TextareaState>) -> Self {
+        self.note = Some(note);
+        self
     }
 }
 
@@ -83,9 +101,10 @@ impl RenderOnce for ApprovalCard {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let m = &DOCK_METRICS;
         let c = cx.theme();
-        let choice = |id: &'static str, label: &'static str, look, answer| {
+        let choice = |id: &'static str, label: &'static str, look, answer: ApprovalIntent| {
             let on_answer = self.on_answer.clone();
             button((self.id.clone(), id), label, look, Size::Md, cx)
+                .disabled(!self.ready && !answer.is_deny())
                 .debug_selector(move || id.to_string())
                 .on_click(move |_, window, cx| on_answer(answer, window, cx))
         };
@@ -118,7 +137,7 @@ impl RenderOnce for ApprovalCard {
                             .child(self.title),
                     ),
             )
-            .child(
+            .children((!self.edit).then(|| {
                 div().w_full().flex().child(
                     div()
                         .flex_1()
@@ -130,8 +149,13 @@ impl RenderOnce for ApprovalCard {
                         .font_family(c.mono_font_family.clone())
                         .text_color(c.muted_foreground)
                         .child(self.detail),
-                ),
-            )
+                )
+            }))
+            .children(self.preview)
+            .children(self.note.map(|note| {
+                gpui_kit::component::input::Textarea::new(&note)
+                    .aria_label("Optional reason for denying")
+            }))
             .child(
                 div()
                     .flex()
@@ -139,12 +163,14 @@ impl RenderOnce for ApprovalCard {
                     .justify_end()
                     .gap(px(m.title_gap))
                     .child(choice("deny", "Deny", Look::Ghost, ApprovalIntent::Deny))
-                    .child(choice(
-                        "always",
-                        "Always allow",
-                        Look::Secondary,
-                        ApprovalIntent::AllowForSession,
-                    ))
+                    .children((!self.edit).then(|| {
+                        choice(
+                            "always",
+                            "Always allow",
+                            Look::Secondary,
+                            ApprovalIntent::AllowForSession,
+                        )
+                    }))
                     .child(choice(
                         "once",
                         "Allow once",
