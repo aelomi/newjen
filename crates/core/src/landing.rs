@@ -63,11 +63,21 @@ pub struct Review {
     pub truncated: bool,
 }
 
+pub fn available(cwd: &Path) -> bool {
+    cwd.ancestors()
+        .find(|path| path.join(".jj").exists())
+        .is_some_and(|root| root.join(".git").exists())
+}
+
 pub fn head(tools: &Tools, cwd: &Path) -> Result<String> {
     revision(tools, cwd, "@")
 }
 
 pub fn prepare_project(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<String> {
+    ensure!(
+        available(cwd),
+        "Landing currently requires a jj repository colocated with git"
+    );
     marker(thread_id)?;
     jj(tools, cwd, &["status"])?;
     let base = head(tools, cwd)?;
@@ -92,6 +102,10 @@ pub fn snapshot(
 }
 
 pub fn review(tools: &Tools, cwd: &Path, base: &str) -> Result<Review> {
+    ensure!(
+        available(cwd),
+        "Landing currently requires a jj repository colocated with git"
+    );
     validate_commit(base)?;
     let head = head(tools, cwd)?;
     ensure_ancestor(tools, cwd, base, &head)?;

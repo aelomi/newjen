@@ -1140,8 +1140,7 @@ impl Thread {
                 store: self.store.clone(),
             }));
         }
-        if self.review_base.is_none() && self.cwd.ancestors().any(|path| path.join(".jj").exists())
-        {
+        if self.review_base.is_none() && landing::available(&self.cwd) {
             self.end_session();
             let was_saved = self.is_saved();
             if !was_saved {

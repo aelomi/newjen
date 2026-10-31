@@ -572,3 +572,17 @@ fn project_landing_refuses_conflicts_without_resolving_the_thread() {
             .is_empty()
     );
 }
+
+#[test]
+fn unsupported_repositories_decline_landing_without_preparing_a_change() {
+    let Some(lab) = Lab::new() else {
+        return;
+    };
+    let repo = lab.dir.path().join("noncolocated");
+    std::fs::create_dir(&repo).unwrap();
+    lab.jj(&repo, &["git", "init", "--no-colocate"]);
+    let before = landing::head(&lab.tools, &repo).unwrap();
+    assert!(landing::prepare_project(&lab.tools, &repo, THREAD).is_err());
+    assert_eq!(landing::head(&lab.tools, &repo).unwrap(), before);
+    assert!(landing::review(&lab.tools, &repo, &before).is_err());
+}
