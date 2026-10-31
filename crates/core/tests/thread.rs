@@ -2392,3 +2392,229 @@ fn recovering_again_never_removes_a_replacement_after_the_original_was_cleaned()
         "unrelated work"
     );
 }
+
+#[test]
+fn recovery_preserves_a_replacement_before_the_first_cleanup() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let status = std::process::Command::new(&tools.jj)
+        .args(["git", "init", "--colocate"])
+        .arg(&fixture.project.path)
+        .envs(tools.env.iter().cloned())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (thread, job) = fixture.preparing("keep my message");
+    let own = job.run(&tools, |_| {}).unwrap();
+    drop(thread);
+    newjen_core::rift::remove(&tools, &own.path, &own.rift_id).unwrap();
+    let replacement = newjen_core::rift::create(
+        &tools,
+        &fixture.project.path,
+        own.path.file_name().unwrap().to_str().unwrap(),
+        |_| {},
+    )
+    .unwrap();
+    std::fs::write(replacement.path.join("valuable.txt"), "replacement work").unwrap();
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    assert_eq!(pending[0].rift_id.as_deref(), Some(own.rift_id.as_str()));
+    assert_eq!(
+        Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending[0], &tools)
+            .unwrap(),
+        newjen_core::thread::CopyRecovery::Draft
+    );
+    assert!(
+        replacement.path.join("valuable.txt").exists(),
+        "recovery deleted a different Rift id at the pending destination"
+    );
+}
+
+#[test]
+fn a_failed_first_thread_write_never_sweeps_a_copy_with_work() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    std::fs::write(fixture.project.path.join("a.txt"), "a\n").unwrap();
+    fixture
+        .database()
+        .execute_batch("CREATE TRIGGER refuse_threads BEFORE INSERT ON threads BEGIN SELECT RAISE(ABORT, 'disk full'); END;")
+        .unwrap();
+    let (mut thread, job) = fixture.preparing("Refactor the parser");
+    let copy = job.run(&tools, |_| {}).unwrap();
+    thread.finish_copy(Ok(copy.clone())).unwrap();
+    finish_turn(&mut thread);
+    assert_eq!(fixture.messages_received(), ["Refactor the parser"]);
+    std::fs::write(copy.workdir.join("parser.rs"), "fn parse() {}\n").unwrap();
+    thread.shutdown_for_quit();
+    drop(thread);
+    assert!(fixture.store.flush(FLUSH));
+    assert!(
+        fixture
+            .store
+            .threads(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].state, newjen_core::store::PendingState::Sent);
+    for row in &pending {
+        assert_eq!(
+            Thread::recover_pending_copy(&fixture.store, &fixture.project, row, &tools).unwrap(),
+            newjen_core::thread::CopyRecovery::Kept(copy.path.clone())
+        );
+    }
+    assert!(fixture.store.flush(FLUSH));
+    assert!(
+        fixture
+            .store
+            .pending_copies(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        copy.workdir.join("parser.rs").exists(),
+        "a copy in which claude already worked was deleted at relaunch"
+    );
+}
+
+#[test]
+fn a_failed_sent_checkpoint_returns_the_message_without_sending_it() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let (mut thread, job) = fixture.preparing("keep this message");
+    let copy = job.run(&tools, |_| {}).unwrap();
+    fixture.database().execute_batch("CREATE TRIGGER refuse_sent BEFORE INSERT ON pending_copies WHEN NEW.state = 'sent' BEGIN SELECT RAISE(ABORT, 'disk full'); END;").unwrap();
+    let failed = thread.finish_copy(Ok(copy.clone())).unwrap_err();
+    assert_eq!(failed.message, "keep this message");
+    thread.shutdown_for_quit();
+    assert!(fixture.messages_received().is_empty());
+    assert!(
+        fixture
+            .store
+            .threads(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    assert_eq!(
+        pending[0].state,
+        newjen_core::store::PendingState::MakingCopy
+    );
+    Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending[0], &tools).unwrap();
+    assert!(!copy.path.exists());
+}
+
+#[test]
+fn quitting_stops_rift_and_postcreate_hooks_before_recovery() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let pid_file = fixture.path("hook-pid");
+    let hook = format!(
+        "echo $$ > '{}'; trap '' TERM; while :; do sleep 1; done",
+        pid_file.display()
+    );
+    std::fs::write(
+        fixture.project.path.join(".rift.toml"),
+        format!("version = 1\n[[hooks.postcreate]]\nrun = {hook:?}\n"),
+    )
+    .unwrap();
+    let (mut thread, job) = fixture.preparing("wait for setup");
+    let job_thread = std::thread::spawn(move || job.run(&tools, |_| {}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pid_file.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let group = std::process::Command::new("/bin/ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let group = String::from_utf8(group.stdout).unwrap().trim().to_string();
+    assert!(newjen_core::orphans::registry_dir().join(&group).exists());
+    thread.shutdown_for_quit();
+    assert!(!newjen_core::orphans::registry_dir().join(&group).exists());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while newjen_core::orphans::start_time(pid as u32).is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let alive = newjen_core::orphans::start_time(pid as u32).is_some();
+    if alive {
+        // SAFETY: clean up the hook if the assertion fails.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    let result = job_thread.join().unwrap();
+    assert!(!alive, "postcreate survived quit");
+    assert!(result.is_err());
+    assert!(fixture.messages_received().is_empty());
+}
+
+#[test]
+fn a_copy_job_not_yet_started_never_runs_rift_after_quit() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let (mut thread, job) = fixture.preparing("wait for setup");
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    thread.shutdown_for_quit();
+    assert!(job.run(&tools, |_| {}).is_err());
+    assert!(!pending[0].path.exists());
+}
+
+#[test]
+fn quitting_lets_a_running_jj_finish_and_prevents_the_copy_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let Some(mut tools) = fixture.rift_tools() else {
+        return;
+    };
+    let status = std::process::Command::new(&tools.jj)
+        .args(["git", "init", "--colocate"])
+        .arg(&fixture.project.path)
+        .envs(tools.env.iter().cloned())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let started = fixture.path("jj-started");
+    let release = fixture.path("jj-release");
+    let wrapper = fixture.path("jj-wait");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep .02; done\nexec '{}' \"$@\"\n",
+            started.display(),
+            release.display(),
+            tools.jj.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tools.jj = wrapper;
+    let (mut thread, job) = fixture.preparing("snapshot first");
+    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
+    let running = std::thread::spawn(move || job.run(&tools, |_| {}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !started.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(started.exists());
+    thread.shutdown_for_quit();
+    assert!(!running.is_finished());
+    std::fs::write(release, "finish").unwrap();
+    assert!(running.join().unwrap().is_err());
+    assert!(!pending[0].path.exists());
+}

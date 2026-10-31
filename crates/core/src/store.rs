@@ -102,6 +102,7 @@ const MIGRATIONS: &[&str] = &[
          path TEXT NOT NULL UNIQUE,
          message TEXT,
          state TEXT NOT NULL,
+         rift_id TEXT,
          created_at INTEGER NOT NULL
      );",
 ];
@@ -178,7 +179,8 @@ pub enum PendingIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingState {
     MakingCopy,
-    Composer,
+    Draft,
+    Sent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +190,7 @@ pub struct PendingCopy {
     pub path: PathBuf,
     pub intent: PendingIntent,
     pub state: PendingState,
+    pub rift_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -256,6 +259,11 @@ type UnsavedByThread = Arc<Mutex<HashMap<String, Unsaved>>>;
 enum Write {
     SavePending {
         pending: PendingCopy,
+        done: mpsc::Sender<Result<(), String>>,
+    },
+    PendingId {
+        thread_id: String,
+        rift_id: String,
         done: mpsc::Sender<Result<(), String>>,
     },
     DeletePending(String),
@@ -510,7 +518,7 @@ impl Store {
     pub fn pending_copies(&self, project_id: i64) -> Result<Vec<PendingCopy>> {
         let read = self.reader();
         let mut statement = read.prepare(
-            "SELECT thread_id, project_id, path, message, created_at, state FROM pending_copies
+            "SELECT thread_id, project_id, path, message, created_at, state, rift_id FROM pending_copies
              WHERE project_id = ?1 ORDER BY created_at",
         )?;
         let rows = statement.query_map([project_id], |row| {
@@ -521,10 +529,12 @@ impl Store {
                 intent: row
                     .get::<_, Option<String>>(3)?
                     .map_or(PendingIntent::Discard, PendingIntent::Restore),
+                rift_id: row.get(6)?,
                 created_at: row.get(4)?,
                 state: match row.get::<_, String>(5)?.as_str() {
                     "making_copy" => PendingState::MakingCopy,
-                    _ => PendingState::Composer,
+                    "sent" => PendingState::Sent,
+                    _ => PendingState::Draft,
                 },
             })
         })?;
@@ -536,6 +546,18 @@ impl Store {
         self.queue(Write::SavePending { pending, done });
         wait.recv_timeout(OPEN_PROJECT_TIMEOUT)
             .context("could not save the message before making a Rift copy")?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn save_pending_id(&self, thread_id: &str, rift_id: &str) -> Result<()> {
+        let (done, wait) = mpsc::channel();
+        self.queue(Write::PendingId {
+            thread_id: thread_id.to_string(),
+            rift_id: rift_id.to_string(),
+            done,
+        });
+        wait.recv_timeout(OPEN_PROJECT_TIMEOUT)
+            .context("could not save the Rift id")?
             .map_err(anyhow::Error::msg)
     }
 
@@ -803,6 +825,7 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         | Write::Archive { .. }
         | Write::CopyRemoved { .. }
         | Write::SavePending { .. }
+        | Write::PendingId { .. }
         | Write::DeletePending(_)
         | Write::DiscardPending(_)
         | Write::Flush(_) => return None,
@@ -818,9 +841,9 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
                 PendingIntent::Discard => None,
             };
             let result = connection.execute(
-                "INSERT INTO pending_copies (thread_id, project_id, path, message, created_at, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT (thread_id) DO UPDATE SET message = excluded.message, state = excluded.state",
+                "INSERT INTO pending_copies (thread_id, project_id, path, message, created_at, state, rift_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (thread_id) DO UPDATE SET message = excluded.message, state = excluded.state, path = excluded.path, rift_id = excluded.rift_id",
                 params![
                     pending.thread_id,
                     pending.project_id,
@@ -829,9 +852,23 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
                     pending.created_at,
                     match pending.state {
                         PendingState::MakingCopy => "making_copy",
-                        PendingState::Composer => "composer",
+                        PendingState::Draft => "draft",
+                        PendingState::Sent => "sent",
                     },
+                    pending.rift_id,
                 ],
+            );
+            let _ = done.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+            result?;
+        }
+        Write::PendingId {
+            thread_id,
+            rift_id,
+            done,
+        } => {
+            let result = connection.execute(
+                "UPDATE pending_copies SET rift_id = ?2 WHERE thread_id = ?1",
+                params![thread_id, rift_id],
             );
             let _ = done.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
             result?;

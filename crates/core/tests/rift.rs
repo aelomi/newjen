@@ -241,7 +241,7 @@ fn a_failing_hook_leaves_no_copy_and_its_output_is_in_the_error() {
     write(
         &project,
         ".rift.toml",
-        "version = 1\n\n[[hooks.postcreate]]\nrun = \"echo installing deps; exit 3\"\n",
+        "version = 1\n\n[[hooks.postcreate]]\nrun = \"echo installing deps; echo rift directory already exists: hook >&2; exit 3\"\n",
     );
 
     let mut seen = Vec::new();
@@ -341,8 +341,8 @@ fn a_copy_already_at_the_path_is_reported_with_its_id() {
 }
 
 #[test]
-fn review_remove_replacement() {
-    let lab = lab().expect("real tools required");
+fn removal_preserves_a_copy_with_a_different_rift_id() {
+    let Some(lab) = lab() else { return };
     let project = lab.jj_repo("replacement");
     let old = lab.create(&project, "same-name");
     rift::remove(&lab.tools, &old.path, &old.rift_id).unwrap();
@@ -360,8 +360,8 @@ fn review_remove_replacement() {
 }
 
 #[test]
-fn review_symlink_trash() {
-    let lab = lab().expect("real tools required");
+fn cleanup_preserves_a_symlink_trash_directory() {
+    let Some(lab) = lab() else { return };
     let parent = lab.folder("copies");
     let unrelated = lab.folder("unrelated");
     write(
@@ -382,23 +382,24 @@ fn review_symlink_trash() {
 }
 
 #[test]
-fn review_retry_unowned_copy() {
+fn a_retry_uses_a_fresh_name_after_a_destination_conflict() {
     use newjen_core::{
         session::SessionConfig,
         store::Store,
         thread::{Sent, Thread, WorksIn},
     };
-    let lab = lab().expect("real tools required");
+    let Some(lab) = lab() else { return };
     let project = lab.jj_repo("retry");
     let store = Store::open_in(&lab.folder("db")).unwrap();
     let project = store.open_project(&project).unwrap();
     let mut thread = Thread::new_draft(store.clone(), &project, SessionConfig::new(&project.path));
     thread.set_works_in(WorksIn::RiftCopy).unwrap();
-    let name = format!("newjen-{}", &thread.id()[..8]);
     let Sent::MakingCopy(job) = thread.send("hello").unwrap() else {
         panic!()
     };
-    let unrelated = lab.create(&project.path, &name);
+    let pending = store.pending_copies(project.id).unwrap();
+    let name = pending[0].path.file_name().unwrap().to_str().unwrap();
+    let unrelated = lab.create(&project.path, name);
     write(&unrelated.path, "valuable.txt", "external copy work");
     let result = job.run(&lab.tools, |_| {});
     println!(
@@ -412,11 +413,23 @@ fn review_retry_unowned_copy() {
     );
     assert!(matches!(&result, Err(CopyError::Exists { .. })));
     assert_eq!(thread.finish_copy(result).unwrap_err().message, "hello");
-    let refused = thread.send("retry").unwrap_err();
-    assert!(matches!(
-        refused.downcast_ref::<CopyError>(),
-        Some(CopyError::Exists { .. })
-    ));
+    let Sent::MakingCopy(retry) = thread.send("retry").unwrap() else {
+        panic!()
+    };
+    let retried = retry.run(&lab.tools, |_| {}).unwrap();
+    assert_ne!(retried.path, unrelated.path);
+    rift::remove(&lab.tools, &retried.path, &retried.rift_id).unwrap();
+    assert_eq!(
+        thread
+            .finish_copy(Err(CopyError::Failed {
+                command: "test".into(),
+                detail: "test".into(),
+                output: vec![]
+            }))
+            .unwrap_err()
+            .message,
+        "retry"
+    );
     assert!(store.flush(std::time::Duration::from_secs(5)));
     assert!(store.pending_copies(project.id).unwrap().is_empty());
     assert_eq!(read(&unrelated.path, "valuable.txt"), "external copy work");
@@ -437,12 +450,12 @@ fn cleanup_refuses_a_symlink_trash_entry() {
 }
 
 #[test]
-fn removal_leaves_an_unmarked_replacement_folder_untouched() {
+fn removal_deletes_an_unmarked_owned_folder() {
     let Some(lab) = lab() else { return };
-    let folder = lab.folder("replacement-folder");
-    write(&folder, "work.txt", "keep this");
+    let folder = lab.folder("owned-folder");
+    write(&folder, "work.txt", "owned work");
     rift::remove(&lab.tools, &folder, "abc123").unwrap();
-    assert_eq!(read(&folder, "work.txt"), "keep this");
+    assert!(!folder.exists());
 }
 
 #[test]
@@ -479,7 +492,55 @@ fn pending_cleanup_finishes_only_its_own_trash_entry() {
     let trash = own.path.parent().unwrap().join(".trash");
     let others_entry = trash.join(format!("{}-other", other.rift_id));
     assert!(!rift::pending_is_gone(&own.path));
-    rift::remove_pending(&lab.tools, &own.path).unwrap();
+    rift::remove_pending(&lab.tools, &own.path, Some(&own.rift_id)).unwrap();
     assert!(rift::pending_is_gone(&own.path));
     assert!(others_entry.exists());
+}
+
+#[test]
+fn a_refused_create_preserves_a_copy_that_appeared_after_the_check() {
+    let Some(lab) = lab() else { return };
+    let project = lab.jj_repo("create-race");
+    let mut external = None;
+    let result = rift::create(&lab.tools, &project, "newjen-race", |progress| {
+        if progress == rift::Progress::MainRepoReady {
+            let copy = lab.create(&project, "newjen-race");
+            write(&copy.path, "valuable.txt", "external work");
+            external = Some(copy);
+        }
+    });
+    let external = external.unwrap();
+    assert!(matches!(result, Err(CopyError::Exists { .. })));
+    assert!(
+        external.path.join("valuable.txt").exists(),
+        "failed create deleted an external copy created after the destination check"
+    );
+}
+
+#[test]
+fn a_missing_marker_does_not_leave_an_archived_copy_on_disk() {
+    let Some(lab) = lab() else { return };
+    let project = lab.folder("missing-marker");
+    let copy = lab.create(&project, "newjen-marker");
+    std::fs::remove_file(copy.path.join(".rift")).unwrap();
+    rift::remove(&lab.tools, &copy.path, &copy.rift_id).unwrap();
+    assert!(!copy.path.exists());
+}
+
+#[test]
+fn a_replacement_does_not_prevent_removing_our_own_trash() {
+    let Some(lab) = lab() else { return };
+    let project = lab.folder("replacement-trash");
+    let own = lab.create(&project, "newjen-trash");
+    lab.rift(&project, &["remove", own.path.to_str().unwrap()]);
+    let entry = own
+        .path
+        .parent()
+        .unwrap()
+        .join(".trash")
+        .join(format!("{}-newjen-trash", own.rift_id));
+    let other = lab.create(&project, "newjen-trash");
+    rift::remove(&lab.tools, &own.path, &own.rift_id).unwrap();
+    assert!(other.path.exists());
+    assert!(!entry.exists());
 }

@@ -194,14 +194,18 @@ pub fn check_destination(path: &Path) -> Result<(), CopyError> {
     Ok(())
 }
 
-pub fn remove_pending(tools: &Tools, path: &Path) -> Result<(), CopyError> {
+pub fn remove_pending(tools: &Tools, path: &Path, rift_id: Option<&str>) -> Result<(), CopyError> {
+    if let Some(id) = rift_id {
+        return remove(tools, path, id);
+    }
     let parent = path
         .parent()
         .ok_or_else(|| failure("rift remove", "missing parent".to_string()))?;
     if path.symlink_metadata().is_ok() {
         check_directory(path, parent)?;
-        if let Some(id) = read_id(path) {
-            remove(tools, path, &id)?;
+        match read_id(path) {
+            Some(id) => remove(tools, path, &id)?,
+            None => delete_directory(path)?,
         }
     }
     for entry in pending_trash(path)? {
@@ -257,6 +261,24 @@ pub fn create(
     name: &str,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<Copy, CopyError> {
+    create_controlled(
+        tools,
+        project_dir,
+        name,
+        &CopyControl::default(),
+        |_| Ok(()),
+        &mut on_progress,
+    )
+}
+
+pub(crate) fn create_controlled(
+    tools: &Tools,
+    project_dir: &Path,
+    name: &str,
+    control: &CopyControl,
+    mut on_created: impl FnMut(&str) -> Result<(), CopyError>,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<Copy, CopyError> {
     let project = std::fs::canonicalize(project_dir)
         .map_err(|error| failure("rift create", format!("{}: {error}", project_dir.display())))?;
     let (root, jj) = project_root(&project);
@@ -296,7 +318,7 @@ pub fn create(
         None
     };
     on_progress(Progress::MainRepoReady);
-    let created = run(
+    let created = run_controlled(
         tools,
         &tools.rift,
         &[
@@ -310,10 +332,18 @@ pub fn create(
         ],
         &root,
         |line| on_progress(Progress::Line(line.to_string())),
+        Some(control),
     );
     if let Err(error) = created {
+        if matches!(&error, CopyError::Failed { detail, .. } if detail.starts_with("rift directory already exists:"))
+        {
+            return Err(CopyError::Exists {
+                path: path.clone(),
+                rift_id: read_id(&path),
+            });
+        }
         if path.exists() {
-            return Err(remove_after(tools, &path, error));
+            return Err(remove_after(tools, &path, None, error));
         }
         return Err(match error {
             CopyError::Failed { detail, .. }
@@ -325,9 +355,12 @@ pub fn create(
         });
     }
 
-    let finish = || -> Result<Copy, CopyError> {
-        let rift_id = read_id(&path)
+    let rift_id = read_id(&path);
+    let mut finish = || -> Result<Copy, CopyError> {
+        let rift_id = rift_id
+            .clone()
             .ok_or_else(|| failure("rift create", format!("{} has no Rift id", path.display())))?;
+        on_created(&rift_id)?;
         if let Some(base) = &base {
             run(
                 tools,
@@ -345,7 +378,7 @@ pub fn create(
             base: base.clone(),
         })
     };
-    finish().map_err(|error| remove_after(tools, &path, error))
+    finish().map_err(|error| remove_after(tools, &path, rift_id.as_deref(), error))
 }
 
 /// Removes the copy at `path` whose Rift id is `rift_id` (see the module docs). Nothing to do
@@ -368,28 +401,35 @@ pub fn remove(tools: &Tools, path: &Path, rift_id: &str) -> Result<(), CopyError
         .join(format!("{rift_id}-{}", name.to_string_lossy()));
     if path.symlink_metadata().is_ok() {
         check_directory(path, parent)?;
-        if read_id(path).as_deref() != Some(rift_id) {
-            return Ok(());
+        match read_id(path) {
+            None => delete_directory(path)?,
+            Some(id) if id == rift_id => {
+                check_trash(parent, &entry)?;
+                run(
+                    tools,
+                    &tools.rift,
+                    &[OsStr::new("remove"), path.as_os_str()],
+                    parent,
+                    |_| {},
+                )?;
+            }
+            Some(_) => {}
         }
-        check_trash(parent, &entry)?;
-        run(
-            tools,
-            &tools.rift,
-            &[OsStr::new("remove"), path.as_os_str()],
-            parent,
-            |_| {},
-        )?;
     }
     check_trash(parent, &entry)?;
     if entry.symlink_metadata().is_ok() && read_id(&entry).as_deref() == Some(rift_id) {
-        std::fs::remove_dir_all(&entry).map_err(|error| {
-            failure(
-                "rift remove",
-                format!("could not delete {}: {error}", entry.display()),
-            )
-        })?;
+        delete_directory(&entry)?;
     }
     Ok(())
+}
+
+fn delete_directory(path: &Path) -> Result<(), CopyError> {
+    std::fs::remove_dir_all(path).map_err(|error| {
+        failure(
+            "rift remove",
+            format!("could not delete {}: {error}", path.display()),
+        )
+    })
 }
 
 fn check_trash(parent: &Path, entry: &Path) -> Result<(), CopyError> {
@@ -493,14 +533,8 @@ fn read_id(copy: &Path) -> Option<String> {
 }
 
 /// `error`, after removing the half-made copy at `path`. If that fails too, the error says so.
-fn remove_after(tools: &Tools, path: &Path, error: CopyError) -> CopyError {
-    let removed = match read_id(path) {
-        Some(rift_id) => remove(tools, path, &rift_id),
-        None => Err(failure(
-            "rift remove",
-            format!("{} has no Rift id", path.display()),
-        )),
-    };
+fn remove_after(tools: &Tools, path: &Path, rift_id: Option<&str>, error: CopyError) -> CopyError {
+    let removed = remove_pending(tools, path, rift_id);
     match (error, removed) {
         (error, Ok(())) => error,
         (
@@ -527,6 +561,46 @@ fn failure(command: &str, detail: String) -> CopyError {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CopyControl(std::sync::Arc<std::sync::Mutex<CopyProcess>>);
+
+#[derive(Debug, Default)]
+enum CopyProcess {
+    #[default]
+    Waiting,
+    Running(u32),
+    Cancelled,
+}
+
+impl CopyControl {
+    pub(crate) fn cancel(&self) -> Option<thread::JoinHandle<()>> {
+        let previous = std::mem::replace(
+            &mut *self.0.lock().expect("copy process"),
+            CopyProcess::Cancelled,
+        );
+        if let CopyProcess::Running(pid) = previous {
+            Some(thread::spawn(move || stop_group(pid)))
+        } else {
+            None
+        }
+    }
+}
+
+fn stop_group(pid: u32) {
+    if let Ok(group) = libc::pid_t::try_from(pid) {
+        // SAFETY: the child started as the leader of this process group.
+        unsafe {
+            libc::killpg(group, libc::SIGTERM);
+        }
+        thread::sleep(Duration::from_millis(150));
+        // SAFETY: finish stopping hooks that ignored SIGTERM.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+        crate::orphans::unregister(pid);
+    }
+}
+
 /// One line a tool printed.
 enum Printed {
     Out(String),
@@ -541,6 +615,17 @@ fn run(
     args: &[&OsStr],
     cwd: &Path,
     mut on_line: impl FnMut(&str),
+) -> Result<String, CopyError> {
+    run_controlled(tools, program, args, cwd, &mut on_line, None)
+}
+
+fn run_controlled(
+    tools: &Tools,
+    program: &Path,
+    args: &[&OsStr],
+    cwd: &Path,
+    mut on_line: impl FnMut(&str),
+    control: Option<&CopyControl>,
 ) -> Result<String, CopyError> {
     let program_name = program
         .file_name()
@@ -560,10 +645,26 @@ fn run(
     for (name, value) in &tools.env {
         command.env(name, value);
     }
+    use std::os::unix::process::CommandExt;
+    let mut process = control.map(|control| control.0.lock().expect("copy process"));
+    if matches!(process.as_deref(), Some(CopyProcess::Cancelled)) {
+        return Err(failure(
+            &command_text,
+            "Newjen stopped making the copy".to_string(),
+        ));
+    }
+    if control.is_some() {
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
         .map_err(|error| failure(&command_text, format!("could not run it: {error}")))?;
 
+    if let Some(process) = process.as_deref_mut() {
+        *process = CopyProcess::Running(child.id());
+        let _ = crate::orphans::register(child.id());
+    }
+    drop(process);
     let (lines, printed) = mpsc::channel();
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
@@ -613,6 +714,13 @@ fn run(
     }
     .map_err(|error| failure(&command_text, error.to_string()))?;
 
+    if let Some(control) = control {
+        let mut process = control.0.lock().expect("copy process");
+        if matches!(*process, CopyProcess::Running(_)) {
+            stop_group(child.id());
+            *process = CopyProcess::Waiting;
+        }
+    }
     if status.success() {
         return Ok(stdout.trim().to_string());
     }

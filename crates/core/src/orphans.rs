@@ -1,4 +1,4 @@
-//! A small registry of the `claude` processes Newjen started, so that processes left behind by
+//! A small registry of the `claude` and Rift copy processes Newjen started, so that processes left behind by
 //! a crashed Newjen can be cleaned up the next time it starts.
 //!
 //! Each running child gets a file in [`registry_dir`] named after the child's pid. The file
@@ -29,7 +29,7 @@ pub fn unregister(child_pid: u32) {
     unregister_in(&registry_dir(), child_pid);
 }
 
-/// Kills `claude` processes left over from a Newjen that is no longer running, and removes
+/// Kills child process groups left over from a Newjen that is no longer running, and removes
 /// stale records. Returns the pids it killed. Call once at app start.
 pub fn reap() -> Vec<u32> {
     reap_in(&registry_dir())
@@ -163,7 +163,7 @@ fn missing_process(pid: u32) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("process {pid} not found"))
 }
 
-/// Terminates the process group led by `pid` (claude and the tools it started).
+/// Terminates the process group led by `pid`.
 fn kill_group(pid: u32) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return;

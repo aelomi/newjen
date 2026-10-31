@@ -160,6 +160,7 @@ pub struct Thread {
     /// Whether this is the thread on screen (see [`Thread::set_active`]).
     active: bool,
     stage: Stage,
+    copy_job: Option<rift::CopyControl>,
     created_at: i64,
     updated_at: i64,
     /// The last time anything happened (an event, a message, an answer), for idle shutdown.
@@ -206,6 +207,7 @@ pub enum WorksIn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preparing {
     message: String,
+    path: PathBuf,
     started_at: Instant,
     last_line: Option<String>,
     main_repo: MainRepoStep,
@@ -250,6 +252,9 @@ pub enum Sent {
 pub struct CopyJob {
     project_dir: PathBuf,
     name: String,
+    control: rift::CopyControl,
+    thread_id: String,
+    store: Store,
 }
 
 impl std::fmt::Debug for CopyJob {
@@ -269,8 +274,30 @@ impl CopyJob {
         tools: &Tools,
         on_progress: impl FnMut(rift::Progress),
     ) -> Result<rift::Copy, CopyError> {
-        rift::create(tools, &self.project_dir, &self.name, on_progress)
+        rift::create_controlled(
+            tools,
+            &self.project_dir,
+            &self.name,
+            &self.control,
+            |id| {
+                self.store
+                    .save_pending_id(&self.thread_id, id)
+                    .map_err(|error| CopyError::Failed {
+                        command: "save Rift id".to_string(),
+                        detail: error.to_string(),
+                        output: Vec::new(),
+                    })
+            },
+            on_progress,
+        )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyRecovery {
+    Draft,
+    Kept(PathBuf),
+    Saved,
 }
 
 /// A first message that could not be sent, back for the composer, and why.
@@ -379,6 +406,7 @@ impl Thread {
             unread: false,
             active: false,
             stage: Stage::Draft,
+            copy_job: None,
             created_at: now,
             updated_at: now,
             last_activity: Instant::now(),
@@ -476,21 +504,42 @@ impl Thread {
         project: &Project,
         pending: &PendingCopy,
         tools: &Tools,
-    ) -> Result<()> {
-        let expected = rift::destination(&project.path, &copy_name(&pending.thread_id))?;
-        if pending.project_id != project.id || pending.path != expected {
+    ) -> Result<CopyRecovery> {
+        let name = pending
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let prefix = format!("{}-", copy_prefix(&pending.thread_id));
+        let suffix = name.strip_prefix(&prefix).unwrap_or("");
+        let expected = rift::destination(&project.path, name)?;
+        if pending.project_id != project.id
+            || pending.path != expected
+            || suffix.len() != 6
+            || !suffix
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
             bail!("the pending Rift copy is outside its destination");
         }
+        if pending.state == PendingState::Sent {
+            let owner = store.copy_owner(&pending.path)?;
+            store.delete_pending_copy(&pending.thread_id);
+            if owner.as_deref() != Some(pending.thread_id.as_str()) {
+                return Ok(CopyRecovery::Kept(pending.path.clone()));
+            }
+            return Ok(CopyRecovery::Saved);
+        }
         if pending.state == PendingState::MakingCopy {
-            rift::remove_pending(tools, &pending.path)?;
+            rift::remove_pending(tools, &pending.path, pending.rift_id.as_deref())?;
             let mut recovered = pending.clone();
-            recovered.state = PendingState::Composer;
+            recovered.state = PendingState::Draft;
             store.save_pending_copy(recovered)?;
         }
         if pending.intent == PendingIntent::Discard {
             store.delete_pending_copy(&pending.thread_id);
         }
-        Ok(())
+        Ok(CopyRecovery::Draft)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -693,19 +742,24 @@ impl Thread {
             bail!("Claude is still working on the last message");
         }
         if self.place == Place::NewCopy {
-            let path = rift::destination(&self.project_dir, &copy_name(&self.id))?;
+            let name = copy_name(&self.id);
+            let path = rift::destination(&self.project_dir, &name)?;
             rift::check_destination(&path)?;
             self.store.save_pending_copy(PendingCopy {
                 thread_id: self.id.clone(),
                 project_id: self.project_id,
-                path,
+                path: path.clone(),
                 intent: PendingIntent::Restore(text.to_string()),
                 state: PendingState::MakingCopy,
+                rift_id: None,
                 created_at: self.created_at,
             })?;
+            let control = rift::CopyControl::default();
+            self.copy_job = Some(control.clone());
             self.title = title_from_message(text);
             self.stage = Stage::Preparing(Preparing {
                 message: text.to_string(),
+                path,
                 started_at: Instant::now(),
                 last_line: None,
                 main_repo: MainRepoStep::Snapshotting,
@@ -713,20 +767,11 @@ impl Thread {
             self.last_activity = Instant::now();
             return Ok(Sent::MakingCopy(CopyJob {
                 project_dir: self.project_dir.clone(),
-                name: copy_name(&self.id),
-            }));
-        }
-        if self.is_draft()
-            && let Some(copy) = self.copy()
-        {
-            self.store.save_pending_copy(PendingCopy {
+                name,
+                control,
                 thread_id: self.id.clone(),
-                project_id: self.project_id,
-                path: copy.path.clone(),
-                intent: PendingIntent::Restore(text.to_string()),
-                state: PendingState::MakingCopy,
-                created_at: self.created_at,
-            })?;
+                store: self.store.clone(),
+            }));
         }
         self.deliver(text)?;
         Ok(Sent::Started)
@@ -766,13 +811,12 @@ impl Thread {
         };
         let message = preparing.message;
         if made.is_err() {
-            let path = rift::destination(&self.project_dir, &copy_name(&self.id));
-            if matches!(&made, Err(CopyError::Exists { .. }))
-                || path.is_ok_and(|path| rift::pending_is_gone(&path))
-            {
+            let path = preparing.path;
+            if matches!(&made, Err(CopyError::Exists { .. })) || rift::pending_is_gone(&path) {
                 self.store.delete_pending_copy(&self.id);
             }
         }
+        self.copy_job = None;
         let sent = made.map_err(anyhow::Error::from).and_then(|copy| {
             self.end_session();
             self.cwd = copy.workdir.clone();
@@ -792,8 +836,22 @@ impl Thread {
 
     /// The part of [`Thread::send`] that writes the message to claude.
     fn deliver(&mut self, text: &str) -> Result<()> {
+        self.save_draft(text)?;
         if self.session.is_none() {
             self.spawn()?;
+        }
+        if self.is_draft()
+            && let Some(copy) = self.copy()
+        {
+            self.store.save_pending_copy(PendingCopy {
+                thread_id: self.id.clone(),
+                project_id: self.project_id,
+                path: copy.path.clone(),
+                rift_id: Some(copy.rift_id.clone()),
+                intent: PendingIntent::Restore(text.to_string()),
+                state: PendingState::Sent,
+                created_at: self.created_at,
+            })?;
         }
         let session = self.session.as_ref().expect("started above");
         if let Err(error) = session.send_prompt(text) {
@@ -995,10 +1053,35 @@ impl Thread {
         finish_quit(&self.store, [quitting]);
     }
 
+    pub fn save_draft(&self, message: &str) -> Result<()> {
+        if !self.is_draft() {
+            return Ok(());
+        }
+        if let Some(mut pending) = self
+            .store
+            .pending_copies(self.project_id)?
+            .into_iter()
+            .find(|pending| pending.thread_id == self.id)
+        {
+            pending.intent = if message.trim().is_empty() {
+                PendingIntent::Discard
+            } else {
+                PendingIntent::Restore(message.to_string())
+            };
+            self.store.save_pending_copy(pending)?;
+        }
+        Ok(())
+    }
+
     /// The first half of [`Thread::shutdown_for_quit`]: settles and saves the thread and
     /// starts stopping its `claude`, without waiting for either. Pass what it returns for
     /// every thread to one [`finish_quit`] call.
     pub fn begin_quit(&mut self) -> Quitting {
+        if let Some(control) = self.copy_job.take()
+            && let Some(stopping) = control.cancel()
+        {
+            self.stopping.push(stopping);
+        }
         if self.preparing().is_some() {
             self.stage = Stage::Draft;
         }
@@ -1427,14 +1510,24 @@ fn is_checkpoint(event: &SessionEvent) -> bool {
     }
 }
 
-/// The name of a thread's Rift copy: `newjen-` and the start of the thread's id.
-fn copy_name(thread_id: &str) -> String {
+/// The prefix shared by a thread's copy attempts.
+fn copy_prefix(thread_id: &str) -> String {
     let short: String = thread_id
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .take(8)
         .collect();
     format!("newjen-{short}")
+}
+
+fn copy_name(thread_id: &str) -> String {
+    let suffix: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(6)
+        .collect();
+    format!("{}-{suffix}", copy_prefix(thread_id))
 }
 
 /// A new random id (a v4 UUID), for threads and Claude conversations.
