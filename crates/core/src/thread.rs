@@ -830,10 +830,12 @@ impl Thread {
     /// On an error nothing was sent, so the app can keep the text in the composer and show why
     /// (for example claude could not be started).
     pub fn send(&mut self, text: &str) -> Result<Sent> {
-        if let Some(reset) = self.paused_until(crate::store::now_ms() / 1000) {
+        let now = crate::store::now_ms() / 1000;
+        if let Some(reset) = self.paused_until(now) {
             bail!(
-                "{} usage limit reached; sending is paused until Unix time {reset}. Newjen won't retry or resume on its own",
-                self.presentation().label
+                "{} usage limit reached; sending is paused until {}. Newjen won't retry or resume on its own",
+                self.presentation().label,
+                crate::picker::reset_time(reset, now)
             );
         }
 

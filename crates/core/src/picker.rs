@@ -173,6 +173,25 @@ mod tests {
         }
     }
     #[test]
+    fn only_actionable_warnings_turn_the_tab_amber() {
+        let mut status = status();
+        let Availability::Ready { warnings, .. } = &mut status.availability else {
+            unreachable!()
+        };
+        warnings.extend([
+            Warning::ClaudeCapabilitiesUnverified,
+            Warning::RateLimitsUnavailable,
+        ]);
+        assert_eq!(account_view(&status).health, Health::Ready);
+        let Availability::Ready { warnings, .. } = &mut status.availability else {
+            unreachable!()
+        };
+        warnings.push(Warning::ApiKeyEnvironment {
+            variable: "OPENAI_API_KEY",
+        });
+        assert_eq!(account_view(&status).health, Health::Warning);
+    }
+    #[test]
     fn labels_and_rows_follow_the_cli_catalog() {
         let status = status();
         let mut config = AgentConfig::cli_default(status.provider);
@@ -274,11 +293,7 @@ pub fn account_view(status: &ProviderStatus) -> AccountView {
             warnings,
             ..
         } => {
-            view.health = if warnings.is_empty() {
-                Health::Ready
-            } else {
-                Health::Warning
-            };
+            view.health = Health::Ready;
             view.version = Some(version.clone());
             view.email = account.email.clone();
             view.api_billing = account.billing == Billing::ApiKey
@@ -327,6 +342,8 @@ pub fn account_view(status: &ProviderStatus) -> AccountView {
                     detail.push_str(&format!(" Weekly {}% used.", weekly.used_percent));
                 }
                 view.callouts.push(detail);
+            }
+            if !view.callouts.is_empty() {
                 view.health = Health::Warning;
             }
         }
