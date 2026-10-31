@@ -30,7 +30,7 @@ use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Side, WindowExt as _};
 use newjen_core::rift::{self, CopyError, Tools};
-use newjen_core::store::{PendingCopy, PendingIntent, now_ms};
+use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
 use newjen_core::transcript::display_name;
 use newjen_core::{
@@ -95,9 +95,12 @@ enum NoticeKind {
     /// Try again starts a fresh `claude`.
     Error,
     /// Try again sends the composer's text again: the message went back there.
-    CopyFailed { output: Vec<String> },
+    CopyFailed {
+        output: Vec<String>,
+    },
     /// Nothing failed and nothing was sent, so no Try again.
     Held,
+    Snapshot,
 }
 
 impl Notice {
@@ -331,12 +334,23 @@ impl ChatView {
             let recovered = cleanup.await;
             let _ = view.update_in(cx, |view, window, cx| {
                 for (pending, result) in recovered {
-                    if let Err(error) = result {
-                        view.save_problem = Some(format!(
-                            "Couldn't remove the unfinished Rift copy: {error:#}"
-                        ));
+                    match result {
+                        Ok(thread::CopyRecovery::Kept(path)) => {
+                            view.save_problem = Some(format!(
+                                "Newjen kept the Rift copy at {}: its thread couldn't be saved.",
+                                path.display()
+                            ));
+                        }
+                        Err(error) => {
+                            view.save_problem = Some(format!(
+                                "Couldn't remove the unfinished Rift copy: {error:#}"
+                            ))
+                        }
+                        _ => {}
                     }
-                    view.restore_pending_draft(pending, window, cx);
+                    if pending.state != PendingState::Sent {
+                        view.restore_pending_draft(pending, window, cx);
+                    }
                 }
             });
         })
@@ -363,10 +377,12 @@ impl ChatView {
         self.show(0, window, cx);
         let field = self.ensure_field(window, cx);
         field.update(cx, |field, cx| field.set_value(message.clone(), window, cx));
-        self.slots[0].notice = Some(Notice::held(
-            "Newjen quit while making a Rift copy. Your message is back.",
-            String::new(),
-        ));
+        if pending.state == PendingState::MakingCopy {
+            self.slots[0].notice = Some(Notice::held(
+                "Newjen quit while making a Rift copy. Your message is back.",
+                String::new(),
+            ));
+        }
         cx.notify();
     }
 
@@ -397,6 +413,11 @@ impl ChatView {
     /// `claude`, all at once (see `newjen_core::thread::finish_quit`). GPUI gives the whole app
     /// about 200 ms; this takes about as long as the slowest `claude` takes to stop.
     pub fn quit(&mut self, cx: &mut Context<Self>) {
+        for (ix, slot) in self.slots.iter().enumerate() {
+            if let Err(error) = slot.thread.read(cx).save_draft(&self.composer_text(ix, cx)) {
+                self.save_problem = Some(format!("Couldn't save the draft: {error:#}"));
+            }
+        }
         let quitting: Vec<Quitting> = self
             .slots
             .iter()
@@ -459,6 +480,20 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .slots
+            .iter()
+            .any(|slot| slot.thread.read(cx).blocks_project_send())
+        {
+            for slot in &mut self.slots {
+                if matches!(
+                    slot.notice.as_ref().map(|notice| &notice.kind),
+                    Some(NoticeKind::Snapshot)
+                ) {
+                    slot.notice = None;
+                }
+            }
+        }
         if let Some(ix) = self.slots.iter().position(|slot| slot.thread == *thread) {
             self.sync_replies(ix, cx);
         }
@@ -909,13 +944,14 @@ impl ChatView {
                 .map(|slot| slot.thread.read(cx))
                 .find(|other| other.blocks_project_send())
             {
-                return Some(Notice::held(
-                    "Wait a moment",
-                    format!(
-                        "Wait a moment: Newjen is taking a jj snapshot of the project for “{}”'s Rift copy.",
+                return Some(Notice {
+                    kind: NoticeKind::Snapshot,
+                    title: "Wait a moment".to_string(),
+                    detail: format!(
+                        "Newjen is taking a jj snapshot of the project to make the Rift copy for “{}”.",
                         blocker.title()
                     ),
-                ));
+                });
             }
             return None;
         }
@@ -1341,7 +1377,7 @@ impl ChatView {
                     cx,
                 ),
                 Some(Notice {
-                    kind: NoticeKind::Held,
+                    kind: NoticeKind::Held | NoticeKind::Snapshot,
                     title,
                     detail,
                 }) => rows::held("notice".into(), title, detail, cx),

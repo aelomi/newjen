@@ -788,7 +788,7 @@ async fn a_project_folder_thread_archives_without_asking(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn review_project_send_must_wait_for_preparing_copy(cx: &mut TestAppContext) {
+fn project_send_must_wait_for_preparing_copy(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "review-reverse-exclusion", true);
     let copying = cx.update(|_, cx| chat.read(cx).thread().clone());
     let job = cx.update(|_, cx| {
@@ -829,7 +829,7 @@ fn review_project_send_must_wait_for_preparing_copy(cx: &mut TestAppContext) {
             .unwrap()
             .detail
             .clone()),
-        "Wait a moment: Newjen is taking a jj snapshot of the project for “copy work”'s Rift copy."
+        "Newjen is taking a jj snapshot of the project to make the Rift copy for “copy work”."
     );
     cx.update(|_, cx| {
         copying.update(cx, |thread, _| {
@@ -947,4 +947,125 @@ async fn a_copy_completion_after_archive_is_removed_by_the_app(cx: &mut TestAppC
     assert!(!copy.path.exists());
     assert!(!cx.update(|_, cx| thread.read(cx).has_session()));
     finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn the_snapshot_notice_clears_when_the_guard_releases(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "snapshot-release", true);
+    let copying = cx.update(|_, cx| chat.read(cx).thread().clone());
+    let job = cx.update(|_, cx| {
+        copying.update(cx, |thread, cx| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            let Sent::MakingCopy(job) = thread.send("copy work").unwrap() else {
+                panic!()
+            };
+            cx.notify();
+            job
+        })
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-n");
+    cx.simulate_input("edit project");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(notice_title(&chat, cx).as_deref(), Some("Wait a moment"));
+    cx.update(|_, cx| {
+        copying.update(cx, |thread, cx| {
+            thread.note_copy_progress(rift::Progress::MainRepoReady);
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| copying.read(cx).blocks_project_send()));
+    assert_eq!(notice_title(&chat, cx), None);
+    drop(job);
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn an_emptied_recovered_draft_is_discarded_on_quit(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "recover-twice", true, Some(CREATE_COPY));
+    let (job, tools) = cx.update(|_, cx| {
+        let view = chat.read(cx);
+        let tools = view.tools.clone();
+        let thread = view.thread().clone();
+        let job = thread.update(cx, |thread, _| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            let Sent::MakingCopy(job) = thread.send("my first message").unwrap() else {
+                panic!()
+            };
+            job
+        });
+        (job, tools)
+    });
+    let _copy = job.run(&tools, |_| {}).unwrap();
+    let startup = |view: &ChatView| Startup {
+        store: view.store.clone(),
+        project: view.project.clone(),
+        base_config: view.base_config.clone(),
+        threads: vec![],
+        problem: None,
+        home: None,
+        tools: view.tools.clone(),
+    };
+    let s1 = cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.quit(cx);
+            startup(view)
+        })
+    });
+    let second = cx.update(|window, cx| cx.new(|cx| ChatView::new(s1, window, cx)));
+    for _ in 0..300 {
+        if cx.update(|_, cx| second.read(cx).composer_text(0, cx) == "my first message") {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        cx.update(|_, cx| second.read(cx).composer_text(0, cx)),
+        "my first message"
+    );
+    let restored = cx.update(|_, cx| {
+        second.update(cx, |view, cx| {
+            view.quit(cx);
+            startup(view)
+        })
+    });
+    let second = cx.update(|window, cx| cx.new(|cx| ChatView::new(restored, window, cx)));
+    for _ in 0..300 {
+        if cx.update(|_, cx| second.read(cx).composer_text(0, cx) == "my first message") {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        cx.update(|_, cx| second.read(cx).composer_text(0, cx)),
+        "my first message"
+    );
+    assert_eq!(notice_title(&second, cx), None);
+    cx.update(|window, cx| {
+        second.update(cx, |view, cx| {
+            let field = view.ensure_field(window, cx);
+            field.update(cx, |field, cx| field.set_value("", window, cx));
+        })
+    });
+    let s2 = cx.update(|_, cx| {
+        second.update(cx, |view, cx| {
+            view.quit(cx);
+            startup(view)
+        })
+    });
+    let third = cx.update(|window, cx| cx.new(|cx| ChatView::new(s2, window, cx)));
+    for _ in 0..100 {
+        cx.background_executor
+            .timer(Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    assert_eq!(cx.update(|_, cx| third.read(cx).composer_text(0, cx)), "");
+    assert_eq!(notice_title(&third, cx), None);
+    finish(&third, path, cx);
 }

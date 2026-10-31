@@ -306,11 +306,12 @@ pub fn error(
 }
 
 pub fn held(id: ElementId, title: &str, detail: &str, cx: &App) -> AnyElement {
-    ui::assistant(
-        gpui_kit::component::alert::Alert::info(id, detail.to_string()).title(title.to_string()),
-        cx,
-    )
-    .into_any_element()
+    let alert = if detail.is_empty() {
+        gpui_kit::component::alert::Alert::info(id, title.to_string())
+    } else {
+        gpui_kit::component::alert::Alert::info(id, detail.to_string()).title(title.to_string())
+    };
+    ui::assistant(alert, cx).into_any_element()
 }
 
 pub fn making_copy(took: &str, last_line: Option<&str>, cx: &App) -> AnyElement {
@@ -424,6 +425,56 @@ pub fn step_state(state: ToolState) -> StepState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoticeExample;
+
+    impl gpui::Render for NoticeExample {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            v_flex()
+                .w(px(600.))
+                .child(
+                    div()
+                        .debug_selector(|| "title-only".to_string())
+                        .child(held(
+                            "title-only-alert".into(),
+                            "Your message is back.",
+                            "",
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "one-line".to_string())
+                        .child(ui::assistant(
+                            gpui_kit::component::alert::Alert::info(
+                                "one-line-alert",
+                                "Your message is back.",
+                            ),
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "with-detail".to_string())
+                        .child(held(
+                            "detail-alert".into(),
+                            "Your message is back.",
+                            "You can send it when you are ready.",
+                            cx,
+                        )),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn a_title_only_notice_has_no_empty_detail_line(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|_, _| NoticeExample);
+        cx.refresh().unwrap();
+        let height = cx.debug_bounds("title-only").unwrap().size.height;
+        assert_eq!(height, cx.debug_bounds("one-line").unwrap().size.height);
+        assert!(height < cx.debug_bounds("with-detail").unwrap().size.height);
+    }
 
     #[test]
     fn tool_states_map_to_steps() {
