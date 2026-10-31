@@ -59,7 +59,7 @@ fn drafts_use_the_detected_binary_and_codex_has_no_invented_conversation() {
     let home = tempfile::tempdir().unwrap();
     let store = Store::open_in(home.path()).unwrap();
     let project = store.open_project(home.path()).unwrap();
-    let thread = Thread::draft_with_agent(
+    let mut thread = Thread::draft_with_agent(
         store.clone(),
         &project,
         AgentConfig::cli_default(Provider::Codex),
@@ -72,6 +72,17 @@ fn drafts_use_the_detected_binary_and_codex_has_no_invented_conversation() {
         thread.session_config().program,
         std::path::Path::new("/usr/bin/false")
     );
+    thread
+        .set_agent_config(
+            AgentConfig::cli_default(Provider::Claude),
+            &detected(Provider::Claude),
+        )
+        .unwrap();
+    assert_eq!(thread.agent_config().unwrap().provider, Provider::Claude);
+    assert!(matches!(
+        thread.conversation(),
+        ConversationState::Reserved(_)
+    ));
     assert!(store.threads(project.id).unwrap().is_empty());
 }
 

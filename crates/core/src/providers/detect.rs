@@ -35,7 +35,7 @@ impl Provider {
 }
 
 impl Provider {
-    fn cli(self) -> Cli {
+    pub(crate) fn cli(self) -> Cli {
         match self {
             Self::Claude => Cli::Claude,
             Self::Codex => Cli::Codex,

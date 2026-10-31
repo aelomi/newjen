@@ -480,7 +480,7 @@ fn group_members(pid: u32) -> Vec<u32> {
 fn next_lifecycle_event(events: &async_channel::Receiver<SessionEvent>) -> SessionEvent {
     loop {
         match common::next_event(events, TIMEOUT) {
-            SessionEvent::Line(_) | SessionEvent::Stderr(_) => {}
+            SessionEvent::Line(_) | SessionEvent::Stderr(_) | SessionEvent::Batch(_) => {}
             other => return other,
         }
     }

@@ -3,12 +3,12 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentKey(pub(crate) u64);
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TextUpdate {
     Append(String),
     Replace(String),
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolDescriptor {
     pub id: String,
     pub name: String,
@@ -16,25 +16,25 @@ pub struct ToolDescriptor {
     pub summary: String,
     pub arguments: Value,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ToolOutcome {
     Completed,
     Denied,
     Failed,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TurnOutcome {
     Completed,
     Stopped,
     Failed { title: String, detail: String },
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackgroundTaskView {
     pub task_id: String,
     pub description: String,
     pub tool: Option<String>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     TurnActive,
     ToolOutput {
@@ -94,7 +94,7 @@ pub enum Checkpoint {
     Transient,
     Save,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentBatch {
     pub events: Vec<AgentEvent>,
     pub checkpoint: Checkpoint,
@@ -143,7 +143,7 @@ pub enum RememberScope {
         shown_in_detail: bool,
     },
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalKind {
     Command {
         command: Option<String>,
@@ -154,7 +154,7 @@ pub enum ApprovalKind {
     },
     OtherTool,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalView {
     pub tool: ToolDescriptor,
     pub kind: ApprovalKind,
@@ -162,7 +162,7 @@ pub struct ApprovalView {
     pub affected_path: Option<String>,
     pub remember: RememberScope,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalRequest {
     pub(crate) key: ApprovalKey,
     pub(crate) view: ApprovalView,
@@ -192,7 +192,7 @@ pub enum GrantLifetime {
     Thread,
     Process,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GrantView {
     pub id: GrantId,
     pub tool: String,

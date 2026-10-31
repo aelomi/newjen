@@ -348,6 +348,9 @@ impl Transcript {
         self.cwd = Some(cwd.into());
     }
 
+    pub(crate) fn set_presentation(&mut self, presentation: crate::agent::AgentPresentation) {
+        self.presentation = presentation;
+    }
     pub fn presentation(&self) -> &crate::agent::AgentPresentation {
         &self.presentation
     }
@@ -797,7 +800,25 @@ impl Transcript {
                             self.session_id = None;
                         }
                         self.close_unfinished_tools("The turn ended before this finished.");
-                        self.push_error(title, detail.clone());
+                        let detail = if let Some(crate::agent::RateLimitEvent::Rejected(limit)) =
+                            &self.rate_limit
+                        {
+                            let resets = limit
+                                .windows
+                                .iter()
+                                .map(|window| match window.resets_at_unix_seconds {
+                                    Some(reset) => {
+                                        format!("{} resets at Unix time {reset}", window.label)
+                                    }
+                                    None => format!("{}: reset time unavailable", window.label),
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            format!("{detail}\n{resets}\nNothing resumes automatically.")
+                        } else {
+                            detail.clone()
+                        };
+                        self.push_error(title, detail);
                         self.status = Status::Failed;
                     }
                     TurnOutcome::Completed => {

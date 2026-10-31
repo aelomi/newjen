@@ -43,6 +43,7 @@ impl ClaudeEvents {
         let mut events = Vec::new();
         let cwd = self.cwd.clone().or_else(|| cwd.map(Path::to_path_buf));
         let checkpoint = match event {
+            SessionEvent::Batch(batch) => return batch.clone(),
             SessionEvent::Line(incoming) => {
                 self.incoming(incoming, cwd.as_deref(), &mut events);
                 match incoming {
@@ -51,7 +52,8 @@ impl ClaudeEvents {
                     | Incoming::User(_)
                     | Incoming::PermissionRequest(_)
                     | Incoming::ControlCancelRequest { .. }
-                    | Incoming::Result(_) => Checkpoint::Save,
+                    | Incoming::Result(_)
+                    | Incoming::RateLimit(_) => Checkpoint::Save,
                     _ => Checkpoint::Transient,
                 }
             }
@@ -315,10 +317,63 @@ impl ClaudeEvents {
                 });
                 self.finish();
             }
-            Incoming::ControlRequest(_)
-            | Incoming::ControlResponse(_)
-            | Incoming::RateLimit(_)
-            | Incoming::Unknown(_) => {}
+            Incoming::RateLimit(value) => {
+                let Some(info) = value.get("rate_limit_info") else {
+                    return;
+                };
+                let Some(status) = info.get("status").and_then(Value::as_str) else {
+                    return;
+                };
+                let mut windows = Vec::new();
+                if let Some(unified) = info.get("unifiedWindows").and_then(Value::as_object) {
+                    for (label, window) in unified {
+                        windows.push(crate::agent::LimitWindow {
+                            label: label.clone(),
+                            used_percent: window["utilization"]
+                                .as_f64()
+                                .filter(|n| n.is_finite())
+                                .map(|n| n * 100.0),
+                            resets_at_unix_seconds: window["resetsAt"].as_i64().filter(|n| *n >= 0),
+                        });
+                    }
+                }
+                if windows.is_empty() {
+                    windows.push(crate::agent::LimitWindow {
+                        label: info["rateLimitType"].as_str().unwrap_or("usage").into(),
+                        used_percent: None,
+                        resets_at_unix_seconds: info["resetsAt"].as_i64().filter(|n| *n >= 0),
+                    });
+                }
+                let snapshot = crate::agent::LimitSnapshot {
+                    bucket: "claude".into(),
+                    windows,
+                    explanation: "Claude reported a usage limit. Nothing resumes automatically."
+                        .into(),
+                };
+                let limit = match status {
+                    "rejected" => crate::agent::RateLimitEvent::Rejected(snapshot),
+                    "allowed_warning" | "warning" => {
+                        crate::agent::RateLimitEvent::Warning(snapshot)
+                    }
+                    _ => crate::agent::RateLimitEvent::Updated(snapshot),
+                };
+                events.push(AgentEvent::RateLimit(limit));
+                if status == "rejected" {
+                    self.finish();
+                    events.push(AgentEvent::TurnFinished {
+                        outcome: TurnOutcome::Failed {
+                            title: "Usage limit reached".into(),
+                            detail: "Claude rejected the turn. Continue only after a user action."
+                                .into(),
+                        },
+                        duration_ms: None,
+                        cost_usd: None,
+                        forget_conversation: false,
+                        queued: false,
+                    });
+                }
+            }
+            Incoming::ControlRequest(_) | Incoming::ControlResponse(_) | Incoming::Unknown(_) => {}
         }
     }
 }

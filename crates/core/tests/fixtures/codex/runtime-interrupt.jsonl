@@ -1,0 +1,16 @@
+{"dir":"in","msg":{"id":1,"method":"initialize","params":{"clientInfo":{"name":"newjen"}}}}
+{"dir":"out","msg":{"id":1,"result":{"userAgent":"codex-cli/0.166.0"}}}
+{"dir":"in","msg":{"method":"initialized"}}
+{"dir":"in","msg":{"id":2,"method":"account/read","params":{"refreshToken":false}}}
+{"dir":"out","msg":{"id":2,"result":{"account":{"type":"chatgpt","planType":"plus"},"requiresOpenaiAuth":true}}}
+{"dir":"in","msg":{"id":3,"method":"model/list"}}
+{"dir":"out","msg":{"id":3,"result":{"data":[{"model":"test-model","displayName":"Test","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low"}],"defaultReasoningEffort":"low","serviceTiers":[],"defaultServiceTier":"default"}],"nextCursor":null}}}
+{"dir":"in","msg":{"id":4,"method":"account/rateLimits/read"}}
+{"dir":"out","msg":{"id":4,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":10,"resetsAt":1800000000}}}}}
+{"dir":"in","msg":{"id":5,"method":"thread/open","params":{"cwd":"$CWD","approvalPolicy":"untrusted","sandbox":"read-only","approvalsReviewer":"user","serviceTier":"default"}}}
+{"dir":"out","msg":{"id":5,"result":{"thread":{"id":"codex-thread"},"model":"test-model","cwd":"$CWD","approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":false},"serviceTier":"default"}}}
+{"dir":"in","msg":{"id":6,"method":"turn/start","params":{"threadId":"codex-thread","serviceTierForTurn":"default"}}}
+{"dir":"out","msg":{"id":6,"result":{"turn":{"id":"turn","items":[],"status":"inProgress"}}}}
+{"dir":"in","msg":{"id":7,"method":"turn/interrupt","params":{"threadId":"codex-thread","turnId":"turn"}}}
+{"dir":"out","msg":{"id":7,"result":{}}}
+{"dir":"out","msg":{"method":"turn/completed","params":{"threadId":"codex-thread","turn":{"id":"turn","status":"interrupted"}}}}

@@ -14,6 +14,8 @@
 //! claude is started through a tiny shell launcher (see `LAUNCHER`) that also starts a
 //! watcher, so claude and its tools die as soon as Newjen dies, even after a crash.
 
+mod codex_transport;
+
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, PipeWriter, Read, Write};
 use std::os::fd::AsRawFd;
@@ -124,8 +126,38 @@ impl SessionConfig {
         }
     }
 
+    pub(crate) fn restore_saved(&mut self, row: &crate::store::ThreadRow) {
+        if let Some(provider) = crate::providers::Provider::from_id(&row.provider) {
+            if self.agent.provider != provider {
+                self.program = find_cli(provider.cli());
+                self.extra_args.clear();
+            }
+            self.agent.provider = provider;
+        }
+        self.agent.model = row.model.clone();
+        self.agent.effort = row.effort.clone();
+        self.agent.speed = row.speed;
+    }
+    pub(crate) fn bind(&mut self, id: &str, established: bool, rules: &[String]) {
+        self.conversation = match self.agent.provider {
+            crate::providers::Provider::Claude => Some(if established {
+                Conversation::Resume(id.into())
+            } else {
+                Conversation::New(id.into())
+            }),
+            crate::providers::Provider::Codex => {
+                established.then(|| Conversation::Resume(id.into()))
+            }
+        };
+        self.allowed_tools = rules.to_vec();
+    }
     /// The full argument list passed to the CLI.
     pub fn args(&self) -> Vec<String> {
+        if self.agent.provider == crate::providers::Provider::Codex {
+            let mut args = vec!["app-server".into()];
+            args.extend(self.extra_args.clone());
+            return args;
+        }
         let mut args: Vec<String> = [
             "-p",
             "--verbose",
@@ -181,6 +213,7 @@ impl SessionConfig {
 pub enum SessionEvent {
     /// One decoded stdout line.
     Line(Incoming),
+    Batch(crate::agent::AgentBatch),
     /// One stderr line (warnings, crash output). Useful in error messages.
     Stderr(String),
     /// Writing a prompt or answer to claude's stdin failed (claude closed it or is gone), so
@@ -198,7 +231,10 @@ pub enum SessionEvent {
     /// Normally the last event. It waits (briefly) for stdout and stderr to reach the end, so
     /// only a leftover process outside claude's group that keeps a pipe open, or a
     /// `WriteFailed`, can follow it.
-    Exited { code: Option<i32>, requested: bool },
+    Exited {
+        code: Option<i32>,
+        requested: bool,
+    },
 }
 
 /// A running `claude` process. Dropping it shuts the process down.
@@ -214,6 +250,9 @@ pub struct Session {
 /// reference-counted pointer: several owners, one object, freed when the last one is gone).
 struct Control {
     pid: u32,
+    codex: Option<Mutex<codex_transport::CodexProcess>>,
+    events: Sender<SessionEvent>,
+    interrupt_ack_timeout: Duration,
     /// Lines waiting to be written to the process's stdin by the writer thread. Closing this
     /// queue makes the writer thread finish and drop stdin, which closes the pipe. The CLI
     /// needs stdin open for the whole session (when it closes, the CLI rejects pending
@@ -239,10 +278,11 @@ struct Control {
 impl Session {
     /// Starts the CLI. Returns the session and the channel its events arrive on.
     pub fn spawn(config: SessionConfig) -> Result<(Session, Receiver<SessionEvent>)> {
-        anyhow::ensure!(
-            config.agent.provider == crate::providers::Provider::Claude,
-            "Codex transport is not available yet"
-        );
+        let codex = if config.agent.provider == crate::providers::Provider::Codex {
+            Some(codex_transport::CodexProcess::new(&config)?)
+        } else {
+            None
+        };
         let could_not_start = || {
             format!(
                 "could not start `{}` in {}",
@@ -313,8 +353,15 @@ impl Session {
         let shutting_down = Arc::new(AtomicBool::new(false));
 
         let to_stdin = spawn_stdin_writer(stdin, sender.clone(), shutting_down.clone());
+        let (codex, initial) = match codex {
+            Some((codec, out)) => (Some(Mutex::new(codec)), Some(out)),
+            None => (None, None),
+        };
         let control = Arc::new(Control {
             pid,
+            codex,
+            events: sender.clone(),
+            interrupt_ack_timeout: config.interrupt_ack_timeout,
             to_stdin,
             shutting_down,
             exited: AtomicBool::new(false),
@@ -331,12 +378,20 @@ impl Session {
             next_request_number: AtomicU64::new(1),
             interrupt_ack_timeout: config.interrupt_ack_timeout,
         };
+        if let Some(initial) = initial {
+            session.control.codex_output(initial)?;
+        }
         Ok((session, receiver))
     }
 
     /// Sends a user prompt.
     pub fn send_prompt(&self, text: &str) -> Result<()> {
-        self.write_line(&protocol::user_message(text))
+        if let Some(codec) = &self.control.codex {
+            let out = lock(codec).prompt(text)?;
+            self.control.codex_output(out)
+        } else {
+            self.write_line(&protocol::user_message(text))
+        }
     }
 
     /// Answers an approval request.
@@ -350,12 +405,38 @@ impl Session {
         })
     }
 
+    fn answer_codex(
+        &self,
+        key: crate::agent::ApprovalKey,
+        intent: crate::agent::ApprovalIntent,
+    ) -> Result<crate::agent::AnswerReceipt> {
+        let Some(codec) = &self.control.codex else {
+            anyhow::bail!("This process has no approval route");
+        };
+        let out = lock(codec).answer(key, intent);
+        if let Some(out) = out {
+            self.control.codex_output(out)?;
+        }
+        Ok(crate::agent::AnswerReceipt { grants: Vec::new() })
+    }
+    fn process_grants(&self) -> Vec<crate::agent::GrantView> {
+        self.control
+            .codex
+            .as_ref()
+            .map(|codec| lock(codec).grants())
+            .unwrap_or_default()
+    }
+
     /// Asks the CLI to stop the current turn. The turn then ends with a "stopped" result.
     ///
     /// If claude neither confirms the request nor ends the turn within
     /// [`SessionConfig::interrupt_ack_timeout`], the session is shut down and
     /// [`SessionEvent::InterruptTimedOut`] is sent, so a stuck claude can always be stopped.
     pub fn interrupt(&self) -> Result<()> {
+        if let Some(codec) = &self.control.codex {
+            let out = lock(codec).interrupt();
+            return self.control.codex_output(out);
+        }
         let number = self.next_request_number.fetch_add(1, Ordering::SeqCst);
         let request_id = format!("newjen_interrupt_{number}");
         // Remember it before sending, so even a very quick answer finds it.
@@ -582,6 +663,11 @@ fn spawn_stdout_reader(
             if line.trim().is_empty() {
                 return;
             }
+            if let Some(codec) = &control.codex {
+                let out = lock(codec).stdout(line);
+                let _ = control.codex_output(out);
+                return;
+            }
             let incoming = Incoming::parse(line);
             control.note_incoming(&incoming);
             // If nobody is listening any more, keep draining so the child never blocks on a
@@ -721,7 +807,165 @@ pub(crate) fn validate_conversation(
     Ok(())
 }
 
-pub(crate) use crate::providers::claude::controller::Controller;
+pub(crate) struct Controller {
+    pub initialized: bool,
+    provider: crate::providers::Provider,
+    claude: crate::providers::claude::controller::Controller,
+}
+impl Controller {
+    pub fn new(provider: crate::providers::Provider) -> Self {
+        Self {
+            initialized: false,
+            provider,
+            claude: Default::default(),
+        }
+    }
+    pub fn begin_message(&mut self, text: &str) {
+        if self.provider == crate::providers::Provider::Claude {
+            self.claude.begin_message(text);
+        }
+    }
+    pub fn message(&self) -> Option<&str> {
+        self.claude.message()
+    }
+    pub fn end_turn(&mut self) {
+        self.claude.end_turn();
+    }
+    pub fn reset(&mut self) {
+        self.claude.reset();
+    }
+    pub fn spawned(&mut self) {
+        self.initialized = false;
+        self.claude.spawned();
+    }
+    pub fn answer(
+        &mut self,
+        key: crate::agent::ApprovalKey,
+        intent: crate::agent::ApprovalIntent,
+        session: Option<&Session>,
+    ) -> Option<Result<crate::agent::AnswerReceipt>> {
+        let Some(session) = session else {
+            return Some(Err(anyhow!("the agent session has ended")));
+        };
+        match self.provider {
+            crate::providers::Provider::Claude => self
+                .claude
+                .answer(key, intent)
+                .map(|reply| session.answer(reply)),
+            crate::providers::Provider::Codex => Some(session.answer_codex(key, intent)),
+        }
+    }
+    pub fn translate(
+        &mut self,
+        event: &SessionEvent,
+        cwd: Option<&std::path::Path>,
+    ) -> crate::agent::AgentBatch {
+        match self.provider {
+            crate::providers::Provider::Claude => self.claude.translate(event, cwd),
+            crate::providers::Provider::Codex => codex_transport::process_batch(event),
+        }
+    }
+    pub fn apply(
+        &mut self,
+        event: &SessionEvent,
+        generation: u64,
+        cwd: &std::path::Path,
+        id: &mut String,
+        started: &mut bool,
+    ) -> Update {
+        match self.provider {
+            crate::providers::Provider::Claude => {
+                self.claude.initialized = self.initialized;
+                let out = self.claude.apply(event, generation, cwd, id, started);
+                self.initialized = self.claude.initialized;
+                out
+            }
+            crate::providers::Provider::Codex => {
+                let batch = codex_transport::process_batch(event);
+                for event in &batch.events {
+                    if let crate::agent::AgentEvent::ConversationEstablished(confirmed) = event {
+                        *id = confirmed.clone();
+                        *started = true;
+                        self.initialized = true;
+                    }
+                }
+                Update::Apply(batch)
+            }
+        }
+    }
+    pub fn grants(
+        &self,
+        saved: &[crate::store::Grant],
+        session: Option<&Session>,
+    ) -> Vec<crate::agent::GrantView> {
+        match self.provider {
+            crate::providers::Provider::Claude => saved
+                .iter()
+                .map(|grant| {
+                    crate::providers::claude::presentation::grant_view(&grant.rule, &grant.label)
+                })
+                .collect(),
+            crate::providers::Provider::Codex => {
+                session.map(Session::process_grants).unwrap_or_default()
+            }
+        }
+    }
+    pub fn failure_reason(&self, title: &str, detail: &str) -> String {
+        match self.provider {
+            crate::providers::Provider::Claude => {
+                crate::providers::claude::presentation::failure_reason(title, detail)
+            }
+            crate::providers::Provider::Codex => detail
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or(title)
+                .into(),
+        }
+    }
+}
+
+pub(crate) fn saved_presentation(provider: &str) -> crate::agent::AgentPresentation {
+    match crate::providers::Provider::from_id(provider) {
+        Some(provider) => presentation(provider),
+        None => crate::agent::AgentPresentation {
+            label: "Unavailable provider",
+            executable_label: "Unavailable provider",
+            working_placeholder: "Provider unavailable",
+            reply_placeholder: "Provider unavailable",
+            empty_title: "Provider unavailable",
+            start_failed: "Provider unavailable",
+            send_failed: "Provider unavailable",
+            installation_hint: "This saved provider is not supported by this version of Newjen.",
+            ..Default::default()
+        },
+    }
+}
+pub(crate) fn presentation(
+    provider: crate::providers::Provider,
+) -> crate::agent::AgentPresentation {
+    match provider {
+        crate::providers::Provider::Claude => Default::default(),
+        crate::providers::Provider::Codex => crate::agent::AgentPresentation {
+            label: "Codex",
+            executable_label: "Codex",
+            working_placeholder: "Codex is working…",
+            reply_placeholder: "Reply to Codex…",
+            empty_title: "What should Codex work on?",
+            grants_detail: "Exact commands allowed for this process. Revoking stops it and clears all its grants.",
+            send_failed: "Could not reach Codex",
+            answer_failed: "Could not send your answer to Codex",
+            stop_failed: "Could not stop Codex",
+            start_failed: "Could not start Codex",
+            installation_hint: "Install Codex and run `codex login` in your terminal, then try again. Set NEWJEN_CODEX to use another path.",
+            unreachable_note: "Codex could not be reached.",
+            send_detail_prefix: "Newjen could not send the message to the codex process",
+            interrupt_title: "Codex did not stop, so Newjen ended the session",
+            interrupt_detail: "Codex did not end the turn in time. Continue manually to resume.",
+            exit_title: "Codex exited",
+            exited_tool_note: "Codex exited before this finished.",
+        },
+    }
+}
 pub(crate) enum Update {
     Held,
     Restart,

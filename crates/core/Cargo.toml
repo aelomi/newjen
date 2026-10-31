@@ -30,3 +30,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[bin]]
+name = "newjen-fake-codex"
+path = "src/bin/newjen-fake-codex.rs"
+test = false
+doc = false

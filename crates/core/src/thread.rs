@@ -61,15 +61,12 @@ use crate::protocol::{Incoming, ResultMessage};
 #[cfg(test)]
 use crate::providers::claude::controller::{is_missing_conversation, is_session_in_use};
 use crate::rift::{self, CopyError, Tools};
-use crate::session::{Conversation, Session, SessionConfig, SessionEvent};
+use crate::session::{Session, SessionConfig, SessionEvent};
 use crate::store::{
     Grant, PendingCopy, PendingIntent, PendingState, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow,
     now_ms,
 };
 use crate::transcript::{Item, Status, Transcript};
-
-/// The provider a thread runs on. Only Claude for now (see `docs/PLAN.md`).
-pub const PROVIDER_CLAUDE: &str = "claude";
 
 /// A thread's title before its first message.
 pub const NEW_THREAD_TITLE: &str = "New thread";
@@ -124,7 +121,7 @@ pub struct Thread {
     /// `claude` processes being stopped in the background (see the module docs).
     stopping: Vec<JoinHandle<()>>,
     /// How to start claude (program, environment); the conversation and grants are filled in
-    /// per start (see [`claude_config`]).
+    /// per start (see [`Thread::session_config`]).
     base_config: SessionConfig,
     /// See the module docs. Goes up whenever a process is started or let go.
     generation: u64,
@@ -345,6 +342,8 @@ impl Thread {
     pub fn new_draft(store: Store, project: &Project, base_config: SessionConfig) -> Thread {
         let now = now_ms();
         let (events_in, events) = async_channel::unbounded();
+        let mut transcript = Transcript::with_cwd(project.path.clone());
+        transcript.set_presentation(crate::session::presentation(base_config.agent.provider));
         Thread {
             id: new_id(),
             project_id: project.id,
@@ -355,8 +354,8 @@ impl Thread {
             provider: base_config.agent.provider.id().to_string(),
             session_id: crate::session::reserved_id(base_config.agent.provider),
             session_started: false,
-            transcript: Transcript::with_cwd(project.path.clone()),
-            controller: Default::default(),
+            transcript,
+            controller: crate::session::Controller::new(base_config.agent.provider),
             session: None,
             stopping: Vec::new(),
             base_config,
@@ -394,6 +393,32 @@ impl Thread {
         config.agent = agent;
         Ok(Self::new_draft(store, project, config))
     }
+    /// Changes an unsent draft's selection. Sending (including a held copy job) freezes it.
+    pub fn set_agent_config(
+        &mut self,
+        agent: crate::agent::AgentConfig,
+        detected: &crate::providers::ProviderStatus,
+    ) -> Result<()> {
+        if !self.is_draft() || self.copy().is_some() {
+            bail!("Only an unsent draft can change its agent settings");
+        }
+        agent.validate(detected)?;
+        let crate::providers::Availability::Ready { binary, .. } = &detected.availability else {
+            unreachable!("validated above")
+        };
+        self.end_session();
+        self.provider = agent.provider.id().into();
+        self.session_id = crate::session::reserved_id(agent.provider);
+        self.session_started = false;
+        self.controller = crate::session::Controller::new(agent.provider);
+        self.transcript
+            .set_presentation(crate::session::presentation(agent.provider));
+        self.base_config.program = binary.clone();
+        self.base_config.extra_args.clear();
+        self.base_config.agent = agent;
+        Ok(())
+    }
+
     pub fn agent_config(&self) -> Option<&crate::agent::AgentConfig> {
         self.unavailable_reason()
             .is_none()
@@ -447,6 +472,7 @@ impl Thread {
         }
 
         let mut thread = Thread::new_draft(store, project, base_config);
+        thread.base_config.restore_saved(&row);
         thread.id = row.id;
         thread.cwd = row.workdir;
         thread.place = row.copy.map_or(Place::ProjectFolder, Place::Copy);
@@ -457,13 +483,8 @@ impl Thread {
             row.conversation,
             crate::agent::ConversationState::Established(_)
         );
-        thread.base_config.agent = crate::agent::AgentConfig {
-            provider: crate::providers::Provider::from_id(&thread.provider)
-                .unwrap_or(crate::providers::Provider::Claude),
-            model: row.model,
-            effort: row.effort,
-            speed: row.speed,
-        };
+        thread.controller = crate::session::Controller::new(thread.base_config.agent.provider);
+        transcript.set_presentation(crate::session::saved_presentation(&thread.provider));
         thread.transcript = transcript;
         thread.grants = grants;
         thread.unread = row.unread;
@@ -699,12 +720,7 @@ impl Thread {
     }
 
     pub fn grant_views(&self) -> Vec<crate::agent::GrantView> {
-        self.grants
-            .iter()
-            .map(|grant| {
-                crate::providers::claude::presentation::grant_view(&grant.rule, &grant.label)
-            })
-            .collect()
+        self.controller.grants(&self.grants, self.session.as_ref())
     }
 
     pub fn failure_summary(&self) -> Option<String> {
@@ -713,9 +729,9 @@ impl Thread {
             .iter()
             .rev()
             .find_map(|item| match item {
-                Item::Error { title, detail, .. } => Some(
-                    crate::providers::claude::presentation::failure_reason(title, detail),
-                ),
+                Item::Error { title, detail, .. } => {
+                    Some(self.controller.failure_reason(title, detail))
+                }
                 _ => None,
             })
     }
@@ -733,15 +749,11 @@ impl Thread {
         self.events.clone()
     }
 
-    /// The `SessionConfig` the next `claude` would be started with (see [`claude_config`]).
+    /// The configuration used for the next provider process.
     pub fn session_config(&self) -> SessionConfig {
         let rules: Vec<String> = self.grants.iter().map(|grant| grant.rule.clone()).collect();
-        let mut config = claude_config(
-            &self.base_config,
-            &self.session_id,
-            self.session_started,
-            &rules,
-        );
+        let mut config = self.base_config.clone();
+        config.bind(&self.session_id, self.session_started, &rules);
         config.cwd = self.cwd.clone();
         if let Place::Copy(copy) = &self.place {
             config.env.extend(copy.env());
@@ -797,7 +809,10 @@ impl Thread {
             bail!("Newjen is still making this thread's Rift copy");
         }
         if self.status().is_busy() {
-            bail!("Claude is still working on the last message");
+            bail!(
+                "{} is still working on the last message",
+                self.presentation().label
+            );
         }
         if self.place == Place::NewCopy {
             let name = copy_name(&self.id);
@@ -950,12 +965,11 @@ impl Thread {
         // Resolve first: a second click or key press now finds nothing to answer.
         self.transcript.resolve_approval(request.key(), answer);
         self.last_activity = Instant::now();
-        let Some(reply) = self.controller.answer(request.key(), answer) else {
+        let Some(sent) = self
+            .controller
+            .answer(request.key(), answer, self.session.as_ref())
+        else {
             return Ok(());
-        };
-        let sent = match &self.session {
-            Some(session) => session.answer(reply),
-            None => Err(anyhow!("the claude session has ended")),
         };
         let sent = sent.map(|receipt| {
             let now = now_ms();
@@ -1021,6 +1035,14 @@ impl Thread {
     /// The next message starts a new one with the remaining rules (`--resume`, so the
     /// conversation goes on).
     pub fn revoke(&mut self, id: &crate::agent::GrantId) {
+        if self
+            .grant_views()
+            .iter()
+            .any(|grant| &grant.id == id && grant.lifetime == crate::agent::GrantLifetime::Process)
+        {
+            self.end_turn_as_stopped();
+            return;
+        }
         let rule = id.0.as_str();
         let before = self.grants.len();
         self.grants.retain(|grant| grant.rule != rule);
@@ -1201,6 +1223,12 @@ impl Thread {
             .events
             .iter()
             .any(|event| matches!(event, crate::agent::AgentEvent::ApprovalRequested(_)));
+        let limit_rejected = batch.events.iter().any(|event| {
+            matches!(
+                event,
+                crate::agent::AgentEvent::RateLimit(crate::agent::RateLimitEvent::Rejected(_))
+            )
+        });
         self.transcript.apply(&batch);
         let turn_ended = was_busy && !self.status().is_busy();
         // claude started a turn by itself (see `Transcript::apply`).
@@ -1222,6 +1250,9 @@ impl Thread {
             // This process can no longer be talked to; let it go.
             SessionEvent::WriteFailed(_) | SessionEvent::InterruptTimedOut => self.end_session(),
             _ => {}
+        }
+        if limit_rejected {
+            self.end_session();
         }
         if turn_ended {
             self.after_turn_ended();
@@ -1293,15 +1324,13 @@ impl Thread {
             Ok(()) => match (self.controller.message(), &self.session) {
                 (Some(message), Some(session)) => session.send_prompt(message).err().map(|error| {
                     (
-                        "Could not reach Claude",
-                        format!(
-                            "Newjen could not send the message to the claude process: {error:#}"
-                        ),
+                        self.presentation().send_failed,
+                        format!("{}: {error:#}", self.presentation().send_detail_prefix),
                     )
                 }),
                 _ => None,
             },
-            Err(error) => Some(("Could not start Claude Code", format!("{error:#}"))),
+            Err(error) => Some((self.presentation().start_failed, format!("{error:#}"))),
         };
         if let Some((title, detail)) = failure {
             let was_busy = self.status().is_busy();
@@ -1470,19 +1499,15 @@ pub fn finish_quit(store: &Store, quitting: impl IntoIterator<Item = Quitting>) 
 /// The config to start `claude` with for a conversation: `--session-id <id>` until the
 /// conversation has started, `--resume <id>` after, and one `--allowedTools <rule>` pair per
 /// granted rule. Everything else comes from `base`.
-pub fn claude_config(
+#[cfg(test)]
+fn claude_config(
     base: &SessionConfig,
     session_id: &str,
     session_started: bool,
     allowed_rules: &[String],
 ) -> SessionConfig {
     let mut config = base.clone();
-    config.conversation = Some(if session_started {
-        Conversation::Resume(session_id.to_string())
-    } else {
-        Conversation::New(session_id.to_string())
-    });
-    config.allowed_tools = allowed_rules.to_vec();
+    config.bind(session_id, session_started, allowed_rules);
     config
 }
 
