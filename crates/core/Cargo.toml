@@ -18,7 +18,7 @@ path = "src/bin/newjen-fake-claude.rs"
 test = false
 doc = false
 
-# `core` must never depend on GPUI or Ely, so the UI layer can be replaced.
+# `core` must never depend on GPUI or GPUI Kit, so the UI layer can be replaced.
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
