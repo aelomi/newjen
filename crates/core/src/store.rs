@@ -104,6 +104,12 @@ const MIGRATIONS: &[&str] = &[
          state TEXT NOT NULL,
          rift_id TEXT,
          created_at INTEGER NOT NULL
+     );
+     CREATE TABLE copy_cleanup (
+         path TEXT PRIMARY KEY,
+         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+         thread_id TEXT NOT NULL,
+         rift_id TEXT
      );",
 ];
 
@@ -194,6 +200,14 @@ pub struct PendingCopy {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyCleanup {
+    pub path: PathBuf,
+    pub project_id: i64,
+    pub thread_id: String,
+    pub rift_id: Option<String>,
+}
+
 /// One saved transcript row (the `thread_items` table). Read it with `Item::from_saved`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedItem {
@@ -267,6 +281,7 @@ enum Write {
         done: mpsc::Sender<Result<(), String>>,
     },
     DeletePending(String),
+    DeleteCopyCleanup(PathBuf),
     DiscardPending(String),
     UpsertProject {
         path: String,
@@ -539,6 +554,26 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn copy_cleanup(&self, project_id: i64) -> Result<Vec<CopyCleanup>> {
+        let read = self.reader();
+        let mut statement = read.prepare(
+            "SELECT path, project_id, thread_id, rift_id FROM copy_cleanup WHERE project_id = ?1 ORDER BY path",
+        )?;
+        let rows = statement.query_map([project_id], |row| {
+            Ok(CopyCleanup {
+                path: PathBuf::from(row.get::<_, String>(0)?),
+                project_id: row.get(1)?,
+                thread_id: row.get(2)?,
+                rift_id: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_copy_cleanup(&self, path: &Path) {
+        self.queue(Write::DeleteCopyCleanup(path.to_path_buf()));
     }
 
     pub fn save_pending_copy(&self, pending: PendingCopy) -> Result<()> {
@@ -827,6 +862,7 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         | Write::SavePending { .. }
         | Write::PendingId { .. }
         | Write::DeletePending(_)
+        | Write::DeleteCopyCleanup(_)
         | Write::DiscardPending(_)
         | Write::Flush(_) => return None,
     };
@@ -840,24 +876,29 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
                 PendingIntent::Restore(message) => Some(message),
                 PendingIntent::Discard => None,
             };
-            let result = connection.execute(
-                "INSERT INTO pending_copies (thread_id, project_id, path, message, created_at, state, rift_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT (thread_id) DO UPDATE SET message = excluded.message, state = excluded.state, path = excluded.path, rift_id = excluded.rift_id",
-                params![
-                    pending.thread_id,
-                    pending.project_id,
-                    path_text(&pending.path),
-                    message,
-                    pending.created_at,
-                    match pending.state {
-                        PendingState::MakingCopy => "making_copy",
-                        PendingState::Draft => "draft",
-                        PendingState::Sent => "sent",
-                    },
-                    pending.rift_id,
-                ],
-            );
+            let result = (|| {
+                let transaction = connection.transaction()?;
+                retain_copy_cleanup(&transaction, &pending.thread_id, Some(&pending.path))?;
+                transaction.execute(
+                    "INSERT INTO pending_copies (thread_id, project_id, path, message, created_at, state, rift_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT (thread_id) DO UPDATE SET message = excluded.message, state = excluded.state, path = excluded.path, rift_id = excluded.rift_id",
+                    params![
+                        pending.thread_id,
+                        pending.project_id,
+                        path_text(&pending.path),
+                        message,
+                        pending.created_at,
+                        match pending.state {
+                            PendingState::MakingCopy => "making_copy",
+                            PendingState::Draft => "draft",
+                            PendingState::Sent => "sent",
+                        },
+                        pending.rift_id,
+                    ],
+                )?;
+                transaction.commit()
+            })();
             let _ = done.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
             result?;
         }
@@ -872,6 +913,12 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
             );
             let _ = done.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
             result?;
+        }
+        Write::DeleteCopyCleanup(path) => {
+            connection.execute(
+                "DELETE FROM copy_cleanup WHERE path = ?1",
+                [path_text(&path)],
+            )?;
         }
         Write::DeletePending(thread_id) => {
             connection.execute(
@@ -970,6 +1017,21 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
     Ok(())
 }
 
+fn retain_copy_cleanup(
+    connection: &Connection,
+    thread_id: &str,
+    keep: Option<&Path>,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO copy_cleanup (path, project_id, thread_id, rift_id)
+         SELECT path, project_id, thread_id, rift_id FROM pending_copies
+         WHERE thread_id = ?1 AND state = 'making_copy' AND (?2 IS NULL OR path != ?2)
+         ON CONFLICT (path) DO NOTHING",
+        params![thread_id, keep.map(path_text)],
+    )?;
+    Ok(())
+}
+
 /// Adds or updates a thread's row (see [`Store::save_thread`]), and adds its copy's row the
 /// first time. Run inside a transaction, so the two go together.
 fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result<()> {
@@ -1016,6 +1078,11 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
             ],
         )?;
     }
+    retain_copy_cleanup(
+        connection,
+        &row.id,
+        row.copy.as_ref().map(|copy| copy.path.as_path()),
+    )?;
     connection.execute("DELETE FROM pending_copies WHERE thread_id = ?1", [&row.id])?;
     Ok(())
 }

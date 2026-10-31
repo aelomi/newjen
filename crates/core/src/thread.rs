@@ -343,7 +343,12 @@ impl Removal {
         for stopping in self.stopping {
             let _ = stopping.join();
         }
-        rift::remove(tools, &self.copy.path, &self.copy.rift_id)?;
+        rift::remove(
+            tools,
+            &self.copy.source,
+            &self.copy.path,
+            &self.copy.rift_id,
+        )?;
         self.store.mark_copy_removed(&self.thread_id, now_ms());
         Ok(())
     }
@@ -499,29 +504,47 @@ impl Thread {
         thread
     }
 
+    pub fn recover_copy_cleanup(store: &Store, project: &Project, tools: &Tools) -> Result<()> {
+        let mut errors = Vec::new();
+        for cleanup in store.copy_cleanup(project.id)? {
+            let result = check_pending_destination(
+                project,
+                cleanup.project_id,
+                &cleanup.thread_id,
+                &cleanup.path,
+            )
+            .and_then(|()| {
+                rift::remove_pending(
+                    tools,
+                    &project.path,
+                    &cleanup.path,
+                    cleanup.rift_id.as_deref(),
+                )
+                .map_err(anyhow::Error::from)
+            });
+            match result {
+                Ok(()) => store.delete_copy_cleanup(&cleanup.path),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if !errors.is_empty() {
+            bail!("{}", errors.join("; "));
+        }
+        Ok(())
+    }
+
     pub fn recover_pending_copy(
         store: &Store,
         project: &Project,
         pending: &PendingCopy,
         tools: &Tools,
     ) -> Result<CopyRecovery> {
-        let name = pending
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        let prefix = format!("{}-", copy_prefix(&pending.thread_id));
-        let suffix = name.strip_prefix(&prefix).unwrap_or("");
-        let expected = rift::destination(&project.path, name)?;
-        if pending.project_id != project.id
-            || pending.path != expected
-            || suffix.len() != 6
-            || !suffix
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        {
-            bail!("the pending Rift copy is outside its destination");
-        }
+        check_pending_destination(
+            project,
+            pending.project_id,
+            &pending.thread_id,
+            &pending.path,
+        )?;
         if pending.state == PendingState::Sent {
             let owner = store.copy_owner(&pending.path)?;
             store.delete_pending_copy(&pending.thread_id);
@@ -531,7 +554,12 @@ impl Thread {
             return Ok(CopyRecovery::Saved);
         }
         if pending.state == PendingState::MakingCopy {
-            rift::remove_pending(tools, &pending.path, pending.rift_id.as_deref())?;
+            rift::remove_pending(
+                tools,
+                &project.path,
+                &pending.path,
+                pending.rift_id.as_deref(),
+            )?;
             let mut recovered = pending.clone();
             recovered.state = PendingState::Draft;
             store.save_pending_copy(recovered)?;
@@ -1508,6 +1536,30 @@ fn is_checkpoint(event: &SessionEvent) -> bool {
         | SessionEvent::InterruptTimedOut
         | SessionEvent::Exited { .. } => true,
     }
+}
+
+fn check_pending_destination(
+    project: &Project,
+    project_id: i64,
+    thread_id: &str,
+    path: &Path,
+) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let prefix = format!("{}-", copy_prefix(thread_id));
+    let suffix = name.strip_prefix(&prefix).unwrap_or("");
+    if project_id != project.id
+        || path != rift::destination(&project.path, name)?
+        || suffix.len() != 6
+        || !suffix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        bail!("the pending Rift copy is outside its destination");
+    }
+    Ok(())
 }
 
 /// The prefix shared by a thread's copy attempts.

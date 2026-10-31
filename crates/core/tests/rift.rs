@@ -311,7 +311,7 @@ fn removing_a_copy_deletes_only_its_own_trash_entry() {
         "removed outside Newjen, still in the trash"
     );
 
-    rift::remove(&lab.tools, &gone.path, &gone.rift_id).unwrap();
+    rift::remove(&lab.tools, &gone.source, &gone.path, &gone.rift_id).unwrap();
     assert!(!gone.path.exists());
     assert!(!trash.join(format!("{}-newjen-gone", gone.rift_id)).exists());
     assert!(others_entry.exists(), "another copy's trash is left alone");
@@ -321,7 +321,7 @@ fn removing_a_copy_deletes_only_its_own_trash_entry() {
         kept.path.display().to_string()
     );
 
-    rift::remove(&lab.tools, &gone.path, &gone.rift_id).unwrap();
+    rift::remove(&lab.tools, &gone.source, &gone.path, &gone.rift_id).unwrap();
 }
 
 #[test]
@@ -345,10 +345,10 @@ fn removal_preserves_a_copy_with_a_different_rift_id() {
     let Some(lab) = lab() else { return };
     let project = lab.jj_repo("replacement");
     let old = lab.create(&project, "same-name");
-    rift::remove(&lab.tools, &old.path, &old.rift_id).unwrap();
+    rift::remove(&lab.tools, &old.source, &old.path, &old.rift_id).unwrap();
     let replacement = lab.create(&project, "same-name");
     write(&replacement.path, "valuable.txt", "replacement's work");
-    let result = rift::remove(&lab.tools, &old.path, &old.rift_id);
+    let result = rift::remove(&lab.tools, &old.source, &old.path, &old.rift_id);
     println!(
         "stale removal: {result:?}; replacement exists: {}",
         replacement.path.exists()
@@ -362,7 +362,10 @@ fn removal_preserves_a_copy_with_a_different_rift_id() {
 #[test]
 fn cleanup_preserves_a_symlink_trash_directory() {
     let Some(lab) = lab() else { return };
-    let parent = lab.folder("copies");
+    let project = lab.folder("copies");
+    let path = rift::destination(&project, "newjen-thread").unwrap();
+    let parent = path.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
     let unrelated = lab.folder("unrelated");
     write(
         &unrelated,
@@ -370,7 +373,12 @@ fn cleanup_preserves_a_symlink_trash_directory() {
         "unrelated work",
     );
     std::os::unix::fs::symlink(&unrelated, parent.join(".trash")).unwrap();
-    let result = rift::remove(&lab.tools, &parent.join("newjen-thread"), "abc123");
+    let result = rift::remove(
+        &lab.tools,
+        &project,
+        &parent.join("newjen-thread"),
+        "abc123",
+    );
     println!(
         "removal: {result:?}; unrelated work exists: {}",
         unrelated.join("abc123-newjen-thread/work.txt").exists()
@@ -418,7 +426,7 @@ fn a_retry_uses_a_fresh_name_after_a_destination_conflict() {
     };
     let retried = retry.run(&lab.tools, |_| {}).unwrap();
     assert_ne!(retried.path, unrelated.path);
-    rift::remove(&lab.tools, &retried.path, &retried.rift_id).unwrap();
+    rift::remove(&lab.tools, &retried.source, &retried.path, &retried.rift_id).unwrap();
     assert_eq!(
         thread
             .finish_copy(Err(CopyError::Failed {
@@ -438,13 +446,24 @@ fn a_retry_uses_a_fresh_name_after_a_destination_conflict() {
 #[test]
 fn cleanup_refuses_a_symlink_trash_entry() {
     let Some(lab) = lab() else { return };
-    let parent = lab.folder("entry-parent");
+    let project = lab.folder("entry-parent");
+    let path = rift::destination(&project, "newjen-thread").unwrap();
+    let parent = path.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
     let outside = lab.folder("outside");
     write(&outside, "work.txt", "keep this");
     std::fs::create_dir(parent.join(".trash")).unwrap();
     let entry = parent.join(".trash/abc123-newjen-thread");
     std::os::unix::fs::symlink(&outside, &entry).unwrap();
-    assert!(rift::remove(&lab.tools, &parent.join("newjen-thread"), "abc123").is_err());
+    assert!(
+        rift::remove(
+            &lab.tools,
+            &project,
+            &parent.join("newjen-thread"),
+            "abc123"
+        )
+        .is_err()
+    );
     assert_eq!(read(&outside, "work.txt"), "keep this");
     assert!(entry.symlink_metadata().unwrap().file_type().is_symlink());
 }
@@ -452,9 +471,11 @@ fn cleanup_refuses_a_symlink_trash_entry() {
 #[test]
 fn removal_deletes_an_unmarked_owned_folder() {
     let Some(lab) = lab() else { return };
-    let folder = lab.folder("owned-folder");
+    let project = lab.folder("owned-folder");
+    let folder = rift::destination(&project, "newjen-thread").unwrap();
+    std::fs::create_dir_all(&folder).unwrap();
     write(&folder, "work.txt", "owned work");
-    rift::remove(&lab.tools, &folder, "abc123").unwrap();
+    rift::remove(&lab.tools, &project, &folder, "abc123").unwrap();
     assert!(!folder.exists());
 }
 
@@ -478,7 +499,7 @@ fn main_repo_ready_is_reported_before_the_copy_hooks_start() {
     .unwrap();
     assert_eq!(progress.first(), Some(&rift::Progress::MainRepoReady));
     assert!(progress.contains(&rift::Progress::Line("hook-started".to_string())));
-    rift::remove(&lab.tools, &copy.path, &copy.rift_id).unwrap();
+    rift::remove(&lab.tools, &copy.source, &copy.path, &copy.rift_id).unwrap();
 }
 
 #[test]
@@ -492,7 +513,7 @@ fn pending_cleanup_finishes_only_its_own_trash_entry() {
     let trash = own.path.parent().unwrap().join(".trash");
     let others_entry = trash.join(format!("{}-other", other.rift_id));
     assert!(!rift::pending_is_gone(&own.path));
-    rift::remove_pending(&lab.tools, &own.path, Some(&own.rift_id)).unwrap();
+    rift::remove_pending(&lab.tools, &own.source, &own.path, Some(&own.rift_id)).unwrap();
     assert!(rift::pending_is_gone(&own.path));
     assert!(others_entry.exists());
 }
@@ -523,7 +544,7 @@ fn a_missing_marker_does_not_leave_an_archived_copy_on_disk() {
     let project = lab.folder("missing-marker");
     let copy = lab.create(&project, "newjen-marker");
     std::fs::remove_file(copy.path.join(".rift")).unwrap();
-    rift::remove(&lab.tools, &copy.path, &copy.rift_id).unwrap();
+    rift::remove(&lab.tools, &copy.source, &copy.path, &copy.rift_id).unwrap();
     assert!(!copy.path.exists());
 }
 
@@ -540,7 +561,52 @@ fn a_replacement_does_not_prevent_removing_our_own_trash() {
         .join(".trash")
         .join(format!("{}-newjen-trash", own.rift_id));
     let other = lab.create(&project, "newjen-trash");
-    rift::remove(&lab.tools, &own.path, &own.rift_id).unwrap();
+    rift::remove(&lab.tools, &own.source, &own.path, &own.rift_id).unwrap();
     assert!(other.path.exists());
     assert!(!entry.exists());
+}
+
+enum RemovalTarget {
+    Copy,
+    Trash,
+}
+
+#[test]
+fn removal_refuses_symlinked_ancestors_of_copies_and_trash() {
+    for depth in [1, 2] {
+        for target in [RemovalTarget::Copy, RemovalTarget::Trash] {
+            let Some(lab) = lab() else { return };
+            let project = lab.jj_repo("parent-symlink");
+            let copy = lab.create(&project, "newjen-parent");
+            write(&copy.path, "valuable.txt", "preserve this work");
+            let target = if matches!(target, RemovalTarget::Trash) {
+                lab.rift(&project, &["remove", copy.path.to_str().unwrap()]);
+                copy.path
+                    .parent()
+                    .unwrap()
+                    .join(".trash")
+                    .join(format!("{}-newjen-parent", copy.rift_id))
+            } else {
+                copy.path.clone()
+            };
+            let parent = copy.path.ancestors().nth(depth).unwrap();
+            let outside = lab.dir.path().join("moved-parent");
+            std::fs::rename(parent, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, parent).unwrap();
+            let result = rift::remove(&lab.tools, &project, &copy.path, &copy.rift_id);
+            assert!(result.is_err());
+            assert_eq!(read(&target, "valuable.txt"), "preserve this work");
+        }
+    }
+}
+
+#[test]
+fn removal_refuses_a_copy_outside_the_canonical_project_destination() {
+    let Some(lab) = lab() else { return };
+    let project = lab.jj_repo("expected-project");
+    let other = lab.jj_repo("other-project");
+    let copy = lab.create(&other, "newjen-unrelated");
+    write(&copy.path, "valuable.txt", "unrelated work");
+    assert!(rift::remove(&lab.tools, &project, &copy.path, &copy.rift_id).is_err());
+    assert_eq!(read(&copy.path, "valuable.txt"), "unrelated work");
 }

@@ -40,6 +40,7 @@ fn newjen_home_holds_a_freshly_created_database() {
         tables,
         [
             "copies",
+            "copy_cleanup",
             "grants",
             "pending_copies",
             "projects",

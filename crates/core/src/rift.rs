@@ -194,9 +194,15 @@ pub fn check_destination(path: &Path) -> Result<(), CopyError> {
     Ok(())
 }
 
-pub fn remove_pending(tools: &Tools, path: &Path, rift_id: Option<&str>) -> Result<(), CopyError> {
+pub fn remove_pending(
+    tools: &Tools,
+    project: &Path,
+    path: &Path,
+    rift_id: Option<&str>,
+) -> Result<(), CopyError> {
+    check_copy_path(project, path)?;
     if let Some(id) = rift_id {
-        return remove(tools, path, id);
+        return remove(tools, project, path, id);
     }
     let parent = path
         .parent()
@@ -204,7 +210,7 @@ pub fn remove_pending(tools: &Tools, path: &Path, rift_id: Option<&str>) -> Resu
     if path.symlink_metadata().is_ok() {
         check_directory(path, parent)?;
         match read_id(path) {
-            Some(id) => remove(tools, path, &id)?,
+            Some(id) => remove(tools, project, path, &id)?,
             None => delete_directory(path)?,
         }
     }
@@ -217,7 +223,7 @@ pub fn remove_pending(tools: &Tools, path: &Path, rift_id: Option<&str>) -> Resu
                     path.file_name().expect("copy name").to_string_lossy()
                 )))
         {
-            remove(tools, path, &id)?;
+            remove(tools, project, path, &id)?;
         }
     }
     Ok(())
@@ -342,8 +348,11 @@ pub(crate) fn create_controlled(
                 rift_id: read_id(&path),
             });
         }
+        if let Some(id) = read_id(&path) {
+            on_created(&id)?;
+        }
         if path.exists() {
-            return Err(remove_after(tools, &path, None, error));
+            return Err(remove_after(tools, &project, &path, None, error));
         }
         return Err(match error {
             CopyError::Failed { detail, .. }
@@ -378,12 +387,13 @@ pub(crate) fn create_controlled(
             base: base.clone(),
         })
     };
-    finish().map_err(|error| remove_after(tools, &path, rift_id.as_deref(), error))
+    finish().map_err(|error| remove_after(tools, &project, &path, rift_id.as_deref(), error))
 }
 
 /// Removes the copy at `path` whose Rift id is `rift_id` (see the module docs). Nothing to do
 /// if it is already gone, so it can run again after a crash.
-pub fn remove(tools: &Tools, path: &Path, rift_id: &str) -> Result<(), CopyError> {
+pub fn remove(tools: &Tools, project: &Path, path: &Path, rift_id: &str) -> Result<(), CopyError> {
+    check_copy_path(project, path)?;
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(failure(
             "rift remove",
@@ -443,12 +453,45 @@ fn check_trash(parent: &Path, entry: &Path) -> Result<(), CopyError> {
     Ok(())
 }
 
+fn check_copy_path(project: &Path, path: &Path) -> Result<(), CopyError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let expected = destination(project, name)?;
+    if path != expected {
+        return Err(failure(
+            "rift remove",
+            format!("refusing unexpected copy {}", path.display()),
+        ));
+    }
+    let anchor = expected
+        .ancestors()
+        .nth(3)
+        .expect("copy destination parent");
+    let mut parent = anchor.to_path_buf();
+    for component in expected
+        .strip_prefix(anchor)
+        .expect("copy destination")
+        .components()
+    {
+        let folder = parent.join(component);
+        match folder.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            _ => check_directory(&folder, &parent)?,
+        }
+        parent = folder;
+    }
+    Ok(())
+}
+
 fn check_directory(path: &Path, parent: &Path) -> Result<(), CopyError> {
     let safe = || -> std::io::Result<bool> {
         let metadata = path.symlink_metadata()?;
         Ok(!metadata.file_type().is_symlink()
             && metadata.is_dir()
-            && path.canonicalize()?.parent() == Some(parent.canonicalize()?.as_path()))
+            && parent.canonicalize()? == parent
+            && path.canonicalize()? == path)
     };
     if safe().unwrap_or(false) {
         Ok(())
@@ -533,8 +576,14 @@ fn read_id(copy: &Path) -> Option<String> {
 }
 
 /// `error`, after removing the half-made copy at `path`. If that fails too, the error says so.
-fn remove_after(tools: &Tools, path: &Path, rift_id: Option<&str>, error: CopyError) -> CopyError {
-    let removed = remove_pending(tools, path, rift_id);
+fn remove_after(
+    tools: &Tools,
+    project: &Path,
+    path: &Path,
+    rift_id: Option<&str>,
+    error: CopyError,
+) -> CopyError {
+    let removed = remove_pending(tools, project, path, rift_id);
     match (error, removed) {
         (error, Ok(())) => error,
         (

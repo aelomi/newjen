@@ -315,24 +315,27 @@ impl ChatView {
                 return;
             }
         };
-        if pending.is_empty() {
-            return;
-        }
         let store = self.store.clone();
         let project = self.project.clone();
         let tools = self.tools.clone();
         let cleanup = cx.background_spawn(async move {
-            pending
+            let cleanup = Thread::recover_copy_cleanup(&store, &project, &tools);
+            let drafts = pending
                 .into_iter()
                 .map(|pending| {
                     let result = Thread::recover_pending_copy(&store, &project, &pending, &tools);
                     (pending, result)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (cleanup, drafts)
         });
         cx.spawn_in(window, async move |view, cx| {
-            let recovered = cleanup.await;
+            let (cleanup, recovered) = cleanup.await;
             let _ = view.update_in(cx, |view, window, cx| {
+                if let Err(error) = cleanup {
+                    view.save_problem =
+                        Some(format!("Couldn't remove unfinished Rift copies: {error:#}"));
+                }
                 for (pending, result) in recovered {
                     match result {
                         Ok(thread::CopyRecovery::Kept(path)) => {
@@ -352,6 +355,7 @@ impl ChatView {
                         view.restore_pending_draft(pending, window, cx);
                     }
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -1059,8 +1063,9 @@ impl ChatView {
             let copy = copy.clone();
             let tools = self.tools.clone();
             let path = tilde(&copy.path, self.home.as_deref());
-            let removed =
-                cx.background_spawn(async move { rift::remove(&tools, &copy.path, &copy.rift_id) });
+            let removed = cx.background_spawn(async move {
+                rift::remove(&tools, &copy.source, &copy.path, &copy.rift_id)
+            });
             cx.spawn(async move |view, cx| {
                 if let Err(error) = removed.await {
                     let _ = view.update(cx, |view, cx| {

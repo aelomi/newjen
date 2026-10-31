@@ -2308,7 +2308,7 @@ fn an_archived_copy_job_returns_its_copy_for_removal_and_never_sends() {
     assert!(thread.archive().is_none());
     let not_sent = thread.finish_copy(Ok(copy.clone())).unwrap_err();
     assert_eq!(not_sent.copy_to_remove.as_deref(), Some(&copy));
-    newjen_core::rift::remove(&tools, &copy.path, &copy.rift_id).unwrap();
+    newjen_core::rift::remove(&tools, &copy.source, &copy.path, &copy.rift_id).unwrap();
     assert!(!copy.path.exists());
     assert!(not_sent.message.is_empty());
     assert!(fixture.spawns().is_empty());
@@ -2409,7 +2409,7 @@ fn recovery_preserves_a_replacement_before_the_first_cleanup() {
     let (thread, job) = fixture.preparing("keep my message");
     let own = job.run(&tools, |_| {}).unwrap();
     drop(thread);
-    newjen_core::rift::remove(&tools, &own.path, &own.rift_id).unwrap();
+    newjen_core::rift::remove(&tools, &own.source, &own.path, &own.rift_id).unwrap();
     let replacement = newjen_core::rift::create(
         &tools,
         &fixture.project.path,
@@ -2617,4 +2617,156 @@ fn quitting_lets_a_running_jj_finish_and_prevents_the_copy_start() {
     std::fs::write(release, "finish").unwrap();
     assert!(running.join().unwrap().is_err());
     assert!(!pending[0].path.exists());
+}
+
+#[test]
+fn recovery_refuses_symlinked_copy_parents_and_preserves_unrelated_work() {
+    for parent_depth in [1, 2] {
+        let fixture = Fixture::new();
+        let Some(tools) = fixture.rift_tools() else {
+            return;
+        };
+        let (thread, job) = fixture.preparing("keep my message");
+        drop(job);
+        let pending = fixture
+            .store
+            .pending_copies(fixture.project.id)
+            .unwrap()
+            .remove(0);
+        let parent = pending.path.ancestors().nth(parent_depth).unwrap();
+        std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+        let outside = fixture.path("unrelated");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join(pending.path.strip_prefix(parent).unwrap());
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("valuable.txt"), "unrelated work").unwrap();
+        std::os::unix::fs::symlink(&outside, parent).unwrap();
+        let result =
+            Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending, &tools);
+        assert!(
+            victim.join("valuable.txt").exists(),
+            "recovery deleted unrelated work through a symlinked parent"
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fixture.store.pending_copies(fixture.project.id).unwrap()[0],
+            pending
+        );
+        assert!(fixture.messages_received().is_empty());
+        drop(thread);
+    }
+}
+
+#[test]
+fn retrying_a_draft_keeps_its_failed_attempt_for_cleanup() {
+    failed_attempt_stays_tracked(WorksIn::RiftCopy, CleanupFailure::RiftRemove);
+}
+
+#[test]
+fn sending_a_draft_in_the_project_keeps_its_failed_attempt_for_cleanup() {
+    failed_attempt_stays_tracked(WorksIn::ProjectFolder, CleanupFailure::RiftRemove);
+}
+
+#[test]
+fn retrying_after_a_hook_blocks_trash_keeps_the_leftover_for_cleanup() {
+    failed_attempt_stays_tracked(WorksIn::RiftCopy, CleanupFailure::TrashSymlink);
+}
+
+enum CleanupFailure {
+    RiftRemove,
+    TrashSymlink,
+}
+
+fn failed_attempt_stays_tracked(works_in: WorksIn, failure: CleanupFailure) {
+    let fixture = Fixture::new();
+    let Some(mut tools) = fixture.rift_tools() else {
+        return;
+    };
+    let real_tools = tools.clone();
+    let wrapper = fixture.path("rift-without-remove");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = remove ]; then exit 1; fi\nexec '{}' \"$@\"\n",
+            tools.rift.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        std::process::Command::new(&tools.jj)
+            .args(["git", "init", "--colocate"])
+            .arg(&fixture.project.path)
+            .envs(tools.env.iter().cloned())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let hook = match failure {
+        CleanupFailure::RiftRemove => {
+            tools.rift = wrapper;
+            "exit 3"
+        }
+        CleanupFailure::TrashSymlink => {
+            r#"mkdir -p "$RIFT_DESTINATION/../safe"; ln -s safe "$RIFT_DESTINATION/../.trash"; exit 7"#
+        }
+    };
+    std::fs::write(
+        fixture.project.path.join(".rift.toml"),
+        format!("version = 1\n[[hooks.postcreate]]\nrun = '{hook}'\n"),
+    )
+    .unwrap();
+    let (mut thread, job) = fixture.preparing("first try");
+    let first = fixture
+        .store
+        .pending_copies(fixture.project.id)
+        .unwrap()
+        .remove(0);
+    let error = job.run(&tools, |_| {}).unwrap_err();
+    assert!(first.path.exists());
+    assert_eq!(
+        thread.finish_copy(Err(error)).unwrap_err().message,
+        "first try"
+    );
+    std::fs::remove_file(fixture.project.path.join(".rift.toml")).unwrap();
+    thread.set_works_in(works_in).unwrap();
+    match thread.send("second try").unwrap() {
+        Sent::MakingCopy(job) => drop(job),
+        Sent::Started => finish_turn(&mut thread),
+    }
+    assert!(fixture.store.flush(FLUSH));
+    let tracked: i64 = fixture
+        .database()
+        .query_row(
+            "SELECT count(*) FROM copy_cleanup WHERE path = ?1",
+            [first.path.to_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tracked, 1, "the failed attempt was forgotten");
+    assert!(first.path.exists());
+    let cleanup = fixture.store.copy_cleanup(fixture.project.id).unwrap();
+    assert_eq!(cleanup.len(), 1);
+    assert!(cleanup[0].rift_id.is_some());
+    assert!(Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &tools).is_err());
+    assert_eq!(
+        fixture.store.copy_cleanup(fixture.project.id).unwrap(),
+        cleanup
+    );
+    if matches!(failure, CleanupFailure::TrashSymlink) {
+        std::fs::remove_file(first.path.parent().unwrap().join(".trash")).unwrap();
+    }
+    Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &real_tools).unwrap();
+    assert!(fixture.store.flush(FLUSH));
+    assert!(!first.path.exists());
+    assert!(
+        fixture
+            .store
+            .copy_cleanup(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+    Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &real_tools).unwrap();
+    thread.shutdown_for_quit();
 }
