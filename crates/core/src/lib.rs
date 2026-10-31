@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod env;
+pub mod instance;
 pub mod orphans;
 mod probe;
 pub mod protocol;

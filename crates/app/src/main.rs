@@ -27,6 +27,7 @@ use gpui::{
     Render, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
 };
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+use newjen_core::instance::InstanceLock;
 use newjen_core::rift::Tools;
 use newjen_core::{SessionConfig, Store, Thread, orphans, store};
 
@@ -39,9 +40,6 @@ use crate::keys::{
 use gpui_kit::component::ActiveTheme as _;
 
 fn main() {
-    // Kill `claude` processes whose Newjen crashed, before starting new ones.
-    orphans::reap();
-
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let project = project_dir(home.as_deref());
     // Check before opening a window: a missing folder would otherwise surface later as a
@@ -51,12 +49,22 @@ fn main() {
         eprintln!("usage: newjen [project-dir]");
         std::process::exit(2);
     }
-    // Without its database Newjen cannot run (there is nowhere to keep threads). It still
-    // starts GPUI to say so in a window: started from Finder or the Dock there is no terminal
-    // to read this line.
-    let startup = open_threads(&project, home).inspect_err(|problem| {
-        eprintln!("newjen: could not open the thread database: {problem:#}");
-    });
+    let (instance, startup) = match acquire_instance() {
+        Ok(instance) => {
+            orphans::reap();
+            let startup = open_threads(&project, home, instance.directory()).map_err(|problem| {
+                StartupProblem::Database {
+                    problem,
+                    folder: instance.directory().to_path_buf(),
+                }
+            });
+            (Some(instance), startup)
+        }
+        Err(problem) => (None, Err(problem)),
+    };
+    if let Err(problem) = &startup {
+        eprintln!("newjen: {}: {}", problem.title(), problem.detail());
+    }
 
     gpui_platform::application()
         .with_assets(AppAssets(gpui_kit::assets::Assets))
@@ -74,7 +82,7 @@ fn main() {
 
             let opened = match startup {
                 Ok(startup) => open_window(startup, cx),
-                Err(problem) => show_database_problem(&problem, cx),
+                Err(problem) => show_startup_problem(&problem, cx),
             };
             if let Err(error) = opened {
                 eprintln!("newjen: could not open the window: {error:#}");
@@ -83,6 +91,51 @@ fn main() {
             }
             cx.activate(true);
         });
+    drop(instance);
+}
+
+enum StartupProblem {
+    AlreadyRunning(PathBuf),
+    Lock(anyhow::Error),
+    Database {
+        problem: anyhow::Error,
+        folder: PathBuf,
+    },
+}
+
+impl StartupProblem {
+    fn title(&self) -> &'static str {
+        match self {
+            Self::AlreadyRunning(_) => "Newjen is already running",
+            Self::Lock(_) => "Newjen couldn't lock its data folder",
+            Self::Database { .. } => "Newjen couldn't open its thread database",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::AlreadyRunning(folder) => format!(
+                "Newjen is already using {}. Switch to the running Newjen window. \
+                 To open a different project, quit Newjen there and launch it again. \
+                 Set NEWJEN_HOME to use a separate data folder.",
+                folder.display()
+            ),
+            Self::Lock(problem) => format!(
+                "{problem:#}.\n\nCheck that the data folder can be written to, then try again. \
+                 Set NEWJEN_HOME to use another folder."
+            ),
+            Self::Database { problem, folder } => {
+                database_problem_detail(problem, &folder.display().to_string())
+            }
+        }
+    }
+}
+
+fn acquire_instance() -> Result<InstanceLock, StartupProblem> {
+    let folder = store::default_dir().map_err(StartupProblem::Lock)?;
+    InstanceLock::try_acquire(&folder)
+        .map_err(StartupProblem::Lock)?
+        .ok_or(StartupProblem::AlreadyRunning(folder))
 }
 
 /// The menu bar and the app-wide actions behind it, so Newjen behaves like any Mac app
@@ -151,10 +204,10 @@ fn install_menus(cx: &mut App) {
 /// first, already settled after the last run: see `Thread::load`). Nothing is started: a
 /// thread's `claude` starts with the first message sent to it.
 ///
-/// A database that cannot be opened stops Newjen after saying why (`show_database_problem`);
+/// A database that cannot be opened stops Newjen after saying why (`show_startup_problem`);
 /// threads that cannot be read are reported in the window and the project opens without them.
-fn open_threads(project: &Path, home: Option<PathBuf>) -> anyhow::Result<Startup> {
-    let store = Store::open()?;
+fn open_threads(project: &Path, home: Option<PathBuf>, data_dir: &Path) -> anyhow::Result<Startup> {
+    let store = Store::open_in(data_dir)?;
     let project = store.open_project(project)?;
     let base_config = SessionConfig::new(project.path.clone());
     let (threads, problem) = match Thread::load_all(&store, &project, &base_config) {
@@ -211,13 +264,8 @@ fn check_project(project: &Path) -> Result<(), String> {
     }
 }
 
-/// When the thread database cannot be opened: a plain window with a native alert that says what
-/// went wrong and where the database is, and quits when it is dismissed.
-fn show_database_problem(problem: &anyhow::Error, cx: &mut App) -> anyhow::Result<()> {
-    let folder = store::default_dir()
-        .map(|dir| dir.display().to_string())
-        .unwrap_or_else(|_| "~/Library/Application Support/Newjen".to_string());
-    let detail = database_problem_detail(problem, &folder);
+fn show_startup_problem(problem: &StartupProblem, cx: &mut App) -> anyhow::Result<()> {
+    let detail = problem.detail();
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
@@ -234,7 +282,7 @@ fn show_database_problem(problem: &anyhow::Error, cx: &mut App) -> anyhow::Resul
     window.update(cx, |_, window, cx| {
         let answer = window.prompt(
             PromptLevel::Critical,
-            "Newjen couldn't open its thread database",
+            problem.title(),
             Some(&detail),
             &["Quit"],
             cx,
@@ -257,7 +305,6 @@ fn database_problem_detail(problem: &anyhow::Error, folder: &str) -> String {
     )
 }
 
-/// What the window shows behind the database alert: only the theme's background.
 struct Blank;
 
 impl Render for Blank {
