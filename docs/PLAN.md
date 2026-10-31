@@ -131,4 +131,4 @@ Kit's default light and dark themes follow the system appearance. Components kee
 ## Open questions
 
 - None blocking. Slices 1, 2 and 3 are built (2026-10-27, 2026-10-31, 2026-10-31). Ely was replaced with GPUI Kit on 2026-10-31. Next: slice 4, jj snapshots, diff view and landing.
-- **Rift gaps found in slice 3:** a copy folder deleted by hand, or removed directly after its `.rift` marker was lost (including `git clean -fdx`), stays in Rift's registry until the user runs `rift gc`; hooks run with the app's `PATH`, which is minimal when Newjen is started from Finder.
+- **Rift gaps found in slice 3:** a copy folder deleted by hand, or removed directly after its `.rift` marker was lost (including `git clean -fdx`), stays in Rift's registry until the user runs `rift gc`. Newjen deletes its own trash entry instead of running `rift gc`. Rift keeps that trash row until the user runs `rift gc`. Hooks run with the app's `PATH`, which is minimal when Newjen is started from Finder.
