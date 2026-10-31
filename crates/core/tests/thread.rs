@@ -2960,3 +2960,88 @@ fn opaque_approval_keys_reject_cross_thread_stale_and_previous_process_answers()
     assert_eq!(first.status(), Status::Done);
     assert_eq!(second.status(), Status::Done);
 }
+
+#[test]
+fn cancelling_before_the_copy_is_made_never_starts_an_agent() {
+    let fixture = Fixture::new();
+    let (mut thread, job) = fixture.preparing("Do not send this");
+    thread.stop().unwrap();
+    assert!(thread.preparing().unwrap().cancelled());
+    assert!(thread.send("too early").is_err());
+    let made = job.run(&Tools::find(), |_| {});
+    assert_eq!(made, Err(CopyError::Cancelled));
+    let failed = thread.finish_copy(made).unwrap_err();
+    assert_eq!(failed.message, "Do not send this");
+    assert!(failed.copy_to_remove.is_none());
+    assert!(thread.is_draft());
+    assert!(fixture.spawns().is_empty());
+    assert!(fixture.messages_received().is_empty());
+}
+
+#[test]
+fn cancelling_during_a_rift_hook_stops_it_and_removes_the_copy() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    std::fs::write(
+        fixture.project.path.join(".rift.toml"),
+        "version = 1\n[[hooks.postcreate]]\nrun = \"echo hook-ready >&2; sleep 30; echo finished > hook-finished\"\n",
+    )
+    .unwrap();
+    let (mut thread, job) = fixture.preparing("Held until ready");
+    let (ready, started) = std::sync::mpsc::channel();
+    let worker_tools = tools.clone();
+    let worker = std::thread::spawn(move || {
+        job.run(&worker_tools, |progress| {
+            if let newjen_core::rift::Progress::Line(line) = progress
+                && line.contains("hook-ready")
+            {
+                let _ = ready.send(());
+            }
+        })
+    });
+    started.recv_timeout(Duration::from_secs(20)).unwrap();
+    let path = thread.preparing().unwrap().path().to_path_buf();
+    let stopped = Instant::now();
+    thread.stop().unwrap();
+    assert!(thread.send("not yet").is_err());
+    let made = worker.join().unwrap();
+    assert!(
+        stopped.elapsed() < Duration::from_secs(20),
+        "the hook was stopped rather than waited for"
+    );
+    assert_eq!(made, Err(CopyError::Cancelled));
+    assert_eq!(
+        thread.finish_copy(made).unwrap_err().message,
+        "Held until ready"
+    );
+    assert!(!path.exists(), "the half-made copy is removed");
+    assert!(fixture.store.flush(Duration::from_secs(5)));
+    assert!(
+        fixture
+            .store
+            .pending_copies(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(fixture.spawns().is_empty());
+    assert!(fixture.messages_received().is_empty());
+}
+
+#[test]
+fn a_copy_finished_after_cancelling_is_removed_instead_of_used() {
+    let fixture = Fixture::new();
+    let Some(tools) = fixture.rift_tools() else {
+        return;
+    };
+    let (mut thread, job) = fixture.preparing("Never deliver");
+    let copy = job.run(&tools, |_| {}).unwrap();
+    thread.stop().unwrap();
+    let failed = thread.finish_copy(Ok(copy.clone())).unwrap_err();
+    assert_eq!(failed.message, "Never deliver");
+    assert_eq!(failed.copy_to_remove.as_deref(), Some(&copy));
+    assert!(thread.is_draft());
+    assert!(fixture.messages_received().is_empty());
+    assert!(fixture.spawns().is_empty());
+}

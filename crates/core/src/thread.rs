@@ -183,6 +183,7 @@ pub struct Preparing {
     started_at: Instant,
     last_line: Option<String>,
     main_repo: MainRepoStep,
+    cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +206,16 @@ impl Preparing {
     /// The last line Rift or its hooks printed (see [`Thread::note_copy_progress`]).
     pub fn last_line(&self) -> Option<&str> {
         self.last_line.as_deref()
+    }
+
+    /// Where the copy is being made.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The user cancelled ([`Thread::stop`]); the message comes back once Rift has stopped.
+    pub fn cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -873,6 +884,7 @@ impl Thread {
                 started_at: Instant::now(),
                 last_line: None,
                 main_repo: MainRepoStep::Snapshotting,
+                cancelled: false,
             });
             self.last_activity = Instant::now();
             self.remember_agent();
@@ -886,6 +898,24 @@ impl Thread {
         }
         self.deliver(text)?;
         Ok(Sent::Started)
+    }
+
+    /// [`Thread::stop`] while the copy is made: Rift and its hooks are stopped as quitting
+    /// stops them, and the half-made copy is removed. The held message is never sent; it comes
+    /// back through [`Thread::finish_copy`] with [`CopyError::Cancelled`].
+    fn cancel_copy(&mut self) {
+        let Stage::Preparing(preparing) = &mut self.stage else {
+            return;
+        };
+        if preparing.cancelled {
+            return;
+        }
+        preparing.cancelled = true;
+        if let Some(control) = &self.copy_job
+            && let Some(stopping) = control.cancel()
+        {
+            self.stopping.push(stopping);
+        }
     }
 
     pub fn note_copy_progress(&mut self, progress: rift::Progress) {
@@ -921,9 +951,17 @@ impl Thread {
             }
         };
         let message = preparing.message;
+        let (made, copy_to_remove) = match made {
+            // Rift finished just as the user cancelled; the copy goes the way a half-made one
+            // does, without being used.
+            Ok(copy) if preparing.cancelled => (Err(CopyError::Cancelled), Some(Box::new(copy))),
+            made => (made, None),
+        };
         if made.is_err() {
             let path = preparing.path;
-            if matches!(&made, Err(CopyError::Exists { .. })) || rift::pending_is_gone(&path) {
+            if copy_to_remove.is_none()
+                && (matches!(&made, Err(CopyError::Exists { .. })) || rift::pending_is_gone(&path))
+            {
                 self.store.delete_pending_copy(&self.id);
             }
         }
@@ -940,7 +978,7 @@ impl Thread {
             NotSent {
                 message,
                 error,
-                copy_to_remove: None,
+                copy_to_remove,
             }
         })
     }
@@ -1029,6 +1067,10 @@ impl Thread {
     /// repair would start claude again and resend the message, running the very turn the user
     /// stopped.
     pub fn stop(&mut self) -> Result<()> {
+        if self.preparing().is_some() {
+            self.cancel_copy();
+            return Ok(());
+        }
         if self.transcript.pending_approval().is_some() {
             return self.answer(None, crate::agent::ApprovalIntent::DenyAndStop);
         }

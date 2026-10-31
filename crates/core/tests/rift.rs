@@ -610,3 +610,32 @@ fn removal_refuses_a_copy_outside_the_canonical_project_destination() {
     assert!(rift::remove(&lab.tools, &project, &copy.path, &copy.rift_id).is_err());
     assert_eq!(read(&copy.path, "valuable.txt"), "unrelated work");
 }
+
+#[test]
+fn hooks_run_with_the_path_the_tools_carry() {
+    let Some(lab) = lab() else { return };
+    let project = lab.folder("hook-path");
+    let bin = lab.folder("user-tools");
+    let tool = bin.join("newjen-hook-tool");
+    std::fs::write(&tool, "#!/bin/sh\necho found > hook-proof\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write(
+        &project,
+        ".rift.toml",
+        "version = 1\n[[hooks.postcreate]]\nrun = \"newjen-hook-tool\"\n",
+    );
+    let minimal = lab
+        .tools
+        .clone()
+        .with_env([("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into())]);
+    let error = rift::create(&minimal, &project, "minimal-path", |_| {}).unwrap_err();
+    assert!(error.to_string().contains("newjen-hook-tool"), "{error}");
+    let resolved = minimal.with_env([(
+        "PATH".into(),
+        format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+    )]);
+    let copy = rift::create(&resolved, &project, "resolved-path", |_| {}).unwrap();
+    assert_eq!(read(&copy.path, "hook-proof"), "found\n");
+    rift::remove(&resolved, &copy.source, &copy.path, &copy.rift_id).unwrap();
+}

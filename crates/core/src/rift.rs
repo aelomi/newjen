@@ -63,6 +63,14 @@ impl Tools {
             env: Vec::new(),
         }
     }
+
+    /// The same tools with these variables set for them and for Rift's hooks. An app started
+    /// from Finder has a minimal `PATH`, so hooks get the login shell's
+    /// ([`crate::env::resolved_path`]) this way.
+    pub fn with_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Tools {
+        self.env.extend(env);
+        self
+    }
 }
 
 /// Finds `rift`, overridden by `$NEWJEN_RIFT`. The `rift` npm installs is a Node script, and an
@@ -145,6 +153,8 @@ pub enum CopyError {
         detail: String,
         output: Vec<String>,
     },
+    /// The user cancelled while the copy was made. Whatever was made is removed again.
+    Cancelled,
 }
 
 impl fmt::Display for CopyError {
@@ -160,6 +170,7 @@ impl fmt::Display for CopyError {
             CopyError::Failed {
                 command, detail, ..
             } => write!(f, "`{command}` failed: {detail}"),
+            CopyError::Cancelled => write!(f, "Newjen stopped making the copy"),
         }
     }
 }
@@ -388,7 +399,18 @@ pub(crate) fn create_controlled(
             base: base.clone(),
         })
     };
-    finish().map_err(|error| remove_after(tools, &project, &path, rift_id.as_deref(), error))
+    let copy = finish()
+        .map_err(|error| remove_after(tools, &project, &path, rift_id.as_deref(), error))?;
+    if control.cancelled() {
+        return Err(remove_after(
+            tools,
+            &project,
+            &path,
+            rift_id.as_deref(),
+            CopyError::Cancelled,
+        ));
+    }
+    Ok(copy)
 }
 
 /// Removes the copy at `path` whose Rift id is `rift_id` (see the module docs). Nothing to do
@@ -623,6 +645,13 @@ enum CopyProcess {
 }
 
 impl CopyControl {
+    fn cancelled(&self) -> bool {
+        matches!(
+            *self.0.lock().expect("copy process"),
+            CopyProcess::Cancelled
+        )
+    }
+
     pub(crate) fn cancel(&self) -> Option<thread::JoinHandle<()>> {
         let previous = std::mem::replace(
             &mut *self.0.lock().expect("copy process"),
@@ -698,10 +727,7 @@ fn run_controlled(
     use std::os::unix::process::CommandExt;
     let mut process = control.map(|control| control.0.lock().expect("copy process"));
     if matches!(process.as_deref(), Some(CopyProcess::Cancelled)) {
-        return Err(failure(
-            &command_text,
-            "Newjen stopped making the copy".to_string(),
-        ));
+        return Err(CopyError::Cancelled);
     }
     if control.is_some() {
         command.process_group(0);
@@ -766,6 +792,9 @@ fn run_controlled(
 
     if let Some(control) = control {
         let mut process = control.0.lock().expect("copy process");
+        if matches!(*process, CopyProcess::Cancelled) {
+            return Err(CopyError::Cancelled);
+        }
         if matches!(*process, CopyProcess::Running(_)) {
             stop_group(child.id());
             *process = CopyProcess::Waiting;
