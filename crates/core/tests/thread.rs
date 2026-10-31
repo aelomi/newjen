@@ -2687,15 +2687,19 @@ fn quitting_stops_rift_and_postcreate_hooks_before_recovery_for(
     .unwrap();
     let (mut thread, job) = fixture.preparing("wait for setup");
     let job_thread = std::thread::spawn(move || job.run(&tools, |_| {}));
+    // The hook creates the file before it writes the pid, so wait for the number itself.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !pid_file.exists() && Instant::now() < deadline {
+    let pid: i32 = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the postcreate hook never ran");
         std::thread::sleep(Duration::from_millis(10));
-    }
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    };
     let group = std::process::Command::new("/bin/ps")
         .args(["-o", "pgid=", "-p", &pid.to_string()])
         .output()
