@@ -245,7 +245,7 @@ impl ChatView {
                 match result {
                     Ok(receipt) => match if receipt.truncated { Ok(Vec::new()) } else { DiffFile::parse(&receipt.patch) } {
                         Ok(files) => {
-                            let message = if receipt.truncated { "The diff is too large to show. Landing is blocked." } else if mode == LandingMode::AgentManaged { "Recorded jj changes only. Unsnapshotted files are not included. The copy stays after landing." } else if receipt.patch.is_empty() { "No changes." } else { "Review the changes, then land or discard the work." }.into();
+                            let message = if receipt.truncated { "The diff is too large to show. Landing is blocked." } else if mode == LandingMode::AgentManaged { "Only work recorded with jj is shown. Git commits are not imported; use jj and bookmark your work. The copy stays after landing." } else if receipt.patch.is_empty() { "No changes." } else { "Review the changes, then land or discard the work." }.into();
                             view.review_panel = Some(ReviewPanel { thread: id, receipt, diff: cx.new(|cx| DiffState::new(files, cx)), busy: false, message });
                         }
                         Err(error) => view.slots[view.active].notice = Some(Notice::held("Couldn't display the diff", error.to_string())),
@@ -280,7 +280,7 @@ impl ChatView {
                 || (other != ix && slot.thread.read(cx).owns_project_work())
         }) {
             self.review_panel.as_mut().unwrap().message =
-                "Wait for project-folder work to stop before changing the project.".into();
+                "Land, discard, or keep the files and close the project-folder thread before landing copy work.".into();
             cx.notify();
             return;
         }
@@ -289,6 +289,7 @@ impl ChatView {
         let copy = thread.copy().cloned();
         let cwd = thread.cwd().to_path_buf();
         let mode = thread.landing_mode();
+        let oversized_copy = copy.is_some() && receipt.truncated;
         let resolution = Resolution {
             id,
             receipt,
@@ -298,7 +299,7 @@ impl ChatView {
             integration: (!discard).then_some(integration),
         };
         if discard {
-            let question = window.prompt(gpui::PromptLevel::Warning, "Discard this thread's work?", Some("This removes the Rift copy, or restores the project-folder work to this thread's base. The conversation is archived."), &["Cancel", "Discard"], cx);
+            let question = window.prompt(gpui::PromptLevel::Warning, "Discard this thread's work?", Some(if oversized_copy { "The diff is too large to display. This deletes the entire Rift copy, including changes you have not reviewed. The conversation is archived." } else { "This removes the Rift copy, or restores the project-folder work to this thread's base. The conversation is archived." }), &["Cancel", "Discard"], cx);
             cx.spawn_in(window, async move |view, cx| {
                 if question.await.ok() == Some(1) {
                     let _ = view.update_in(cx, |view, window, cx| {
@@ -378,6 +379,71 @@ impl ChatView {
         cx.notify();
     }
 
+    pub(super) fn keep_project_files_and_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.review_loading || self.review_panel.as_ref().is_some_and(|panel| panel.busy) {
+            return;
+        }
+        let thread = self.thread().clone();
+        if !thread.read(cx).can_release_project_tracking() {
+            return;
+        }
+        let id = thread.read(cx).id().to_string();
+        let question = window.prompt(gpui::PromptLevel::Warning, "Keep files and close this thread?", Some("Newjen stops tracking this thread. Files and jj history stay as they are. Manage this work in your terminal. Other threads can then use the project folder."), &["Cancel", "Keep files and close"], cx);
+        cx.spawn_in(window, async move |view, cx| {
+            if question.await.ok() != Some(1) {
+                return;
+            }
+            let task = view.update_in(cx, |view, _, cx| {
+                let ix = view.index_of(&id, cx)?;
+                let thread = view.slots[ix].thread.clone();
+                if !thread.read(cx).can_release_project_tracking()
+                    || view.review_loading
+                    || view.review_panel.as_ref().is_some_and(|panel| panel.busy)
+                {
+                    return None;
+                }
+                view.review_loading = true;
+                let stopping = thread.update(cx, |thread, _| thread.begin_quit());
+                let store = view.store.clone();
+                cx.notify();
+                Some(cx.background_spawn(async move {
+                    thread::finish_quit(&store, [stopping]);
+                }))
+            });
+            let Ok(Some(task)) = task else {
+                return;
+            };
+            task.await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.review_loading = false;
+                let Some(ix) = view.index_of(&id, cx) else {
+                    return;
+                };
+                let result = view.slots[ix].thread.update(cx, |thread, cx| {
+                    let result = thread.release_project_tracking();
+                    cx.notify();
+                    result
+                });
+                match result {
+                    Ok(()) => {
+                        view.review_panel = None;
+                        view.archive(&id, window, cx);
+                    }
+                    Err(error) => {
+                        view.slots[ix].notice =
+                            Some(Notice::held("Couldn't close the thread", error.to_string()))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn render_review_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let thread = self.thread().read(cx);
         if thread.is_draft() {
@@ -439,6 +505,25 @@ impl ChatView {
                     cx,
                 )
                 .on_click(cx.listener(|view, _, window, cx| view.open_review(window, cx))),
+            )
+            .children(thread.can_release_project_tracking().then(|| {
+                ui::button(
+                    "keep-files-close",
+                    "Keep files and close",
+                    ui::Look::Ghost,
+                    ui::Size::Sm,
+                    cx,
+                )
+                .on_click(
+                    cx.listener(|view, _, window, cx| {
+                        view.keep_project_files_and_close(window, cx)
+                    }),
+                )
+            }))
+            .children(
+                thread
+                    .snapshot_waits_for_background()
+                    .then(|| ui::caption("Stop background tasks to save this turn.", cx)),
             )
             .children(
                 thread

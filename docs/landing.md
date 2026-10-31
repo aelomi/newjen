@@ -6,9 +6,9 @@ Landing requires a jj repository colocated with git. Git-only projects can still
 
 ## Harness-managed work
 
-Newjen asks the agent not to commit. At each turn's end, it describes the working change and starts a new one. The next message waits for that snapshot. A failed snapshot shows an error and a retry button.
+Newjen asks the agent not to commit. At each turn's end, it describes the working change and starts a new one. The next message waits for that snapshot. A failed snapshot shows an error and a retry button. If a background task keeps the folder busy, Stop remains available. Stop ends those tasks and lets the snapshot finish.
 
-For a project-folder thread, Newjen first snapshots existing work and starts the thread on its own change. The review excludes the earlier work. Resolve that thread before starting another project-folder thread. A copy can keep working independently.
+For a project-folder thread, Newjen first snapshots existing work and starts the thread on its own change. The review excludes the earlier work. Resolve that thread before starting another project-folder thread. A copy can keep working independently. Resolve the project-folder thread before landing copy work.
 
 Open **Review work** after the turn finishes. Kit's diff viewer shows the changes since the thread's base. Choose one of these actions.
 
@@ -18,13 +18,15 @@ Open **Review work** after the turn finishes. Kit's diff viewer shows the change
 
 Project-folder changes are already present in the project. Landing runs the checks, records the thread bookmark, and starts a fresh change. It does not copy files over themselves.
 
-Landing rejects files changed since review, oversized diffs, unexpected project history, and conflicts found during preflight. The final jj command uses the current project state. If an external editor or jj command changes the project after preflight, jj can leave a conflict in the project with both versions preserved. Resolve it there before continuing. A failed land keeps the copy. Refresh the review after changing files or fixing a conflict.
+Landing rejects files changed since review, oversized diffs, unexpected project history, and conflicts found during preflight. The final jj command uses the current project state. If an external editor or jj command changes the project after preflight, jj can leave a conflict in the project with both versions preserved. Resolve it there before continuing. A failed land keeps the copy. When a copy diff exceeds the display limit, Discard remains available with an explicit warning that it deletes unreviewed work after confirmation. Refresh the review after changing files or fixing a conflict.
+
+If you change jj history yourself, Newjen may no longer be able to land or discard the project thread. Choose **Keep files and close** to release its tracking and archive the conversation. This changes no files or jj history and lets other threads use the project folder. You can also use this action to keep unfinished work for manual handling. The agent must stop first; a running snapshot must finish.
 
 After landing, archive the thread to close it and remove its copy and temporary jj remote. Newjen removes only that copy's trash entry. It never runs `rift gc`.
 
 ## Agent-managed work
 
-After a Rift copy is initialized, Newjen never writes to version control in that folder. Reads use `--ignore-working-copy`. The agent owns snapshots and bookmarks.
+After a Rift copy is initialized, Newjen never writes to version control in that folder. Reads use `--ignore-working-copy`. The agent owns snapshots and bookmarks. Newjen instructs the agent to use jj and bookmark all its work before ending a turn. Git commits are not imported automatically and may be absent from review until the agent records them with jj.
 
 Review shows recorded jj changes only. Files changed since the last jj snapshot are not included. Copy landing requires one bookmarked head containing the recorded work. It fetches the agent's bookmarks, then creates `thread/<id>` in the project. The copy remains until you explicitly archive it.
 

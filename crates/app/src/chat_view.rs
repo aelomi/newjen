@@ -1091,7 +1091,7 @@ impl ChatView {
                 .iter()
                 .any(|slot| slot.thread != thread && slot.thread.read(cx).owns_project_work())
         {
-            self.slots[self.active].notice = Some(Notice::held("Review the project thread first", "Land or discard the existing project-folder work before starting another thread here.".into()));
+            self.slots[self.active].notice = Some(Notice::held("Review the project thread first", "Land, discard, or keep the files and close the existing project-folder thread before starting another one here.".into()));
             cx.notify();
             return false;
         }
@@ -1410,7 +1410,9 @@ impl ChatView {
             let pending = thread.transcript().pending_approval().is_some();
             (
                 pending,
-                thread.status().is_busy() || thread.preparing().is_some(),
+                thread.status().is_busy()
+                    || thread.preparing().is_some()
+                    || !thread.background_tasks().is_empty(),
             )
         };
         if !pending && !busy {
@@ -1438,6 +1440,9 @@ impl ChatView {
     /// "Try again" on an error: a fresh `claude` for the same conversation (core works out
     /// whether it resumes or starts over).
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review_loading || self.review_panel.as_ref().is_some_and(|panel| panel.busy) {
+            return;
+        }
         let thread = self.thread().clone();
         let (program, gone) = {
             let thread = thread.read(cx);
@@ -1979,6 +1984,8 @@ impl ChatView {
             ui::Footer::Disabled("Install an agent, then Refresh")
         } else if checking {
             ui::Footer::Disabled("Checking agents…")
+        } else if self.thread().read(cx).snapshot_waits_for_background() {
+            ui::Footer::Stop(self.press(cx, |view, window, cx| view.stop(window, cx)))
         } else if self.thread().read(cx).work_pending() {
             ui::Footer::Wait("Saving a jj snapshot…")
         } else if self.thread().read(cx).landing_finished() {
