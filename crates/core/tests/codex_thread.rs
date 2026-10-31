@@ -804,6 +804,12 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
         complete(&mut thread, true, &copy.workdir) > 0,
         "expected a shell approval"
     );
+    // A harness-managed thread snapshots its copy after each turn; the app runs this job.
+    let snapshot = thread
+        .take_snapshot_job()
+        .expect("a snapshot is due after the turn");
+    thread.finish_snapshot(snapshot.run(&tools));
+    assert!(!thread.work_pending(), "{:?}", thread.snapshot_error());
     let users: Vec<_> = thread
         .transcript()
         .items()
