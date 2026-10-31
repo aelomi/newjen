@@ -67,7 +67,7 @@ Never label the full imported ancestry as exclusively agent-authored. With a dir
 
 For native Git, a temporary index can capture `B` without changing the user's real index. The ordinary-file probe used `GIT_INDEX_FILE`, `git read-tree`, `git add -A`, `git write-tree`, and `git commit-tree`, then pinned the snapshot under a private ref. A reviewer proved that seeding only from `HEAD` omits newly staged files covered by ignore rules. A follow-up probe seeded the temporary index from the real index instead. `git add -A` then preserved those tracked paths, and the resulting diff included their edits. Preserve the real index's tracked-path membership when constructing both snapshots. The tested correction uses an ordinary index. Split indexes and unresolved index entries still need explicit handling. Keeping index bytes unchanged does not prove that the file snapshot is complete.
 
-`commit-tree` creates a snapshot commit without running normal commit hooks or signing a user commit. This distinction must be explicit. Final user-facing commits must follow the project's chosen checks, identity, and signing policy. Do not disable those silently.
+`commit-tree` creates a snapshot commit without running normal commit hooks or signing a user commit. Supply an explicit technical author and committer identity for app-owned snapshots. A probe reproduced failure under `user.useConfigOnly=true` with no configured identity, then success with `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` set for the snapshot command. Do not change the user's global identity. This distinction must be explicit. Final user-facing commits must follow the project's chosen checks, identity, and signing policy. Do not disable those silently.
 
 Checkpoint snapshots must be pinned before returning success. Retain `B` and the reviewed `T` across restarts. If a thread continues after review, invalidate the old approval. A second apply must cover only work after the last successful apply or report that the same result is already applied. Never reapply the original full delta blindly.
 
@@ -77,7 +77,7 @@ Checkpoint snapshots must be pinned before returning success. Retain `B` and the
 
 `jj git init --colocate` reuses `.git` and adds `.jj`. A supplemental scratch probe also observed a rewritten `.git/index`, new Git objects, and private `refs/jj/keep` refs at initialization. The branch remained attached and the staged path remained staged at that point. It does not clone the repository or require a network operation. It is still a change to the user's repository setup.
 
-The installed jj 0.46.0 snapshot included tracked edits and untracked files, while excluding ignored files. After `jj new`, Git HEAD was detached and the copied staging distinction was gone. This is a meaningful workflow change for a Git user, even though committed history remains Git-compatible.
+The initial ordinary-file fixture showed jj 0.46.0 capturing tracked edits and small untracked files while excluding ignored files. This is not a completeness guarantee. Its default `snapshot.max-new-file-size` is 1 MiB for new files. A later probe produced a warning and exit status zero while omitting a 2 MiB untracked file. Newjen must set a deliberate snapshot-size policy or show each exclusion and withhold a claim that all in-scope work is reviewed or transferred. Raising the cap explicitly included the fixture file. This limit does not mean all modifications to already tracked large files are omitted. After `jj new`, Git HEAD was detached and the copied staging distinction was gone. This is a meaningful workflow change for a Git user, even though committed history remains Git-compatible.
 
 Do not choose this automatically. An explicit future Convert to jj action could offer it after explaining the consequences.
 
@@ -91,7 +91,7 @@ Record the complete initial jj snapshot as `B`, then start a child change before
 
 This is the selected approach for harness-managed copies. In agent-managed mode, adding jj and periodically snapshotting it contradicts the promise that Newjen does not write version control on the agent's behalf. Agent-managed Git threads need a saved baseline for review, but Newjen should not move their branches, clear their index, or invent final commits.
 
-Do not use `jj diff --git` alone as the transfer artifact. A supplemental probe created a new binary file in a non-colocated jj copy. jj emitted a descriptive `Binary files ... differ` record, and `git apply --check` rejected it. Running `git diff --binary --full-index B T` against the copy's backing Git store produced an applicable patch and restored the exact binary bytes in a non-repo destination. For a colocated copy, use its `.git` store. The non-colocated probe used `.jj/repo/store/git` with jj 0.46.0. That path was only an experimental detail. Use the documented `jj --ignore-working-copy git root` to discover it in the core adapter, as verified in the later project-mode probe. A direct file transaction from snapshot contents is another option. jj snapshots do not require using jj's display diff for transfer.
+Do not use `jj diff --git` alone as the transfer artifact. A supplemental probe created a new binary file in a non-colocated jj copy. jj emitted a descriptive `Binary files ... differ` record, and `git apply --check` rejected it. The initial native Git diff against the copy's backing store restored the exact binary bytes in a non-repo destination under a clean configuration. A later review proved that porcelain diff is unsafe under user diff configuration. Use the hardened `diff-tree` recipe below for transfer. For a colocated copy, use its `.git` store. The non-colocated probe used `.jj/repo/store/git` with jj 0.46.0. That path was only an experimental detail. Use the documented `jj --ignore-working-copy git root` to discover it in the core adapter, as verified in the later project-mode probe. A direct file transaction from snapshot contents is another option. jj snapshots do not require using jj's display diff for transfer.
 
 jj's documented compatibility gaps include Git attributes, hooks, submodules, sparse checkouts, partial clones, and unfinished Git operations. The scratch tests cover ordinary files, not those configurations. Read the [jj compatibility documentation](https://docs.jj-vcs.dev/latest/git-compatibility/) before expanding support.
 
@@ -134,10 +134,12 @@ A production merge or cherry-pick path needs an explicit target branch, a clean 
 
 ### Return a patch instead of merging ancestry
 
-Generate a binary-capable patch between saved trees `B` and `T`. The native Git tests established the following command shape. Review added the explicit whitespace flag after reproducing silent changes under `apply.whitespace=fix`:
+Generate a binary-capable patch between saved trees `B` and `T`. The original porcelain `git diff` recipe is superseded. User text-conversion configuration made it emit a patch that applied successfully but wrote display text instead of the reviewed binary. Other tested diff settings changed prefixes, added color, or suppressed the patch. The following plumbing recipe restored binary and nested-file contents under each tested setting. The explicit apply whitespace flag preserves reviewed trailing spaces:
 
 ```sh
-git -C "$copy" diff --binary --full-index "$baseline" "$result"
+git -C "$copy" diff-tree -r -p --binary --full-index \
+	--no-ext-diff --no-textconv --no-color \
+	--src-prefix=a/ --dst-prefix=b/ "$baseline" "$result" -- > "$patch"
 git -C "$source" apply --check --whitespace=nowarn "$patch"
 git -C "$source" apply --whitespace=nowarn "$patch"
 ```
@@ -160,7 +162,11 @@ This conservative rule sacrifices automatic combination of independent edits in 
 
 There is nothing to fetch when a thread works in the original folder. Its changes are already there. Use **Review changes** and **Keep changes** rather than suggesting that Land will transfer files.
 
-Capture `B` before the first edit with an app-owned snapshot that does not alter the user's index or initialize jj in the folder. For a Git project, the private-index technique is a tested starting point. For a non-repo folder, a private store or file manifest is a possible design, not a complete tested implementation.
+Capture `B` before the first edit with an app-owned snapshot outside the user's repository. A temporary index by itself is insufficient. A probe stored a baseline under `refs/newjen/baseline` in the project and sent it to a local remote with `git push --mirror`. A snapshot branch is also eligible for `push --all`. A private-looking ref name is not an isolation boundary.
+
+For private project-folder checkpoints, use an app-owned Git object store and index, with explicit `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` command environment. The probe captured the fixture files while leaving the project's `.git` file set and contents unchanged. Preserve the project's tracked-path membership and ignore policy explicitly. The external store does not inherit the project's `.git/info/exclude`, including Rift's marker exclusion. The initial empty-store scan must hash its selected files. Snapshot identity and objects must belong to that store. Do not assume that copying an index or adding object alternates proves independent, durable storage. Only deliberately selected and reviewed refs should enter the import or push workflow. Intentional checkpoints in ordinary project history must not be described as private.
+
+Passive Git UI reads also need a defined command policy. In the probe, `git diff` and `git diff --quiet` rewrote the index even with `GIT_OPTIONAL_LOCKS=0`. The tested `diff-index` and `diff-files` reads did not. Use plumbing observations such as `diff-index`, `diff-files`, `diff-tree`, and `ls-files`, with optional locks disabled. Verify the chosen commands against the supported Git configurations rather than treating every Git read as write-free. For a non-repo folder, a private store or file manifest is a possible design, not a complete tested implementation.
 
 Do not attribute arbitrary `git status` changes to one thread. Other project-folder threads, terminals, and editors can edit the same files. The current creation guard prevents making a copy while a project-folder turn runs. It is not a general guarantee of exclusive ownership over the project.
 
@@ -225,13 +231,15 @@ The probe passed assertions for these behaviors:
 - A jj workspace backed by the original Git store exported a branch into that original.
 - Non-colocated jj in a non-repo copy produced private snapshots without top-level `.git`.
 
+The late review probe `/tmp/newjen-git-landing/late-landing-review.py` passed 21 assertions. It reproduced textconv corruption, tested deterministic plumbing patches and nested files, proved mirror publication of a nominally private ref, checked an external snapshot store, verified technical snapshot identity, exercised jj's new-file limit, and compared index writes from porcelain and plumbing reads. The artifact location is recorded in `/tmp/newjen-git-landing/latest-late-landing`. Duplicate whitespace and working-tree-redirection findings were already corrected.
+
 These tests establish mechanics. They do not prove an application transaction, cancellation, crash recovery, concurrent-editor safety, or a complete policy for selecting files. No GUI, application build, or live Claude or Codex run was needed.
 
 ## Review status
 
 GPT 6.1 Sol found one verified issue with inherited whitespace-fixing configuration. GPT 6 Astra found two verified issues with redirected working trees and staged ignored files. The findings were independently rerun. This memo now records the corrected requirements and tested remedies. These are local corrections after review, not a second panel approval of a production implementation.
 
-Claude Fable 5.1 did not complete this earlier standalone landing review because the provider reported a rate limit. It later completed the broader [project source-control review](project-source-control.md#verification-and-handoff), which also examined landing and supplied the non-colocated export correction. That later verdict approves the three-mode design with documented corrections. It is not a separate retroactive approval of every statement in this historical memo.
+Claude Fable 5.1 later completed both this standalone landing review and the broader [project source-control review](project-source-control.md#verification-and-handoff). The landing verdict accepts the architecture with corrections to command shapes, snapshot storage, completeness checks, identity, and observation behavior. Its whitespace and working-tree-redirection findings overlap earlier corrections. The remaining findings were independently reproduced and are recorded here. All requested reviewers have returned. This is completed review plus local corrections, not a second unanimous verdict on revised text or approval of an implemented landing transaction.
 
 The prose-only comment scan found no code comments, commented-out code, or suppressions. It changed no files. The owner's decisions arrived during review and are recorded above. No reviewer approved an implemented landing transaction because this task implements none.
 
@@ -243,6 +251,9 @@ The finish behavior remains an apply of reviewed edits without an automatic comm
 
 The next implementation needs these concrete boundaries:
 
+- Keep private project-folder checkpoint objects and refs in app-owned storage, not the project's Git store. Preserve source ignore and tracked-path policies explicitly.
+- Generate transfer patches with the hardened plumbing recipe and verify the resulting bytes. Use non-mutating Git observations and explicit snapshot identity.
+- Treat omitted or oversized jj files as incomplete review coverage, even when the snapshot command succeeds.
 - Capture a durable baseline for new copy and project-folder threads. Do not fabricate one for older `base: None` rows.
 - Reject redirected working trees and shared metadata before copy hooks or agents can mutate them. Preserve the original tracked-path membership when snapshotting.
 - Use copy-local jj for harness-managed copies. Export binary-capable patches from its Git store or transfer snapshot files directly. Preserve the no-version-control-writes promise in agent-managed mode.
