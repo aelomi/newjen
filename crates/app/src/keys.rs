@@ -10,7 +10,7 @@
 use std::rc::Rc;
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, KeyDownEvent, NoAction, actions};
-use newjen_core::PermissionAnswer;
+use newjen_core::ApprovalIntent;
 
 // Each name becomes a unit struct, e.g. `pub struct Stop;`.
 actions!(
@@ -90,7 +90,7 @@ pub fn bind(cx: &mut App) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalKey {
     /// A fresh press of ⌘↵ (allow once) or Esc (deny).
-    Answer(PermissionAnswer),
+    Answer(ApprovalIntent),
     /// The same keys repeating because they are held down. These must answer nothing.
     Repeat,
 }
@@ -107,8 +107,8 @@ pub fn approval_key(event: &KeyDownEvent) -> Option<ApprovalKey> {
     let modifiers = keystroke.modifiers;
     let others = modifiers.control || modifiers.alt || modifiers.shift;
     let answer = match keystroke.key.as_str() {
-        "enter" if modifiers.platform && !others => PermissionAnswer::AllowOnce,
-        "escape" if !modifiers.platform && !others => PermissionAnswer::Deny,
+        "enter" if modifiers.platform && !others => ApprovalIntent::AllowOnce,
+        "escape" if !modifiers.platform && !others => ApprovalIntent::Deny,
         _ => return None,
     };
     Some(if event.is_held {
@@ -124,7 +124,7 @@ pub enum KeyRoute {
     /// Esc while the thread drawer is open: close it.
     CloseDrawer,
     /// ⌘↵ or Esc while an approval waits: answer it.
-    Answer(PermissionAnswer),
+    Answer(ApprovalIntent),
     /// ⌘↵ or Esc held down while an approval waits: ours, but it answers nothing.
     Ignore,
     /// Not ours: the key goes on to whatever else handles it.
@@ -185,11 +185,11 @@ mod tests {
     fn approval_keys_answer_only_on_a_fresh_press() {
         assert_eq!(
             approval_key(&press("cmd-enter", false)),
-            Some(ApprovalKey::Answer(PermissionAnswer::AllowOnce))
+            Some(ApprovalKey::Answer(ApprovalIntent::AllowOnce))
         );
         assert_eq!(
             approval_key(&press("escape", false)),
-            Some(ApprovalKey::Answer(PermissionAnswer::Deny))
+            Some(ApprovalKey::Answer(ApprovalIntent::Deny))
         );
         // Held down: macOS repeats the key, and a repeat answers nothing.
         assert_eq!(
@@ -233,12 +233,12 @@ mod tests {
         // With the drawer shut, the same press denies the waiting request.
         assert_eq!(
             key_route(&press("escape", false), false, false, true),
-            KeyRoute::Answer(PermissionAnswer::Deny)
+            KeyRoute::Answer(ApprovalIntent::Deny)
         );
         // The drawer does not use ⌘↵, so it still allows once.
         assert_eq!(
             key_route(&press("cmd-enter", false), true, false, true),
-            KeyRoute::Answer(PermissionAnswer::AllowOnce)
+            KeyRoute::Answer(ApprovalIntent::AllowOnce)
         );
     }
 

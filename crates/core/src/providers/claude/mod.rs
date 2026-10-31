@@ -1,4 +1,6 @@
+mod approvals;
 pub mod events;
+pub mod presentation;
 
 use serde_json::Value;
 use std::path::Path;
@@ -54,5 +56,62 @@ fn relative(path: &str, cwd: Option<&Path>) -> String {
     match Path::new(path).strip_prefix(cwd) {
         Ok(inside) if !inside.as_os_str().is_empty() => inside.display().to_string(),
         _ => path.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn display_name_shortens_mcp_tools() {
+        assert_eq!(
+            display_name("mcp__linear__list_issues"),
+            "linear · list_issues"
+        );
+        assert_eq!(display_name("Bash"), "Bash");
+        assert_eq!(display_name("mcp__broken"), "mcp__broken");
+    }
+
+    #[test]
+    fn summarize_common_tools() {
+        let cwd = Path::new("/tmp/project");
+        assert_eq!(
+            summarize("Bash", &json!({"command": "ls -la\necho hi"}), None),
+            "ls -la"
+        );
+        assert_eq!(
+            summarize(
+                "Edit",
+                &json!({"file_path": "/tmp/project/src/main.rs"}),
+                Some(cwd)
+            ),
+            "src/main.rs"
+        );
+        assert_eq!(
+            summarize("Read", &json!({"file_path": "/etc/hosts"}), Some(cwd)),
+            "/etc/hosts"
+        );
+        assert_eq!(
+            summarize("Grep", &json!({"pattern": "fn main"}), None),
+            "fn main"
+        );
+        assert_eq!(
+            summarize("WebFetch", &json!({"url": "https://example.com"}), None),
+            "https://example.com"
+        );
+        assert_eq!(
+            summarize("WebSearch", &json!({"query": "rust"}), None),
+            "rust"
+        );
+        assert_eq!(
+            summarize("Task", &json!({"description": "Explore"}), None),
+            "Explore"
+        );
+        assert_eq!(
+            summarize("SomethingElse", &json!({"n": 1, "a": "x"}), None),
+            "x"
+        );
+        assert_eq!(summarize("SomethingElse", &json!({}), None), "");
     }
 }

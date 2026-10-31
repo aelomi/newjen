@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
-use crate::protocol::{Incoming, PermissionAnswer, ResultMessage, session_rules};
+use crate::protocol::{Incoming, ResultMessage};
 use crate::rift::{self, CopyError, Tools};
 use crate::session::{Conversation, Session, SessionConfig, SessionEvent};
 use crate::store::{
@@ -692,6 +692,32 @@ impl Thread {
         self.turn_started.filter(|_| self.status().is_busy())
     }
 
+    pub fn presentation(&self) -> &crate::agent::AgentPresentation {
+        self.transcript.presentation()
+    }
+
+    pub fn grant_views(&self) -> Vec<crate::agent::GrantView> {
+        self.grants
+            .iter()
+            .map(|grant| {
+                crate::providers::claude::presentation::grant_view(&grant.rule, &grant.label)
+            })
+            .collect()
+    }
+
+    pub fn failure_summary(&self) -> Option<String> {
+        self.transcript
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Error { title, detail, .. } => Some(
+                    crate::providers::claude::presentation::failure_reason(title, detail),
+                ),
+                _ => None,
+            })
+    }
+
     /// What claude keeps running in the background now (a dev server, say), even between
     /// turns. Empty when no claude runs: stopping claude stops these too.
     pub fn background_tasks(&self) -> &[crate::agent::BackgroundTaskView] {
@@ -905,37 +931,40 @@ impl Thread {
         Ok(())
     }
 
-    /// Answers the approval on screen. `request_id` is the request the button belonged to; a
+    /// Answers the approval on screen. `key` is the request the button belonged to; a
     /// stale click (that request was already answered) does nothing.
     ///
-    /// "Always allow" ([`PermissionAnswer::AllowForSession`]) also saves the rules it makes
+    /// "Always allow" ([`crate::agent::ApprovalIntent::AllowForSession`]) also saves the rules it makes
     /// claude remember (`protocol::session_rules`), so every later `claude` for this thread
     /// gets them too. When it remembers nothing it is allow once, and nothing is saved.
-    pub fn answer(&mut self, request_id: Option<&str>, answer: PermissionAnswer) -> Result<()> {
+    pub fn answer(
+        &mut self,
+        key: Option<crate::agent::ApprovalKey>,
+        answer: crate::agent::ApprovalIntent,
+    ) -> Result<()> {
         let Some(request) = self.transcript.pending_approval().cloned() else {
             return Ok(());
         };
-        if request_id.is_some_and(|id| id != request.request_id) {
+        if key.is_some_and(|key| key != request.key()) {
             return Ok(());
         }
         // Resolve first: a second click or key press now finds nothing to answer.
-        self.transcript
-            .resolve_approval(&request.request_id, answer);
+        self.transcript.resolve_approval(request.key(), answer);
         self.last_activity = Instant::now();
+        let Some(reply) = self.translator.answer(request.key(), answer) else {
+            return Ok(());
+        };
         let sent = match &self.session {
-            Some(session) => session.answer(&request, answer),
+            Some(session) => session.answer(reply),
             None => Err(anyhow!("the claude session has ended")),
         };
-        if sent.is_ok() && answer == PermissionAnswer::AllowForSession {
+        let sent = sent.map(|receipt| {
             let now = now_ms();
-            for rule in session_rules(&request) {
-                self.add_grant(Grant {
-                    rule: rule.cli_rule(),
-                    label: rule.label(),
-                    created_at: now,
-                });
+            for mut grant in receipt.grants {
+                grant.created_at = now;
+                self.add_grant(grant);
             }
-        }
+        });
         self.save();
         sent
     }
@@ -949,7 +978,7 @@ impl Thread {
     /// stopped.
     pub fn stop(&mut self) -> Result<()> {
         if self.transcript.pending_approval().is_some() {
-            return self.answer(None, PermissionAnswer::DenyAndStop);
+            return self.answer(None, crate::agent::ApprovalIntent::DenyAndStop);
         }
         if !self.status().is_busy() {
             return Ok(());
@@ -992,7 +1021,8 @@ impl Thread {
     /// any command it runs in the background: now if it is idle, or when the running turn ends.
     /// The next message starts a new one with the remaining rules (`--resume`, so the
     /// conversation goes on).
-    pub fn revoke(&mut self, rule: &str) {
+    pub fn revoke(&mut self, id: &crate::agent::GrantId) {
+        let rule = id.0.as_str();
         let before = self.grants.len();
         self.grants.retain(|grant| grant.rule != rule);
         if self.grants.len() == before {
@@ -1212,21 +1242,23 @@ impl Thread {
         // Anything held back above is real now (the repair did not apply), so it goes in
         // first, in the order it happened.
         if let Some(line) = self.recovery.in_use_line.take() {
-            self.transcript.apply(
-                &self
-                    .translator
-                    .translate(&SessionEvent::Stderr(line), Some(&self.cwd)),
-            );
+            self.transcript.apply(&self.translator.translate_generation(
+                self.generation,
+                &SessionEvent::Stderr(line),
+                Some(&self.cwd),
+            ));
         }
         if let Some(detail) = self.recovery.write_failure.take() {
-            self.transcript.apply(
-                &self
-                    .translator
-                    .translate(&SessionEvent::WriteFailed(detail), Some(&self.cwd)),
-            );
+            self.transcript.apply(&self.translator.translate_generation(
+                self.generation,
+                &SessionEvent::WriteFailed(detail),
+                Some(&self.cwd),
+            ));
         }
 
-        let batch = self.translator.translate(&event, Some(&self.cwd));
+        let batch = self
+            .translator
+            .translate_generation(self.generation, &event, Some(&self.cwd));
         self.transcript.apply(&batch);
         let turn_ended = was_busy && !self.status().is_busy();
         // claude started a turn by itself (see `Transcript::apply`).

@@ -1,4 +1,3 @@
-use crate::protocol::PermissionRequest;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -52,10 +51,13 @@ pub enum AgentEvent {
         id: String,
         outcome: ToolOutcome,
         output: String,
-        closes_approval: bool,
     },
-    ApprovalRequested(PermissionRequest),
-    ApprovalWithdrawn(String),
+    ApprovalRequested(ApprovalRequest),
+    ApprovalResolved(ApprovalKey),
+    ApprovalWithdrawn {
+        key: ApprovalKey,
+        note: String,
+    },
     BackgroundTasks(Vec<BackgroundTaskView>),
     TurnFinished {
         outcome: TurnOutcome,
@@ -81,4 +83,167 @@ pub enum Checkpoint {
 pub struct AgentBatch {
     pub events: Vec<AgentEvent>,
     pub checkpoint: Checkpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ApprovalKey {
+    pub(crate) namespace: u64,
+    pub(crate) serial: u64,
+}
+impl std::fmt::Display for ApprovalKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.namespace, self.serial)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalIntent {
+    AllowOnce,
+    AllowForSession,
+    Deny,
+    DenyAndStop,
+}
+impl ApprovalIntent {
+    pub fn is_deny(self) -> bool {
+        matches!(self, Self::Deny | Self::DenyAndStop)
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnceReason {
+    FileChanges,
+    NoSafeScope,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleMeaning {
+    Exact,
+    Arguments,
+    Pattern,
+    OneTool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RememberScope {
+    OnceOnly(OnceReason),
+    Rules {
+        labels: Vec<String>,
+        meaning: RuleMeaning,
+        shown_in_detail: bool,
+    },
+}
+#[derive(Debug, Clone)]
+pub enum ApprovalKind {
+    Command {
+        command: Option<String>,
+        purpose: Option<String>,
+    },
+    FileChange {
+        path: Option<String>,
+    },
+    OtherTool,
+}
+#[derive(Debug, Clone)]
+pub struct ApprovalView {
+    pub tool: ToolDescriptor,
+    pub kind: ApprovalKind,
+    pub question: String,
+    pub affected_path: Option<String>,
+    pub remember: RememberScope,
+}
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    pub(crate) key: ApprovalKey,
+    pub(crate) view: ApprovalView,
+}
+impl ApprovalRequest {
+    pub fn key(&self) -> ApprovalKey {
+        self.key
+    }
+    pub fn view(&self) -> &ApprovalView {
+        &self.view
+    }
+}
+#[derive(Debug)]
+pub struct ApprovalReply {
+    pub(crate) message: Value,
+    pub(crate) grants: Vec<crate::store::Grant>,
+}
+#[derive(Debug)]
+pub struct AnswerReceipt {
+    pub(crate) grants: Vec<crate::store::Grant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantId(pub(crate) String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantLifetime {
+    Thread,
+}
+#[derive(Debug, Clone)]
+pub struct GrantView {
+    pub id: GrantId,
+    pub tool: String,
+    pub shown: String,
+    pub note: Option<String>,
+    pub lifetime: GrantLifetime,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolDisposition {
+    Ordinary,
+    Expired { note: String },
+    Stopped { note: String },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentPresentation {
+    pub label: &'static str,
+    pub executable_label: &'static str,
+    pub working_placeholder: &'static str,
+    pub reply_placeholder: &'static str,
+    pub empty_title: &'static str,
+    pub grants_detail: &'static str,
+    pub send_failed: &'static str,
+    pub answer_failed: &'static str,
+    pub stop_failed: &'static str,
+    pub start_failed: &'static str,
+    pub installation_hint: &'static str,
+    pub unreachable_note: &'static str,
+    pub send_detail_prefix: &'static str,
+    pub interrupt_title: &'static str,
+    pub interrupt_detail: &'static str,
+    pub exit_title: &'static str,
+    pub exited_tool_note: &'static str,
+}
+impl AgentPresentation {
+    pub fn new_thread_placeholder(&self, project: &str) -> String {
+        format!("Ask {} to work on {project}…", self.label)
+    }
+    pub fn empty_caption(&self, project: &str) -> String {
+        format!(
+            "{} runs in {project}. You approve each tool call before it runs.",
+            self.executable_label
+        )
+    }
+    pub fn start_failure(
+        &self,
+        error: &anyhow::Error,
+        program: &std::path::Path,
+    ) -> (String, String) {
+        use std::io;
+        let program = program.display();
+        let kind = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .map(io::Error::kind);
+        let detail = match kind {
+            Some(io::ErrorKind::NotFound) => format!(
+                "Newjen could not find `{program}`. {}",
+                self.installation_hint
+            ),
+            Some(io::ErrorKind::PermissionDenied) => format!(
+                "`{program}` is not allowed to run ({error:#}). Check that it is an executable file, then try again."
+            ),
+            _ => {
+                format!("{error:#}.\n\nCheck that `{program}` runs in a terminal, then try again.")
+            }
+        };
+        (self.start_failed.to_string(), detail)
+    }
 }

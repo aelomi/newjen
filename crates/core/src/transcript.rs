@@ -1,7 +1,7 @@
 //! The UI-agnostic state of one conversation.
 //!
-//! A [`Transcript`] is fed every [`SessionEvent`] the session produces (see [`Transcript::apply`])
-//! and turns the raw protocol into a simple list of [`Item`]s a UI can render: user prompts,
+//! A [`Transcript`] is fed atomic [`AgentBatch`] values (see [`Transcript::apply`])
+//! and turns semantic events into a simple list of [`Item`]s a UI can render: user prompts,
 //! assistant replies, tool calls, end-of-turn captions and errors. It also tracks the overall
 //! [`Status`] and the queue of approvals waiting for an answer.
 //!
@@ -23,7 +23,6 @@ use crate::agent::{
     AgentBatch, AgentEvent, BackgroundTaskView, ContentKey, TextUpdate, ToolDescriptor,
     ToolOutcome, TurnOutcome,
 };
-use crate::protocol::{PermissionAnswer, PermissionRequest};
 
 /// How many stderr lines to keep for the "Claude exited" error.
 const STDERR_LINES_KEPT: usize = 20;
@@ -263,20 +262,18 @@ fn is_false(flag: &bool) -> bool {
 #[derive(Debug, Clone)]
 pub struct Transcript {
     items: Vec<Item>,
+    presentation: crate::agent::AgentPresentation,
     status: Status,
-    /// What claude keeps running in the background now, as its last `background_tasks_changed`
-    /// said. Empty when no claude runs.
+    /// The agent's currently reported background tasks.
     background_tasks: Vec<BackgroundTaskView>,
-    /// Which tool call started each task (task id → tool_use_id), from `task_started`.
     session_id: Option<String>,
     model: Option<String>,
     /// The project directory, used to shorten file paths in tool summaries.
     cwd: Option<PathBuf>,
     /// Approvals waiting for an answer, oldest first.
-    pending: VecDeque<PermissionRequest>,
+    pending: VecDeque<crate::agent::ApprovalRequest>,
     next_id: u64,
-    /// Assistant text items still receiving streamed text, keyed by
-    /// (API message id, content block index) → position in `items`.
+    /// Live content key → row position.
     open_text: HashMap<ContentKey, usize>,
     /// When each tool call was first seen, to compute how long it took.
     tool_started: HashMap<String, Instant>,
@@ -297,6 +294,7 @@ impl Transcript {
     pub fn new() -> Self {
         Transcript {
             items: Vec::new(),
+            presentation: Default::default(),
             status: Status::Idle,
             background_tasks: Vec::new(),
             session_id: None,
@@ -346,6 +344,10 @@ impl Transcript {
         self.cwd = Some(cwd.into());
     }
 
+    pub fn presentation(&self) -> &crate::agent::AgentPresentation {
+        &self.presentation
+    }
+
     pub fn items(&self) -> &[Item] {
         &self.items
     }
@@ -365,7 +367,7 @@ impl Transcript {
     }
 
     /// The approval to show now: the oldest unanswered one.
-    pub fn pending_approval(&self) -> Option<&PermissionRequest> {
+    pub fn pending_approval(&self) -> Option<&crate::agent::ApprovalRequest> {
         self.pending.front()
     }
 
@@ -579,16 +581,16 @@ impl Transcript {
 
     /// Records the user's answer to an approval: removes it from the queue and updates the
     /// tool's state. Call this right after `Session::answer`.
-    pub fn resolve_approval(&mut self, request_id: &str, answer: PermissionAnswer) {
-        let Some(position) = self
-            .pending
-            .iter()
-            .position(|request| request.request_id == request_id)
-        else {
+    pub fn resolve_approval(
+        &mut self,
+        key: crate::agent::ApprovalKey,
+        answer: crate::agent::ApprovalIntent,
+    ) {
+        let Some(position) = self.pending.iter().position(|request| request.key() == key) else {
             return; // Already answered or dropped; nothing to do.
         };
         let request = self.pending.remove(position).expect("position is valid");
-        let tool_use_id = request.tool_use_id.unwrap_or(request.request_id);
+        let tool_use_id = request.view().tool.id.clone();
         let new_state = if answer.is_deny() {
             ToolState::Denied
         } else {
@@ -624,10 +626,10 @@ impl Transcript {
             return;
         }
         self.finish_turn();
-        self.close_unfinished_tools("Claude could not be reached.");
+        self.close_unfinished_tools(self.presentation.unreachable_note);
         self.push_error(
-            "Could not reach Claude",
-            format!("Newjen could not send the message to the claude process: {detail}"),
+            self.presentation.send_failed,
+            format!("{}: {detail}", self.presentation.send_detail_prefix),
         );
         self.status = Status::Failed;
     }
@@ -641,10 +643,8 @@ impl Transcript {
         self.finish_turn();
         self.close_unfinished_tools("Stopped");
         self.push_error(
-            "Claude didn't stop, so Newjen ended the session",
-            "Claude did not confirm the stop request in time. Try again to continue the \
-             conversation."
-                .to_string(),
+            self.presentation.interrupt_title,
+            self.presentation.interrupt_detail.to_string(),
         );
         self.status = Status::Failed;
     }
@@ -701,16 +701,8 @@ impl Transcript {
                 id,
                 outcome,
                 output,
-                closes_approval,
             } => {
                 let took = self.tool_started.get(id).map(|started| started.elapsed());
-                if *closes_approval {
-                    self.pending
-                        .retain(|request| request.tool_use_id.as_deref() != Some(id));
-                    if self.pending.is_empty() && self.status == Status::Waiting {
-                        self.status = Status::Working;
-                    }
-                }
                 if let Some(Item::Tool {
                     state,
                     output: current,
@@ -728,8 +720,14 @@ impl Transcript {
                     *tool_took = took;
                 }
             }
+            AgentEvent::ApprovalResolved(key) => {
+                self.pending.retain(|request| request.key() != *key);
+                if self.pending.is_empty() && self.status == Status::Waiting {
+                    self.status = Status::Working;
+                }
+            }
             AgentEvent::ApprovalRequested(request) => self.apply_permission_request(request),
-            AgentEvent::ApprovalWithdrawn(id) => self.apply_cancel(id),
+            AgentEvent::ApprovalWithdrawn { key, note } => self.apply_cancel(*key, note),
             AgentEvent::BackgroundTasks(tasks) => {
                 self.background_tasks = tasks.clone();
                 self.mark_background_tools();
@@ -779,11 +777,8 @@ impl Transcript {
         }
     }
 
-    fn apply_permission_request(&mut self, request: &PermissionRequest) {
-        let tool_use_id = request
-            .tool_use_id
-            .clone()
-            .unwrap_or_else(|| request.request_id.clone());
+    fn apply_permission_request(&mut self, request: &crate::agent::ApprovalRequest) {
+        let tool_use_id = request.view().tool.id.clone();
         if let Some(Item::Tool { state, .. }) = self.find_tool_mut(&tool_use_id) {
             *state = ToolState::Waiting;
         }
@@ -793,19 +788,15 @@ impl Transcript {
 
     /// The CLI withdrew an approval request: it no longer waits for the answer, so drop the
     /// request from the queue and close its tool card.
-    fn apply_cancel(&mut self, request_id: &str) {
-        let Some(position) = self
-            .pending
-            .iter()
-            .position(|request| request.request_id == request_id)
-        else {
+    fn apply_cancel(&mut self, key: crate::agent::ApprovalKey, note: &str) {
+        let Some(position) = self.pending.iter().position(|request| request.key() == key) else {
             return; // Already answered, or not an approval.
         };
         let request = self.pending.remove(position).expect("position is valid");
-        let tool_use_id = request.tool_use_id.unwrap_or(request.request_id);
+        let tool_use_id = request.view().tool.id.clone();
         if let Some(Item::Tool { state, output, .. }) = self.find_tool_mut(&tool_use_id) {
             *state = ToolState::Failed;
-            *output = Some("Cancelled by Claude".to_string());
+            *output = Some(note.to_string());
         }
         self.tool_started.remove(&tool_use_id);
         if self.pending.is_empty() && self.status == Status::Waiting {
@@ -831,16 +822,22 @@ impl Transcript {
         if self.status == Status::Failed {
             return;
         }
-        self.close_unfinished_tools("Claude exited before this finished.");
+        self.close_unfinished_tools(self.presentation.exited_tool_note);
         let mut detail = match code {
-            Some(code) => format!("The claude process exited with code {code}."),
-            None => "The claude process was killed by a signal.".to_string(),
+            Some(code) => format!(
+                "The {} process exited with code {code}.",
+                self.presentation.label.to_lowercase()
+            ),
+            None => format!(
+                "The {} process was killed by a signal.",
+                self.presentation.label.to_lowercase()
+            ),
         };
         if !self.stderr_tail.is_empty() {
             detail.push_str("\n\n");
             detail.push_str(&Vec::from(self.stderr_tail.clone()).join("\n"));
         }
-        self.push_error("Claude exited", detail);
+        self.push_error(self.presentation.exit_title, detail);
         self.status = Status::Failed;
     }
 
@@ -1000,62 +997,8 @@ mod tests {
     use super::*;
     use crate::protocol::Incoming;
     use crate::providers::claude::events::ClaudeEvents;
-    use crate::providers::claude::{display_name, summarize};
     use crate::session::SessionEvent;
     use serde_json::json;
-    use std::path::Path;
-
-    #[test]
-    fn display_name_shortens_mcp_tools() {
-        assert_eq!(
-            display_name("mcp__linear__list_issues"),
-            "linear · list_issues"
-        );
-        assert_eq!(display_name("Bash"), "Bash");
-        assert_eq!(display_name("mcp__broken"), "mcp__broken");
-    }
-
-    #[test]
-    fn summarize_common_tools() {
-        let cwd = Path::new("/tmp/project");
-        assert_eq!(
-            summarize("Bash", &json!({"command": "ls -la\necho hi"}), None),
-            "ls -la"
-        );
-        assert_eq!(
-            summarize(
-                "Edit",
-                &json!({"file_path": "/tmp/project/src/main.rs"}),
-                Some(cwd)
-            ),
-            "src/main.rs"
-        );
-        assert_eq!(
-            summarize("Read", &json!({"file_path": "/etc/hosts"}), Some(cwd)),
-            "/etc/hosts"
-        );
-        assert_eq!(
-            summarize("Grep", &json!({"pattern": "fn main"}), None),
-            "fn main"
-        );
-        assert_eq!(
-            summarize("WebFetch", &json!({"url": "https://example.com"}), None),
-            "https://example.com"
-        );
-        assert_eq!(
-            summarize("WebSearch", &json!({"query": "rust"}), None),
-            "rust"
-        );
-        assert_eq!(
-            summarize("Task", &json!({"description": "Explore"}), None),
-            "Explore"
-        );
-        assert_eq!(
-            summarize("SomethingElse", &json!({"n": 1, "a": "x"}), None),
-            "x"
-        );
-        assert_eq!(summarize("SomethingElse", &json!({}), None), "");
-    }
 
     /// One of every kind of item, as a saved thread could hold them.
     fn every_item() -> Vec<Item> {
@@ -1098,7 +1041,6 @@ mod tests {
             Item::FreshStart { id: 7 },
         ]
     }
-
     #[test]
     fn every_item_survives_saving_and_loading() {
         for item in every_item() {

@@ -10,8 +10,10 @@ use crate::agent::{
 use crate::protocol::{BackgroundTask, ContentBlock, Delta, Incoming, StreamEvent};
 use crate::session::SessionEvent;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct ClaudeEvents {
+    generation: Option<u64>,
+    approvals: super::approvals::Approvals,
     next_content: u64,
     cwd: Option<PathBuf>,
     open_text: HashMap<(String, u64), ContentKey>,
@@ -22,6 +24,21 @@ pub struct ClaudeEvents {
 }
 
 impl ClaudeEvents {
+    pub(crate) fn translate_generation(
+        &mut self,
+        generation: u64,
+        event: &SessionEvent,
+        cwd: Option<&Path>,
+    ) -> AgentBatch {
+        if self.generation != Some(generation) {
+            self.finish();
+            self.tasks.clear();
+            self.task_tools.clear();
+            self.generation = Some(generation);
+        }
+        self.translate(event, cwd)
+    }
+
     pub fn translate(&mut self, event: &SessionEvent, cwd: Option<&Path>) -> AgentBatch {
         let mut events = Vec::new();
         let cwd = self.cwd.clone().or_else(|| cwd.map(Path::to_path_buf));
@@ -66,6 +83,14 @@ impl ClaudeEvents {
         AgentBatch { events, checkpoint }
     }
 
+    pub fn answer(
+        &mut self,
+        key: crate::agent::ApprovalKey,
+        intent: crate::agent::ApprovalIntent,
+    ) -> Option<crate::agent::ApprovalReply> {
+        self.approvals.answer(key, intent)
+    }
+
     fn content_key(&mut self) -> ContentKey {
         self.next_content += 1;
         ContentKey(self.next_content)
@@ -82,8 +107,8 @@ impl ClaudeEvents {
     }
 
     fn finish(&mut self) {
+        self.approvals.clear();
         self.open_text.clear();
-        self.api_error_text = None;
     }
 
     fn background(&self) -> AgentEvent {
@@ -206,6 +231,12 @@ impl ClaudeEvents {
                         is_error,
                     } = block
                     {
+                        events.extend(
+                            self.approvals
+                                .settle_tool(tool_use_id)
+                                .into_iter()
+                                .map(AgentEvent::ApprovalResolved),
+                        );
                         let rejected = message
                             .tool_result_meta
                             .iter()
@@ -220,7 +251,6 @@ impl ClaudeEvents {
                                 ToolOutcome::Completed
                             },
                             output: ContentBlock::tool_result_text(content),
-                            closes_approval: true,
                         });
                     }
                 }
@@ -233,10 +263,17 @@ impl ClaudeEvents {
                     &request.input,
                     cwd,
                 )));
-                events.push(AgentEvent::ApprovalRequested(request.clone()));
+                events.push(AgentEvent::ApprovalRequested(
+                    self.approvals.request(request, cwd),
+                ));
             }
             Incoming::ControlCancelRequest { request_id } => {
-                events.push(AgentEvent::ApprovalWithdrawn(request_id.clone()))
+                if let Some(key) = self.approvals.cancel(request_id) {
+                    events.push(AgentEvent::ApprovalWithdrawn {
+                        key,
+                        note: "Cancelled by Claude".to_string(),
+                    });
+                }
             }
             Incoming::Result(result) => {
                 let cost_usd = result.turn_cost_usd().or_else(|| {
@@ -307,5 +344,52 @@ fn starts_turn(incoming: &Incoming) -> bool {
         Incoming::Assistant(message) => message.parent_tool_use_id.is_none(),
         Incoming::StreamEvent(message) => message.parent_tool_use_id.is_none(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn new_process_drops_transient_maps_and_preserves_cumulative_cost_fallback() {
+        let mut codec = ClaudeEvents::default();
+        let line = |value| SessionEvent::Line(Incoming::from_value(value));
+        codec.translate_generation(1, &line(json!({"type":"system", "subtype":"background_tasks_changed", "tasks":[{"task_id":"b1", "description":"old task"}]})), None);
+        codec.translate_generation(1, &line(json!({"type":"system", "subtype":"task_started", "task_id":"b1", "tool_use_id":"t1"})), None);
+        assert_eq!(codec.tasks.len(), 1);
+        assert_eq!(codec.task_tools.get("b1").map(String::as_str), Some("t1"));
+        codec.translate_generation(
+            1,
+            &line(json!({"type":"result", "is_error":false, "total_cost_usd":1.0})),
+            None,
+        );
+        let ask = line(
+            json!({"type":"control_request", "request_id":"r1", "request":{"subtype":"can_use_tool", "tool_name":"Bash", "input":{"command":"touch a"}}}),
+        );
+        let batch = codec.translate_generation(1, &ask, None);
+        let key = batch
+            .events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ApprovalRequested(request) => Some(request.key()),
+                _ => None,
+            })
+            .unwrap();
+        codec.translate_generation(2, &line(json!({"type":"system", "subtype":"task_started", "task_id":"b2", "tool_use_id":"t2"})), None);
+        assert!(codec.tasks.is_empty());
+        assert!(!codec.task_tools.contains_key("b1"));
+        assert!(
+            codec
+                .answer(key, crate::agent::ApprovalIntent::AllowForSession)
+                .is_none()
+        );
+        let batch = codec.translate_generation(
+            2,
+            &line(json!({"type":"result", "is_error":false, "total_cost_usd":1.25})),
+            None,
+        );
+        assert!(batch.events.iter().any(|event| matches!(event, AgentEvent::TurnFinished { cost_usd: Some(cost), .. } if *cost == 0.25)));
     }
 }

@@ -257,7 +257,9 @@ fn request_id(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> String {
             .transcript()
             .pending_approval()
             .unwrap()
-            .request_id
+            .view()
+            .tool
+            .id
             .clone()
     })
 }
@@ -288,7 +290,7 @@ async fn held_allow_only_answers_once_and_dock_focus_returns(cx: &mut TestAppCon
         is_held: false,
         prefer_character_input: false,
     });
-    assert_eq!(request_id(&chat, cx), "second-request");
+    assert_eq!(request_id(&chat, cx), "second-tool");
     cx.executor()
         .advance_clock(KEY_ANSWER_DELAY + Duration::from_millis(1));
     cx.simulate_event(KeyDownEvent {
@@ -299,7 +301,7 @@ async fn held_allow_only_answers_once_and_dock_focus_returns(cx: &mut TestAppCon
     cx.simulate_event(gpui::KeyUpEvent {
         keystroke: gpui::Keystroke::parse("cmd-enter").unwrap(),
     });
-    assert_eq!(request_id(&chat, cx), "second-request");
+    assert_eq!(request_id(&chat, cx), "second-tool");
     wait_answers(cx, &path, 1).await;
     assert_eq!(
         answers(&path)[0]["response"]["response"]["behavior"],
@@ -332,7 +334,7 @@ async fn escape_closes_a_drawer_before_denying_a_pending_request(cx: &mut TestAp
     assert_eq!(request_id(&chat, cx), first);
     assert!(answers(&path).is_empty());
     cx.simulate_keystrokes("escape");
-    assert_eq!(request_id(&chat, cx), "second-request");
+    assert_eq!(request_id(&chat, cx), "second-tool");
     wait_answers(cx, &path, 1).await;
     assert_eq!(
         answers(&path)[0]["response"]["response"]["behavior"],
@@ -352,7 +354,7 @@ async fn kit_sheet_routes_allow_and_thread_shortcuts(cx: &mut TestAppContext) {
     assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
     cx.executor().advance_clock(KEY_ANSWER_DELAY);
     cx.simulate_keystrokes("cmd-enter");
-    assert_eq!(request_id(&chat, cx), "second-request");
+    assert_eq!(request_id(&chat, cx), "second-tool");
     wait_answers(cx, &path, 1).await;
     assert_eq!(
         answers(&path)[0]["response"]["response"]["behavior"],
@@ -406,7 +408,7 @@ async fn grants_popover_keeps_approval_keys_and_closes_outside(cx: &mut TestAppC
     pending(&chat, cx).await;
     click(cx, "always");
     wait_answers(cx, &path, 1).await;
-    assert_eq!(request_id(&chat, cx), "second-request");
+    assert_eq!(request_id(&chat, cx), "second-tool");
     assert_eq!(
         cx.update(|_, cx| chat.read(cx).thread().read(cx).grants().len()),
         1
@@ -415,16 +417,16 @@ async fn grants_popover_keeps_approval_keys_and_closes_outside(cx: &mut TestAppC
     click(cx, "grants-chip");
     assert!(cx.update(|window, _| overlay_focused(window)));
     cx.simulate_keystrokes("cmd-enter");
-    assert_eq!(request_id(&chat, cx), "second-request");
+    assert_eq!(request_id(&chat, cx), "second-tool");
     cx.simulate_keystrokes("escape");
     assert!(!cx.update(|window, _| overlay_focused(window)));
-    assert_eq!(request_id(&chat, cx), "second-request");
+    assert_eq!(request_id(&chat, cx), "second-tool");
     assert_eq!(answers(&path).len(), 1);
     assert!(cx.update(|window, cx| chat.read(cx).root.is_focused(window)));
     cx.simulate_keystrokes("cmd-n");
     assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
     cx.simulate_keystrokes("cmd-2");
-    assert_eq!(request_id(&chat, cx), "second-request");
+    assert_eq!(request_id(&chat, cx), "second-tool");
     click(cx, "grants-chip");
     assert!(cx.update(|window, _| overlay_focused(window)));
     let outside = cx.debug_bounds("approval-dock").unwrap().center();

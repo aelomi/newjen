@@ -4,7 +4,7 @@ use gpui::{
     AnyElement, App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement,
     RenderOnce, SharedString, Styled, Window, div, px,
 };
-use newjen_core::PermissionAnswer;
+use newjen_core::ApprovalIntent;
 
 use super::{IconName, Look, Size, button, icon};
 use gpui_kit::component::ActiveTheme as _;
@@ -53,7 +53,7 @@ impl DockMetrics {
     }
 }
 
-type OnAnswer = Rc<dyn Fn(PermissionAnswer, &mut Window, &mut App)>;
+type OnAnswer = Rc<dyn Fn(ApprovalIntent, &mut Window, &mut App)>;
 
 #[derive(IntoElement)]
 pub struct ApprovalCard {
@@ -68,7 +68,7 @@ impl ApprovalCard {
         id: impl Into<ElementId>,
         title: impl Into<SharedString>,
         detail: impl Into<SharedString>,
-        on_answer: impl Fn(PermissionAnswer, &mut Window, &mut App) + 'static,
+        on_answer: impl Fn(ApprovalIntent, &mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
             id: id.into(),
@@ -138,18 +138,18 @@ impl RenderOnce for ApprovalCard {
                     .flex_wrap()
                     .justify_end()
                     .gap(px(m.title_gap))
-                    .child(choice("deny", "Deny", Look::Ghost, PermissionAnswer::Deny))
+                    .child(choice("deny", "Deny", Look::Ghost, ApprovalIntent::Deny))
                     .child(choice(
                         "always",
                         "Always allow",
                         Look::Secondary,
-                        PermissionAnswer::AllowForSession,
+                        ApprovalIntent::AllowForSession,
                     ))
                     .child(choice(
                         "once",
                         "Allow once",
                         Look::Primary,
-                        PermissionAnswer::AllowOnce,
+                        ApprovalIntent::AllowOnce,
                     )),
             )
     }
@@ -174,7 +174,7 @@ mod tests {
 
     struct Example {
         focus: FocusHandle,
-        answers: Vec<PermissionAnswer>,
+        answers: Vec<ApprovalIntent>,
     }
 
     impl Render for Example {
@@ -215,9 +215,9 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         for (selector, answer) in [
-            ("deny", PermissionAnswer::Deny),
-            ("always", PermissionAnswer::AllowForSession),
-            ("once", PermissionAnswer::AllowOnce),
+            ("deny", ApprovalIntent::Deny),
+            ("always", ApprovalIntent::AllowForSession),
+            ("once", ApprovalIntent::AllowOnce),
         ] {
             let bounds = cx.debug_bounds(selector).unwrap();
             assert!(bounds.size.height >= gpui::px(32.));

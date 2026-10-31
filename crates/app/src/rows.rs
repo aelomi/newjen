@@ -7,8 +7,8 @@ use gpui::{
 };
 use gpui_kit::base::{h_flex, v_flex};
 use newjen_core::transcript::{
-    BACKGROUND_STOPPED_NOTE, EXPIRED_NOTE, FRESH_START_NOTE, STOPPED_ON_QUIT,
-    STOPPED_ON_QUIT_DETAIL, STOPPED_TOOL_NOTE, STOPPED_UNSENT_DETAIL, UNREADABLE_NOTE,
+    FRESH_START_NOTE, STOPPED_ON_QUIT, STOPPED_ON_QUIT_DETAIL, STOPPED_UNSENT_DETAIL,
+    UNREADABLE_NOTE,
 };
 use newjen_core::{Item, ToolState};
 
@@ -216,20 +216,17 @@ pub enum QuietIcon {
 /// answered"; a call that was running then is "Stopped when Newjen quit", and a command left
 /// running in the background when Newjen stopped its claude is "Stopped with Claude".
 pub fn tool_look(state: ToolState, output: Option<&str>) -> ToolLook {
-    match state {
-        ToolState::Expired => ToolLook::Quiet {
+    use newjen_core::ToolDisposition;
+    match newjen_core::tool_disposition(state, output) {
+        ToolDisposition::Expired { note } => ToolLook::Quiet {
             icon: QuietIcon::Expired,
-            note: format!("Expired · {EXPIRED_NOTE}"),
+            note,
         },
-        ToolState::Failed
-            if let Some(note @ (STOPPED_TOOL_NOTE | BACKGROUND_STOPPED_NOTE)) = output =>
-        {
-            ToolLook::Quiet {
-                icon: QuietIcon::Stopped,
-                note: note.to_string(),
-            }
-        }
-        state => ToolLook::Card(step_state(state)),
+        ToolDisposition::Stopped { note } => ToolLook::Quiet {
+            icon: QuietIcon::Stopped,
+            note,
+        },
+        ToolDisposition::Ordinary => ToolLook::Card(step_state(state)),
     }
 }
 
@@ -425,6 +422,7 @@ pub fn step_state(state: ToolState) -> StepState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use newjen_core::transcript::{BACKGROUND_STOPPED_NOTE, EXPIRED_NOTE, STOPPED_TOOL_NOTE};
 
     struct NoticeExample;
 

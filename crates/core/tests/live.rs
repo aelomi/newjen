@@ -9,7 +9,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use newjen_core::protocol::PermissionAnswer;
+use newjen_core::ApprovalIntent;
 use newjen_core::providers::claude::events::ClaudeEvents;
 use newjen_core::session::{Session, SessionConfig, SessionEvent};
 use newjen_core::transcript::{Status, Transcript};
@@ -42,9 +42,13 @@ fn live_touch_file_with_approval() {
         transcript.apply(&codec.translate(&event, None));
         if let Some(request) = transcript.pending_approval().cloned() {
             session
-                .answer(&request, PermissionAnswer::AllowOnce)
+                .answer(
+                    codec
+                        .answer(request.key(), ApprovalIntent::AllowOnce)
+                        .unwrap(),
+                )
                 .unwrap();
-            transcript.resolve_approval(&request.request_id, PermissionAnswer::AllowOnce);
+            transcript.resolve_approval(request.key(), ApprovalIntent::AllowOnce);
             approvals += 1;
         }
     }

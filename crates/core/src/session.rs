@@ -30,7 +30,7 @@ use async_channel::{Receiver, Sender};
 use serde_json::Value;
 
 use crate::orphans;
-use crate::protocol::{self, Incoming, PermissionAnswer, PermissionRequest};
+use crate::protocol::{self, Incoming};
 
 /// Environment variables that mark "this process runs inside Claude Code". They leak in when
 /// Newjen itself is started from a Claude Code terminal and would make the child think it is a
@@ -385,8 +385,14 @@ impl Session {
     }
 
     /// Answers an approval request.
-    pub fn answer(&self, request: &PermissionRequest, answer: PermissionAnswer) -> Result<()> {
-        self.write_line(&protocol::permission_response(request, answer))
+    pub fn answer(
+        &self,
+        reply: crate::agent::ApprovalReply,
+    ) -> Result<crate::agent::AnswerReceipt> {
+        self.write_line(&reply.message)?;
+        Ok(crate::agent::AnswerReceipt {
+            grants: reply.grants,
+        })
     }
 
     /// Asks the CLI to stop the current turn. The turn then ends with a "stopped" result.

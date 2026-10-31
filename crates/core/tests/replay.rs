@@ -5,7 +5,8 @@
 
 mod common;
 
-use newjen_core::protocol::{Incoming, PermissionAnswer};
+use newjen_core::ApprovalIntent;
+use newjen_core::protocol::Incoming;
 use newjen_core::providers::claude::events::ClaudeEvents;
 use newjen_core::session::SessionEvent;
 use newjen_core::transcript::{Item, Status, ToolState, Transcript};
@@ -26,16 +27,26 @@ fn replay(name: &str) -> Replay {
     let mut after_each_result = Vec::new();
     let mut saw_pending_approval = false;
     let mut prefixes = Vec::new();
+    let mut approval_ids = std::collections::HashMap::new();
     for line in common::load(name) {
         if line.out {
             let incoming = Incoming::from_value(line.msg.clone());
             let is_result = matches!(incoming, Incoming::Result(_));
-            transcript.apply(&codec.translate(&SessionEvent::Line(incoming), None));
+            let batch = codec.translate(&SessionEvent::Line(incoming), None);
+            for event in &batch.events {
+                if let newjen_core::agent::AgentEvent::ApprovalRequested(request) = event {
+                    approval_ids.insert(
+                        request.key(),
+                        line.msg["request_id"].as_str().unwrap().to_string(),
+                    );
+                }
+            }
+            transcript.apply(&batch);
             saw_pending_approval |= transcript.pending_approval().is_some();
             if is_result {
                 after_each_result.push(transcript.clone());
             }
-            prefixes.push(snapshot(&transcript));
+            prefixes.push(snapshot(&transcript, &approval_ids));
             continue;
         }
         match line.msg["type"].as_str() {
@@ -48,13 +59,15 @@ fn replay(name: &str) -> Replay {
                 let pending = transcript
                     .pending_approval()
                     .expect("an approval should be pending when the fixture answers one");
-                assert_eq!(pending.request_id, request_id);
-                transcript
-                    .resolve_approval(request_id, answer_from(&line.msg["response"]["response"]));
+                assert_eq!(approval_ids[&pending.key()], request_id);
+                let key = pending.key();
+                let answer = answer_from(&line.msg["response"]["response"]);
+                codec.answer(key, answer).expect("live fixture approval");
+                transcript.resolve_approval(key, answer);
             }
             _ => {} // initialize / interrupt requests: nothing to record.
         }
-        prefixes.push(snapshot(&transcript));
+        prefixes.push(snapshot(&transcript, &approval_ids));
     }
     let expected: Vec<Value> = serde_json::from_str(
         &std::fs::read_to_string(
@@ -75,16 +88,16 @@ fn replay(name: &str) -> Replay {
     }
 }
 
-/// The `PermissionAnswer` a recorded control_response corresponds to.
-fn answer_from(response: &Value) -> PermissionAnswer {
+/// The `ApprovalIntent` a recorded control_response corresponds to.
+fn answer_from(response: &Value) -> ApprovalIntent {
     match (
         response["behavior"].as_str(),
         response["interrupt"].as_bool(),
     ) {
-        (Some("deny"), Some(true)) => PermissionAnswer::DenyAndStop,
-        (Some("deny"), _) => PermissionAnswer::Deny,
-        _ if response.get("updatedPermissions").is_some() => PermissionAnswer::AllowForSession,
-        _ => PermissionAnswer::AllowOnce,
+        (Some("deny"), Some(true)) => ApprovalIntent::DenyAndStop,
+        (Some("deny"), _) => ApprovalIntent::Deny,
+        _ if response.get("updatedPermissions").is_some() => ApprovalIntent::AllowForSession,
+        _ => ApprovalIntent::AllowOnce,
     }
 }
 
@@ -220,8 +233,8 @@ fn tool_allow_status_while_waiting() {
         tools(&transcript),
         [("Bash".to_string(), ToolState::Waiting)]
     );
-    let request_id = transcript.pending_approval().unwrap().request_id.clone();
-    transcript.resolve_approval(&request_id, PermissionAnswer::AllowOnce);
+    let request_id = transcript.pending_approval().unwrap().key();
+    transcript.resolve_approval(request_id, ApprovalIntent::AllowOnce);
     assert_eq!(transcript.status(), Status::Working);
     assert_eq!(
         tools(&transcript),
@@ -676,7 +689,10 @@ fn approved_subagent_tool_settles_when_its_result_arrives() {
             "subtype": "can_use_tool", "tool_name": "Write", "tool_use_id": "sub_t",
             "input": {"file_path": "/tmp/a.txt"}, "agent_id": "agent_1"}}),
     );
-    transcript.resolve_approval("r1", PermissionAnswer::AllowOnce);
+    transcript.resolve_approval(
+        transcript.pending_approval().unwrap().key(),
+        ApprovalIntent::AllowOnce,
+    );
     // Its result arrives on a subagent line.
     feed(
         &mut transcript,
@@ -848,7 +864,10 @@ fn background_task_then_a_turn_claude_starts_by_itself() {
     assert_close(turn_ends(transcript)[1].0, 0.00042816);
 }
 
-fn snapshot(transcript: &Transcript) -> Value {
+fn snapshot(
+    transcript: &Transcript,
+    approval_ids: &std::collections::HashMap<newjen_core::ApprovalKey, String>,
+) -> Value {
     let items: Vec<Value> = transcript
         .items()
         .iter()
@@ -862,7 +881,7 @@ fn snapshot(transcript: &Transcript) -> Value {
         .collect();
     serde_json::json!({"items":items,"status":transcript.status(),"dirty":transcript.dirty_from(),
         "session":transcript.session_id(),"model":transcript.model(),
-        "pending":transcript.pending_approval().map(|r| &r.request_id),
+        "pending":transcript.pending_approval().map(|r| &approval_ids[&r.key()]),
         "background":transcript.background_tasks().iter().map(|t| (&t.task_id, &t.description)).collect::<Vec<_>>()})
 }
 

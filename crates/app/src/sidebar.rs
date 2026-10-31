@@ -169,18 +169,6 @@ pub fn row_look(facts: &RowFacts, now_ms: i64) -> RowLook {
     }
 }
 
-/// The short reason after "Failed · ": the error's title ("Claude exited"), except for an
-/// error Claude reported itself, whose title ("Claude stopped") says nothing about why; then
-/// the first line of what it said ("Not logged in · Please run /login").
-pub fn failure_reason(title: &str, detail: &str) -> String {
-    const SAYS_NOTHING: &str = "Claude stopped";
-    let first_line = detail.lines().map(str::trim).find(|line| !line.is_empty());
-    match first_line {
-        Some(line) if title == SAYS_NOTHING => line.to_string(),
-        _ => title.to_string(),
-    }
-}
-
 /// Where the thread list is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -627,22 +615,6 @@ mod tests {
             busy.background_tasks = 1;
             assert_ne!(row_look(&busy, NOW).detail, "Background task running");
         }
-    }
-
-    #[test]
-    fn a_failure_says_why_in_a_few_words() {
-        assert_eq!(
-            failure_reason("Claude exited", "The claude process exited with code 1."),
-            "Claude exited"
-        );
-        assert_eq!(
-            failure_reason(
-                "Claude stopped",
-                "\nNot logged in · Please run /login\nmore"
-            ),
-            "Not logged in · Please run /login"
-        );
-        assert_eq!(failure_reason("Claude stopped", ""), "Claude stopped");
     }
 
     #[test]

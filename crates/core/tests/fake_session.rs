@@ -7,7 +7,8 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
-use newjen_core::protocol::{Incoming, PermissionAnswer};
+use newjen_core::ApprovalIntent;
+use newjen_core::protocol::Incoming;
 use newjen_core::providers::claude::events::ClaudeEvents;
 use newjen_core::session::{Session, SessionConfig, SessionEvent};
 use newjen_core::transcript::{Item, Status, ToolState, Transcript};
@@ -67,9 +68,13 @@ fn tool_allow_end_to_end_through_the_fake_cli() {
         .cloned()
         .expect("pending approval");
     session
-        .answer(&request, PermissionAnswer::AllowOnce)
+        .answer(
+            codec
+                .answer(request.key(), ApprovalIntent::AllowOnce)
+                .unwrap(),
+        )
         .unwrap();
-    transcript.resolve_approval(&request.request_id, PermissionAnswer::AllowOnce);
+    transcript.resolve_approval(request.key(), ApprovalIntent::AllowOnce);
 
     // Then the result, then a clean exit (the fake exits 0 once the fixture is replayed).
     let mut saw_result = false;
@@ -111,14 +116,21 @@ fn fake_cli_rejects_a_wrong_answer() {
     // proving the fake really checks what the session writes.
     let (session, events) = Session::spawn(fake_config("tool_allow")).unwrap();
     session.send_prompt("go").unwrap();
-    let request = loop {
-        if let SessionEvent::Line(Incoming::PermissionRequest(request)) =
-            common::next_event(&events, TIMEOUT)
+    let mut codec = ClaudeEvents::default();
+    let key = loop {
+        let event = common::next_event(&events, TIMEOUT);
+        let batch = codec.translate(&event, None);
+        if let Some(newjen_core::agent::AgentEvent::ApprovalRequested(request)) = batch
+            .events
+            .iter()
+            .find(|event| matches!(event, newjen_core::agent::AgentEvent::ApprovalRequested(_)))
         {
-            break request;
+            break request.key();
         }
     };
-    session.answer(&request, PermissionAnswer::Deny).unwrap();
+    session
+        .answer(codec.answer(key, ApprovalIntent::Deny).unwrap())
+        .unwrap();
     let code = loop {
         if let SessionEvent::Exited { code, .. } = common::next_event(&events, TIMEOUT) {
             break code;

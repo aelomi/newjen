@@ -12,7 +12,7 @@ use gpui::{
 use gpui_kit::base::{FocusTrapElement as _, Selectable, h_flex, v_flex};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{Sizable as _, tag::Tag};
-use newjen_core::{Grant, Status};
+use newjen_core::{GrantId, GrantView, Status};
 
 use crate::sidebar::{self, OnPress};
 use crate::ui::{self, AgentState, IconName, Look, Tone, ellipsis, middle_ellipsis};
@@ -44,7 +44,7 @@ const GRANTS_MARGIN: f32 = 16.0;
 /// The rows always get at least this much, about two rules.
 const GRANT_ROWS_MIN: f32 = 100.0;
 /// Called with a grant's rule when its Revoke button is pressed.
-pub type OnRevoke = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+pub type OnRevoke = Rc<dyn Fn(&GrantId, &mut Window, &mut App)>;
 
 /// Called when the grants popover opens (`true`) or closes.
 pub type OnGrantsOpen = Rc<dyn Fn(bool, &mut Window, &mut App)>;
@@ -70,7 +70,8 @@ pub struct Bar {
     /// another thread waits for an approval (an amber dot on the button).
     pub show_list: Option<(OnPress, bool)>,
     /// The thread's "Always allow" rules.
-    pub grants: Vec<Grant>,
+    pub grants: Vec<GrantView>,
+    pub grants_detail: &'static str,
     pub pill: Option<Pill>,
     /// How many commands Claude keeps running in the background.
     pub background_tasks: usize,
@@ -162,7 +163,12 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
             .gap_1p5()
             .occlude()
             .when(!bar.grants.is_empty(), |right| {
-                right.child(grants_popover(bar.grants, bar.background_tasks, grants))
+                right.child(grants_popover(
+                    bar.grants,
+                    bar.grants_detail,
+                    bar.background_tasks,
+                    grants,
+                ))
             })
             .children(bar.pill.map(status_pill)),
     );
@@ -247,7 +253,12 @@ fn status_pill(pill: Pill) -> AnyElement {
 
 /// "🛡 2 allowed": opens the list of the thread's remembered rules. Tab stays inside it; Esc, a
 /// press outside or focus moving elsewhere closes it.
-fn grants_popover(grants: Vec<Grant>, background_tasks: usize, state: Grants) -> AnyElement {
+fn grants_popover(
+    grants: Vec<GrantView>,
+    detail: &'static str,
+    background_tasks: usize,
+    state: Grants,
+) -> AnyElement {
     let label = format!("{} allowed", grants.len());
     let on_open = state.on_open;
     let on_revoke = state.on_revoke;
@@ -261,7 +272,7 @@ fn grants_popover(grants: Vec<Grant>, background_tasks: usize, state: Grants) ->
         .track_focus(&state.focus)
         .content(move |_, window, cx| {
             let dismiss = cx.listener(|state, _, window, cx| state.dismiss(window, cx));
-            let panel = grants_panel(&grants, background_tasks, &on_revoke, window, cx);
+            let panel = grants_panel(&grants, detail, background_tasks, &on_revoke, window, cx);
             div()
                 .child(panel)
                 .on_mouse_down_out(dismiss)
@@ -298,7 +309,8 @@ impl RenderOnce for GrantsChip {
 
 /// The popover's content (the "Allowed rules popover" frame of the mock).
 fn grants_panel(
-    grants: &[Grant],
+    grants: &[GrantView],
+    detail: &str,
     background_tasks: usize,
     on_revoke: &OnRevoke,
     window: &Window,
@@ -327,11 +339,11 @@ fn grants_panel(
             div()
                 .text_size(small)
                 .text_color(colors.muted_foreground)
-                .child("Claude runs these without asking, until you revoke them."),
+                .child(detail.to_string()),
         );
     let rows = grants.iter().enumerate().map(|(ix, grant)| {
-        let parts = grant_parts(&grant.rule, &grant.label);
-        let rule = grant.rule.clone();
+        let parts = grant.clone();
+        let rule = grant.id.clone();
         let on_revoke = on_revoke.clone();
         h_flex()
             .gap_2()
@@ -396,61 +408,9 @@ fn grants_panel(
         .into_any_element()
 }
 
-/// One remembered rule as the popover shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrantParts {
-    /// The tool, e.g. "Bash", or "MCP" for one MCP tool.
-    pub tool: String,
-    /// The rule on one line, e.g. `touch one.txt` or `pencil · get_style`.
-    pub shown: String,
-    /// What it allows, in words: "exact command", "git add with any arguments", "this tool
-    /// only". `None` when the rule says it best itself.
-    pub note: Option<String>,
-}
-
-/// Splits a grant (its CLI `rule`, such as `Bash(git add:*)`, and its `label`, such as
-/// `git add:*`) into what the popover shows.
-pub fn grant_parts(rule: &str, label: &str) -> GrantParts {
-    // One line: a multi-line command's line breaks are shown as ↵, as the approval dock does.
-    let shown = label.replace('\n', " ↵ ");
-    let tool = rule.split('(').next().unwrap_or(rule);
-    if !rule.contains('(') && tool.starts_with("mcp__") {
-        return GrantParts {
-            tool: "MCP".to_string(),
-            shown,
-            note: Some("this tool only".to_string()),
-        };
-    }
-    // In a Bash rule a trailing `:*` or ` *` means "any arguments"; another `*` is a pattern.
-    let note = if tool == "Bash" {
-        let prefix = label
-            .strip_suffix(":*")
-            .or_else(|| label.strip_suffix(" *"))
-            .map(str::trim_end)
-            .filter(|prefix| !prefix.is_empty() && !prefix.contains('*'));
-        Some(match prefix {
-            Some(prefix) => format!("{} with any arguments", prefix.replace('\n', " ↵ ")),
-            None if label.contains('*') => "a pattern".to_string(),
-            None => "exact command".to_string(),
-        })
-    } else {
-        label.contains('*').then(|| "a pattern".to_string())
-    };
-    GrantParts {
-        tool: tool.to_string(),
-        shown,
-        note,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parts(rule: &str, label: &str) -> (String, String, Option<String>) {
-        let parts = grant_parts(rule, label);
-        (parts.tool, parts.shown, parts.note)
-    }
 
     struct Narrow {
         focus: FocusHandle,
@@ -470,6 +430,7 @@ mod tests {
                 copy: true,
                 show_list: Some((Rc::new(|_, _| {}), false)),
                 grants: vec![],
+                grants_detail: "Claude runs these without asking, until you revoke them.",
                 pill: pill(Status::Waiting, 0),
                 background_tasks: 0,
             };
@@ -581,70 +542,6 @@ mod tests {
         assert_eq!(
             grants_footer(3),
             format!("{when} It also stops the 3 commands running in the background.")
-        );
-    }
-
-    #[test]
-    fn grants_read_like_the_popover_mock() {
-        assert_eq!(
-            parts("Bash(touch one.txt)", "touch one.txt"),
-            (
-                "Bash".to_string(),
-                "touch one.txt".to_string(),
-                Some("exact command".to_string())
-            )
-        );
-        assert_eq!(
-            parts("Bash(git add:*)", "git add:*"),
-            (
-                "Bash".to_string(),
-                "git add:*".to_string(),
-                Some("git add with any arguments".to_string())
-            )
-        );
-        assert_eq!(
-            parts("mcp__pencil__get_style", "pencil · get_style"),
-            (
-                "MCP".to_string(),
-                "pencil · get_style".to_string(),
-                Some("this tool only".to_string())
-            )
-        );
-    }
-
-    #[test]
-    fn patterns_and_other_tools_are_named_honestly() {
-        assert_eq!(
-            parts("Bash(npm test *)", "npm test *").2.as_deref(),
-            Some("npm test with any arguments")
-        );
-        assert_eq!(
-            parts("Bash(rm *.log)", "rm *.log").2.as_deref(),
-            Some("a pattern")
-        );
-        // A bare `*` allows anything: never "with any arguments" of nothing.
-        assert_eq!(parts("Bash(*)", "*").2.as_deref(), Some("a pattern"));
-        assert_eq!(
-            parts("WebFetch(domain:*.example.com)", "domain:*.example.com"),
-            (
-                "WebFetch".to_string(),
-                "domain:*.example.com".to_string(),
-                Some("a pattern".to_string())
-            )
-        );
-        assert_eq!(
-            parts("WebFetch(domain:example.com)", "domain:example.com").2,
-            None
-        );
-        // Escaped brackets in the CLI rule do not confuse the tool name.
-        assert_eq!(
-            parts(r"Bash(sed 's/\\\(a\\\)/b/' f)", r"sed 's/\(a\)/b/' f").0,
-            "Bash"
-        );
-        // A multi-line command stays on one line.
-        assert_eq!(
-            parts("Bash(echo a\necho b)", "echo a\necho b").1,
-            "echo a ↵ echo b"
         );
     }
 }

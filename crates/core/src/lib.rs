@@ -21,11 +21,15 @@ pub mod store;
 pub mod thread;
 pub mod transcript;
 
-pub use protocol::{
-    Incoming, OnceReason, PermissionAnswer, PermissionRequest, SessionRule, SessionScope,
-    allows_for_session, session_rules, session_scope,
+pub use agent::{
+    ApprovalIntent, ApprovalKey, ApprovalKind, ApprovalRequest, ApprovalView, GrantId,
+    GrantLifetime, GrantView, OnceReason, RememberScope, RuleMeaning, ToolDisposition,
 };
 pub use session::{Conversation, Session, SessionConfig, SessionEvent, find_claude};
 pub use store::{Grant, Project, Store, ThreadRow, WriteError};
 pub use thread::{Thread, ThreadEvent};
 pub use transcript::{Item, Status, ToolState, Transcript};
+
+pub use providers::claude::presentation::tool_disposition;
+
+pub use agent::AgentPresentation;

@@ -43,7 +43,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use newjen_core::protocol::PermissionAnswer;
+use newjen_core::ApprovalIntent;
 use newjen_core::rift::{Copy, CopyError, Tools};
 use newjen_core::session::{SessionConfig, SessionEvent};
 use newjen_core::store::{Project, Store};
@@ -806,7 +806,7 @@ fn always_allow_is_saved_and_given_to_every_later_claude_until_revoked() {
     let mut thread = fixture.draft();
     send_and_wait_for_approval(&mut thread, "make a file");
     thread
-        .answer(None, PermissionAnswer::AllowForSession)
+        .answer(None, ApprovalIntent::AllowForSession)
         .unwrap();
     finish_turn(&mut thread);
     fixture.switch("ask", false);
@@ -840,7 +840,14 @@ fn always_allow_is_saved_and_given_to_every_later_claude_until_revoked() {
 
     // Revoking while idle stops claude at once; the next one starts without the rule.
     assert!(thread.has_session());
-    thread.revoke("Bash(touch one.txt)");
+    thread.revoke(
+        &thread
+            .grant_views()
+            .into_iter()
+            .find(|grant| grant.shown == "touch one.txt")
+            .unwrap()
+            .id,
+    );
     assert!(!thread.has_session());
     assert!(thread.grants().is_empty());
     thread.send("third").unwrap();
@@ -856,7 +863,7 @@ fn always_allow_is_saved_and_given_to_every_later_claude_until_revoked() {
     fixture.switch("ask", true);
     send_and_wait_for_approval(&mut thread, "once more");
     thread
-        .answer(None, PermissionAnswer::AllowForSession)
+        .answer(None, ApprovalIntent::AllowForSession)
         .unwrap();
     finish_turn(&mut thread);
     let reloaded = fixture.reload(thread.id());
@@ -873,7 +880,7 @@ fn allow_once_saves_no_grant() {
     fixture.switch("ask", true);
     let mut thread = fixture.draft();
     send_and_wait_for_approval(&mut thread, "make a file");
-    thread.answer(None, PermissionAnswer::AllowOnce).unwrap();
+    thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
     finish_turn(&mut thread);
     assert!(thread.grants().is_empty());
     assert!(fixture.store.flush(FLUSH));
@@ -887,14 +894,21 @@ fn revoking_mid_turn_stops_claude_when_the_turn_ends() {
     let mut thread = fixture.draft();
     send_and_wait_for_approval(&mut thread, "one");
     thread
-        .answer(None, PermissionAnswer::AllowForSession)
+        .answer(None, ApprovalIntent::AllowForSession)
         .unwrap();
     finish_turn(&mut thread);
 
     send_and_wait_for_approval(&mut thread, "two");
-    thread.revoke("Bash(touch one.txt)");
+    thread.revoke(
+        &thread
+            .grant_views()
+            .into_iter()
+            .find(|grant| grant.shown == "touch one.txt")
+            .unwrap()
+            .id,
+    );
     assert!(thread.has_session(), "never mid-turn");
-    thread.answer(None, PermissionAnswer::AllowOnce).unwrap();
+    thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
     finish_turn(&mut thread);
     assert_eq!(thread.status(), Status::Done);
     assert!(!thread.has_session(), "stopped once the turn ended");
@@ -929,7 +943,7 @@ fn idle_shutdown_waits_30_minutes_and_never_cuts_a_turn_short() {
     send_and_wait_for_approval(&mut thread, "two");
     assert!(!thread.idle_check(Instant::now() + IDLE_TIMEOUT * 2));
     assert!(thread.has_session());
-    thread.answer(None, PermissionAnswer::AllowOnce).unwrap();
+    thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
     finish_turn(&mut thread);
     fixture.switch("ask", false);
 
@@ -969,7 +983,7 @@ fn unread_is_set_off_screen_and_cleared_on_screen() {
     assert!(thread.is_unread());
     thread.set_active(true);
     assert!(!thread.is_unread());
-    thread.answer(None, PermissionAnswer::AllowOnce).unwrap();
+    thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
     finish_turn(&mut thread);
     assert!(!thread.is_unread());
 }
@@ -1763,7 +1777,7 @@ fn thread_with_a_grant_and_a_background_task(fixture: &Fixture) -> Thread {
     let mut thread = fixture.draft();
     send_and_wait_for_approval(&mut thread, "Start the dev server and make a file");
     thread
-        .answer(None, PermissionAnswer::AllowForSession)
+        .answer(None, ApprovalIntent::AllowForSession)
         .unwrap();
     finish_turn(&mut thread);
     fixture.switch("ask", false);
@@ -1777,7 +1791,14 @@ fn thread_with_a_grant_and_a_background_task(fixture: &Fixture) -> Thread {
 fn revoking_a_grant_says_it_stopped_the_background_task() {
     let fixture = Fixture::new();
     let mut thread = thread_with_a_grant_and_a_background_task(&fixture);
-    thread.revoke("Bash(touch one.txt)");
+    thread.revoke(
+        &thread
+            .grant_views()
+            .into_iter()
+            .find(|grant| grant.shown == "touch one.txt")
+            .unwrap()
+            .id,
+    );
     assert_background_stopped(&fixture, &thread, Status::Done);
 }
 
@@ -1788,15 +1809,22 @@ fn revoking_mid_turn_says_it_stopped_the_background_task_when_the_turn_ends() {
     let mut thread = fixture.draft();
     send_and_wait_for_approval(&mut thread, "make a file");
     thread
-        .answer(None, PermissionAnswer::AllowForSession)
+        .answer(None, ApprovalIntent::AllowForSession)
         .unwrap();
     finish_turn(&mut thread);
 
     fixture.switch("background", true);
     send_and_wait_for_approval(&mut thread, "Start the dev server and make a file");
     assert_eq!(thread.background_tasks().len(), 1);
-    thread.revoke("Bash(touch one.txt)");
-    thread.answer(None, PermissionAnswer::AllowOnce).unwrap();
+    thread.revoke(
+        &thread
+            .grant_views()
+            .into_iter()
+            .find(|grant| grant.shown == "touch one.txt")
+            .unwrap()
+            .id,
+    );
+    thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
     finish_turn(&mut thread);
     assert_background_stopped(&fixture, &thread, Status::Done);
 }
@@ -1965,7 +1993,7 @@ fn always_allow_that_never_reaches_claude_saves_no_grant() {
     }
     assert!(
         thread
-            .answer(None, PermissionAnswer::AllowForSession)
+            .answer(None, ApprovalIntent::AllowForSession)
             .is_err()
     );
     assert!(thread.grants().is_empty());
@@ -2769,4 +2797,57 @@ fn failed_attempt_stays_tracked(works_in: WorksIn, failure: CleanupFailure) {
     );
     Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &real_tools).unwrap();
     thread.shutdown_for_quit();
+}
+
+#[test]
+fn opaque_approval_keys_reject_cross_thread_stale_and_previous_process_answers() {
+    let fixture = Fixture::new();
+    fixture.switch("ask", true);
+    let mut first = fixture.draft();
+    let mut second = fixture.draft();
+    send_and_wait_for_approval(&mut first, "first");
+    send_and_wait_for_approval(&mut second, "second");
+    let first_key = first.transcript().pending_approval().unwrap().key();
+    let second_key = second.transcript().pending_approval().unwrap().key();
+    assert_ne!(first_key, second_key);
+    first
+        .answer(Some(second_key), ApprovalIntent::AllowForSession)
+        .unwrap();
+    assert_eq!(
+        first.transcript().pending_approval().unwrap().key(),
+        first_key
+    );
+    assert!(first.grants().is_empty());
+    first
+        .answer(Some(first_key), ApprovalIntent::AllowOnce)
+        .unwrap();
+    first
+        .answer(Some(first_key), ApprovalIntent::AllowForSession)
+        .unwrap();
+    assert!(
+        first.grants().is_empty(),
+        "stale remember never grants anything"
+    );
+    finish_turn(&mut first);
+    first.restart().unwrap();
+    send_and_wait_for_approval(&mut first, "after restart");
+    let current = first.transcript().pending_approval().unwrap().key();
+    assert_ne!(first_key, current);
+    first
+        .answer(Some(first_key), ApprovalIntent::DenyAndStop)
+        .unwrap();
+    assert_eq!(
+        first.transcript().pending_approval().unwrap().key(),
+        current
+    );
+    first
+        .answer(Some(current), ApprovalIntent::AllowOnce)
+        .unwrap();
+    second
+        .answer(Some(second_key), ApprovalIntent::AllowOnce)
+        .unwrap();
+    finish_turn(&mut first);
+    finish_turn(&mut second);
+    assert_eq!(first.status(), Status::Done);
+    assert_eq!(second.status(), Status::Done);
 }

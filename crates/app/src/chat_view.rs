@@ -13,7 +13,6 @@
 //! calls on the thread on screen and draws what the threads say. Every change ends with
 //! `cx.notify()`, which asks GPUI to call `render` again.
 
-use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -29,13 +28,10 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Side, WindowExt as _};
-use newjen_core::providers::claude::display_name;
 use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
-use newjen_core::{
-    Item, PermissionAnswer, Project, SessionConfig, Status, Store, Thread, ToolState, session_scope,
-};
+use newjen_core::{ApprovalIntent, Item, Project, SessionConfig, Status, Store, Thread, ToolState};
 
 use crate::approval::{self, Room};
 use crate::format::{elapsed, fit_rows, short_path, text_rows, tilde};
@@ -217,7 +213,7 @@ pub struct ChatView {
     grants_open: bool,
     grants_focus: FocusHandle,
     /// The approval the dock is showing, to notice when a new one takes its place.
-    dock_request: Option<String>,
+    dock_request: Option<newjen_core::ApprovalKey>,
     /// The root has the keyboard while the thread on screen waits for its Rift copy: the
     /// composer is disabled until then.
     making_copy_shown: bool,
@@ -661,7 +657,11 @@ impl ChatView {
         let question = {
             let thread = self.slots[ix].thread.read(cx);
             thread.copy().map(|copy| {
-                archive_question(thread.title(), &tilde(&copy.path, self.home.as_deref()))
+                archive_question(
+                    thread.title(),
+                    &tilde(&copy.path, self.home.as_deref()),
+                    thread.presentation(),
+                )
             })
         };
         let Some((title, body)) = question else {
@@ -818,10 +818,10 @@ impl ChatView {
         let (front, outside, status, empty, making_copy) = {
             let thread = self.thread().read(cx);
             let request = thread.transcript().pending_approval();
-            let front = request.map(|request| request.request_id.clone());
+            let front = request.map(|request| request.key());
             // Only for a new request: it reads the disk.
             let outside = if front != self.dock_request {
-                request.and_then(|request| approval::outside_path(request, thread.cwd()))
+                request.and_then(|request| approval::outside_path(request.view(), thread.cwd()))
             } else {
                 self.dock_outside.clone()
             };
@@ -861,10 +861,29 @@ impl ChatView {
         }
 
         let placeholder = SharedString::from(match status {
-            _ if making_copy => "Reply to Claude…".to_string(),
-            Status::Working | Status::Waiting => "Claude is working…".to_string(),
-            _ if empty => format!("Ask Claude to work on {}…", self.project_label),
-            _ => "Reply to Claude…".to_string(),
+            _ if making_copy => self
+                .thread()
+                .read(cx)
+                .presentation()
+                .reply_placeholder
+                .to_string(),
+            Status::Working | Status::Waiting => self
+                .thread()
+                .read(cx)
+                .presentation()
+                .working_placeholder
+                .to_string(),
+            _ if empty => self
+                .thread()
+                .read(cx)
+                .presentation()
+                .new_thread_placeholder(&self.project_label),
+            _ => self
+                .thread()
+                .read(cx)
+                .presentation()
+                .reply_placeholder
+                .to_string(),
         });
         let slot = &mut self.slots[self.active];
         if placeholder != slot.placeholder {
@@ -939,9 +958,16 @@ impl ChatView {
                 error.downcast_ref::<CopyError>().expect("checked"),
                 self.home.as_deref(),
             )),
-            Err(error) if had_claude => notice_after(Err(error), "Could not reach Claude"),
+            Err(error) if had_claude => {
+                notice_after(Err(error), thread.read(cx).presentation().send_failed)
+            }
             // No claude was running, so the error is from starting one.
-            Err(error) => Some(spawn_notice(&error, &program, gone.as_deref())),
+            Err(error) => Some(spawn_notice(
+                &error,
+                &program,
+                thread.read(cx).presentation(),
+                gone.as_deref(),
+            )),
         };
         self.slots[self.active].notice = notice;
         self.sync_field(window, cx);
@@ -1100,7 +1126,12 @@ impl ChatView {
                     Some(failed) => copy_failed(failed, self.home.as_deref()),
                     None => {
                         let gone = self.gone_copy(thread.read(cx));
-                        spawn_notice(&error, &program, gone.as_deref())
+                        spawn_notice(
+                            &error,
+                            &program,
+                            thread.read(cx).presentation(),
+                            gone.as_deref(),
+                        )
                     }
                 })
             }
@@ -1137,8 +1168,8 @@ impl ChatView {
     /// as allow once (see `sent_answer`).
     fn answer(
         &mut self,
-        request_id: Option<&str>,
-        choice: PermissionAnswer,
+        request_id: Option<newjen_core::ApprovalKey>,
+        choice: ApprovalIntent,
         rule_cut: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1152,7 +1183,8 @@ impl ChatView {
         });
         // No note after the click when "Always allow" acts once: the scope row under the dock
         // already said so before the click.
-        self.slots[self.active].notice = notice_after(sent, "Could not send your answer to Claude");
+        self.slots[self.active].notice =
+            notice_after(sent, thread.read(cx).presentation().answer_failed);
         self.sync_field(window, cx);
         cx.notify();
     }
@@ -1174,9 +1206,9 @@ impl ChatView {
             sent
         });
         let failed = if pending {
-            "Could not send your answer to Claude"
+            thread.read(cx).presentation().answer_failed
         } else {
-            "Could not stop Claude"
+            thread.read(cx).presentation().stop_failed
         };
         self.slots[self.active].notice = notice_after(sent, failed);
         self.sync_field(window, cx);
@@ -1196,9 +1228,14 @@ impl ChatView {
             cx.notify();
             started
         });
-        self.slots[self.active].notice = started
-            .err()
-            .map(|error| spawn_notice(&error, &program, gone.as_deref()));
+        self.slots[self.active].notice = started.err().map(|error| {
+            spawn_notice(
+                &error,
+                &program,
+                thread.read(cx).presentation(),
+                gone.as_deref(),
+            )
+        });
         self.sync_field(window, cx);
         cx.notify();
     }
@@ -1458,7 +1495,8 @@ impl ChatView {
                 path,
                 copy: making_copy || thread.copy().is_some(),
                 show_list,
-                grants: thread.grants().to_vec(),
+                grants: thread.grant_views(),
+                grants_detail: thread.presentation().grants_detail,
                 pill: if making_copy {
                     Some(title_bar::STARTING)
                 } else {
@@ -1469,12 +1507,14 @@ impl ChatView {
         };
         // claude cannot forget a rule, so core stops it (now, or when the turn ends) and the
         // next message starts one without the rule.
-        let on_revoke: OnRevoke = Rc::new(move |rule: &str, _window: &mut Window, cx: &mut App| {
-            entity.update(cx, |thread, cx| {
-                thread.revoke(rule);
-                cx.notify();
-            });
-        });
+        let on_revoke: OnRevoke = Rc::new(
+            move |rule: &newjen_core::GrantId, _window: &mut Window, cx: &mut App| {
+                entity.update(cx, |thread, cx| {
+                    thread.revoke(rule);
+                    cx.notify();
+                });
+            },
+        );
         let view = cx.weak_entity();
         let on_open: OnGrantsOpen = Rc::new(move |open, _, cx| {
             let _ = view.update(cx, |view, cx| {
@@ -1500,11 +1540,22 @@ impl ChatView {
             .justify_center()
             .gap_2()
             .px_4()
-            .child(ui::title("What should Claude work on?", cx))
+            .child(ui::title(
+                self.thread().read(cx).presentation().empty_title,
+                cx,
+            ))
             .child(
                 // Centered and kept to the column, so a long path wraps under the title.
                 div().max_w(COLUMN_WIDTH).text_center().child(
-                    ui::caption(empty_caption(works_in, &self.project_label), cx).text_base(),
+                    ui::caption(
+                        empty_caption(
+                            works_in,
+                            &self.project_label,
+                            self.thread().read(cx).presentation(),
+                        ),
+                        cx,
+                    )
+                    .text_base(),
                 ),
             )
     }
@@ -1578,7 +1629,7 @@ impl ChatView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (request, waiting, cwd) = {
+        let (request, waiting) = {
             let thread = self.thread().read(cx);
             let request = thread.transcript().pending_approval()?.clone();
             // Say when more approvals are queued behind this one (each tool waiting for an
@@ -1597,32 +1648,28 @@ impl ChatView {
                     )
                 })
                 .count();
-            (request, waiting, thread.cwd().to_path_buf())
+            (request, waiting)
         };
-        let mut title = approval::title(&request, Some(&cwd));
+        let mut title = approval::title(request.view());
         if waiting > 1 {
             title.push_str(&format!(" (1 of {waiting})"));
         }
         let (title, room) = self.dock_room(&title, main_width, window, cx);
         // `sync_field` keeps `dock_outside` in step with the dock's request.
-        let detail = approval::detail(&request, Some(&cwd), self.dock_outside.as_deref(), room);
-        let scope = approval::scope_row(
-            &session_scope(&request),
-            &request,
-            detail.shortened,
-            room.cols,
-        );
+        let detail = approval::detail(request.view(), self.dock_outside.as_deref(), room);
+        let scope = approval::scope_row(&request.view().remember, detail.shortened, room.cols);
         let rule_cut = scope.once;
-        let request_id = SharedString::from(request.request_id.clone());
+        let request_key = request.key();
+        let request_id = SharedString::from(request_key.to_string());
         let view = cx.weak_entity();
-        let answered_id = request_id.clone();
+        let answered_id = request_key;
         let card = ui::ApprovalCard::new(
             (ElementId::from("approval"), request_id.clone()),
             title,
             detail.text,
             move |answer, window, cx| {
                 let _ = view.update(cx, |view, cx| {
-                    view.answer(Some(answered_id.as_ref()), answer, rule_cut, window, cx)
+                    view.answer(Some(answered_id), answer, rule_cut, window, cx)
                 });
             },
         );
@@ -1797,7 +1844,7 @@ impl Render for ChatView {
             self.drawer_open = false;
         }
         // Revoking the last rule takes the chip, and its popover, away.
-        if self.thread().read(cx).grants().is_empty() {
+        if self.thread().read(cx).grant_views().is_empty() {
             self.grants_open = false;
         }
         let placement = sidebar::placement(width, self.sidebar_hidden, self.drawer_open);
@@ -1976,12 +2023,7 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
     let status = thread.status();
     // Only a failed thread needs its error, so the others never search their transcript.
     let failure = (status == Status::Failed)
-        .then(|| {
-            transcript.items().iter().rev().find_map(|item| match item {
-                Item::Error { title, detail, .. } => Some(sidebar::failure_reason(title, detail)),
-                _ => None,
-            })
-        })
+        .then(|| thread.failure_summary())
         .flatten();
     let folder = match (thread.preparing(), thread.works_in()) {
         (Some(_), _) => sidebar::Folder::MakingRiftCopy,
@@ -1995,7 +2037,7 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
         unread: thread.is_unread(),
         waiting_tool: transcript
             .pending_approval()
-            .map(|request| display_name(&request.tool_name)),
+            .map(|request| request.view().tool.display_name.clone()),
         working_for: thread
             .turn_started_at()
             .map(|started| now.saturating_duration_since(started)),
@@ -2029,35 +2071,24 @@ fn is_empty_draft(draft: bool, composer_text: &str) -> bool {
 }
 
 /// The error row shown when `claude` could not be started, worded by what went wrong.
-fn spawn_notice(error: &anyhow::Error, program: &Path, gone_copy: Option<&str>) -> Notice {
+fn spawn_notice(
+    error: &anyhow::Error,
+    program: &Path,
+    presentation: &newjen_core::AgentPresentation,
+    gone_copy: Option<&str>,
+) -> Notice {
     if let Some(copy) = gone_copy {
         return Notice::error(
-            "Could not start Claude Code",
+            presentation.start_failed,
             format!(
-                "This thread's Rift copy at {copy} is gone, so Claude has nowhere to work. \
-                 Archive the thread and start a new one."
+                "This thread's Rift copy at {copy} is gone, so {} has nowhere to work. \
+                 Archive the thread and start a new one.",
+                presentation.label
             ),
         );
     }
-    let program = program.display();
-    let kind = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<io::Error>())
-        .map(io::Error::kind);
-    let detail = match kind {
-        // The project folder is checked at startup, so this is the program (unless the folder
-        // was deleted since).
-        Some(io::ErrorKind::NotFound) => format!(
-            "Newjen could not find `{program}`. Install Claude Code and run `claude` once in a \
-             terminal to log in, then try again. Set NEWJEN_CLAUDE to use another path."
-        ),
-        Some(io::ErrorKind::PermissionDenied) => format!(
-            "`{program}` is not allowed to run ({error:#}). Check that it is an executable \
-             file, then try again."
-        ),
-        _ => format!("{error:#}.\n\nCheck that `{program}` runs in a terminal, then try again."),
-    };
-    Notice::error("Could not start Claude Code", detail)
+    let (title, detail) = presentation.start_failure(error, program);
+    Notice::error(&title, detail)
 }
 
 /// Rift's own message is the last line it printed, so it is not shown twice.
@@ -2143,12 +2174,17 @@ fn missing_tool(tools: &Tools, jj_repo: bool) -> Option<Notice> {
     None
 }
 
-fn archive_question(title: &str, path: &str) -> (String, String) {
+fn archive_question(
+    title: &str,
+    path: &str,
+    presentation: &newjen_core::AgentPresentation,
+) -> (String, String) {
     (
         format!("Archive “{title}”?"),
         format!(
-            "This deletes its Rift copy at {path}. Changes Claude made there that aren't in your \
-             project are lost."
+            "This deletes its Rift copy at {path}. Changes {} made there that aren't in your \
+             project are lost.",
+            presentation.label
         ),
     )
 }
@@ -2157,12 +2193,16 @@ fn in_jj_repo(project: &Path) -> bool {
     project.ancestors().any(|dir| dir.join(".jj").exists())
 }
 
-fn empty_caption(works_in: WorksIn, project: &str) -> String {
+fn empty_caption(
+    works_in: WorksIn,
+    project: &str,
+    presentation: &newjen_core::AgentPresentation,
+) -> String {
     let place = match works_in {
         WorksIn::ProjectFolder => project.to_string(),
         WorksIn::RiftCopy => format!("a new Rift copy of {project}"),
     };
-    format!("Claude Code runs in {place}. You approve each tool call before it runs.")
+    presentation.empty_caption(&place)
 }
 
 fn works_in_label(works_in: WorksIn) -> (ui::IconName, &'static str) {
@@ -2191,9 +2231,9 @@ fn notice_after(sent: anyhow::Result<()>, failed: &str) -> Option<Notice> {
 /// What to send for the user's `choice`. When the dock could not show the remembered rule in
 /// full (`rule_cut`), "Always allow" is sent as allow once: nothing is remembered that the user
 /// could not read.
-fn sent_answer(choice: PermissionAnswer, rule_cut: bool) -> PermissionAnswer {
+fn sent_answer(choice: ApprovalIntent, rule_cut: bool) -> ApprovalIntent {
     match choice {
-        PermissionAnswer::AllowForSession if rule_cut => PermissionAnswer::AllowOnce,
+        ApprovalIntent::AllowForSession if rule_cut => ApprovalIntent::AllowOnce,
         other => other,
     }
 }
@@ -2208,18 +2248,20 @@ fn offers_retry(ix: usize, item_count: usize, notice: Option<&Notice>, busy: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newjen_core::{SessionEvent, Transcript};
+    use newjen_core::Transcript;
+    use newjen_core::agent::{AgentBatch, AgentEvent, Checkpoint};
+    use std::io;
 
     #[test]
     fn always_allow_on_a_cut_rule_is_sent_as_allow_once() {
-        let always = PermissionAnswer::AllowForSession;
-        assert_eq!(sent_answer(always, true), PermissionAnswer::AllowOnce);
+        let always = ApprovalIntent::AllowForSession;
+        assert_eq!(sent_answer(always, true), ApprovalIntent::AllowOnce);
         // Shown in full: remembered as asked.
         assert_eq!(sent_answer(always, false), always);
         // Other answers are never changed.
         assert_eq!(
-            sent_answer(PermissionAnswer::Deny, true),
-            PermissionAnswer::Deny
+            sent_answer(ApprovalIntent::Deny, true),
+            ApprovalIntent::Deny
         );
     }
 
@@ -2267,20 +2309,17 @@ mod tests {
     fn an_interrupt_timeout_leaves_the_composer_usable_with_try_again() {
         let mut transcript = Transcript::new();
         transcript.push_user("hello");
-        transcript.apply(
-            &newjen_core::providers::claude::events::ClaudeEvents::default()
-                .translate(&SessionEvent::InterruptTimedOut, None),
-        );
-        // The session shuts claude down right after; that must not change the outcome.
-        transcript.apply(
-            &newjen_core::providers::claude::events::ClaudeEvents::default().translate(
-                &SessionEvent::Exited {
-                    code: None,
-                    requested: true,
-                },
-                None,
-            ),
-        );
+        transcript.apply(&AgentBatch {
+            events: vec![AgentEvent::InterruptTimedOut],
+            checkpoint: Checkpoint::Save,
+        });
+        transcript.apply(&AgentBatch {
+            events: vec![AgentEvent::Exited {
+                code: None,
+                requested: true,
+            }],
+            checkpoint: Checkpoint::Save,
+        });
         let busy = is_busy(transcript.status());
         assert!(!busy, "the composer must not stay on \"Working\"");
         let items = transcript.items();
@@ -2317,12 +2356,12 @@ mod tests {
         let mut transcript = Transcript::new();
         transcript.push_user("hello");
         assert!(is_busy(transcript.status()));
-        transcript.apply(
-            &newjen_core::providers::claude::events::ClaudeEvents::default().translate(
-                &SessionEvent::WriteFailed("Broken pipe (os error 32)".to_string()),
-                None,
-            ),
-        );
+        transcript.apply(&AgentBatch {
+            events: vec![AgentEvent::WriteFailed(
+                "Broken pipe (os error 32)".to_string(),
+            )],
+            checkpoint: Checkpoint::Save,
+        });
         let busy = is_busy(transcript.status());
         assert!(!busy, "the composer must not stay on \"Working\"");
         let items = transcript.items();
@@ -2426,7 +2465,11 @@ mod tests {
     #[test]
     fn archiving_a_copy_says_what_is_deleted() {
         assert_eq!(
-            archive_question("Fix the parser", "~/.rifts/Newjen/newjen-1a2b3c4d"),
+            archive_question(
+                "Fix the parser",
+                "~/.rifts/Newjen/newjen-1a2b3c4d",
+                &Default::default()
+            ),
             (
                 "Archive “Fix the parser”?".to_string(),
                 "This deletes its Rift copy at ~/.rifts/Newjen/newjen-1a2b3c4d. Changes Claude \
@@ -2439,11 +2482,11 @@ mod tests {
     #[test]
     fn the_empty_state_says_where_claude_will_work() {
         assert_eq!(
-            empty_caption(WorksIn::ProjectFolder, "~/Newjen"),
+            empty_caption(WorksIn::ProjectFolder, "~/Newjen", &Default::default()),
             "Claude Code runs in ~/Newjen. You approve each tool call before it runs."
         );
         assert_eq!(
-            empty_caption(WorksIn::RiftCopy, "~/Newjen"),
+            empty_caption(WorksIn::RiftCopy, "~/Newjen", &Default::default()),
             "Claude Code runs in a new Rift copy of ~/Newjen. You approve each tool call before \
              it runs."
         );
@@ -2454,6 +2497,7 @@ mod tests {
         let notice = spawn_notice(
             &failed(io::ErrorKind::NotFound),
             Path::new("/opt/bin/claude"),
+            &Default::default(),
             Some("~/.rifts/app/newjen-1a2b3c4d"),
         );
         assert_eq!(notice.title, "Could not start Claude Code");
@@ -2475,15 +2519,30 @@ mod tests {
     #[test]
     fn spawn_notice_names_the_actual_problem() {
         let program = Path::new("/opt/bin/claude");
-        let missing = spawn_notice(&failed(io::ErrorKind::NotFound), program, None);
+        let missing = spawn_notice(
+            &failed(io::ErrorKind::NotFound),
+            program,
+            &Default::default(),
+            None,
+        );
         assert!(missing.detail.contains("could not find `/opt/bin/claude`"));
         assert!(missing.detail.contains("Install Claude Code"));
 
-        let denied = spawn_notice(&failed(io::ErrorKind::PermissionDenied), program, None);
+        let denied = spawn_notice(
+            &failed(io::ErrorKind::PermissionDenied),
+            program,
+            &Default::default(),
+            None,
+        );
         assert!(denied.detail.contains("not allowed to run"));
         assert!(!denied.detail.contains("Install Claude Code"));
 
-        let other = spawn_notice(&failed(io::ErrorKind::OutOfMemory), program, None);
+        let other = spawn_notice(
+            &failed(io::ErrorKind::OutOfMemory),
+            program,
+            &Default::default(),
+            None,
+        );
         assert!(
             other
                 .detail
