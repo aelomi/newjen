@@ -786,3 +786,165 @@ async fn a_project_folder_thread_archives_without_asking(cx: &mut TestAppContext
     assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
     finish(&chat, path, cx);
 }
+
+#[gpui::test]
+fn review_project_send_must_wait_for_preparing_copy(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "review-reverse-exclusion", true);
+    let copying = cx.update(|_, cx| chat.read(cx).thread().clone());
+    let job = cx.update(|_, cx| {
+        copying.update(cx, |thread, cx| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            let sent = thread.send("copy work").unwrap();
+            cx.notify();
+            match sent {
+                Sent::MakingCopy(job) => job,
+                _ => panic!("expected copy job"),
+            }
+        })
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-n");
+    cx.simulate_input("edit project");
+    let accepted = cx.update(|window, cx| {
+        chat.update(cx, |view, cx| view.send_text("edit project", window, cx))
+    });
+    let preparing = cx.update(|_, cx| copying.read(cx).preparing().is_some());
+    let busy = cx.update(|_, cx| chat.read(cx).thread().read(cx).status().is_busy());
+    println!(
+        "copy preparing: {preparing}; project send accepted: {accepted}; project agent busy: {busy}"
+    );
+    assert!(
+        !accepted,
+        "project send must wait until the snapshot is done"
+    );
+    assert!(!busy);
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(chat.read(cx).active, cx)),
+        "edit project"
+    );
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).slots[chat.read(cx).active]
+            .notice
+            .as_ref()
+            .unwrap()
+            .detail
+            .clone()),
+        "Wait a moment: Newjen is taking a jj snapshot of the project for “copy work”'s Rift copy."
+    );
+    cx.update(|_, cx| {
+        copying.update(cx, |thread, _| {
+            thread.note_copy_progress(rift::Progress::Line("still preparing".to_string()))
+        })
+    });
+    assert!(cx.update(|_, cx| copying.read(cx).blocks_project_send()));
+    cx.update(|_, cx| {
+        copying.update(cx, |thread, _| {
+            thread.note_copy_progress(rift::Progress::MainRepoReady)
+        })
+    });
+    assert!(!cx.update(|_, cx| copying.read(cx).blocks_project_send()));
+    assert!(
+        cx.update(|window, cx| chat.update(cx, |view, cx| view.send_text(
+            "edit project",
+            window,
+            cx
+        )))
+    );
+    drop(job);
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn startup_restores_a_pending_copy_message_to_a_rift_draft(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "recover-copy", true, Some(CREATE_COPY));
+    let (job, tools) = cx.update(|_, cx| {
+        let view = chat.read(cx);
+        let tools = view.tools.clone();
+        let thread = view.thread().clone();
+        let job = thread.update(cx, |thread, _| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            let Sent::MakingCopy(job) = thread.send("my first message").unwrap() else {
+                panic!()
+            };
+            job
+        });
+        (job, tools)
+    });
+    let copy = job.run(&tools, |_| {}).unwrap();
+    let startup = cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.quit(cx);
+            Startup {
+                store: view.store.clone(),
+                project: view.project.clone(),
+                base_config: view.base_config.clone(),
+                threads: vec![],
+                problem: None,
+                home: None,
+                tools: view.tools.clone(),
+            }
+        })
+    });
+    let recovered = cx.update(|window, cx| cx.new(|cx| ChatView::new(startup, window, cx)));
+    for _ in 0..300 {
+        if cx.update(|_, cx| recovered.read(cx).composer_text(0, cx) == "my first message") {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+    cx.update(|_, cx| {
+        let view = recovered.read(cx);
+        assert_eq!(view.slots.len(), 1);
+        assert_eq!(view.composer_text(0, cx), "my first message");
+        assert_eq!(view.thread().read(cx).works_in(), WorksIn::RiftCopy);
+        assert!(view.thread().read(cx).is_draft());
+        assert!(!view.thread().read(cx).has_session());
+        assert!(view.thread().read(cx).transcript().items().is_empty());
+        assert_eq!(
+            view.slots[0].notice.as_ref().unwrap().title,
+            "Newjen quit while making a Rift copy. Your message is back."
+        );
+    });
+    assert!(!copy.path.exists());
+    finish(&recovered, path, cx);
+}
+
+#[gpui::test]
+async fn a_copy_completion_after_archive_is_removed_by_the_app(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "late-copy", true, Some(CREATE_COPY));
+    let (thread, job, tools) = cx.update(|_, cx| {
+        let view = chat.read(cx);
+        let thread = view.thread().clone();
+        let tools = view.tools.clone();
+        let job = thread.update(cx, |thread, _| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            let Sent::MakingCopy(job) = thread.send("don't send after archive").unwrap() else {
+                panic!()
+            };
+            job
+        });
+        (thread, job, tools)
+    });
+    let copy = job.run(&tools, |_| {}).unwrap();
+    cx.update(|window, cx| {
+        thread.update(cx, |thread, _| {
+            assert!(thread.archive().is_none());
+        });
+        chat.update(cx, |view, cx| {
+            view.copy_made(&thread, Ok(copy.clone()), window, cx)
+        });
+    });
+    for _ in 0..300 {
+        if !copy.path.exists() {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+    assert!(!copy.path.exists());
+    assert!(!cx.update(|_, cx| thread.read(cx).has_session()));
+    finish(&chat, path, cx);
+}

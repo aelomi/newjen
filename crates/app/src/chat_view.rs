@@ -30,7 +30,7 @@ use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Side, WindowExt as _};
 use newjen_core::rift::{self, CopyError, Tools};
-use newjen_core::store::now_ms;
+use newjen_core::store::{PendingCopy, PendingIntent, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
 use newjen_core::transcript::display_name;
 use newjen_core::{
@@ -146,7 +146,7 @@ impl Entry {
 }
 
 enum CopyProgress {
-    Line(String),
+    Progress(rift::Progress),
     Made(Result<rift::Copy, CopyError>),
 }
 
@@ -300,7 +300,74 @@ impl ChatView {
                 ));
             }
         }
+        view.restore_pending_copies(window, cx);
         view
+    }
+
+    fn restore_pending_copies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = match self.store.pending_copies(self.project.id) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.save_problem = Some(format!("Couldn't recover Rift copies: {error:#}"));
+                return;
+            }
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        let project = self.project.clone();
+        let tools = self.tools.clone();
+        let cleanup = cx.background_spawn(async move {
+            pending
+                .into_iter()
+                .map(|pending| {
+                    let result = Thread::recover_pending_copy(&store, &project, &pending, &tools);
+                    (pending, result)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let recovered = cleanup.await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                for (pending, result) in recovered {
+                    if let Err(error) = result {
+                        view.save_problem = Some(format!(
+                            "Couldn't remove the unfinished Rift copy: {error:#}"
+                        ));
+                    }
+                    view.restore_pending_draft(pending, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn restore_pending_draft(
+        &mut self,
+        pending: PendingCopy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PendingIntent::Restore(message) = &pending.intent else {
+            return;
+        };
+        let draft = Thread::recovered_draft(
+            self.store.clone(),
+            &self.project,
+            self.base_config.clone(),
+            &pending,
+        );
+        self.add_slot(draft, 0, window, cx);
+        self.active += 1;
+        self.show(0, window, cx);
+        let field = self.ensure_field(window, cx);
+        field.update(cx, |field, cx| field.set_value(message.clone(), window, cx));
+        self.slots[0].notice = Some(Notice::held(
+            "Newjen quit while making a Rift copy. Your message is back.",
+            String::new(),
+        ));
+        cx.notify();
     }
 
     /// When the focused element leaves the window (an overlay closed without handing focus
@@ -818,6 +885,10 @@ impl ChatView {
                 self.make_copy(&thread, job, window, cx);
                 None
             }
+            Err(error) if error.downcast_ref::<CopyError>().is_some() => Some(copy_failed(
+                error.downcast_ref::<CopyError>().expect("checked"),
+                self.home.as_deref(),
+            )),
             Err(error) if had_claude => notice_after(Err(error), "Could not reach Claude"),
             // No claude was running, so the error is from starting one.
             Err(error) => Some(spawn_notice(&error, &program, gone.as_deref())),
@@ -830,6 +901,24 @@ impl ChatView {
 
     /// Checked before `Thread::send`, which would hold the message and rename the thread.
     fn copy_hold(&self, thread: &Entity<Thread>, cx: &App) -> Option<Notice> {
+        if thread.read(cx).works_in() == WorksIn::ProjectFolder {
+            if let Some(blocker) = self
+                .slots
+                .iter()
+                .filter(|slot| slot.thread != *thread)
+                .map(|slot| slot.thread.read(cx))
+                .find(|other| other.blocks_project_send())
+            {
+                return Some(Notice::held(
+                    "Wait a moment",
+                    format!(
+                        "Wait a moment: Newjen is taking a jj snapshot of the project for “{}”'s Rift copy.",
+                        blocker.title()
+                    ),
+                ));
+            }
+            return None;
+        }
         let wants_copy = {
             let thread = thread.read(cx);
             thread.is_draft() && thread.works_in() == WorksIn::RiftCopy && thread.copy().is_none()
@@ -872,32 +961,29 @@ impl ChatView {
         let (progress, updates) = async_channel::unbounded();
         let lines = progress.clone();
         cx.background_spawn(async move {
-            let made = job.run(&tools, |line| {
-                let _ = lines.send_blocking(CopyProgress::Line(line.to_string()));
+            let made = job.run(&tools, |progress| {
+                let _ = lines.send_blocking(CopyProgress::Progress(progress));
             });
             let _ = progress.send_blocking(CopyProgress::Made(made));
         })
         .detach();
-        let thread = thread.downgrade();
+        let thread = thread.clone();
         cx.spawn_in(window, async move |view, cx| {
             let mut redrawn: Option<Instant> = None;
             let made = loop {
                 match updates.recv().await {
-                    Ok(CopyProgress::Line(line)) => {
+                    Ok(CopyProgress::Progress(progress)) => {
                         let now = Instant::now();
                         let redraw = redrawn.is_none_or(|at| now - at >= LINE_REDRAW);
                         if redraw {
                             redrawn = Some(now);
                         }
-                        let noted = thread.update(cx, |thread, cx| {
-                            thread.note_copy_line(&line);
+                        thread.update(cx, |thread, cx| {
+                            thread.note_copy_progress(progress);
                             if redraw {
                                 cx.notify();
                             }
                         });
-                        if noted.is_err() {
-                            return;
-                        }
                     }
                     Ok(CopyProgress::Made(made)) => break made,
                     Err(_) => {
@@ -908,9 +994,6 @@ impl ChatView {
                         });
                     }
                 }
-            };
-            let Some(thread) = thread.upgrade() else {
-                return;
             };
             let _ = view.update_in(cx, |view, window, cx| {
                 view.copy_made(&thread, made, window, cx)
@@ -932,12 +1015,32 @@ impl ChatView {
             cx.notify();
             finished
         });
+        if let Err(NotSent {
+            copy_to_remove: Some(copy),
+            ..
+        }) = &finished
+        {
+            let copy = copy.clone();
+            let tools = self.tools.clone();
+            let path = tilde(&copy.path, self.home.as_deref());
+            let removed =
+                cx.background_spawn(async move { rift::remove(&tools, &copy.path, &copy.rift_id) });
+            cx.spawn(async move |view, cx| {
+                if let Err(error) = removed.await {
+                    let _ = view.update(cx, |view, cx| {
+                        view.save_problem = Some(removal_problem(&path, &error.into()));
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
         let Some(ix) = self.slots.iter().position(|slot| slot.thread == *thread) else {
             return;
         };
         let notice = match finished {
             Ok(()) => None,
-            Err(NotSent { message, error }) => {
+            Err(NotSent { message, error, .. }) => {
                 if let Some(field) = self.slots[ix].field.clone().filter(|_| !message.is_empty()) {
                     field.update(cx, |field, cx| field.set_value(message, window, cx));
                 }
@@ -1914,7 +2017,7 @@ fn copy_failed(error: &CopyError, home: Option<&Path>) -> Notice {
         }
         CopyError::Exists { path, .. } => (
             format!(
-                "Something is already at {}. Move it out of the way, then try again.",
+                "A folder already exists at {}. Move it out of the way, then try again.",
                 tilde(path, home)
             ),
             Vec::new(),
@@ -2198,7 +2301,7 @@ mod tests {
         assert!(
             copy_failed(&exists, Some(home))
                 .detail
-                .starts_with("Something is already at ~/.rifts/app/newjen-1a2b3c4d.")
+                .starts_with("A folder already exists at ~/.rifts/app/newjen-1a2b3c4d.")
         );
         let listed = CopyError::Registered(home.join(".rifts/app/newjen-1a2b3c4d"));
         let detail = copy_failed(&listed, Some(home)).detail;
