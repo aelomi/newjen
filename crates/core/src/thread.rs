@@ -56,7 +56,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
+#[cfg(test)]
 use crate::protocol::{Incoming, ResultMessage};
+#[cfg(test)]
+use crate::providers::claude::controller::{is_missing_conversation, is_session_in_use};
 use crate::rift::{self, CopyError, Tools};
 use crate::session::{Conversation, Session, SessionConfig, SessionEvent};
 use crate::store::{
@@ -82,34 +85,6 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// What the Continue button on a "Stopped when Newjen quit" notice sends, as a visible message,
 /// when claude got the user's last message (see [`Thread::continue_text`]).
 pub const CONTINUE_MESSAGE: &str = "Continue where you left off.";
-
-/// True if `line` is what claude prints on stderr (and then exits 1) when `--session-id`
-/// names a conversation that already exists: `Error: Session ID <id> is already in use.`
-/// Only this exact message for this id counts, so another error that happens to say "already
-/// in use" (a busy port, say) is shown as it is.
-fn is_session_in_use(line: &str, session_id: &str) -> bool {
-    line.contains(&format!("Session ID {session_id} is already in use"))
-}
-
-/// True if `result` is claude's "No conversation found" error for `session_id`. A message that
-/// names another session id does not count.
-fn is_missing_conversation(result: &ResultMessage, session_id: &str) -> bool {
-    const NAMED: &str = "No conversation found with session ID:";
-    let names_another = |text: &String| {
-        text.split_once(NAMED).is_some_and(|(_, rest)| {
-            rest.split_whitespace()
-                .next()
-                .map(|id| id.trim_end_matches('.'))
-                != Some(session_id)
-        })
-    };
-    result.is_missing_conversation()
-        && !result
-            .error_lines()
-            .iter()
-            .chain(result.result.as_ref())
-            .any(names_another)
-}
 
 /// One event from one of the thread's `claude` processes. Pass it to [`Thread::apply`].
 #[derive(Debug, Clone)]
@@ -141,12 +116,11 @@ pub struct Thread {
     /// True once claude has reported the conversation exists, so it must be resumed.
     session_started: bool,
     transcript: Transcript,
-    translator: crate::providers::claude::events::ClaudeEvents,
+    controller: crate::session::Controller,
     /// The running `claude`, if any. Started on the first message that needs it.
     session: Option<Session>,
     /// The running `claude` has sent `system/init`, so it got past the start-up checks where
     /// the two repairs apply.
-    session_initialized: bool,
     /// `claude` processes being stopped in the background (see the module docs).
     stopping: Vec<JoinHandle<()>>,
     /// How to start claude (program, environment); the conversation and grants are filled in
@@ -171,7 +145,6 @@ pub struct Thread {
     /// A grant was revoked during a turn: stop claude when the turn ends, so the next message
     /// starts one without that rule.
     stop_after_turn: bool,
-    recovery: Recovery,
     /// What the store last got for the thread's row, so unchanged rows are not rewritten.
     saved_row: Option<RowState>,
     store: Store,
@@ -365,24 +338,6 @@ struct RowState {
     status: Status,
 }
 
-/// Bookkeeping for the two repairs (see the module docs). Reset by every user message.
-#[derive(Debug, Default)]
-struct Recovery {
-    /// The user's last message, resent once if claude must be started again to receive it.
-    /// Dropped when its turn ends.
-    message: Option<String>,
-    /// The current process printed the "already in use" line. Held back from the transcript
-    /// until it is clear whether the repair works.
-    in_use_line: Option<String>,
-    /// A failed write to a process that has not started its conversation yet. Held back
-    /// because it is usually the same "already in use" exit seen from the other side.
-    write_failure: Option<String>,
-    /// The "already in use" repair has run for this message.
-    resumed: bool,
-    /// The "No conversation found" repair has run for this message.
-    started_fresh: bool,
-}
-
 impl Thread {
     /// A new, empty thread in `project`. It is a draft: nothing is saved until its first
     /// message is sent. `base_config` says how to start claude (usually
@@ -401,9 +356,8 @@ impl Thread {
             session_id: new_id(),
             session_started: false,
             transcript: Transcript::with_cwd(project.path.clone()),
-            translator: Default::default(),
+            controller: Default::default(),
             session: None,
-            session_initialized: false,
             stopping: Vec::new(),
             base_config,
             generation: 0,
@@ -419,7 +373,6 @@ impl Thread {
             last_activity: Instant::now(),
             turn_started: None,
             stop_after_turn: false,
-            recovery: Recovery::default(),
             saved_row: None,
             store,
         }
@@ -921,10 +874,7 @@ impl Thread {
             self.title = title_from_message(text);
         }
         self.transcript.push_user(text);
-        self.recovery = Recovery {
-            message: Some(text.to_string()),
-            ..Recovery::default()
-        };
+        self.controller.begin_message(text);
         self.turn_started = Some(Instant::now());
         self.last_activity = Instant::now();
         self.save();
@@ -951,7 +901,7 @@ impl Thread {
         // Resolve first: a second click or key press now finds nothing to answer.
         self.transcript.resolve_approval(request.key(), answer);
         self.last_activity = Instant::now();
-        let Some(reply) = self.translator.answer(request.key(), answer) else {
+        let Some(reply) = self.controller.answer(request.key(), answer) else {
             return Ok(());
         };
         let sent = match &self.session {
@@ -984,7 +934,7 @@ impl Thread {
             return Ok(());
         }
         self.last_activity = Instant::now();
-        if !self.session_initialized {
+        if !self.controller.initialized {
             self.end_turn_as_stopped();
             return Ok(());
         }
@@ -1001,7 +951,7 @@ impl Thread {
         if self.session.is_some() {
             // The old process's own exit event will be ignored (its generation is over), so
             // end its turn here as a requested stop would.
-            self.transcript.apply(&self.translator.translate(
+            self.transcript.apply(&self.controller.translate(
                 &SessionEvent::Exited {
                     code: None,
                     requested: true,
@@ -1010,7 +960,7 @@ impl Thread {
             ));
         }
         self.end_session();
-        self.recovery = Recovery::default();
+        self.controller.reset();
         self.last_activity = Instant::now();
         let started = self.spawn();
         self.save();
@@ -1079,7 +1029,7 @@ impl Thread {
     /// sends nothing and returns its copy for removal.
     pub fn archive(&mut self) -> Option<Removal> {
         if self.session.is_some() {
-            self.transcript.apply(&self.translator.translate(
+            self.transcript.apply(&self.controller.translate(
                 &SessionEvent::Exited {
                     code: None,
                     requested: true,
@@ -1172,100 +1122,42 @@ impl Thread {
         let event = event.event;
         self.last_activity = Instant::now();
 
-        match &event {
-            // Hold the "already in use" line back until the exit shows whether the repair
-            // works; it only becomes part of an error if it doesn't.
-            SessionEvent::Stderr(line)
-                if !self.session_started && is_session_in_use(line, &self.session_id) =>
-            {
-                self.recovery.in_use_line = Some(line.clone());
-                return;
-            }
-            SessionEvent::WriteFailed(detail) if !self.session_started => {
-                self.recovery.write_failure = Some(detail.clone());
-                return;
-            }
-            SessionEvent::Exited {
-                requested: false, ..
-            } if self.recovery.in_use_line.is_some() && !self.recovery.resumed => {
-                self.recovery.resumed = true;
-                self.recovery.in_use_line = None;
-                self.recovery.write_failure = None;
-                self.session_started = true;
+        let was_busy = self.status().is_busy();
+        let batch = match self.controller.apply(
+            &event,
+            self.generation,
+            &self.cwd,
+            &mut self.session_id,
+            &mut self.session_started,
+        ) {
+            crate::session::Update::Held => return,
+            crate::session::Update::Restart => {
                 self.start_again();
                 return;
             }
-            // claude checks the conversation as it starts, before it reads any message, so this
-            // also comes after "Try again" (which sends nothing). Either way the conversation is
-            // gone, so switch to a new one now; otherwise every later start would fail the same
-            // way.
-            SessionEvent::Line(Incoming::Result(result))
-                if self.session_started
-                    && !self.session_initialized
-                    && !self.recovery.started_fresh
-                    && is_missing_conversation(result, &self.session_id) =>
-            {
-                self.recovery.started_fresh = true;
-                self.session_id = new_id();
-                self.session_started = false;
-                match self.recovery.message.as_deref() {
-                    Some(message) if message != CONTINUE_MESSAGE => {
-                        self.transcript.insert_fresh_start_before_last_message();
-                        self.start_again();
-                    }
-                    // "Continue where you left off." means nothing to a new conversation, and
-                    // "Try again" has nothing to resend: the turn ends, and the user's next
-                    // message starts the new conversation.
-                    _ => {
-                        self.end_turn_as_stopped();
-                        self.transcript.push_fresh_start();
-                        self.save();
-                    }
-                }
+            crate::session::Update::FreshRestart => {
+                self.transcript.insert_fresh_start_before_last_message();
+                self.start_again();
                 return;
             }
-            SessionEvent::Line(Incoming::System(message)) if message.subtype == "init" => {
-                self.session_started = true;
-                self.session_initialized = true;
-                // claude normally reports the id it was given; if not, its own id is the one
-                // to resume.
-                if let Some(session_id) = message.session_id.as_ref().filter(|id| !id.is_empty()) {
-                    self.session_id = session_id.clone();
-                }
+            crate::session::Update::FreshStopped => {
+                self.end_turn_as_stopped();
+                self.transcript.push_fresh_start();
+                self.save();
+                return;
             }
-            _ => {}
-        }
-
-        // Read before the held lines go in: one of them can end the turn, and that turn end
-        // must still clear the message a repair would resend.
-        let was_busy = self.status().is_busy();
-        // Anything held back above is real now (the repair did not apply), so it goes in
-        // first, in the order it happened.
-        if let Some(line) = self.recovery.in_use_line.take() {
-            self.transcript.apply(&self.translator.translate_generation(
-                self.generation,
-                &SessionEvent::Stderr(line),
-                Some(&self.cwd),
-            ));
-        }
-        if let Some(detail) = self.recovery.write_failure.take() {
-            self.transcript.apply(&self.translator.translate_generation(
-                self.generation,
-                &SessionEvent::WriteFailed(detail),
-                Some(&self.cwd),
-            ));
-        }
-
-        let batch = self
-            .translator
-            .translate_generation(self.generation, &event, Some(&self.cwd));
+            crate::session::Update::Apply(batch) => batch,
+        };
+        let approval_asked = batch
+            .events
+            .iter()
+            .any(|event| matches!(event, crate::agent::AgentEvent::ApprovalRequested(_)));
         self.transcript.apply(&batch);
         let turn_ended = was_busy && !self.status().is_busy();
         // claude started a turn by itself (see `Transcript::apply`).
         if !was_busy && self.status().is_busy() {
             self.turn_started = Some(Instant::now());
         }
-        let approval_asked = matches!(event, SessionEvent::Line(Incoming::PermissionRequest(_)));
         if approval_asked && becomes_unread(self.active, false, true) {
             self.set_unread(true);
         }
@@ -1275,7 +1167,7 @@ impl Thread {
             // new one.
             SessionEvent::Exited { .. } => {
                 self.session = None;
-                self.session_initialized = false;
+                self.controller.initialized = false;
                 self.generation += 1;
             }
             // This process can no longer be talked to; let it go.
@@ -1318,9 +1210,7 @@ impl Thread {
             }
         });
         self.session = Some(session);
-        self.session_initialized = false;
-        self.recovery.in_use_line = None;
-        self.recovery.write_failure = None;
+        self.controller.spawned();
         Ok(())
     }
 
@@ -1329,7 +1219,7 @@ impl Thread {
     fn end_session(&mut self) {
         self.generation += 1;
         self.stop_after_turn = false;
-        self.session_initialized = false;
+        self.controller.initialized = false;
         // Its exit will be ignored, so the background tasks it takes with it are settled here.
         self.transcript.stop_background_tasks();
         if let Some(session) = self.session.take() {
@@ -1344,7 +1234,7 @@ impl Thread {
     fn start_again(&mut self) {
         self.end_session();
         let failure = match self.spawn() {
-            Ok(()) => match (&self.recovery.message, &self.session) {
+            Ok(()) => match (self.controller.message(), &self.session) {
                 (Some(message), Some(session)) => session.send_prompt(message).err().map(|error| {
                     (
                         "Could not reach Claude",
@@ -1373,7 +1263,7 @@ impl Thread {
     /// process's own exit will be ignored, so its turn is ended here. Saves.
     fn end_turn_as_stopped(&mut self) {
         let was_busy = self.status().is_busy();
-        self.transcript.apply(&self.translator.translate(
+        self.transcript.apply(&self.controller.translate(
             &SessionEvent::Exited {
                 code: None,
                 requested: true,
@@ -1382,7 +1272,7 @@ impl Thread {
         ));
         self.end_session();
         // Whatever a repair was waiting for no longer matters.
-        self.recovery = Recovery::default();
+        self.controller.reset();
         if was_busy && !self.status().is_busy() {
             self.after_turn_ended();
         }
@@ -1397,7 +1287,7 @@ impl Thread {
             self.set_unread(true);
         }
         self.turn_started = None;
-        self.recovery.message = None;
+        self.controller.end_turn();
         if self.stop_after_turn {
             self.end_session();
         }
@@ -1682,7 +1572,7 @@ mod tests {
         }
 
         assert!(!thread.status().is_busy(), "{:?}", thread.status());
-        assert_eq!(thread.recovery.message, None);
+        assert_eq!(thread.controller.message(), None);
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(delivered(), 1, "the message reached claude again");
         thread.end_session();

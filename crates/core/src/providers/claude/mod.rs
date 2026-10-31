@@ -1,4 +1,5 @@
 mod approvals;
+pub(crate) mod controller;
 pub mod events;
 pub mod presentation;
 

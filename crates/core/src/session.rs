@@ -678,6 +678,15 @@ pub(crate) fn for_each_line(source: impl Read, mut handle: impl FnMut(&str)) {
     }
 }
 
+pub(crate) use crate::providers::claude::controller::Controller;
+pub(crate) enum Update {
+    Held,
+    Restart,
+    FreshRestart,
+    FreshStopped,
+    Apply(crate::agent::AgentBatch),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
