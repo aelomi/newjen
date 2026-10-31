@@ -1,5 +1,7 @@
 //! Newjen's core: everything except the UI.
 //!
+//! - [`env`]: login-shell PATH and installed CLI lookup.
+//! - [`providers`]: usage-free sign-in, account, model and limit detection.
 //! - [`protocol`]: the Claude Code CLI's stream-json wire format.
 //! - [`session`]: starts and talks to one `claude` process.
 //! - [`transcript`]: turns session events into a conversation a UI can render.
@@ -12,7 +14,9 @@
 //! the core can be tested headlessly.
 
 pub mod agent;
+pub mod env;
 pub mod orphans;
+mod probe;
 pub mod protocol;
 pub mod providers;
 pub mod rift;
@@ -25,7 +29,8 @@ pub use agent::{
     ApprovalIntent, ApprovalKey, ApprovalKind, ApprovalRequest, ApprovalView, GrantId,
     GrantLifetime, GrantView, OnceReason, RememberScope, RuleMeaning, ToolDisposition,
 };
-pub use session::{Conversation, Session, SessionConfig, SessionEvent, find_claude};
+pub use env::{Cli, find_cli, resolved_path};
+pub use session::{Conversation, Session, SessionConfig, SessionEvent};
 pub use store::{Grant, Project, Store, ThreadRow, WriteError};
 pub use thread::{Thread, ThreadEvent};
 pub use transcript::{Item, Status, ToolState, Transcript};

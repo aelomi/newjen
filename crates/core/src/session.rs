@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, PipeWriter, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -29,29 +29,9 @@ use anyhow::{Context, Result, anyhow};
 use async_channel::{Receiver, Sender};
 use serde_json::Value;
 
+use crate::env::{Cli, find_cli, is_executable};
 use crate::orphans;
 use crate::protocol::{self, Incoming};
-
-/// Environment variables that mark "this process runs inside Claude Code". They leak in when
-/// Newjen itself is started from a Claude Code terminal and would make the child think it is a
-/// nested session, so they are removed. Everything else (API keys, `CLAUDE_CONFIG_DIR`, cloud
-/// provider settings) is passed through unchanged.
-const NESTED_SESSION_ENV_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_AGENT_SDK_VERSION",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_PID",
-    "CLAUDE_EFFORT",
-    // Names the app driving Claude. An SDK app that launched Newjen would otherwise have its
-    // name sent on Newjen's requests. Newjen doesn't set its own, like T3 Code.
-    "CLAUDE_AGENT_SDK_CLIENT_APP",
-];
 
 /// How long `shutdown` waits after SIGTERM before it sends SIGKILL. Kept short because GPUI
 /// gives the whole app about 200 ms to quit.
@@ -108,7 +88,7 @@ pub enum Conversation {
 /// How to start the CLI.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
-    /// The `claude` executable. Defaults to [`find_claude`].
+    /// The `claude` executable. Defaults to [`find_cli`].
     pub program: PathBuf,
     /// The project directory the agent works in.
     pub cwd: PathBuf,
@@ -129,10 +109,10 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
-    /// A config that runs the `claude` found by [`find_claude`] in `cwd`.
+    /// A config that runs the `claude` found by [`find_cli`] in `cwd`.
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         SessionConfig {
-            program: find_claude(),
+            program: find_cli(Cli::Claude),
             cwd: cwd.into(),
             conversation: None,
             allowed_tools: Vec::new(),
@@ -180,45 +160,6 @@ impl SessionConfig {
         args.extend(self.extra_args.iter().cloned());
         args
     }
-}
-
-/// Finds the `claude` executable (see [`find_program`]), overridden by `$NEWJEN_CLAUDE`.
-pub fn find_claude() -> PathBuf {
-    find_program("NEWJEN_CLAUDE", "claude", &[".local/bin", ".claude/local"])
-}
-
-/// Finds the executable `name`.
-///
-/// Order: `$<override_var>`, then every directory on `$PATH`, then `home_dirs` (relative to
-/// `$HOME`), `/opt/homebrew/bin` and `/usr/local/bin`. The fallbacks matter because apps
-/// started from Finder get a minimal `PATH` that usually does not include where the program
-/// was installed. If nothing is found, returns plain `name` so the spawn error names it.
-pub(crate) fn find_program(override_var: &str, name: &str, home_dirs: &[&str]) -> PathBuf {
-    if let Some(path) = std::env::var_os(override_var).filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
-    }
-    let on_path = std::env::var_os("PATH")
-        .map(|path_var| std::env::split_paths(&path_var).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let in_home = home_dirs
-        .iter()
-        .filter_map(|dir| Some(home.as_ref()?.join(dir)));
-    on_path
-        .into_iter()
-        .chain(in_home)
-        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
-        .unwrap_or_else(|| PathBuf::from(name))
-}
-
-pub(crate) fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    // `metadata` follows symlinks, so a symlink to the real binary counts.
-    std::fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 /// Something that happened in the CLI process.
@@ -336,12 +277,11 @@ impl Session {
                 Ok(())
             });
         }
-        for name in NESTED_SESSION_ENV_VARS {
-            command.env_remove(name);
-        }
+        crate::env::configure(&mut command);
         for (name, value) in &config.env {
             command.env(OsString::from(name), OsString::from(value));
         }
+        crate::env::strip_session_env(&mut command);
 
         let mut child = command.spawn().with_context(could_not_start)?;
         // Only the watcher needs the read end.
@@ -571,8 +511,7 @@ fn check_program(config: &SessionConfig) -> Result<()> {
             .rev()
             .find(|(name, _)| name == "PATH")
             .map(|(_, value)| OsString::from(value))
-            .or_else(|| std::env::var_os("PATH"))
-            .unwrap_or_default();
+            .unwrap_or_else(|| crate::env::resolved_path().to_owned());
         std::env::split_paths(&path).any(|dir| is_executable(&dir.join(program)))
     };
     if found {

@@ -1,0 +1,9 @@
+{
+  "id": 1,
+  "result": {
+    "userAgent": "newjen/0.166.0 (Mac OS 27.0.1; arm64) dumb (newjen; 0.1.0)",
+    "codexHome": "/Users/REDACTED/.codex",
+    "platformFamily": "unix",
+    "platformOs": "macos"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": 2,
+  "result": {
+    "account": {
+      "type": "chatgpt",
+      "email": "user@example.com",
+      "planType": "plus",
+      "workspaceName": null
+    },
+    "requiresOpenaiAuth": true,
+    "workspaceRouting": {
+      "chatgptAccountId": "REDACTED",
+      "backendOrigin": "https://chatgpt.com",
+      "accountRoutingOverride": "NO_CONSTRAINT"
+    }
+  }
+}

@@ -165,7 +165,7 @@ fn child_gets_no_nested_session_vars() {
     writeln!(file, "#!/bin/sh").unwrap();
     writeln!(
         file,
-        r#"echo "client=${{CLAUDE_AGENT_SDK_CLIENT_APP-unset}} nested=${{CLAUDECODE-unset}}" >&2"#
+        r#"echo "client=${{CLAUDE_AGENT_SDK_CLIENT_APP-unset}} nested=${{CLAUDECODE-unset}} codex=${{CODEX_THREAD_ID-unset}} path=$PATH" >&2"#
     )
     .unwrap();
     drop(file);
@@ -173,8 +173,15 @@ fn child_gets_no_nested_session_vars() {
 
     let mut config = SessionConfig::new(dir.path());
     config.program = script;
+    config
+        .env
+        .push(("CODEX_THREAD_ID".into(), "parent-thread".into()));
+    config.env.push(("CLAUDECODE".into(), "1".into()));
     let (_session, events) = Session::spawn(config).unwrap();
-    let expected = "client=unset nested=unset";
+    let expected = format!(
+        "client=unset nested=unset codex=unset path={}",
+        newjen_core::resolved_path().to_string_lossy()
+    );
     loop {
         match common::next_event(&events, TIMEOUT) {
             SessionEvent::Stderr(line) => {
@@ -303,6 +310,10 @@ fn unexpected_exit_stops_the_tools_claude_started() {
 
     let mut config = SessionConfig::new(dir.path());
     config.program = script;
+    config
+        .env
+        .push(("CODEX_THREAD_ID".into(), "parent-thread".into()));
+    config.env.push(("CLAUDECODE".into(), "1".into()));
     let (_session, events) = Session::spawn(config).unwrap();
     let tool_pid: u32 = match common::next_event(&events, TIMEOUT) {
         SessionEvent::Line(Incoming::System(message)) => message.subtype.parse().unwrap(),

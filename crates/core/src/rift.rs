@@ -29,7 +29,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::session::{find_program, for_each_line, is_executable};
+use crate::env::{find_program, is_executable};
+use crate::session::for_each_line;
 
 /// The file Rift keeps a folder's id in, at the root of the project and of each copy.
 const MARKER: &str = ".rift";
