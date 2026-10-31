@@ -755,7 +755,7 @@ impl SessionRule {
     pub fn label(&self) -> String {
         match &self.rule_content {
             Some(content) => content.clone(),
-            None => crate::transcript::display_name(&self.tool_name),
+            None => crate::providers::claude::display_name(&self.tool_name),
         }
     }
 }

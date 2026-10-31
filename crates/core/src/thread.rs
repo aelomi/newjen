@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
-use crate::protocol::{BackgroundTask, Incoming, PermissionAnswer, ResultMessage, session_rules};
+use crate::protocol::{Incoming, PermissionAnswer, ResultMessage, session_rules};
 use crate::rift::{self, CopyError, Tools};
 use crate::session::{Conversation, Session, SessionConfig, SessionEvent};
 use crate::store::{
@@ -141,6 +141,7 @@ pub struct Thread {
     /// True once claude has reported the conversation exists, so it must be resumed.
     session_started: bool,
     transcript: Transcript,
+    translator: crate::providers::claude::events::ClaudeEvents,
     /// The running `claude`, if any. Started on the first message that needs it.
     session: Option<Session>,
     /// The running `claude` has sent `system/init`, so it got past the start-up checks where
@@ -400,6 +401,7 @@ impl Thread {
             session_id: new_id(),
             session_started: false,
             transcript: Transcript::with_cwd(project.path.clone()),
+            translator: Default::default(),
             session: None,
             session_initialized: false,
             stopping: Vec::new(),
@@ -692,7 +694,7 @@ impl Thread {
 
     /// What claude keeps running in the background now (a dev server, say), even between
     /// turns. Empty when no claude runs: stopping claude stops these too.
-    pub fn background_tasks(&self) -> &[BackgroundTask] {
+    pub fn background_tasks(&self) -> &[crate::agent::BackgroundTaskView] {
         self.transcript.background_tasks()
     }
 
@@ -970,10 +972,13 @@ impl Thread {
         if self.session.is_some() {
             // The old process's own exit event will be ignored (its generation is over), so
             // end its turn here as a requested stop would.
-            self.transcript.apply(&SessionEvent::Exited {
-                code: None,
-                requested: true,
-            });
+            self.transcript.apply(&self.translator.translate(
+                &SessionEvent::Exited {
+                    code: None,
+                    requested: true,
+                },
+                Some(&self.cwd),
+            ));
         }
         self.end_session();
         self.recovery = Recovery::default();
@@ -1044,10 +1049,13 @@ impl Thread {
     /// sends nothing and returns its copy for removal.
     pub fn archive(&mut self) -> Option<Removal> {
         if self.session.is_some() {
-            self.transcript.apply(&SessionEvent::Exited {
-                code: None,
-                requested: true,
-            });
+            self.transcript.apply(&self.translator.translate(
+                &SessionEvent::Exited {
+                    code: None,
+                    requested: true,
+                },
+                Some(&self.cwd),
+            ));
         }
         self.end_session();
         self.save();
@@ -1204,13 +1212,22 @@ impl Thread {
         // Anything held back above is real now (the repair did not apply), so it goes in
         // first, in the order it happened.
         if let Some(line) = self.recovery.in_use_line.take() {
-            self.transcript.apply(&SessionEvent::Stderr(line));
+            self.transcript.apply(
+                &self
+                    .translator
+                    .translate(&SessionEvent::Stderr(line), Some(&self.cwd)),
+            );
         }
         if let Some(detail) = self.recovery.write_failure.take() {
-            self.transcript.apply(&SessionEvent::WriteFailed(detail));
+            self.transcript.apply(
+                &self
+                    .translator
+                    .translate(&SessionEvent::WriteFailed(detail), Some(&self.cwd)),
+            );
         }
 
-        self.transcript.apply(&event);
+        let batch = self.translator.translate(&event, Some(&self.cwd));
+        self.transcript.apply(&batch);
         let turn_ended = was_busy && !self.status().is_busy();
         // claude started a turn by itself (see `Transcript::apply`).
         if !was_busy && self.status().is_busy() {
@@ -1236,7 +1253,7 @@ impl Thread {
         if turn_ended {
             self.after_turn_ended();
         }
-        if is_checkpoint(&event) {
+        if batch.checkpoint == crate::agent::Checkpoint::Save {
             self.save();
         }
     }
@@ -1324,10 +1341,13 @@ impl Thread {
     /// process's own exit will be ignored, so its turn is ended here. Saves.
     fn end_turn_as_stopped(&mut self) {
         let was_busy = self.status().is_busy();
-        self.transcript.apply(&SessionEvent::Exited {
-            code: None,
-            requested: true,
-        });
+        self.transcript.apply(&self.translator.translate(
+            &SessionEvent::Exited {
+                code: None,
+                requested: true,
+            },
+            Some(&self.cwd),
+        ));
         self.end_session();
         // Whatever a repair was waiting for no longer matters.
         self.recovery = Recovery::default();
@@ -1518,26 +1538,6 @@ pub fn keeps_draft(composer_text: &str) -> bool {
     !composer_text.trim().is_empty()
 }
 
-/// Events after which the thread is saved. Streamed words (`stream_event`) and stderr lines
-/// are not: the reply is saved once its block is finished.
-fn is_checkpoint(event: &SessionEvent) -> bool {
-    match event {
-        SessionEvent::Line(incoming) => matches!(
-            incoming,
-            Incoming::System(_)
-                | Incoming::Assistant(_)
-                | Incoming::User(_)
-                | Incoming::PermissionRequest(_)
-                | Incoming::ControlCancelRequest { .. }
-                | Incoming::Result(_)
-        ),
-        SessionEvent::Stderr(_) => false,
-        SessionEvent::WriteFailed(_)
-        | SessionEvent::InterruptTimedOut
-        | SessionEvent::Exited { .. } => true,
-    }
-}
-
 fn check_pending_destination(
     project: &Project,
     project_id: i64,
@@ -1594,6 +1594,13 @@ mod tests {
     /// Found by the TurnStart model: a write failure held back during start-up, flushed by an
     /// unrelated stderr line, ended the turn without clearing the message, so the "already in
     /// use" repair resent it after the turn had failed.
+    fn checkpoint(event: &SessionEvent) -> bool {
+        crate::providers::claude::events::ClaudeEvents::default()
+            .translate(event, None)
+            .checkpoint
+            == crate::agent::Checkpoint::Save
+    }
+
     #[test]
     fn a_turn_ended_by_a_held_write_failure_is_never_resent() {
         let home = tempfile::tempdir().unwrap();
@@ -1686,15 +1693,15 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,
                 "delta":{"type":"text_delta","text":"Hel"}}}"#,
         );
-        assert!(!is_checkpoint(&SessionEvent::Line(delta)));
-        assert!(!is_checkpoint(&SessionEvent::Stderr("warning".to_string())));
+        assert!(!checkpoint(&SessionEvent::Line(delta)));
+        assert!(!checkpoint(&SessionEvent::Stderr("warning".to_string())));
         let finished = Incoming::parse(
             r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"Hi"}]}}"#,
         );
-        assert!(is_checkpoint(&SessionEvent::Line(finished)));
+        assert!(checkpoint(&SessionEvent::Line(finished)));
         let result = Incoming::parse(r#"{"type":"result","subtype":"success","is_error":false}"#);
-        assert!(is_checkpoint(&SessionEvent::Line(result)));
-        assert!(is_checkpoint(&SessionEvent::Exited {
+        assert!(checkpoint(&SessionEvent::Line(result)));
+        assert!(checkpoint(&SessionEvent::Exited {
             code: Some(0),
             requested: false
         }));

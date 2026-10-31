@@ -11,8 +11,10 @@
 //! This crate must never depend on GPUI or GPUI Kit, so the UI layer could be replaced and
 //! the core can be tested headlessly.
 
+pub mod agent;
 pub mod orphans;
 pub mod protocol;
+pub mod providers;
 pub mod rift;
 pub mod session;
 pub mod store;

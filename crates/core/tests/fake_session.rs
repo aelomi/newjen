@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use newjen_core::protocol::{Incoming, PermissionAnswer};
+use newjen_core::providers::claude::events::ClaudeEvents;
 use newjen_core::session::{Session, SessionConfig, SessionEvent};
 use newjen_core::transcript::{Item, Status, ToolState, Transcript};
 
@@ -43,6 +44,7 @@ fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
 #[test]
 fn tool_allow_end_to_end_through_the_fake_cli() {
     let (session, events) = Session::spawn(fake_config("tool_allow")).expect("spawn fake claude");
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     session.send_prompt("Run this exact shell command").unwrap();
     transcript.push_user("Run this exact shell command");
@@ -50,7 +52,7 @@ fn tool_allow_end_to_end_through_the_fake_cli() {
     // Read until the approval request.
     loop {
         let event = common::next_event(&events, TIMEOUT);
-        transcript.apply(&event);
+        transcript.apply(&codec.translate(&event, None));
         if common::is_permission_request(&event) {
             break;
         }
@@ -74,7 +76,7 @@ fn tool_allow_end_to_end_through_the_fake_cli() {
     let mut stderr = Vec::new();
     let code = loop {
         let event = common::next_event(&events, TIMEOUT);
-        transcript.apply(&event);
+        transcript.apply(&codec.translate(&event, None));
         match event {
             SessionEvent::Line(Incoming::Result(_)) => saw_result = true,
             SessionEvent::Stderr(line) => stderr.push(line),
@@ -353,14 +355,15 @@ fn a_failed_write_is_reported_as_one_error() {
         ],
     );
     let (session, events) = Session::spawn(config).unwrap();
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
-    transcript.apply(&common::next_event(&events, TIMEOUT));
+    transcript.apply(&codec.translate(&common::next_event(&events, TIMEOUT), None));
 
     session.send_prompt("hello").unwrap();
     transcript.push_user("hello");
     loop {
         let event = common::next_event(&events, TIMEOUT);
-        transcript.apply(&event);
+        transcript.apply(&codec.translate(&event, None));
         match event {
             SessionEvent::WriteFailed(_) => break,
             SessionEvent::Exited { .. } => panic!("exited before reporting the failed write"),
@@ -372,7 +375,7 @@ fn a_failed_write_is_reported_as_one_error() {
     session.shutdown();
     loop {
         let event = common::next_event(&events, TIMEOUT);
-        transcript.apply(&event);
+        transcript.apply(&codec.translate(&event, None));
         if matches!(event, SessionEvent::Exited { .. }) {
             break;
         }
@@ -582,15 +585,16 @@ fn deaf_config(dir: &std::path::Path) -> SessionConfig {
 fn an_unanswered_interrupt_ends_the_session() {
     let dir = tempfile::tempdir().unwrap();
     let (session, events) = Session::spawn(deaf_config(dir.path())).unwrap();
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
-    transcript.apply(&common::next_event(&events, TIMEOUT));
+    transcript.apply(&codec.translate(&common::next_event(&events, TIMEOUT), None));
     session.send_prompt("hello").unwrap();
     transcript.push_user("hello");
 
     session.interrupt().unwrap();
     let timed_out = next_lifecycle_event(&events);
     assert_eq!(timed_out, SessionEvent::InterruptTimedOut);
-    transcript.apply(&timed_out);
+    transcript.apply(&codec.translate(&timed_out, None));
     let exited = next_lifecycle_event(&events);
     assert!(
         matches!(
@@ -602,7 +606,7 @@ fn an_unanswered_interrupt_ends_the_session() {
         ),
         "{exited:?}"
     );
-    transcript.apply(&exited);
+    transcript.apply(&codec.translate(&exited, None));
     assert!(wait_until_dead(session.pid(), Duration::from_secs(1)));
 
     assert_eq!(transcript.status(), Status::Failed);

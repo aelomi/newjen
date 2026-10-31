@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use newjen_core::transcript::{display_name, summarize};
+use newjen_core::providers::claude::{display_name, summarize};
 use newjen_core::{OnceReason, PermissionRequest, SessionScope};
 use serde_json::Value;
 

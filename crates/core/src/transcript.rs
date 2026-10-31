@@ -13,17 +13,17 @@
 //! so a save rewrites only the rows from there on.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::protocol::{
-    AssistantMessage, BackgroundTask, ContentBlock, Delta, Incoming, PermissionAnswer,
-    PermissionRequest, ResultMessage, StreamEvent, StreamEventMessage, SystemMessage, UserMessage,
+use crate::agent::{
+    AgentBatch, AgentEvent, BackgroundTaskView, ContentKey, TextUpdate, ToolDescriptor,
+    ToolOutcome, TurnOutcome,
 };
-use crate::session::SessionEvent;
+use crate::protocol::{PermissionAnswer, PermissionRequest};
 
 /// How many stderr lines to keep for the "Claude exited" error.
 const STDERR_LINES_KEPT: usize = 20;
@@ -266,9 +266,8 @@ pub struct Transcript {
     status: Status,
     /// What claude keeps running in the background now, as its last `background_tasks_changed`
     /// said. Empty when no claude runs.
-    background_tasks: Vec<BackgroundTask>,
+    background_tasks: Vec<BackgroundTaskView>,
     /// Which tool call started each task (task id → tool_use_id), from `task_started`.
-    task_tools: HashMap<String, String>,
     session_id: Option<String>,
     model: Option<String>,
     /// The project directory, used to shorten file paths in tool summaries.
@@ -278,13 +277,9 @@ pub struct Transcript {
     next_id: u64,
     /// Assistant text items still receiving streamed text, keyed by
     /// (API message id, content block index) → position in `items`.
-    open_text: HashMap<(String, u64), usize>,
+    open_text: HashMap<ContentKey, usize>,
     /// When each tool call was first seen, to compute how long it took.
     tool_started: HashMap<String, Instant>,
-    /// The previous result's `total_cost_usd`, for the fallback per-turn cost.
-    previous_total_cost: Option<f64>,
-    /// The text of an API-error message (e.g. "Not logged in"), shown in the turn's error.
-    api_error_text: Option<String>,
     /// The last few stderr lines, shown if the process exits unexpectedly.
     stderr_tail: VecDeque<String>,
     /// The lowest index of `items` that changed since the last save (see
@@ -304,7 +299,6 @@ impl Transcript {
             items: Vec::new(),
             status: Status::Idle,
             background_tasks: Vec::new(),
-            task_tools: HashMap::new(),
             session_id: None,
             model: None,
             cwd: None,
@@ -312,8 +306,6 @@ impl Transcript {
             next_id: 1,
             open_text: HashMap::new(),
             tool_started: HashMap::new(),
-            previous_total_cost: None,
-            api_error_text: None,
             stderr_tail: VecDeque::new(),
             dirty_from: None,
         }
@@ -379,7 +371,7 @@ impl Transcript {
 
     /// What claude keeps running in the background now (a dev server, say), oldest first.
     /// These keep running after the turn that started them, until they finish or claude stops.
-    pub fn background_tasks(&self) -> &[BackgroundTask] {
+    pub fn background_tasks(&self) -> &[BackgroundTaskView] {
         &self.background_tasks
     }
 
@@ -406,7 +398,6 @@ impl Transcript {
 
     fn clear_background_tasks(&mut self) {
         self.background_tasks.clear();
-        self.task_tools.clear();
         self.mark_background_tools();
     }
 
@@ -579,7 +570,6 @@ impl Transcript {
         self.pending.clear();
         self.tool_started.clear();
         self.background_tasks.clear();
-        self.task_tools.clear();
         if self.status.is_busy() || background_stopped {
             let id = self.new_id();
             self.push(Item::Stopped { id });
@@ -619,19 +609,10 @@ impl Transcript {
         }
     }
 
-    /// Updates the state from one session event. This is the whole state machine.
-    pub fn apply(&mut self, event: &SessionEvent) {
-        match event {
-            SessionEvent::Line(incoming) => self.apply_incoming(incoming),
-            SessionEvent::Stderr(line) => {
-                self.stderr_tail.push_back(line.clone());
-                while self.stderr_tail.len() > STDERR_LINES_KEPT {
-                    self.stderr_tail.pop_front();
-                }
-            }
-            SessionEvent::WriteFailed(detail) => self.apply_write_failed(detail),
-            SessionEvent::InterruptTimedOut => self.apply_interrupt_timed_out(),
-            SessionEvent::Exited { code, requested } => self.apply_exit(*code, *requested),
+    /// Applies one atomic batch from the agent adapter.
+    pub fn apply(&mut self, batch: &AgentBatch) {
+        for event in &batch.events {
+            self.apply_event(event);
         }
     }
 
@@ -668,214 +649,133 @@ impl Transcript {
         self.status = Status::Failed;
     }
 
-    fn apply_incoming(&mut self, incoming: &Incoming) {
-        if !self.status.is_busy() && starts_turn(incoming) {
-            self.status = Status::Working;
-        }
-        match incoming {
-            Incoming::System(message) => self.apply_system(message),
-            Incoming::StreamEvent(message) => self.apply_stream_event(message),
-            Incoming::Assistant(message) => self.apply_assistant(message),
-            Incoming::User(message) => self.apply_user(message),
-            Incoming::PermissionRequest(request) => self.apply_permission_request(request),
-            Incoming::Result(result) => self.apply_result(result),
-            Incoming::ControlCancelRequest { request_id } => self.apply_cancel(request_id),
-            // Hooks, rate limits, answers to our own requests and unknown lines change nothing.
-            Incoming::ControlRequest(_)
-            | Incoming::ControlResponse(_)
-            | Incoming::RateLimit(_)
-            | Incoming::Unknown(_) => {}
-        }
-    }
-
-    fn apply_system(&mut self, message: &SystemMessage) {
-        if let Some(tasks) = message.background_tasks() {
-            self.background_tasks = tasks.to_vec();
-            self.mark_background_tools();
-            return;
-        }
-        if message.subtype == "task_started"
-            && let (Some(task_id), Some(tool_use_id)) = (&message.task_id, &message.tool_use_id)
-        {
-            self.task_tools.insert(task_id.clone(), tool_use_id.clone());
-            self.mark_background_tools();
-            return;
-        }
-        if message.subtype != "init" {
-            return;
-        }
-        self.confirm_last_message();
-        if let Some(session_id) = &message.session_id {
-            self.session_id = Some(session_id.clone());
-        }
-        if let Some(model) = &message.model {
-            self.model = Some(model.clone());
-        }
-        if let Some(cwd) = &message.cwd {
-            self.cwd = Some(PathBuf::from(cwd));
-        }
-    }
-
-    /// Live text: each `text_delta` grows the assistant item for its (message, block). The item
-    /// is marked changed, but the thread does not save on these (see `Thread::apply`).
-    fn apply_stream_event(&mut self, message: &StreamEventMessage) {
-        if message.parent_tool_use_id.is_some() {
-            return; // A subagent's stream; slice 1 only shows the main conversation.
-        }
-        let StreamEvent::ContentBlockDelta {
-            index,
-            delta: Delta::Text(text),
-        } = &message.event
-        else {
-            return;
-        };
-        let Some(message_id) = &message.api_message_id else {
-            return;
-        };
-        let key = (message_id.clone(), *index);
-        let position = match self.open_text.get(&key) {
-            Some(position) => *position,
-            None => {
-                let position = self.push_assistant(String::new());
-                self.open_text.insert(key, position);
-                position
+    fn apply_event(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::TurnActive => {
+                if !self.status.is_busy() {
+                    self.status = Status::Working;
+                }
             }
-        };
-        if let Some(Item::Assistant { text: current, .. }) = self.item_mut(position) {
-            current.push_str(text);
-        }
-    }
-
-    /// A finished content block: final text, a tool call, or an API error message.
-    fn apply_assistant(&mut self, message: &AssistantMessage) {
-        if message.parent_tool_use_id.is_some() {
-            return; // A subagent's message; not shown in slice 1.
-        }
-        if message.is_api_error_message {
-            // Shown as the turn's error when the result arrives, not as a chat bubble.
-            let text = message
-                .message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.api_error_text = Some(text);
-            return;
-        }
-
-        let message_id = &message.message.id;
-        for block in &message.message.content {
-            match block {
-                ContentBlock::Text { text } => {
-                    // The full text replaces whatever the deltas built, so they can never drift.
-                    match self.take_open_text(message_id) {
-                        Some(position) => {
-                            if let Some(Item::Assistant { text: current, .. }) =
-                                self.item_mut(position)
-                            {
-                                *current = text.clone();
-                            }
+            AgentEvent::UserConfirmed => self.confirm_last_message(),
+            AgentEvent::ConversationEstablished(id) => self.session_id = Some(id.clone()),
+            AgentEvent::ModelReported(model) => self.model = Some(model.clone()),
+            AgentEvent::WorkingDirectoryReported(cwd) => self.cwd = Some(cwd.clone()),
+            AgentEvent::Text { key, update } => match update {
+                TextUpdate::Append(text) => {
+                    let position = match self.open_text.get(key) {
+                        Some(position) => *position,
+                        None => {
+                            let position = self.push_assistant(String::new());
+                            self.open_text.insert(*key, position);
+                            position
                         }
-                        None if !text.is_empty() => {
-                            self.push_assistant(text.clone());
-                        }
-                        None => {}
+                    };
+                    if let Some(Item::Assistant { text: current, .. }) = self.item_mut(position) {
+                        current.push_str(text);
                     }
                 }
-                ContentBlock::ToolUse { id, name, input } => self.add_tool(id, name, input),
-                // Thinking arrives with empty text in Claude Code; nothing to show.
-                _ => {}
+                TextUpdate::Replace(text) => {
+                    if let Some(position) = self.open_text.remove(key) {
+                        if let Some(Item::Assistant { text: current, .. }) = self.item_mut(position)
+                        {
+                            *current = text.clone();
+                        }
+                    } else if !text.is_empty() {
+                        self.push_assistant(text.clone());
+                    }
+                }
+            },
+            AgentEvent::ReplyInterrupted => {
+                let latest = self
+                    .items
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Assistant { live: true, .. }));
+                if let Some(Item::Assistant { interrupted, .. }) =
+                    latest.and_then(|position| self.item_mut(position))
+                {
+                    *interrupted = true;
+                }
             }
-        }
-
-        if message.aborted {
-            // The user stopped this reply. Close any text still open for it and mark this turn's
-            // latest assistant text as interrupted. Only `live` items belong to the current turn
-            // (`finish_turn` clears `live` at every result), so if the user stopped Claude before
-            // any text arrived, an earlier turn's reply is left alone.
-            while self.take_open_text(message_id).is_some() {}
-            let latest_live = self
-                .items
-                .iter()
-                .rposition(|item| matches!(item, Item::Assistant { live: true, .. }));
-            if let Some(Item::Assistant { interrupted, .. }) =
-                latest_live.and_then(|position| self.item_mut(position))
-            {
-                *interrupted = true;
-            }
-        }
-    }
-
-    /// Removes and returns the most recent open text item for `message_id`.
-    ///
-    /// This pairs a finished text block with the newest open item for its message. That is
-    /// right because the CLI prints one content block per `assistant` line. If one line ever
-    /// carried several text blocks while several were open, they would be paired in the wrong
-    /// order.
-    fn take_open_text(&mut self, message_id: &str) -> Option<usize> {
-        let key = self
-            .open_text
-            .iter()
-            .filter(|((id, _), _)| id == message_id)
-            .max_by_key(|(_, position)| **position)
-            .map(|(key, _)| key.clone())?;
-        self.open_text.remove(&key)
-    }
-
-    fn apply_user(&mut self, message: &UserMessage) {
-        // Subagent lines (with `parent_tool_use_id`) are handled too: this never adds items, it
-        // only settles tool cards that already exist. A subagent's approval request carries no
-        // parent id, so its card is shown, and its result must settle it here.
-        //
-        // Only tool results matter. Text blocks here are synthetic notes such as
-        // "[Request interrupted by user]" and are never shown as a user bubble.
-        for block in message.message.content.blocks() {
-            let ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } = block
-            else {
-                continue;
-            };
-            let rejected = message
-                .tool_result_meta
-                .iter()
-                .any(|meta| meta.id == *tool_use_id && meta.was_rejected());
-            let took = self
-                .tool_started
-                .get(tool_use_id)
-                .map(|started| started.elapsed());
-            // The CLI has settled this call, so any approval still queued for it is stale
-            // (for example after stdin closed while it was pending).
-            self.pending
-                .retain(|request| request.tool_use_id.as_deref() != Some(tool_use_id));
-            if self.pending.is_empty() && self.status == Status::Waiting {
-                self.status = Status::Working;
-            }
-
-            if let Some(Item::Tool {
-                state,
+            AgentEvent::ToolUpsert(tool) => self.add_tool(tool),
+            AgentEvent::ToolFinished {
+                id,
+                outcome,
                 output,
-                took: tool_took,
-                ..
-            }) = self.find_tool_mut(tool_use_id)
-            {
-                // A denied call stays Denied, even though its result is marked as an error.
-                *state = if rejected || *state == ToolState::Denied {
-                    ToolState::Denied
-                } else if *is_error {
-                    ToolState::Failed
-                } else {
-                    ToolState::Done
-                };
-                *output = Some(ContentBlock::tool_result_text(content));
-                *tool_took = took;
+                closes_approval,
+            } => {
+                let took = self.tool_started.get(id).map(|started| started.elapsed());
+                if *closes_approval {
+                    self.pending
+                        .retain(|request| request.tool_use_id.as_deref() != Some(id));
+                    if self.pending.is_empty() && self.status == Status::Waiting {
+                        self.status = Status::Working;
+                    }
+                }
+                if let Some(Item::Tool {
+                    state,
+                    output: current,
+                    took: tool_took,
+                    ..
+                }) = self.find_tool_mut(id)
+                {
+                    *state = match outcome {
+                        ToolOutcome::Denied => ToolState::Denied,
+                        _ if *state == ToolState::Denied => ToolState::Denied,
+                        ToolOutcome::Failed => ToolState::Failed,
+                        ToolOutcome::Completed => ToolState::Done,
+                    };
+                    *current = Some(output.clone());
+                    *tool_took = took;
+                }
             }
+            AgentEvent::ApprovalRequested(request) => self.apply_permission_request(request),
+            AgentEvent::ApprovalWithdrawn(id) => self.apply_cancel(id),
+            AgentEvent::BackgroundTasks(tasks) => {
+                self.background_tasks = tasks.clone();
+                self.mark_background_tools();
+            }
+            AgentEvent::TurnFinished {
+                outcome,
+                duration_ms,
+                cost_usd,
+                forget_conversation,
+                queued,
+            } => {
+                self.finish_turn();
+                match outcome {
+                    TurnOutcome::Stopped => {
+                        self.close_unfinished_tools("Stopped");
+                        self.push_turn_end(*duration_ms, *cost_usd, true);
+                        self.status = Status::Stopped;
+                    }
+                    TurnOutcome::Failed { title, detail } => {
+                        if *forget_conversation {
+                            self.session_id = None;
+                        }
+                        self.close_unfinished_tools("The turn ended before this finished.");
+                        self.push_error(title, detail.clone());
+                        self.status = Status::Failed;
+                    }
+                    TurnOutcome::Completed => {
+                        self.close_unfinished_tools("The turn ended before this finished.");
+                        self.push_turn_end(*duration_ms, *cost_usd, false);
+                        self.status = Status::Done;
+                    }
+                }
+                if *queued {
+                    self.status = Status::Working;
+                    self.unconfirm_last_message();
+                }
+            }
+            AgentEvent::Stderr(line) => {
+                self.stderr_tail.push_back(line.clone());
+                while self.stderr_tail.len() > STDERR_LINES_KEPT {
+                    self.stderr_tail.pop_front();
+                }
+            }
+            AgentEvent::WriteFailed(detail) => self.apply_write_failed(detail),
+            AgentEvent::InterruptTimedOut => self.apply_interrupt_timed_out(),
+            AgentEvent::Exited { code, requested } => self.apply_exit(*code, *requested),
         }
     }
 
@@ -884,9 +784,6 @@ impl Transcript {
             .tool_use_id
             .clone()
             .unwrap_or_else(|| request.request_id.clone());
-        if self.tool_position(&tool_use_id).is_none() {
-            self.add_tool(&tool_use_id, &request.tool_name, &request.input);
-        }
         if let Some(Item::Tool { state, .. }) = self.find_tool_mut(&tool_use_id) {
             *state = ToolState::Waiting;
         }
@@ -913,59 +810,6 @@ impl Transcript {
         self.tool_started.remove(&tool_use_id);
         if self.pending.is_empty() && self.status == Status::Waiting {
             self.status = Status::Working;
-        }
-    }
-
-    fn apply_result(&mut self, result: &ResultMessage) {
-        self.finish_turn();
-
-        // Prefer the per-turn usage. Only if it is missing, fall back to the difference of
-        // the running totals (wrong on the first turn after --resume, hence the preference).
-        let cost_usd = result.turn_cost_usd().or_else(|| {
-            let total = result.total_cost_usd?;
-            Some(total - self.previous_total_cost.unwrap_or(0.0))
-        });
-        if result.total_cost_usd.is_some() {
-            self.previous_total_cost = result.total_cost_usd;
-        }
-        let api_error_text = self.api_error_text.take();
-
-        if result.was_stopped() {
-            self.close_unfinished_tools("Stopped");
-            self.push_turn_end(result.duration_ms, cost_usd, true);
-            self.status = Status::Stopped;
-        } else if result.is_error {
-            if result.is_missing_conversation() {
-                // `--resume` named a session the CLI does not have. Forget it, so the next
-                // restart starts a fresh session instead of failing the same way forever.
-                self.session_id = None;
-            }
-            self.close_unfinished_tools("The turn ended before this finished.");
-            let detail = api_error_text
-                .filter(|text| !text.is_empty())
-                .or_else(|| result.result.clone().filter(|text| !text.is_empty()))
-                .unwrap_or_else(|| {
-                    let lines = result.error_lines();
-                    if lines.is_empty() {
-                        "Claude reported an error but gave no details.".to_string()
-                    } else {
-                        lines.join("\n")
-                    }
-                });
-            self.push_error("Claude stopped", detail);
-            self.status = Status::Failed;
-        } else {
-            // Normally every tool has its result by now; this is a backstop so no card spins
-            // forever after the turn is over.
-            self.close_unfinished_tools("The turn ended before this finished.");
-            self.push_turn_end(result.duration_ms, cost_usd, false);
-            self.status = Status::Done;
-        }
-        // The user's message arrived while claude ran a turn of its own; it runs next.
-        if !result.was_stopped() && result.another_turn_follows() {
-            self.status = Status::Working;
-            // The init that just ended confirmed the queued message too early.
-            self.unconfirm_last_message();
         }
     }
 
@@ -1032,7 +876,8 @@ impl Transcript {
         }
     }
 
-    fn add_tool(&mut self, tool_use_id: &str, name: &str, input: &Value) {
+    fn add_tool(&mut self, tool: &ToolDescriptor) {
+        let tool_use_id = &tool.id;
         if self.tool_position(tool_use_id).is_some() {
             return;
         }
@@ -1042,10 +887,10 @@ impl Transcript {
         self.push(Item::Tool {
             id,
             tool_use_id: tool_use_id.to_string(),
-            name: name.to_string(),
-            display_name: display_name(name),
-            summary: summarize(name, input, self.cwd.as_deref()),
-            input: input.clone(),
+            name: tool.name.clone(),
+            display_name: tool.display_name.clone(),
+            summary: tool.summary.clone(),
+            input: tool.arguments.clone(),
             state: ToolState::Running,
             output: None,
             took: None,
@@ -1058,7 +903,7 @@ impl Transcript {
         let running: Vec<&str> = self
             .background_tasks
             .iter()
-            .filter_map(|task| self.task_tools.get(&task.task_id).map(String::as_str))
+            .filter_map(|task| task.tool.as_deref())
             .collect();
         let changed: Vec<usize> = self
             .items
@@ -1150,79 +995,15 @@ impl Transcript {
     }
 }
 
-/// Lines that only come while a turn runs: its `init`, and the main conversation's replies.
-/// One between turns means claude started a turn by itself, as it does when a background task
-/// finishes: no user message, just `init` and a reply. It is a turn like any other.
-///
-/// Assumes claude sends `init` only to start a turn, never at spawn or after a result (true in
-/// every fixture; checked in `tests/replay.rs`).
-fn starts_turn(incoming: &Incoming) -> bool {
-    match incoming {
-        Incoming::System(message) => message.subtype == "init",
-        Incoming::Assistant(message) => message.parent_tool_use_id.is_none(),
-        Incoming::StreamEvent(message) => message.parent_tool_use_id.is_none(),
-        _ => false,
-    }
-}
-
-/// A friendlier tool name: MCP tools arrive as `mcp__<server>__<tool>` and become
-/// `<server> · <tool>`. Other names are returned unchanged.
-pub fn display_name(tool_name: &str) -> String {
-    if let Some(rest) = tool_name.strip_prefix("mcp__")
-        && let Some((server, tool)) = rest.split_once("__")
-    {
-        return format!("{server} · {tool}");
-    }
-    tool_name.to_string()
-}
-
-/// A one-line summary of a tool call for its card, e.g. the Bash command or the file it edits.
-/// File paths inside `cwd` are shown relative to it.
-pub fn summarize(tool_name: &str, input: &Value, cwd: Option<&Path>) -> String {
-    let field = |name: &str| input.get(name).and_then(Value::as_str);
-    let summary = match tool_name {
-        "Bash" => field("command").map(|command| command.lines().next().unwrap_or("").to_string()),
-        "Read" | "Edit" | "Write" | "MultiEdit" => {
-            field("file_path").map(|path| relative(path, cwd))
-        }
-        "NotebookEdit" => field("notebook_path")
-            .or_else(|| field("file_path"))
-            .map(|path| relative(path, cwd)),
-        "Glob" | "Grep" => field("pattern").map(str::to_string),
-        "WebFetch" => field("url").map(str::to_string),
-        "WebSearch" => field("query").map(str::to_string),
-        "Task" | "Agent" => field("description").map(str::to_string),
-        _ => None,
-    };
-    summary
-        .or_else(|| first_string_field(input))
-        .unwrap_or_default()
-}
-
-/// The first string value in a JSON object, as a last-resort summary.
-fn first_string_field(input: &Value) -> Option<String> {
-    let object = input.as_object()?;
-    object
-        .values()
-        .find_map(Value::as_str)
-        .map(|text| text.lines().next().unwrap_or("").to_string())
-}
-
-/// `path` relative to `cwd` when it is inside it; otherwise unchanged.
-fn relative(path: &str, cwd: Option<&Path>) -> String {
-    let Some(cwd) = cwd else {
-        return path.to_string();
-    };
-    match Path::new(path).strip_prefix(cwd) {
-        Ok(inside) if !inside.as_os_str().is_empty() => inside.display().to_string(),
-        _ => path.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Incoming;
+    use crate::providers::claude::events::ClaudeEvents;
+    use crate::providers::claude::{display_name, summarize};
+    use crate::session::SessionEvent;
     use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn display_name_shortens_mcp_tools() {
@@ -1347,6 +1128,7 @@ mod tests {
 
     #[test]
     fn a_message_is_unconfirmed_until_its_turn_starts() {
+        let mut codec = ClaudeEvents::default();
         // A message saved before the flag existed counts as received.
         let old = Item::from_saved(ITEM_SCHEMA_VERSION, r#"{"type":"user","id":1,"text":"a"}"#);
         let mut transcript = Transcript::from_saved("/tmp/p", vec![old], Status::Stopped);
@@ -1356,7 +1138,7 @@ mod tests {
         assert_eq!(transcript.unconfirmed_message(), Some("b"));
         transcript.mark_saved();
         let init = Incoming::parse(r#"{"type":"system","subtype":"init","session_id":"s"}"#);
-        transcript.apply(&SessionEvent::Line(init));
+        transcript.apply(&codec.translate(&SessionEvent::Line(init), None));
         assert_eq!(transcript.unconfirmed_message(), None);
         assert_eq!(
             transcript.dirty_from(),
@@ -1428,19 +1210,26 @@ mod tests {
         assert_eq!(Status::from_saved("napping"), Status::Idle);
     }
 
-    fn line(value: Value) -> SessionEvent {
-        SessionEvent::Line(Incoming::from_value(value))
+    fn line(codec: &mut ClaudeEvents, value: Value) -> AgentBatch {
+        codec.translate(&SessionEvent::Line(Incoming::from_value(value)), None)
     }
 
     #[test]
     fn only_changed_rows_are_marked_for_saving() {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = Transcript::new();
         assert_eq!(transcript.dirty_from(), None);
         transcript.push_user("one");
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
-            "content": [{"type": "text", "text": "first"}]}})));
-        transcript.apply(&line(json!({"type": "result", "subtype": "success",
-            "is_error": false})));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "text", "text": "first"}]}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "result", "subtype": "success",
+            "is_error": false}),
+        ));
         assert_eq!(transcript.dirty_from(), Some(0));
         transcript.mark_saved();
         assert_eq!(transcript.dirty_from(), None);
@@ -1448,8 +1237,11 @@ mod tests {
         // The second turn's end must not mark the first turn's reply (it is no longer live).
         transcript.push_user("two");
         assert_eq!(transcript.dirty_from(), Some(3));
-        transcript.apply(&line(json!({"type": "result", "subtype": "success",
-            "is_error": false})));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "result", "subtype": "success",
+            "is_error": false}),
+        ));
         assert_eq!(transcript.dirty_from(), Some(3));
         transcript.mark_saved();
 
@@ -1458,6 +1250,7 @@ mod tests {
         transcript.push_user("three");
         transcript.mark_saved();
         transcript.apply(&line(
+            &mut codec,
             json!({"type": "stream_event", "api_message_id": "m3",
             "event": {"type": "content_block_delta", "index": 0,
                       "delta": {"type": "text_delta", "text": "Hel"}}}),
@@ -1466,6 +1259,7 @@ mod tests {
         assert_eq!(transcript.dirty_from(), Some(reply));
         transcript.mark_saved();
         transcript.apply(&line(
+            &mut codec,
             json!({"type": "stream_event", "api_message_id": "m3",
             "event": {"type": "content_block_delta", "index": 0,
                       "delta": {"type": "text_delta", "text": "lo"}}}),
@@ -1475,31 +1269,49 @@ mod tests {
 
     #[test]
     fn a_tool_result_marks_its_card_even_when_it_is_far_up() {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = Transcript::new();
         transcript.push_user("go");
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m1",
             "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
-                         "input": {"command": "ls"}}]}})));
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
-            "content": [{"type": "text", "text": "while it runs"}]}})));
+                         "input": {"command": "ls"}}]}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "text", "text": "while it runs"}]}}),
+        ));
         transcript.mark_saved();
-        transcript.apply(&line(json!({"type": "user", "message": {"content": [
-            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}})));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}),
+        ));
         assert_eq!(transcript.dirty_from(), Some(1));
     }
 
     /// A transcript as Newjen left it when it quit: a reply streaming, one tool running, one
     /// waiting for an approval.
     fn interrupted_transcript() -> Transcript {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = Transcript::with_cwd("/tmp/project");
         transcript.push_user("go");
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
-            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
-                         "input": {"command": "sleep 9"}}]}})));
-        transcript.apply(&line(json!({"type": "control_request", "request_id": "r2",
-            "request": {"subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t2",
-                        "input": {"command": "touch a.txt"}}})));
         transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                         "input": {"command": "sleep 9"}}]}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "control_request", "request_id": "r2",
+            "request": {"subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t2",
+                        "input": {"command": "touch a.txt"}}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
             json!({"type": "stream_event", "api_message_id": "m2",
             "event": {"type": "content_block_delta", "index": 0,
                       "delta": {"type": "text_delta", "text": "Working on"}}}),
@@ -1549,13 +1361,18 @@ mod tests {
 
     #[test]
     fn relaunch_stops_a_thread_that_was_working_without_an_approval() {
+        let mut codec = ClaudeEvents::default();
         // The common case: claude was running a tool and streaming a reply, nothing to answer.
         let mut working = Transcript::with_cwd("/tmp/project");
         working.push_user("go");
-        working.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
-            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
-                         "input": {"command": "sleep 9"}}]}})));
         working.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                         "input": {"command": "sleep 9"}}]}}),
+        ));
+        working.apply(&line(
+            &mut codec,
             json!({"type": "stream_event", "api_message_id": "m2",
             "event": {"type": "content_block_delta", "index": 0,
                       "delta": {"type": "text_delta", "text": "Still"}}}),
@@ -1601,10 +1418,14 @@ mod tests {
 
     #[test]
     fn relaunch_leaves_a_finished_thread_alone() {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = Transcript::new();
         transcript.push_user("go");
-        transcript.apply(&line(json!({"type": "result", "subtype": "success",
-            "is_error": false})));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "result", "subtype": "success",
+            "is_error": false}),
+        ));
         let items = transcript.items().to_vec();
         let mut loaded = Transcript::from_saved("/tmp/p", items.clone(), Status::Done);
         loaded.normalize_after_relaunch();
@@ -1613,33 +1434,52 @@ mod tests {
         assert_eq!(loaded.dirty_from(), None);
     }
 
-    fn tasks_changed(ids: &[&str]) -> SessionEvent {
+    fn tasks_changed(codec: &mut ClaudeEvents, ids: &[&str]) -> AgentBatch {
         let tasks: Vec<Value> = ids
             .iter()
             .map(
                 |id| json!({"task_id": id, "task_type": "local_bash", "description": "Dev server"}),
             )
             .collect();
-        line(json!({"type": "system", "subtype": "background_tasks_changed", "tasks": tasks}))
+        line(
+            codec,
+            json!({"type": "system", "subtype": "background_tasks_changed", "tasks": tasks}),
+        )
     }
 
     /// A finished turn whose Bash call `t1` left task `b1` running in the background.
     fn turn_with_a_background_task() -> Transcript {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = Transcript::with_cwd("/tmp/project");
         transcript.push_user("start the server");
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m1",
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m1",
             "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
-                         "input": {"command": "npm run dev", "run_in_background": true}}]}})));
-        transcript.apply(&tasks_changed(&["b1"]));
-        transcript.apply(&line(json!({"type": "system", "subtype": "task_started",
-            "task_id": "b1", "tool_use_id": "t1", "is_backgrounded": true})));
-        transcript.apply(&line(json!({"type": "user", "message": {"content": [
+                         "input": {"command": "npm run dev", "run_in_background": true}}]}}),
+        ));
+        transcript.apply(&tasks_changed(&mut codec, &["b1"]));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "system", "subtype": "task_started",
+            "task_id": "b1", "tool_use_id": "t1", "is_backgrounded": true}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "user", "message": {"content": [
             {"type": "tool_result", "tool_use_id": "t1",
-             "content": "Command running in background with ID: b1."}]}})));
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m2",
-            "content": [{"type": "text", "text": "started"}]}})));
-        transcript.apply(&line(json!({"type": "result", "subtype": "success",
-            "is_error": false})));
+             "content": "Command running in background with ID: b1."}]}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m2",
+            "content": [{"type": "text", "text": "started"}]}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "result", "subtype": "success",
+            "is_error": false}),
+        ));
         transcript
     }
 
@@ -1655,6 +1495,7 @@ mod tests {
 
     #[test]
     fn a_background_task_outlives_its_turn_and_is_flagged_on_its_call() {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = turn_with_a_background_task();
         assert_eq!(transcript.status(), Status::Done);
         assert_eq!(transcript.background_tasks().len(), 1);
@@ -1670,7 +1511,7 @@ mod tests {
 
         // The list is the whole truth: once the task leaves it, its call is no longer flagged.
         transcript.mark_saved();
-        transcript.apply(&tasks_changed(&[]));
+        transcript.apply(&tasks_changed(&mut codec, &[]));
         assert!(transcript.background_tasks().is_empty());
         assert!(!is_background(&transcript.items()[1]));
         assert_eq!(transcript.dirty_from(), Some(1));
@@ -1678,21 +1519,32 @@ mod tests {
 
     #[test]
     fn claude_can_start_a_turn_by_itself() {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = turn_with_a_background_task();
         transcript.apply(&line(
+            &mut codec,
             json!({"type": "system", "subtype": "task_notification",
             "task_id": "b1", "tool_use_id": "t1", "status": "completed"}),
         ));
-        transcript.apply(&tasks_changed(&[]));
+        transcript.apply(&tasks_changed(&mut codec, &[]));
         assert_eq!(transcript.status(), Status::Done, "not a turn yet");
 
-        transcript.apply(&line(json!({"type": "system", "subtype": "init",
-            "session_id": "s"})));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "system", "subtype": "init",
+            "session_id": "s"}),
+        ));
         assert_eq!(transcript.status(), Status::Working);
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m3",
-            "content": [{"type": "text", "text": "The server stopped."}]}})));
-        transcript.apply(&line(json!({"type": "result", "subtype": "success",
-            "is_error": false, "duration_ms": 1851})));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m3",
+            "content": [{"type": "text", "text": "The server stopped."}]}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "result", "subtype": "success",
+            "is_error": false, "duration_ms": 1851}),
+        ));
         assert_eq!(transcript.status(), Status::Done);
         let users = transcript
             .items()
@@ -1710,6 +1562,7 @@ mod tests {
 
         // A streamed word between turns starts one too (if `init` was missed).
         transcript.apply(&line(
+            &mut codec,
             json!({"type": "stream_event", "api_message_id": "m4",
             "event": {"type": "content_block_delta", "index": 0,
                       "delta": {"type": "text_delta", "text": "Also"}}}),
@@ -1719,6 +1572,7 @@ mod tests {
 
     #[test]
     fn lines_outside_a_turn_do_not_start_one() {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = turn_with_a_background_task();
         for quiet in [
             json!({"type": "system", "subtype": "status", "status": "requesting"}),
@@ -1729,7 +1583,7 @@ mod tests {
             json!({"type": "assistant", "parent_tool_use_id": "t9",
                    "message": {"id": "m9", "content": [{"type": "text", "text": "sub"}]}}),
         ] {
-            transcript.apply(&line(quiet));
+            transcript.apply(&line(&mut codec, quiet));
             assert_eq!(transcript.status(), Status::Done);
         }
     }
@@ -1771,10 +1625,13 @@ mod tests {
         // Newjen stopped claude ("Try again"): the card says the command stopped with it.
         let mut transcript = turn_with_a_background_task();
         transcript.mark_saved();
-        transcript.apply(&SessionEvent::Exited {
-            code: Some(0),
-            requested: true,
-        });
+        transcript.apply(&ClaudeEvents::default().translate(
+            &SessionEvent::Exited {
+                code: Some(0),
+                requested: true,
+            },
+            None,
+        ));
         assert!(transcript.background_tasks().is_empty());
         assert!(matches!(
             &transcript.items()[1],
@@ -1795,10 +1652,13 @@ mod tests {
 
         // claude exited by itself: its "Claude exited" error is what the user sees.
         let mut crashed = turn_with_a_background_task();
-        crashed.apply(&SessionEvent::Exited {
-            code: Some(1),
-            requested: false,
-        });
+        crashed.apply(&ClaudeEvents::default().translate(
+            &SessionEvent::Exited {
+                code: Some(1),
+                requested: false,
+            },
+            None,
+        ));
         assert!(crashed.background_tasks().is_empty());
         assert!(matches!(
             &crashed.items()[1],
@@ -1813,16 +1673,26 @@ mod tests {
 
     #[test]
     fn a_message_queued_behind_claudes_own_turn_keeps_the_turn_going() {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = turn_with_a_background_task();
         transcript.push_user("What next?");
-        transcript.apply(&tasks_changed(&[]));
-        transcript.apply(&line(json!({"type": "system", "subtype": "init",
-            "session_id": "s"})));
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m3",
-            "content": [{"type": "text", "text": "The server stopped."}]}})));
-        transcript.apply(&line(json!({"type": "result", "subtype": "success",
+        transcript.apply(&tasks_changed(&mut codec, &[]));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "system", "subtype": "init",
+            "session_id": "s"}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m3",
+            "content": [{"type": "text", "text": "The server stopped."}]}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "result", "subtype": "success",
             "is_error": false, "queued_turn_count": 1,
-            "origin": {"kind": "task-notification"}})));
+            "origin": {"kind": "task-notification"}}),
+        ));
         assert_eq!(
             transcript.status(),
             Status::Working,
@@ -1838,18 +1708,28 @@ mod tests {
             Some(Item::TurnEnd { .. })
         ));
 
-        transcript.apply(&line(json!({"type": "system", "subtype": "init",
-            "session_id": "s"})));
-        transcript.apply(&line(json!({"type": "assistant", "message": {"id": "m4",
-            "content": [{"type": "text", "text": "Here is what is next."}]}})));
-        transcript.apply(&line(json!({"type": "result", "subtype": "success",
-            "is_error": false, "queued_turn_count": 0})));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "system", "subtype": "init",
+            "session_id": "s"}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "assistant", "message": {"id": "m4",
+            "content": [{"type": "text", "text": "Here is what is next."}]}}),
+        ));
+        transcript.apply(&line(
+            &mut codec,
+            json!({"type": "result", "subtype": "success",
+            "is_error": false, "queued_turn_count": 0}),
+        ));
         assert_eq!(transcript.status(), Status::Done);
         assert_eq!(transcript.unconfirmed_message(), None);
 
         // A stop ends the turn even with a message queued; claude starts that one by itself.
         transcript.push_user("And then?");
         transcript.apply(&line(
+            &mut codec,
             json!({"type": "result", "subtype": "error_during_execution",
             "is_error": true, "terminal_reason": "aborted_streaming", "queued_turn_count": 1}),
         ));

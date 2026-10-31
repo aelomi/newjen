@@ -10,6 +10,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use newjen_core::protocol::PermissionAnswer;
+use newjen_core::providers::claude::events::ClaudeEvents;
 use newjen_core::session::{Session, SessionConfig, SessionEvent};
 use newjen_core::transcript::{Status, Transcript};
 
@@ -20,6 +21,7 @@ fn live_touch_file_with_approval() {
     let (session, events) = Session::spawn(SessionConfig::new(project.path())).expect(
         "could not start claude; is it installed (or NEWJEN_CLAUDE set) and are you logged in?",
     );
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::with_cwd(project.path());
     let prompt = "Run this exact shell command with the Bash tool: touch live.txt -- then tell me \
                   in one sentence whether it worked.";
@@ -37,7 +39,7 @@ fn live_touch_file_with_approval() {
         if let SessionEvent::Stderr(line) = &event {
             eprintln!("claude stderr: {line}");
         }
-        transcript.apply(&event);
+        transcript.apply(&codec.translate(&event, None));
         if let Some(request) = transcript.pending_approval().cloned() {
             session
                 .answer(&request, PermissionAnswer::AllowOnce)

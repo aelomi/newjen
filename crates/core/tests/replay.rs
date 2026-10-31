@@ -6,6 +6,7 @@
 mod common;
 
 use newjen_core::protocol::{Incoming, PermissionAnswer};
+use newjen_core::providers::claude::events::ClaudeEvents;
 use newjen_core::session::SessionEvent;
 use newjen_core::transcript::{Item, Status, ToolState, Transcript};
 use serde_json::Value;
@@ -20,18 +21,21 @@ struct Replay {
 }
 
 fn replay(name: &str) -> Replay {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     let mut after_each_result = Vec::new();
     let mut saw_pending_approval = false;
+    let mut prefixes = Vec::new();
     for line in common::load(name) {
         if line.out {
             let incoming = Incoming::from_value(line.msg.clone());
             let is_result = matches!(incoming, Incoming::Result(_));
-            transcript.apply(&SessionEvent::Line(incoming));
+            transcript.apply(&codec.translate(&SessionEvent::Line(incoming), None));
             saw_pending_approval |= transcript.pending_approval().is_some();
             if is_result {
                 after_each_result.push(transcript.clone());
             }
+            prefixes.push(snapshot(&transcript));
             continue;
         }
         match line.msg["type"].as_str() {
@@ -50,7 +54,20 @@ fn replay(name: &str) -> Replay {
             }
             _ => {} // initialize / interrupt requests: nothing to record.
         }
+        prefixes.push(snapshot(&transcript));
     }
+    let expected: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(
+            common::fixture_path(name)
+                .parent()
+                .unwrap()
+                .join("prefixes")
+                .join(format!("{name}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prefixes, expected, "fixture {name}");
     Replay {
         end: transcript,
         after_each_result,
@@ -186,10 +203,12 @@ fn tool_allow() {
 #[test]
 fn tool_allow_status_while_waiting() {
     // Stop right after the approval request arrives.
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     for line in common::load("tool_allow") {
         if line.out {
-            transcript.apply(&SessionEvent::Line(Incoming::from_value(line.msg)));
+            transcript
+                .apply(&codec.translate(&SessionEvent::Line(Incoming::from_value(line.msg)), None));
         } else if line.msg["type"] == "user" {
             transcript.push_user("prompt");
         } else {
@@ -242,6 +261,7 @@ fn tool_auto_allowed_readonly() {
 fn partial_builds_text_from_deltas_then_finalizes() {
     // Feed lines up to (not including) the full assistant line: the deltas alone must have
     // produced a live assistant item.
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     for line in common::load("partial") {
         if !line.out {
@@ -251,7 +271,8 @@ fn partial_builds_text_from_deltas_then_finalizes() {
         if line.msg["type"] == "assistant" {
             break;
         }
-        transcript.apply(&SessionEvent::Line(Incoming::from_value(line.msg)));
+        transcript
+            .apply(&codec.translate(&SessionEvent::Line(Incoming::from_value(line.msg)), None));
     }
     assert!(matches!(
         transcript.items().last(),
@@ -394,15 +415,17 @@ fn error_bad_resume() {
 #[test]
 fn bad_resume_forgets_the_session_id_so_a_retry_starts_fresh() {
     // Without this, every restart would `--resume` the same missing session and fail again.
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "system", "subtype": "init", "session_id": "gone-session"}),
     );
     assert_eq!(transcript.session_id(), Some("gone-session"));
     for line in common::load("error_bad_resume") {
         if line.out {
-            feed(&mut transcript, line.msg);
+            feed(&mut transcript, &mut codec, line.msg);
         }
     }
     assert_eq!(transcript.status(), Status::Failed);
@@ -411,6 +434,7 @@ fn bad_resume_forgets_the_session_id_so_a_retry_starts_fresh() {
     // The fresh session that follows reports its own id as usual.
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "system", "subtype": "init", "session_id": "new-session"}),
     );
     assert_eq!(transcript.session_id(), Some("new-session"));
@@ -418,10 +442,11 @@ fn bad_resume_forgets_the_session_id_so_a_retry_starts_fresh() {
 
 #[test]
 fn other_errors_keep_the_session_id() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = replay("error_bad_model").end;
     assert_eq!(transcript.status(), Status::Failed);
     assert!(transcript.session_id().is_some());
-    feed(&mut transcript, success_result());
+    feed(&mut transcript, &mut codec, success_result());
     assert!(transcript.session_id().is_some());
 }
 
@@ -453,13 +478,15 @@ fn write_allow_session_recording_replays_both_writes() {
 
 #[test]
 fn initialize_adds_no_items() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     for line in common::load("initialize") {
         if !line.out && line.msg["type"] == "user" {
             break; // Only the start-up part: hooks and the initialize response.
         }
         if line.out {
-            transcript.apply(&SessionEvent::Line(Incoming::from_value(line.msg)));
+            transcript
+                .apply(&codec.translate(&SessionEvent::Line(Incoming::from_value(line.msg)), None));
         }
     }
     assert!(transcript.items().is_empty());
@@ -516,12 +543,16 @@ fn no_fixture_leaves_the_thread_working_after_its_last_result() {
 
 #[test]
 fn unexpected_exit_is_an_error_with_stderr() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = replay("text_reply").end;
-    transcript.apply(&SessionEvent::Stderr("something broke".to_string()));
-    transcript.apply(&SessionEvent::Exited {
-        code: Some(1),
-        requested: false,
-    });
+    transcript.apply(&codec.translate(&SessionEvent::Stderr("something broke".to_string()), None));
+    transcript.apply(&codec.translate(
+        &SessionEvent::Exited {
+            code: Some(1),
+            requested: false,
+        },
+        None,
+    ));
     assert_eq!(transcript.status(), Status::Failed);
     let errors = errors(&transcript);
     assert_eq!(errors.len(), 1);
@@ -532,23 +563,31 @@ fn unexpected_exit_is_an_error_with_stderr() {
 
 #[test]
 fn exit_after_requested_shutdown_is_not_an_error() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = replay("text_reply").end;
-    transcript.apply(&SessionEvent::Exited {
-        code: None,
-        requested: true,
-    });
+    transcript.apply(&codec.translate(
+        &SessionEvent::Exited {
+            code: None,
+            requested: true,
+        },
+        None,
+    ));
     assert!(errors(&transcript).is_empty());
     assert_eq!(transcript.status(), Status::Done);
 }
 
 #[test]
 fn requested_exit_mid_turn_ends_as_stopped() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     transcript.push_user("hi");
-    transcript.apply(&SessionEvent::Exited {
-        code: None,
-        requested: true,
-    });
+    transcript.apply(&codec.translate(
+        &SessionEvent::Exited {
+            code: None,
+            requested: true,
+        },
+        None,
+    ));
     assert!(errors(&transcript).is_empty());
     assert_eq!(transcript.status(), Status::Stopped);
 }
@@ -561,22 +600,27 @@ fn crash_after_a_restart_is_still_reported() {
         code: Some(1),
         requested: false,
     };
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     transcript.push_user("a");
-    transcript.apply(&crash);
+    transcript.apply(&codec.translate(&crash, None));
     transcript.push_user("again");
-    transcript.apply(&crash);
+    transcript.apply(&codec.translate(&crash, None));
     assert_eq!(errors(&transcript).len(), 2);
     assert_eq!(transcript.status(), Status::Failed);
 }
 
 #[test]
 fn exit_after_a_failed_turn_adds_no_second_error() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = replay("error_bad_resume").end;
-    transcript.apply(&SessionEvent::Exited {
-        code: Some(1),
-        requested: false,
-    });
+    transcript.apply(&codec.translate(
+        &SessionEvent::Exited {
+            code: Some(1),
+            requested: false,
+        },
+        None,
+    ));
     assert_eq!(errors(&transcript).len(), 1);
 }
 
@@ -591,10 +635,11 @@ fn a_failed_write_and_a_crash_show_one_error_in_either_order() {
         (&crash, &write_failed, "Claude exited"),
         (&write_failed, &crash, "Could not reach Claude"),
     ] {
+        let mut codec = ClaudeEvents::default();
         let mut transcript = Transcript::new();
         transcript.push_user("hi");
-        transcript.apply(first);
-        transcript.apply(second);
+        transcript.apply(&codec.translate(first, None));
+        transcript.apply(&codec.translate(second, None));
         let errors = errors(&transcript);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0].0, title);
@@ -603,8 +648,8 @@ fn a_failed_write_and_a_crash_show_one_error_in_either_order() {
 }
 
 /// Feeds one raw stdout line to the transcript.
-fn feed(transcript: &mut Transcript, line: Value) {
-    transcript.apply(&SessionEvent::Line(Incoming::from_value(line)));
+fn feed(transcript: &mut Transcript, codec: &mut ClaudeEvents, line: Value) {
+    transcript.apply(&codec.translate(&SessionEvent::Line(Incoming::from_value(line)), None));
 }
 
 fn success_result() -> Value {
@@ -614,16 +659,19 @@ fn success_result() -> Value {
 
 #[test]
 fn approved_subagent_tool_settles_when_its_result_arrives() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     transcript.push_user("use a subagent");
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "assistant", "message": {"id": "m1", "content": [
             {"type": "tool_use", "id": "task_1", "name": "Task", "input": {"description": "Write"}}]}}),
     );
     // The subagent's approval request has no parent_tool_use_id, so its card is shown.
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "control_request", "request_id": "r1", "request": {
             "subtype": "can_use_tool", "tool_name": "Write", "tool_use_id": "sub_t",
             "input": {"file_path": "/tmp/a.txt"}, "agent_id": "agent_1"}}),
@@ -632,16 +680,18 @@ fn approved_subagent_tool_settles_when_its_result_arrives() {
     // Its result arrives on a subagent line.
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "user", "parent_tool_use_id": "task_1", "message": {
             "role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "sub_t", "content": "ok"}]}}),
     );
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "task_1", "content": "done"}]}}),
     );
-    feed(&mut transcript, success_result());
+    feed(&mut transcript, &mut codec, success_result());
 
     assert_eq!(transcript.status(), Status::Done);
     assert_eq!(
@@ -655,18 +705,21 @@ fn approved_subagent_tool_settles_when_its_result_arrives() {
 
 #[test]
 fn stop_during_thinking_leaves_the_previous_reply_alone() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     transcript.push_user("one");
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "assistant", "message": {"id": "m1", "content": [
             {"type": "text", "text": "First reply"}]}}),
     );
-    feed(&mut transcript, success_result());
+    feed(&mut transcript, &mut codec, success_result());
     transcript.push_user("two");
     // Stopped while Claude was still thinking: the aborted line has no text.
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "assistant", "aborted": true, "message": {"id": "m2",
             "content": [{"type": "thinking", "thinking": ""}]}}),
     );
@@ -678,10 +731,12 @@ fn stop_during_thinking_leaves_the_previous_reply_alone() {
 
 #[test]
 fn a_cancelled_approval_is_dropped_and_its_tool_fails() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     transcript.push_user("go");
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "control_request", "request_id": "r1", "request": {
             "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t1",
             "input": {"command": "ls"}}}),
@@ -689,6 +744,7 @@ fn a_cancelled_approval_is_dropped_and_its_tool_fails() {
     assert_eq!(transcript.status(), Status::Waiting);
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "control_cancel_request", "request_id": "r1"}),
     );
     assert!(transcript.pending_approval().is_none());
@@ -702,19 +758,24 @@ fn a_cancelled_approval_is_dropped_and_its_tool_fails() {
 
 #[test]
 fn an_interrupt_timeout_fails_the_turn_with_one_error() {
+    let mut codec = ClaudeEvents::default();
     let mut transcript = Transcript::new();
     transcript.push_user("go");
     feed(
         &mut transcript,
+        &mut codec,
         serde_json::json!({"type": "assistant", "message": {"id": "m1", "content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "sleep 99"}}]}}),
     );
-    transcript.apply(&SessionEvent::InterruptTimedOut);
+    transcript.apply(&codec.translate(&SessionEvent::InterruptTimedOut, None));
     // The shutdown that follows must not change the outcome.
-    transcript.apply(&SessionEvent::Exited {
-        code: None,
-        requested: true,
-    });
+    transcript.apply(&codec.translate(
+        &SessionEvent::Exited {
+            code: None,
+            requested: true,
+        },
+        None,
+    ));
     assert_eq!(transcript.status(), Status::Failed);
     assert_eq!(
         tools(&transcript),
@@ -785,4 +846,29 @@ fn background_task_then_a_turn_claude_starts_by_itself() {
     ));
     // Each turn's own cost, not the running total.
     assert_close(turn_ends(transcript)[1].0, 0.00042816);
+}
+
+fn snapshot(transcript: &Transcript) -> Value {
+    let items: Vec<Value> = transcript
+        .items()
+        .iter()
+        .map(|item| {
+            let mut value: Value = serde_json::from_str(&item.to_saved().1).unwrap();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("took");
+            }
+            value
+        })
+        .collect();
+    serde_json::json!({"items":items,"status":transcript.status(),"dirty":transcript.dirty_from(),
+        "session":transcript.session_id(),"model":transcript.model(),
+        "pending":transcript.pending_approval().map(|r| &r.request_id),
+        "background":transcript.background_tasks().iter().map(|t| (&t.task_id, &t.description)).collect::<Vec<_>>()})
+}
+
+#[test]
+fn every_fixture_prefix_preserves_the_original_projection() {
+    for name in common::all_fixture_names() {
+        replay(&name);
+    }
 }

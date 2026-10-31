@@ -29,10 +29,10 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Side, WindowExt as _};
+use newjen_core::providers::claude::display_name;
 use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
-use newjen_core::transcript::display_name;
 use newjen_core::{
     Item, PermissionAnswer, Project, SessionConfig, Status, Store, Thread, ToolState, session_scope,
 };
@@ -2267,12 +2267,20 @@ mod tests {
     fn an_interrupt_timeout_leaves_the_composer_usable_with_try_again() {
         let mut transcript = Transcript::new();
         transcript.push_user("hello");
-        transcript.apply(&SessionEvent::InterruptTimedOut);
+        transcript.apply(
+            &newjen_core::providers::claude::events::ClaudeEvents::default()
+                .translate(&SessionEvent::InterruptTimedOut, None),
+        );
         // The session shuts claude down right after; that must not change the outcome.
-        transcript.apply(&SessionEvent::Exited {
-            code: None,
-            requested: true,
-        });
+        transcript.apply(
+            &newjen_core::providers::claude::events::ClaudeEvents::default().translate(
+                &SessionEvent::Exited {
+                    code: None,
+                    requested: true,
+                },
+                None,
+            ),
+        );
         let busy = is_busy(transcript.status());
         assert!(!busy, "the composer must not stay on \"Working\"");
         let items = transcript.items();
@@ -2309,9 +2317,12 @@ mod tests {
         let mut transcript = Transcript::new();
         transcript.push_user("hello");
         assert!(is_busy(transcript.status()));
-        transcript.apply(&SessionEvent::WriteFailed(
-            "Broken pipe (os error 32)".to_string(),
-        ));
+        transcript.apply(
+            &newjen_core::providers::claude::events::ClaudeEvents::default().translate(
+                &SessionEvent::WriteFailed("Broken pipe (os error 32)".to_string()),
+                None,
+            ),
+        );
         let busy = is_busy(transcript.status());
         assert!(!busy, "the composer must not stay on \"Working\"");
         let items = transcript.items();
