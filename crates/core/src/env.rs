@@ -156,35 +156,40 @@ pub(crate) fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn strip_session_env(command: &mut Command) {
-    for name in [
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_AGENT_SDK_VERSION",
-        "CLAUDE_CODE_MESSAGING_SOCKET",
-        "CLAUDE_CODE_MESSAGING_TOKEN",
-        "CLAUDE_CODE_EXECPATH",
-        "CLAUDE_CODE_SESSION_ID",
-        "CLAUDE_CODE_CHILD_SESSION",
-        "CLAUDE_CODE_SESSION_ATTENDED",
-        "CLAUDE_PID",
-        "CLAUDE_EFFORT",
-        "CLAUDE_AGENT_SDK_CLIENT_APP",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CODEX_THREAD_ID",
-        "CODEX_SESSION_ID",
-        "CODEX_TOOL_CALL_ID",
-        "CODEX_SANDBOX",
-        "CODEX_SANDBOX_NETWORK_DISABLED",
-        "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
-        "CODEX_PERMISSION_PROFILE",
-        "CODEX_VERSION",
-        "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS",
-        "CODEX_PLUGIN_METRICS_OUTPUT",
-    ] {
+/// Removes the variables an agent CLI leaves in the environment when Newjen itself runs
+/// inside one, so a child never looks like a nested session. Shared by sessions and the
+/// terminal (which builds its command through a PTY, hence [`SESSION_ENV`] is public too).
+pub fn strip_session_env(command: &mut Command) {
+    for name in SESSION_ENV {
         command.env_remove(name);
     }
 }
+
+pub const SESSION_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "CLAUDE_AGENT_SDK_CLIENT_APP",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "CODEX_TOOL_CALL_ID",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+    "CODEX_PERMISSION_PROFILE",
+    "CODEX_VERSION",
+    "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS",
+    "CODEX_PLUGIN_METRICS_OUTPUT",
+];
 
 pub(crate) fn configure(command: &mut Command) {
     command.env("PATH", resolved_path());
