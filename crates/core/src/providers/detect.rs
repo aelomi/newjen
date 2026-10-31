@@ -366,8 +366,8 @@ fn probe_provider(
                 probe: Probe::spawn(command(binary).arg("app-server"), deadline)?,
                 next_id: 0,
             };
-            let init: Initialize = rpc.request("initialize", json!({"clientInfo":{"name":"newjen","title":"Newjen","version":env!("CARGO_PKG_VERSION")}}))?;
-            rpc.probe.send(&json!({"method":"initialized"}))?;
+            let init: Initialize = rpc.request("initialize", Value::Null)?;
+            rpc.probe.send(&super::rpc::initialized())?;
             let version = parse_version(&init.user_agent)?;
             version_warnings(provider, &version, &mut warnings);
             let auth: CodexAuth = rpc.request("account/read", json!({"refreshToken":false}))?;
@@ -521,21 +521,21 @@ fn claude_catalog() -> ModelCatalog {
 }
 
 #[derive(Deserialize)]
-struct Initialize {
+pub(crate) struct Initialize {
     #[serde(rename = "userAgent")]
-    user_agent: String,
+    pub(crate) user_agent: String,
 }
 
 #[derive(Deserialize)]
-struct CodexAuth {
-    account: Option<CodexAccount>,
+pub(crate) struct CodexAuth {
+    pub(crate) account: Option<CodexAccount>,
     #[serde(rename = "requiresOpenaiAuth")]
-    requires_openai_auth: bool,
+    pub(crate) requires_openai_auth: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum CodexAccount {
+pub(crate) enum CodexAccount {
     #[serde(rename = "apiKey")]
     ApiKey,
     #[serde(rename = "chatgpt")]
@@ -573,18 +573,18 @@ impl From<CodexAccount> for Account {
 }
 
 #[derive(Deserialize)]
-struct ModelPage {
-    data: Vec<CodexModel>,
+pub(crate) struct ModelPage {
+    pub(crate) data: Vec<CodexModel>,
     #[serde(rename = "nextCursor")]
-    next_cursor: Option<String>,
+    pub(crate) next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct CodexModel {
+pub(crate) struct CodexModel {
     model: String,
     #[serde(rename = "displayName")]
     display_name: String,
-    hidden: bool,
+    pub(crate) hidden: bool,
     #[serde(rename = "supportedReasoningEfforts")]
     efforts: Vec<Effort>,
     #[serde(rename = "defaultReasoningEffort")]
@@ -636,8 +636,13 @@ impl Rpc {
         params: Value,
     ) -> Result<T> {
         self.next_id += 1;
-        self.probe
-            .send(&json!({"id":self.next_id,"method":method,"params":params}))?;
+        let id = super::rpc::RpcId::Integer(self.next_id as i64);
+        let message = if method == "initialize" {
+            super::rpc::initialize(&id)
+        } else {
+            super::rpc::request(&id, method, params)
+        };
+        self.probe.send(&message)?;
         loop {
             let message: Value = serde_json::from_slice(&self.probe.line()?)
                 .context("The CLI returned unreadable JSON")?;

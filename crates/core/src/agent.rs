@@ -37,6 +37,21 @@ pub struct BackgroundTaskView {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnActive,
+    ToolOutput {
+        id: String,
+        update: TextUpdate,
+    },
+    ToolDuration {
+        id: String,
+        duration_ms: u64,
+    },
+    ApprovalUpdated(ApprovalRequest),
+    ApprovalAnswered {
+        key: ApprovalKey,
+        intent: ApprovalIntent,
+    },
+    UsageUpdated(Usage),
+    RateLimit(RateLimitEvent),
     UserConfirmed,
     ConversationEstablished(String),
     ModelReported(String),
@@ -175,6 +190,7 @@ pub struct GrantId(pub(crate) String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantLifetime {
     Thread,
+    Process,
 }
 #[derive(Debug, Clone)]
 pub struct GrantView {
@@ -246,4 +262,55 @@ impl AgentPresentation {
         };
         (self.start_failed.to_string(), detail)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffortSelection {
+    CliDefault,
+    Chosen(String),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speed {
+    Normal,
+    Fast,
+}
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    pub provider: crate::providers::Provider,
+    pub model: crate::providers::ModelSelection,
+    pub effort: EffortSelection,
+    pub speed: Speed,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenCounts {
+    pub input: u64,
+    pub cached_input: u64,
+    pub cache_write_input: u64,
+    pub output: u64,
+    pub reasoning_output: u64,
+    pub total: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Usage {
+    pub last: TokenCounts,
+    pub total: TokenCounts,
+    pub context_window: Option<u64>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitWindow {
+    pub label: String,
+    pub used_percent: Option<f64>,
+    pub resets_at_unix_seconds: Option<i64>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitSnapshot {
+    pub bucket: String,
+    pub windows: Vec<LimitWindow>,
+    pub explanation: String,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub enum RateLimitEvent {
+    Updated(LimitSnapshot),
+    Warning(LimitSnapshot),
+    Rejected(LimitSnapshot),
 }

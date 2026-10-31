@@ -263,6 +263,8 @@ fn is_false(flag: &bool) -> bool {
 pub struct Transcript {
     items: Vec<Item>,
     presentation: crate::agent::AgentPresentation,
+    usage: Option<crate::agent::Usage>,
+    rate_limit: Option<crate::agent::RateLimitEvent>,
     status: Status,
     /// The agent's currently reported background tasks.
     background_tasks: Vec<BackgroundTaskView>,
@@ -295,6 +297,8 @@ impl Transcript {
         Transcript {
             items: Vec::new(),
             presentation: Default::default(),
+            usage: None,
+            rate_limit: None,
             status: Status::Idle,
             background_tasks: Vec::new(),
             session_id: None,
@@ -346,6 +350,13 @@ impl Transcript {
 
     pub fn presentation(&self) -> &crate::agent::AgentPresentation {
         &self.presentation
+    }
+
+    pub fn usage(&self) -> Option<&crate::agent::Usage> {
+        self.usage.as_ref()
+    }
+    pub fn rate_limit(&self) -> Option<&crate::agent::RateLimitEvent> {
+        self.rate_limit.as_ref()
     }
 
     pub fn items(&self) -> &[Item] {
@@ -596,7 +607,9 @@ impl Transcript {
         } else {
             ToolState::Running
         };
-        if let Some(Item::Tool { state, .. }) = self.find_tool_mut(&tool_use_id) {
+        if let Some(Item::Tool { state, .. }) = self.find_tool_mut(&tool_use_id)
+            && *state != ToolState::Denied
+        {
             *state = new_state;
         }
         // A tool's time should be how long it ran, not how long the user took to answer:
@@ -651,6 +664,27 @@ impl Transcript {
 
     fn apply_event(&mut self, event: &AgentEvent) {
         match event {
+            AgentEvent::UsageUpdated(usage) => self.usage = Some(usage.clone()),
+            AgentEvent::RateLimit(limit) => self.rate_limit = Some(limit.clone()),
+            AgentEvent::ToolOutput { id, update } => {
+                if let Some(Item::Tool { output, .. }) = self.find_tool_mut(id) {
+                    match update {
+                        TextUpdate::Append(text) => output.get_or_insert_default().push_str(text),
+                        TextUpdate::Replace(text) => *output = Some(text.clone()),
+                    }
+                }
+            }
+            AgentEvent::ToolDuration { id, duration_ms } => {
+                if let Some(Item::Tool { took, .. }) = self.find_tool_mut(id) {
+                    *took = Some(Duration::from_millis(*duration_ms));
+                }
+            }
+            AgentEvent::ApprovalAnswered { key, intent } => self.resolve_approval(*key, *intent),
+            AgentEvent::ApprovalUpdated(request) => {
+                if let Some(current) = self.pending.iter_mut().find(|r| r.key() == request.key()) {
+                    *current = request.clone();
+                }
+            }
             AgentEvent::TurnActive => {
                 if !self.status.is_busy() {
                     self.status = Status::Working;
@@ -721,7 +755,19 @@ impl Transcript {
                 }
             }
             AgentEvent::ApprovalResolved(key) => {
+                let tool_id = self
+                    .pending
+                    .iter()
+                    .find(|r| r.key() == *key)
+                    .map(|r| r.view().tool.id.clone());
                 self.pending.retain(|request| request.key() != *key);
+                if let Some(id) = tool_id
+                    && !self.pending.iter().any(|r| r.view().tool.id == id)
+                    && let Some(Item::Tool { state, .. }) = self.find_tool_mut(&id)
+                    && *state == ToolState::Waiting
+                {
+                    *state = ToolState::Running;
+                }
                 if self.pending.is_empty() && self.status == Status::Waiting {
                     self.status = Status::Working;
                 }
@@ -779,7 +825,9 @@ impl Transcript {
 
     fn apply_permission_request(&mut self, request: &crate::agent::ApprovalRequest) {
         let tool_use_id = request.view().tool.id.clone();
-        if let Some(Item::Tool { state, .. }) = self.find_tool_mut(&tool_use_id) {
+        if let Some(Item::Tool { state, .. }) = self.find_tool_mut(&tool_use_id)
+            && *state != ToolState::Denied
+        {
             *state = ToolState::Waiting;
         }
         self.pending.push_back(request.clone());
@@ -875,7 +923,18 @@ impl Transcript {
 
     fn add_tool(&mut self, tool: &ToolDescriptor) {
         let tool_use_id = &tool.id;
-        if self.tool_position(tool_use_id).is_some() {
+        if let Some(Item::Tool {
+            name,
+            display_name,
+            summary,
+            input,
+            ..
+        }) = self.find_tool_mut(tool_use_id)
+        {
+            *name = tool.name.clone();
+            *display_name = tool.display_name.clone();
+            *summary = tool.summary.clone();
+            *input = tool.arguments.clone();
             return;
         }
         let id = self.new_id();

@@ -41,8 +41,7 @@ impl Probe {
     }
 
     pub(crate) fn send(&mut self, value: &serde_json::Value) -> Result<()> {
-        let mut bytes = serde_json::to_vec(value)?;
-        bytes.push(b'\n');
+        let bytes = crate::providers::rpc::line(value)?;
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
             self.check_deadline()?;
