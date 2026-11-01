@@ -52,6 +52,9 @@ impl Reply {
         self.source = text.into();
         self.state.update(cx, |state, cx| state.set_text(text, cx));
     }
+    pub fn state(&self) -> Entity<TextViewState> {
+        self.state.clone()
+    }
     pub fn view(&self, _: &App) -> TextView {
         TextView::new(&self.state)
             .selectable(false)

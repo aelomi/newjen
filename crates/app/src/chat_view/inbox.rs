@@ -1,5 +1,5 @@
-//! The Thread / Terminal tabs over the main column and the per-thread terminal. (Approvals
-//! are answered from the thread's own dock; the list's "Needs you" group replaces the inbox.)
+//! The per-thread terminal and the panel under the main column that shows it. (Approvals are
+//! answered from the thread's own dock; the list's "Needs you" group replaces the inbox.)
 
 use super::*;
 impl ChatView {
@@ -40,11 +40,22 @@ impl ChatView {
                 .any(|peer| making_in(peer.read(cx)))
     }
 
-    /// ⌘` or the Terminal tab: shows the thread's shell, opening one in its working folder
-    /// the first time. Back to the thread when it is already up.
+    /// Whether the terminal panel is out and the keyboard is in it.
+    pub(super) fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
+        self.terminal_open
+            && self.slots[self.active]
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    /// ⌘` or the terminal button: shows the thread's shell under the chat, opening one in its
+    /// working folder the first time. Hides the panel when it is already up (the shell keeps
+    /// running).
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.panel == Panel::Terminal {
-            self.panel = Panel::Thread;
+        if self.terminal_open {
+            self.terminal_open = false;
+            self.terminal_wanted = false;
             self.enter(window, cx);
             return;
         }
@@ -73,7 +84,6 @@ impl ChatView {
         };
         if let Some(notice) = refused {
             self.slots[self.active].notice = Some(notice);
-            self.panel = Panel::Thread;
             cx.notify();
             return;
         }
@@ -82,76 +92,76 @@ impl ChatView {
             .terminal
             .get_or_insert_with(|| cx.new(|cx| TerminalPanel::new(&cwd, cx)))
             .clone();
-        self.thread()
-            .clone()
-            .update(cx, |thread, _| thread.set_active(false));
-        self.panel = Panel::Terminal;
+        self.terminal_open = true;
+        self.terminal_wanted = true;
         self.drawer_open = false;
         window.focus(&terminal.focus_handle(cx), cx);
         cx.notify();
     }
 
+    /// The panel's ×: stops the shell and takes the panel away.
     fn close_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(terminal) = self.slots[self.active].terminal.take() {
             terminal.update(cx, |terminal, _| terminal.shutdown());
         }
-        self.panel = Panel::Thread;
+        self.terminal_open = false;
+        self.terminal_wanted = false;
         self.enter(window, cx);
     }
 
-    pub(super) fn render_panel_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
-        let thread = self.press(cx, |view, window, cx| {
-            view.panel = Panel::Thread;
-            view.enter(window, cx);
-        });
-        let terminal = self.press(cx, |view, window, cx| view.toggle_terminal(window, cx));
+    /// The terminal panel under the chat: a strip with the shell's tab and a close button, over
+    /// the shell. `None` while it is hidden.
+    pub(super) fn render_terminal_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.terminal_open {
+            return None;
+        }
+        let terminal = self.slots[self.active].terminal.clone()?;
         let close = self.press(cx, |view, window, cx| view.close_terminal(window, cx));
-        let tab = |id, label: SharedString, panel, action: OnPress| {
-            ui::button(
-                id,
-                label,
-                if self.panel == panel {
-                    ui::Look::Secondary
-                } else {
-                    ui::Look::Ghost
-                },
-                ui::Size::Sm,
-                cx,
-            )
-            .on_click(move |_, window, cx| action(window, cx))
-        };
-        h_flex()
+        let colors = &cx.theme().colors;
+        let strip = h_flex()
             .flex_none()
-            .gap_2()
-            .px_4()
+            .justify_between()
+            .px_2()
             .py_1()
-            .child(tab(
-                "conversation-tab",
-                "Thread".into(),
-                Panel::Thread,
-                thread,
-            ))
-            .child(tab(
-                "terminal-tab",
-                "Terminal".into(),
-                Panel::Terminal,
-                terminal,
-            ))
-            .when(self.panel == Panel::Terminal, |row| {
-                row.child(
-                    ui::button(
-                        "close-terminal",
-                        "Close terminal",
-                        ui::Look::Ghost,
-                        ui::Size::Sm,
-                        cx,
-                    )
+            .border_t_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(colors.muted)
+                    .text_sm()
+                    .text_color(colors.foreground)
+                    .child(ui::icon(
+                        ui::IconName::Terminal,
+                        gpui_kit::component::Size::Small,
+                        colors.muted_foreground,
+                    ))
+                    .child(crate::terminal::shell_name()),
+            )
+            .child(
+                ui::icon_button("close-terminal", ui::IconName::Close, "Close terminal", cx)
+                    .debug_selector(|| "close-terminal".to_string())
                     .on_click(move |_, window, cx| close(window, cx)),
-                )
-            })
-            .into_any_element()
+            );
+        Some(
+            v_flex()
+                .id("terminal-drawer")
+                .debug_selector(|| "terminal-drawer".to_string())
+                .flex_none()
+                .w_full()
+                .h(px(TERMINAL_HEIGHT))
+                .max_h(gpui::relative(0.5))
+                .child(strip)
+                .child(v_flex().flex_1().min_h_0().child(terminal))
+                .into_any_element(),
+        )
     }
 }
+
+const TERMINAL_HEIGHT: f32 = 250.0;
 
 /// Whether two project roots are the same repository, or one lies in the other.
 pub(super) fn overlaps(a: &Path, b: &Path) -> bool {

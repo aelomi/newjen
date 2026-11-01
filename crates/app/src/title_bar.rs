@@ -1,7 +1,7 @@
-//! The bar across the top of the chat (screens 8–11): the thread's title and folder in the
-//! middle; the shield with its list of rules allowed in the thread and the status pill on the
-//! right; and, while the thread list is out of sight, the button that brings it back on the
-//! left.
+//! The bar across the top of the chat: the thread's title and where it works (Local or a Rift
+//! copy) in the middle; the shield with its list of rules allowed in the thread, the terminal
+//! button and the Changes button on the right; and, while the thread list is out of sight, the
+//! button that brings it back on the left.
 //!
 use std::rc::Rc;
 
@@ -16,22 +16,15 @@ use gpui_kit::base::{FocusTrapElement as _, Selectable, h_flex, v_flex};
 use gpui_kit::component::ThemeStyled as _;
 use gpui_kit::component::animation::ease_out_cubic;
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::{Sizable as _, tag::Tag};
-use newjen_core::{GrantId, GrantView, Status};
+use gpui_kit::component::tooltip::Tooltip;
+use newjen_core::{GrantId, GrantView};
 
 use crate::sidebar::{self, OnPress};
-use crate::ui::{self, AgentState, IconName, Look, Tone, ellipsis, middle_ellipsis};
+use crate::ui::{self, IconName, Look, ellipsis, middle_ellipsis};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::TITLE_BAR_HEIGHT;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 
-/// About how wide one character of the path (12 px mono) is, and the share of the chat's
-/// width the path may take beside the title.
-const PATH_CHAR: f32 = 7.2;
-const PATH_SHARE: f32 = 0.25;
-/// The path is never cut shorter than this many characters, nor kept longer.
-const PATH_MIN_CHARS: usize = 12;
-const PATH_MAX_CHARS: usize = 48;
 /// The grants popover's width, as in the mock (330 px with its own padding).
 const GRANTS_WIDTH: f32 = 306.0;
 /// Everything in the grants popover that is not a rule's row, top to bottom: its padding and
@@ -67,8 +60,10 @@ pub struct Grants {
 pub struct Bar {
     /// The thread's title, e.g. "Fix the flaky orphan test" or "New thread".
     pub title: SharedString,
-    /// The folder the thread's claude works in, as `~/…`, already cut to fit.
+    /// The folder the thread's claude works in, as `~/…`: the where chip's tooltip. Empty while
+    /// the Rift copy is made and its folder is not known yet.
     pub path: String,
+    /// The thread works in a Rift copy (the chip says "Rift copy"), not the project folder.
     pub copy: bool,
     /// Set while the thread list is out of sight: the button that shows it, and whether
     /// another thread waits for an approval (an amber dot on the button).
@@ -76,15 +71,22 @@ pub struct Bar {
     /// The thread's "Allow in this thread" rules.
     pub grants: Vec<GrantView>,
     pub grants_detail: &'static str,
-    pub pill: Option<Pill>,
     /// How many commands Claude keeps running in the background.
     pub background_tasks: usize,
+    /// The button that shows and hides the terminal panel.
+    pub terminal: TerminalToggle,
     /// The button that shows and hides the Changes card; none while there is nothing to show.
     pub changes: Option<ChangesToggle>,
 }
 
 /// Called with the click, so a key press and a mouse click can tell themselves apart.
 pub type OnClick = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+pub struct TerminalToggle {
+    /// The panel is on screen.
+    pub shown: bool,
+    pub on_press: OnClick,
+}
 
 pub struct ChangesToggle {
     /// The card is on screen.
@@ -122,16 +124,8 @@ pub fn grants_footer(background_tasks: usize) -> String {
     }
 }
 
-/// How many characters of the path fit beside the title in a chat `main_width` pixels wide.
-/// The title gives way first (it is cut with "…"); the path keeps about a quarter of the bar,
-/// cut in its middle (`format::short_path`) so its last folders stay readable.
-pub fn path_budget(main_width: f32) -> usize {
-    ((main_width * PATH_SHARE / PATH_CHAR).max(0.0) as usize).clamp(PATH_MIN_CHARS, PATH_MAX_CHARS)
-}
-
 /// Draws the bar.
 pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> AnyElement {
-    let colors = cx.theme().colors;
     let lights_over_bar = bar.show_list.is_some();
 
     // Left: Kit's room for the traffic lights, which sit over this bar while the list is
@@ -150,28 +144,10 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
         .gap_2()
         .child(
             gpui_kit::component::label::Label::new(bar.title)
-                .flex_1()
                 .min_w_0()
                 .text_ellipsis(),
         )
-        .when(bar.copy, |middle| {
-            middle.child(
-                div()
-                    .flex_none()
-                    .debug_selector(|| "rift-copy-tag".to_string())
-                    .child(Tag::secondary().small().child("Rift copy")),
-            )
-        })
-        .when(!bar.path.is_empty(), |middle| {
-            middle.child(
-                div()
-                    .min_w_0()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_sm()
-                    .text_color(colors.muted_foreground)
-                    .child(middle_ellipsis(bar.path)),
-            )
-        });
+        .child(where_chip(bar.copy, bar.path, cx));
     let right = div().flex_none().flex().justify_end().pl_2().pr_3().child(
         // Over the drag region, so a press here is the control's, not a window drag.
         h_flex()
@@ -186,7 +162,7 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
                     grants,
                 ))
             })
-            .children(bar.pill.map(status_pill))
+            .child(terminal_button(bar.terminal, cx))
             .children(bar.changes.map(|toggle| changes_button(toggle, cx))),
     );
     ui::card_title_bar(cx)
@@ -195,6 +171,60 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
         .child(middle)
         .child(right)
         .into_any_element()
+}
+
+/// Where the thread works: the project folder ("Local") or its Rift copy, quiet beside the
+/// title. The full folder is its tooltip.
+fn where_chip(copy: bool, path: String, cx: &App) -> AnyElement {
+    let colors = &cx.theme().colors;
+    let (glyph, label) = if copy {
+        (IconName::Layers, "Rift copy")
+    } else {
+        (IconName::Folder, "Local")
+    };
+    h_flex()
+        .id("where-chip")
+        .flex_none()
+        .gap_1()
+        .items_center()
+        .text_sm()
+        .text_color(colors.muted_foreground)
+        .debug_selector(|| "where-chip".to_string())
+        .child(ui::icon(
+            glyph,
+            gpui_kit::component::Size::Small,
+            colors.muted_foreground,
+        ))
+        .child(
+            div()
+                .when(copy, |label| {
+                    label.debug_selector(|| "rift-copy-tag".to_string())
+                })
+                .child(label),
+        )
+        .when(!path.is_empty(), |chip| {
+            chip.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
+        })
+        .into_any_element()
+}
+
+/// The terminal button, lit while the panel is out.
+fn terminal_button(toggle: TerminalToggle, cx: &App) -> AnyElement {
+    let on_press = toggle.on_press;
+    ui::icon_button(
+        "terminal-toggle",
+        IconName::Terminal,
+        if toggle.shown {
+            "Hide terminal"
+        } else {
+            "Show terminal"
+        },
+        cx,
+    )
+    .selected(toggle.shown)
+    .debug_selector(|| "terminal-toggle".to_string())
+    .on_click(move |event, window, cx| on_press(event, window, cx))
+    .into_any_element()
 }
 
 /// The git-compare button at the right end of the bar, lit while the Changes card is out.
@@ -238,49 +268,6 @@ fn show_list_button(on_press: OnPress, attention: bool, cx: &App) -> AnyElement 
             )
         })
         .into_any_element()
-}
-
-/// How the status pill looks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Pill {
-    /// The agent status tag.
-    Agent(AgentState),
-    /// A badge with a dot: this word, in this tone.
-    Badge(&'static str, Tone),
-    /// A blue badge with a dot: this many commands still run in the background.
-    Background(usize),
-}
-
-pub const STARTING: Pill = Pill::Badge("Starting", Tone::Info);
-
-/// The pill for a thread's status, worded as the mocks and the thread list word it (screens
-/// 8–11): "Needs approval" in amber, a quiet "Idle" once a turn is done, a quiet "Stopped",
-/// and "Background task running" instead of those (and of failed) while a command Claude
-/// started still runs. The agent tag stays for working and
-/// failed.
-/// A thread with no message yet has none.
-pub fn pill(status: Status, background_tasks: usize) -> Option<Pill> {
-    Some(match status {
-        Status::Working => Pill::Agent(AgentState::Working),
-        Status::Waiting => Pill::Badge(sidebar::NEEDS_APPROVAL, Tone::Warning),
-        _ if background_tasks > 0 => Pill::Background(background_tasks),
-        Status::Failed => Pill::Agent(AgentState::Failed),
-        // The turn's own "Done in 4.2s" line and the list's "Done · 4m ago" already say it
-        // finished; the pill says what the thread is doing now.
-        Status::Done => Pill::Badge("Idle", Tone::Neutral),
-        Status::Stopped => Pill::Badge("Stopped", Tone::Neutral),
-        Status::Idle => return None,
-    })
-}
-
-fn status_pill(pill: Pill) -> AnyElement {
-    match pill {
-        Pill::Agent(state) => ui::agent_pill(state).into_any_element(),
-        Pill::Badge(label, tone) => ui::status_badge(label, tone).into_any_element(),
-        Pill::Background(count) => {
-            ui::status_badge(sidebar::background_detail(count), Tone::Info).into_any_element()
-        }
-    }
 }
 
 /// A shield with the count of rules allowed in this thread: opens the list of them. Tab stays
@@ -501,13 +488,16 @@ mod tests {
                 title: "Reconcile the billing data for the partial reversal handler and every \
                         currency pair"
                     .into(),
-                path: "…/verify-project".into(),
+                path: "~/work/verify-project".into(),
                 copy: true,
                 show_list: Some((Rc::new(|_, _| {}), false)),
                 grants: vec![],
                 grants_detail: "Claude runs these without asking, until you revoke them.",
-                pill: pill(Status::Waiting, 0),
                 background_tasks: 0,
+                terminal: TerminalToggle {
+                    shown: false,
+                    on_press: Rc::new(|_, _, _| {}),
+                },
                 changes: None,
             };
             let grants = Grants {
@@ -522,7 +512,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_long_title_gives_way_to_the_status_pill(cx: &mut gpui::TestAppContext) {
+    fn a_long_title_gives_way_to_the_where_chip_and_buttons(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_kit::init);
         let (_, cx) = cx.add_window_view(|_, cx| Narrow {
             focus: cx.focus_handle(),
@@ -531,63 +521,14 @@ mod tests {
         cx.run_until_parked();
         let right = cx.debug_bounds("title-bar-right").unwrap();
         assert!(right.right() <= px(640.), "{right:?}");
-        let tag = cx.debug_bounds("rift-copy-tag").unwrap();
-        assert!(tag.size.width > px(40.), "the tag keeps its width: {tag:?}");
-        assert!(tag.right() <= right.left(), "{tag:?} {right:?}");
-    }
-
-    #[test]
-    fn the_path_keeps_a_quarter_of_the_bar() {
-        assert_eq!(path_budget(640.0), 22);
-        assert_eq!(path_budget(960.0), 33);
-        // Never too short to read, never so long it pushes the title away.
-        assert_eq!(path_budget(100.0), PATH_MIN_CHARS);
-        assert_eq!(path_budget(4000.0), PATH_MAX_CHARS);
-    }
-
-    #[test]
-    fn the_pill_says_what_the_list_says() {
-        assert_eq!(
-            pill(Status::Waiting, 0),
-            Some(Pill::Badge("Needs approval", Tone::Warning))
+        let chip = cx.debug_bounds("where-chip").unwrap();
+        assert!(
+            chip.size.width > px(40.),
+            "the chip keeps its width: {chip:?}"
         );
-        assert_eq!(
-            pill(Status::Done, 0),
-            Some(Pill::Badge("Idle", Tone::Neutral))
-        );
-        assert_eq!(
-            pill(Status::Stopped, 0),
-            Some(Pill::Badge("Stopped", Tone::Neutral))
-        );
-        assert_eq!(
-            pill(Status::Working, 0),
-            Some(Pill::Agent(AgentState::Working))
-        );
-        assert_eq!(
-            pill(Status::Failed, 0),
-            Some(Pill::Agent(AgentState::Failed))
-        );
-        assert_eq!(pill(Status::Idle, 0), None);
-    }
-
-    #[test]
-    fn a_command_left_running_in_the_background_replaces_idle() {
-        assert_eq!(pill(Status::Done, 1), Some(Pill::Background(1)));
-        assert_eq!(pill(Status::Stopped, 2), Some(Pill::Background(2)));
-        // The failed turn's error row is on screen right below.
-        assert_eq!(pill(Status::Failed, 1), Some(Pill::Background(1)));
-        // A running turn or an approval says more.
-        assert_eq!(
-            pill(Status::Working, 1),
-            Some(Pill::Agent(AgentState::Working))
-        );
-        assert_eq!(
-            pill(Status::Waiting, 1),
-            Some(Pill::Badge("Needs approval", Tone::Warning))
-        );
-        // The same words as the thread's row.
-        assert_eq!(sidebar::background_detail(1), "Background task running");
-        assert_eq!(sidebar::background_detail(2), "2 background tasks running");
+        assert!(chip.right() <= right.left(), "{chip:?} {right:?}");
+        assert!(cx.debug_bounds("rift-copy-tag").is_some());
+        assert!(cx.debug_bounds("terminal-toggle").is_some());
     }
 
     #[test]

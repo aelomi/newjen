@@ -9,6 +9,11 @@ pub const SIDEBAR: Pixels = px(255.);
 pub const CARD_INSET: Pixels = px(8.);
 pub const CARD_RADIUS: Pixels = px(10.);
 
+/// How opaque menus, popovers and tooltips are. GPUI blurs only what is behind the window, not
+/// the card's own text behind a popover, so anything much more see-through is illegible over
+/// text. This keeps a hint of the glass.
+const POPOVER_ALPHA: f32 = 0.97;
+
 /// The window's materials, chosen by light or dark mode and by Reduce Transparency.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
@@ -22,7 +27,8 @@ pub struct Material {
     /// The solid floating panel: the chat, and the recent projects.
     pub card: Hsla,
     pub card_stroke: Hsla,
-    /// Menus, popovers and tooltips. Opaque under Reduce Transparency.
+    /// Menus, popovers and tooltips: nearly opaque (see `POPOVER_ALPHA`), fully so under Reduce
+    /// Transparency.
     pub popover_glass: Hsla,
 }
 
@@ -35,9 +41,9 @@ impl Material {
             color
         };
         let (tint, popover) = if dark {
-            (shade(0x0e0e12, 0.82), shade(0x1b1b21, 0.82))
+            (shade(0x0e0e12, 0.82), shade(0x1b1b21, POPOVER_ALPHA))
         } else {
-            (shade(0xf4f4f7, 0.82), shade(0xfbfbfd, 0.85))
+            (shade(0xf4f4f7, 0.82), shade(0xfbfbfd, POPOVER_ALPHA))
         };
         let (glass_tint, popover_glass) = if reduce_transparency {
             (Hsla { a: 1.0, ..tint }, Hsla { a: 1.0, ..popover })

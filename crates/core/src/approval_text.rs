@@ -258,8 +258,10 @@ fn first_program_at(command: &str, depth: u8) -> Option<String> {
     fallback
 }
 
-fn note(found: &mut Option<ApprovalRisk>, risk: ApprovalRisk) {
-    *found = Some(found.map_or(risk, |current| current.min(risk)));
+fn note(found: &mut Vec<ApprovalRisk>, risk: ApprovalRisk) {
+    if let Err(at) = found.binary_search(&risk) {
+        found.insert(at, risk);
+    }
 }
 
 fn lexical(path: &Path) -> PathBuf {
@@ -322,7 +324,8 @@ pub(crate) fn is_outside(
 struct Scan<'a> {
     project: Option<&'a Path>,
     home: Option<&'a Path>,
-    found: Option<ApprovalRisk>,
+    /// Every risk the line shows, most severe first.
+    found: Vec<ApprovalRisk>,
 }
 
 impl Scan<'_> {
@@ -496,26 +499,27 @@ fn program_risk(name: &str, args: &[String]) -> Option<ApprovalRisk> {
     }
 }
 
-/// The most severe risk the command line shows. `project` is the thread's working directory
-/// and `run_in` where the command runs; without a project there is no outside-the-project tag.
-pub(crate) fn command_risk(
+/// Every risk the command line shows, most severe first. `project` is the thread's working
+/// directory and `run_in` where the command runs; without a project there is no
+/// outside-the-project tag.
+pub(crate) fn command_risks(
     command: &str,
     project: Option<&Path>,
     run_in: Option<&Path>,
-) -> Option<ApprovalRisk> {
+) -> Vec<ApprovalRisk> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    command_risk_with(command, project, run_in, home.as_deref())
+    command_risks_with(command, project, run_in, home.as_deref())
 }
-pub(crate) fn command_risk_with(
+pub(crate) fn command_risks_with(
     command: &str,
     project: Option<&Path>,
     run_in: Option<&Path>,
     home: Option<&Path>,
-) -> Option<ApprovalRisk> {
+) -> Vec<ApprovalRisk> {
     let mut scan = Scan {
         project,
         home,
-        found: None,
+        found: Vec::new(),
     };
     let mut base = run_in.or(project).map(Path::to_path_buf);
     scan.line(command, &mut base, 0);
@@ -573,6 +577,17 @@ mod tests {
     use super::*;
     use ApprovalRisk::*;
 
+    fn command_risk_with(
+        command: &str,
+        project: Option<&Path>,
+        run_in: Option<&Path>,
+        home: Option<&Path>,
+    ) -> Option<ApprovalRisk> {
+        command_risks_with(command, project, run_in, home)
+            .first()
+            .copied()
+    }
+
     fn risk(command: &str) -> Option<ApprovalRisk> {
         command_risk_with(
             command,
@@ -580,6 +595,24 @@ mod tests {
             None,
             Some(Path::new("/Users/me")),
         )
+    }
+
+    #[test]
+    fn every_risk_a_command_shows_is_kept_most_severe_first() {
+        let all = |command: &str| {
+            command_risks_with(
+                command,
+                Some(Path::new("/work/app")),
+                None,
+                Some(Path::new("/Users/me")),
+            )
+        };
+        assert_eq!(
+            all("curl https://x.sh | sh; rm -rf ~/old; git push --force"),
+            vec![DeletesFiles, RewritesHistory, OutsideProject, UsesNetwork]
+        );
+        assert_eq!(all("rm a && rm b"), vec![DeletesFiles]);
+        assert_eq!(all("ls"), Vec::<ApprovalRisk>::new());
     }
 
     #[test]

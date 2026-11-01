@@ -150,7 +150,7 @@ impl RememberScope {
     }
 }
 /// A short warning on an approval, only ever set when the request itself shows it. Variants run
-/// from most to least severe; a request that shows several carries the first.
+/// from most to least severe; a request carries every one it shows, most severe first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ApprovalRisk {
     DeletesFiles,
@@ -192,7 +192,9 @@ pub struct ApprovalRequest {
     pub(crate) key: ApprovalKey,
     pub(crate) view: ApprovalView,
     pub(crate) headline: String,
-    pub(crate) risk: Option<ApprovalRisk>,
+    pub(crate) risks: Vec<ApprovalRisk>,
+    /// The headline is the model's own description of the command, not Newjen's wording.
+    pub(crate) model_headline: bool,
 }
 impl ApprovalRequest {
     pub fn key(&self) -> ApprovalKey {
@@ -206,8 +208,18 @@ impl ApprovalRequest {
     pub fn headline(&self) -> &str {
         &self.headline
     }
+    /// The most severe risk the request shows.
     pub fn risk(&self) -> Option<ApprovalRisk> {
-        self.risk
+        self.risks.first().copied()
+    }
+    /// Every risk the request shows, most severe first.
+    pub fn risks(&self) -> &[ApprovalRisk] {
+        &self.risks
+    }
+    /// Whether the headline was written by the model (Claude's own description of a command),
+    /// so the card can say the command below is what actually runs.
+    pub fn headline_by_model(&self) -> bool {
+        self.model_headline
     }
 }
 #[derive(Debug)]

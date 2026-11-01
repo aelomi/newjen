@@ -366,7 +366,7 @@ fn open_window(
         view.update(cx, |view, cx| view.install_attention(window, cx));
         let closing = view.downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            let _ = closing.update(cx, |view, cx| view.request_quit(window, cx));
+            let _ = closing.update(cx, |view, cx| view.ask_to_quit(window, cx));
             false
         });
         view
@@ -443,17 +443,24 @@ fn open_window(
     .detach();
     // Quit targets this window even when minimized, and defers past the key event's update.
     let asking = view.downgrade();
-    let request = move |cx: &mut App| {
+    let request = move |cx: &mut App, confirms: bool| {
         let view = asking.clone();
         cx.defer(move |cx| {
             let _ = window_handle.update(cx, |_, window, cx| {
-                let _ = view.update(cx, |view, cx| view.request_quit(window, cx));
+                let _ = view.update(cx, |view, cx| {
+                    if confirms {
+                        view.request_quit(window, cx)
+                    } else {
+                        view.ask_to_quit(window, cx)
+                    }
+                });
             });
         });
     };
     let quit = request.clone();
-    cx.on_action(move |_: &Quit, cx| quit(cx));
-    cx.on_action(move |_: &CloseWindow, cx| request(cx));
+    // Only a second ⌘Q answers the question yes; ⌘W just keeps it up.
+    cx.on_action(move |_: &Quit, cx| quit(cx, true));
+    cx.on_action(move |_: &CloseWindow, cx| request(cx, false));
     // Quitting settles and saves every thread and stops every agent and terminal. GPUI runs
     // this hook to completion; its 200 ms limit applies only to the returned future. The hook
     // keeps the view alive itself: closing the window drops the window's hold on it before the

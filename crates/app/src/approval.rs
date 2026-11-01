@@ -45,21 +45,22 @@ pub struct Detail {
 /// headline already), the file for edits, otherwise the arguments as compact JSON. Cut to
 /// `room`, so a huge command cannot push the buttons off screen: a long command keeps its first
 /// and last lines with the middle cut, so the end of the command (often the part that actually
-/// runs things) is always visible before you approve it. When the risk tag does not already say
-/// "Outside the project", a last row warns about `outside`, the path from [`outside_path`]
-/// (passed in, so drawing a frame never touches the disk).
+/// runs things) is always visible before you approve it. A command that carries any risk tag is
+/// never cut: the user reads all of it (the card's detail block scrolls). When the risk tag does
+/// not already say "Outside the project", a last row warns about `outside`, the path from
+/// [`outside_path`] (passed in, so drawing a frame never touches the disk).
 pub fn card_detail(
     request: &ApprovalView,
     outside: Option<&str>,
     room: Room,
-    risk: Option<ApprovalRisk>,
+    risks: &[ApprovalRisk],
 ) -> Detail {
-    let style = if risk == Some(ApprovalRisk::OutsideProject) {
+    let style = if risks.contains(&ApprovalRisk::OutsideProject) {
         Style::CardTagged
     } else {
         Style::Card
     };
-    detail_in(request, outside, room, style)
+    detail_in(request, outside, room, style, !risks.is_empty())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,7 +71,14 @@ enum Style {
     CardTagged,
 }
 
-fn detail_in(request: &ApprovalView, outside: Option<&str>, room: Room, style: Style) -> Detail {
+/// `whole`: the Bash command is kept whole, however long.
+fn detail_in(
+    request: &ApprovalView,
+    outside: Option<&str>,
+    room: Room,
+    style: Style,
+    whole: bool,
+) -> Detail {
     // The warning gets its row first: it matters more than the purpose.
     let outside = outside.map(|path| match style {
         Style::CardTagged => short_path(path, room.cols.max(12)),
@@ -85,7 +93,11 @@ fn detail_in(request: &ApprovalView, outside: Option<&str>, room: Room, style: S
         ..
     } = &request.kind
     {
-        let text = fit_rows(command, room.cols, rows);
+        let text = if whole {
+            command.clone()
+        } else {
+            fit_rows(command, room.cols, rows)
+        };
         let shortened = text != *command;
         (text, shortened)
     } else {
@@ -308,7 +320,7 @@ mod tests {
     }
 
     fn detail(request: &ApprovalView, outside: Option<&str>, room: Room) -> Detail {
-        card_detail(request, outside, room, None)
+        card_detail(request, outside, room, &[])
     }
 
     #[test]
@@ -328,11 +340,11 @@ mod tests {
             "Bash",
             json!({"command": "rm a.rs b.rs", "description": "Delete"}),
         );
-        assert_eq!(card_detail(&ask, None, ROOMY, None).text, "rm a.rs b.rs");
+        assert_eq!(card_detail(&ask, None, ROOMY, &[]).text, "rm a.rs b.rs");
         let mut ask = request("Bash", json!({"command": "touch new.txt"}));
         ask.affected_path = Some("/elsewhere/new.txt".to_string());
         assert_eq!(
-            card_detail(&ask, Some("/elsewhere/new.txt"), ROOMY, None).text,
+            card_detail(&ask, Some("/elsewhere/new.txt"), ROOMY, &[]).text,
             "touch new.txt\nOutside the project: /elsewhere/new.txt"
         );
         // The tag already says "Outside the project", so the row keeps only the path.
@@ -341,7 +353,7 @@ mod tests {
                 &ask,
                 Some("/elsewhere/new.txt"),
                 ROOMY,
-                Some(ApprovalRisk::OutsideProject)
+                &[ApprovalRisk::OutsideProject]
             )
             .text,
             "touch new.txt\n/elsewhere/new.txt"
@@ -354,12 +366,31 @@ mod tests {
             &request("Bash", json!({ "command": long })),
             None,
             ROOMY,
-            None,
+            &[],
         );
         assert!(
             cut.shortened && cut.text.ends_with("echo 40"),
             "{}",
             cut.text
+        );
+        // With any risk tag the command is shown whole.
+        let whole = card_detail(
+            &request("Bash", json!({ "command": long })),
+            None,
+            ROOMY,
+            &[ApprovalRisk::UsesNetwork],
+        );
+        assert!(!whole.shortened && whole.text == long, "{}", whole.text);
+        let wide = format!("curl {}", "x".repeat(900));
+        let whole = card_detail(
+            &request("Bash", json!({ "command": wide })),
+            Some("/elsewhere/a"),
+            ROOMY,
+            &[ApprovalRisk::DeletesFiles],
+        );
+        assert_eq!(
+            whole.text,
+            format!("{wide}\nOutside the project: /elsewhere/a")
         );
     }
 

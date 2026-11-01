@@ -11,7 +11,7 @@ pub use chrome::{card, card_title_bar, glass_title_bar};
 pub use gpui_kit::assets::IconName;
 #[allow(unused_imports)]
 pub use monogram::{monogram, monogram_color, monogram_large};
-pub use status::{AgentState, Tone, agent_pill, status_badge};
+pub use status::{Tone, status_badge};
 pub use text::{caption, ellipsis, key_caps, middle_ellipsis, title};
 
 use gpui::{Hsla, Styled};
@@ -33,7 +33,7 @@ pub use copy::CopyButton;
 pub use message::{ErrorNotice, Pending, assistant, user, user_pending};
 pub use motion::Chevron;
 pub use step::{
-    Detail, Mark, Part, QuietMark, StepState, StepView, WorkBlockView, mark, step_mark,
+    Detail, Mark, Narration, Part, QuietMark, StepState, StepView, WorkBlockView, mark, step_mark,
 };
 pub use tool_card::{ToolBody, ToolCard};
 

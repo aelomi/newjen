@@ -22,8 +22,12 @@ use newjen_core::{Item, Thread, ToolState};
 use crate::approval::ScopeRow;
 use crate::format::{cap, cap_ends, elapsed, turn_caption};
 
-use crate::ui::{self, Look, Mark, Part, QuietMark, StepState, StepView, ToolCard, WorkBlockView};
+use crate::ui::{
+    self, Look, Mark, Narration, Part, QuietMark, StepState, StepView, ToolCard, WorkBlockView,
+};
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::text::TextViewState;
+use gpui_kit::component::tooltip::Tooltip;
 
 // Bound large tool outputs to keep transcript layout responsive.
 const TOOL_TEXT_LINES: usize = 200;
@@ -133,6 +137,11 @@ impl Plan {
         }
     }
 
+    /// The items of block `index`, from its first tool call to its last.
+    pub fn tools(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        self.blocks.get(index)?.tools.clone()
+    }
+
     pub fn slot(&self, ix: usize) -> Slot {
         self.slots.get(ix).copied().unwrap_or(Slot::Plain)
     }
@@ -177,7 +186,13 @@ fn mark_of(state: ToolState) -> Mark {
 
 /// The work block of one turn: a box with the turn's state in its header and its steps below
 /// while it runs, folded to "Worked for 4m 3s · 7 steps" once it ends.
-pub fn work_block(plan: &Plan, index: usize, thread: &Entity<Thread>, cx: &App) -> AnyElement {
+pub fn work_block(
+    plan: &Plan,
+    index: usize,
+    thread: &Entity<Thread>,
+    narrations: HashMap<u64, Entity<TextViewState>>,
+    cx: &App,
+) -> AnyElement {
     let Some(block) = plan.blocks.get(index).cloned() else {
         return div().into_any_element();
     };
@@ -218,7 +233,7 @@ pub fn work_block(plan: &Plan, index: usize, thread: &Entity<Thread>, cx: &App) 
     let parts = {
         let thread = thread.clone();
         let stats = plan.stats.clone();
-        Rc::new(move |cx: &App| parts(&block, &thread, &stats.borrow(), cx))
+        Rc::new(move |cx: &App| parts(&block, &thread, &stats.borrow(), &narrations, cx))
     };
     WorkBlockView::new(id, mark, title, count, live, parts)
         .elapsed(shown)
@@ -229,6 +244,7 @@ fn parts(
     block: &WorkBlock,
     thread: &Entity<Thread>,
     stats: &HashMap<StatKey, Option<(usize, usize)>>,
+    narrations: &HashMap<u64, Entity<TextViewState>>,
     cx: &App,
 ) -> Vec<Part> {
     let reader = thread.read(cx);
@@ -245,8 +261,8 @@ fn parts(
         .iter()
         .enumerate()
         .filter_map(|(offset, item)| match item {
-            Item::Assistant { text, .. } if !text.trim().is_empty() => {
-                Some((tools.start + offset, text.trim()))
+            Item::Assistant { id, text, .. } if !text.trim().is_empty() => {
+                Some((tools.start + offset, *id, text.trim()))
             }
             _ => None,
         })
@@ -259,8 +275,8 @@ fn parts(
             .and_then(|id| at.get(id))
             .copied()
             .unwrap_or(usize::MAX);
-        while let Some((_, text)) = narration.next_if(|(ix, _)| *ix < first_at) {
-            out.push(Part::Narration(cap(text, 4, 400).into()));
+        while let Some((_, id, text)) = narration.next_if(|(ix, _, _)| *ix < first_at) {
+            out.push(narration_part(reader.id(), id, text, narrations));
         }
         let stat = step
             .item_ids
@@ -278,6 +294,19 @@ fn parts(
         )));
     }
     out
+}
+
+fn narration_part(
+    thread: &str,
+    id: u64,
+    text: &str,
+    narrations: &HashMap<u64, Entity<TextViewState>>,
+) -> Part {
+    Part::Narration(Narration {
+        key: ElementId::NamedInteger(format!("narration:{thread}").into(), id),
+        text: cap(text, 4, 400).into(),
+        state: narrations.get(&id).cloned(),
+    })
 }
 
 fn step_view(
@@ -1002,9 +1031,13 @@ fn turn_end(
                 .map(|answer| ui::CopyButton::new(("answer-copy", id), answer)),
         )
         .child(
-            ui::button(("turn-footer", id), model, Look::Ghost, ui::Size::Sm, cx)
-                .tooltip(caption)
-                .text_color(cx.theme().muted_foreground),
+            div()
+                .id(("turn-footer-label", id))
+                .px_2()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(model)
+                .tooltip(move |window, cx| Tooltip::new(caption.clone()).build(window, cx)),
         )
         .into_any_element()
 }

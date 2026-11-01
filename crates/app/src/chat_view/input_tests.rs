@@ -787,6 +787,20 @@ async fn a_turns_tool_calls_fold_into_one_live_work_block(cx: &mut TestAppContex
     let (calls, hidden, blocks) = cx.update(|_, cx| {
         let view = chat.read(cx);
         let items = view.thread().read(cx).transcript().items();
+        // A hidden item is no row of the list: a row of nothing would still take the list's gap.
+        let hidden_items = (0..items.len())
+            .filter(|ix| view.plan.slot(*ix) == rows::Slot::Hidden)
+            .count();
+        assert_eq!(
+            view.slots[view.active].shown.len(),
+            items.len() - hidden_items
+        );
+        assert!(
+            view.slots[view.active]
+                .shown
+                .iter()
+                .all(|ix| view.plan.slot(*ix) != rows::Slot::Hidden)
+        );
         let calls = items
             .iter()
             .filter(|item| matches!(item, Item::Tool { .. }))
@@ -1925,7 +1939,7 @@ async fn cmd_j_goes_to_the_next_thread_that_needs_you_here_then_in_another_proje
     cx.update(|_, cx| {
         let view = chat.read(cx);
         assert_eq!(view.thread().read(cx).id(), first);
-        assert_eq!(view.panel, Panel::Thread);
+        assert!(!view.terminal_open);
     });
     assert_eq!(opened.borrow().len(), 1);
     cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
@@ -1945,7 +1959,7 @@ fn closing_the_drawer_restores_focus_to_the_visible_panel(cx: &mut TestAppContex
     cx.update(|window, cx| {
         assert!(!window.has_active_sheet(cx));
         let view = chat.read(cx);
-        assert_eq!(view.panel, Panel::Terminal);
+        assert!(view.terminal_open);
         assert!(
             view.slots[view.active]
                 .terminal
@@ -1960,6 +1974,67 @@ fn closing_the_drawer_restores_focus_to_the_visible_panel(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn the_terminal_is_a_panel_under_the_chat_with_its_own_close_button(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "terminal-panel", false);
+    cx.executor().allow_parking();
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    cx.run_until_parked();
+    // No tab row over the chat, no status pill; the header has the button.
+    assert!(cx.debug_bounds("conversation-tab").is_none());
+    assert!(cx.debug_bounds("terminal-tab").is_none());
+    assert!(cx.debug_bounds("terminal-drawer").is_none());
+    assert!(cx.debug_bounds("where-chip").is_some());
+    let composer_before = cx.debug_bounds("composer").map(|bounds| bounds.size.width);
+    click(cx, "terminal-toggle");
+    cx.run_until_parked();
+    let drawer = cx.debug_bounds("terminal-drawer").expect("the panel");
+    assert!(drawer.size.height <= px(250.5), "{drawer:?}");
+    assert!(drawer.size.height > px(150.), "{drawer:?}");
+    // The chat stays above it, and the composer is still there to type in.
+    assert!(cx.debug_bounds("where-chip").is_some());
+    assert_eq!(
+        cx.debug_bounds("composer").map(|bounds| bounds.size.width),
+        composer_before
+    );
+    let composer = cx.debug_bounds("composer").expect("the composer stays");
+    assert!(composer.bottom() <= drawer.top() + px(1.));
+    cx.update(|window, cx| {
+        let view = chat.read(cx);
+        assert!(view.terminal_open);
+        assert!(
+            view.slots[view.active]
+                .terminal
+                .as_ref()
+                .unwrap()
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+    });
+    // The same button, and ⌘`, hide it; the shell keeps running.
+    click(cx, "terminal-toggle");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("terminal-drawer").is_none());
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).quit_blockers(cx).terminals),
+        1
+    );
+    cx.simulate_keystrokes("cmd-`");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("terminal-drawer").is_some());
+    // The × stops the shell and takes the panel away.
+    click(cx, "close-terminal");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("terminal-drawer").is_none());
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert!(!view.terminal_open);
+        assert!(view.slots[view.active].terminal.is_none());
+        assert_eq!(view.quit_blockers(cx).terminals, 0);
+    });
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
 fn archiving_the_selected_terminal_returns_to_a_visible_conversation(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "archive-terminal-panel", false);
     cx.executor().allow_parking();
@@ -1968,7 +2043,7 @@ fn archiving_the_selected_terminal_returns_to_a_visible_conversation(cx: &mut Te
         chat.update(cx, |view, cx| {
             let id = view.thread().read(cx).id().to_string();
             view.archive(&id, window, cx);
-            assert_eq!(view.panel, Panel::Thread);
+            assert!(!view.terminal_open);
             assert!(view.slots[view.active].terminal.is_none());
         })
     });

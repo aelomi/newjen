@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use super::{IconName, ToolBody, icon};
 use gpui::{
-    AnyElement, App, ElementId, FontFeatures, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement, RenderOnce, SharedString, Styled, Window, div, prelude::*, px, relative,
+    AnyElement, App, ElementId, Entity, FontFeatures, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div, prelude::*, px,
+    relative,
 };
 use gpui_kit::base::{MotionReveal, MotionStatus, Transition, animation::cubic_bezier};
 use gpui_kit::base::{h_flex, transition_with_status, v_flex};
@@ -12,6 +13,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     spinner::Spinner,
+    text::{TextView, TextViewState},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,7 +133,79 @@ pub struct StepView {
 pub enum Part {
     Step(StepView),
     /// What the agent said between two steps.
-    Narration(SharedString),
+    Narration(Narration),
+}
+
+/// A reply written between two steps: markdown like any reply, quieter, and cut to a few lines
+/// with a "Show more" when it is longer.
+pub struct Narration {
+    pub key: ElementId,
+    pub text: SharedString,
+    /// Its rendered markdown. Without one (never in the app) the text shows as plain lines.
+    pub state: Option<Entity<TextViewState>>,
+}
+
+/// Lines of a narration shown before "Show more".
+const NARRATION_LINES: usize = 6;
+
+#[derive(IntoElement)]
+struct NarrationRow {
+    narration: Narration,
+}
+
+impl RenderOnce for NarrationRow {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Narration { key, text, state } = self.narration;
+        let ui = window.use_keyed_state((key.clone(), "ui"), cx, |_, _| Disclosure::default());
+        let expanded = ui.read(cx).forced.unwrap_or(false);
+        // The text finds out after it is painted whether it was cut: redraw when that changes.
+        let watched = state.clone();
+        window.use_keyed_state((key.clone(), "watch"), cx, move |_, cx| {
+            if let Some(state) = &watched {
+                cx.observe(state, |_, _, cx| cx.notify()).detach();
+            }
+        });
+        let muted = cx.theme().muted_foreground;
+        let (body, more) = match state {
+            Some(state) => {
+                let clamped = state.read(cx).is_clamped();
+                let view = TextView::new(&state)
+                    .selectable(false)
+                    .stream_fade(false)
+                    .code_block_actions(|block, _, _| {
+                        super::CopyButton::new("copy", block.code().to_string())
+                    });
+                let view = if expanded {
+                    view
+                } else {
+                    view.max_lines(NARRATION_LINES)
+                };
+                (view.into_any_element(), clamped || expanded)
+            }
+            None => (div().line_clamp(4).child(text).into_any_element(), false),
+        };
+        v_flex()
+            .debug_selector(|| "narration".to_string())
+            .pr(px(ROW_PAD))
+            .py_1()
+            .pl(px(ROW_PAD + MARK + ROW_GAP))
+            .text_color(muted)
+            .text_size(gpui::rems(0.8125))
+            .child(body)
+            .when(more, |row| {
+                row.child(
+                    super::button(
+                        (key, "more"),
+                        if expanded { "Show less" } else { "Show more" },
+                        super::Look::Ghost,
+                        super::Size::Sm,
+                        cx,
+                    )
+                    .debug_selector(|| "narration-more".to_string())
+                    .on_click(move |event, _, cx| toggle(&ui, expanded, event.is_keyboard(), cx)),
+                )
+            })
+    }
 }
 
 /// The whole block, as the transcript row draws it. Its steps are built only while it is open.
@@ -303,22 +377,12 @@ impl RenderOnce for WorkBlockView {
             ));
         let content = (state != Reveal::Hidden).then(|| {
             let parts = (self.parts)(cx);
-            let muted = cx.theme().muted_foreground;
             v_flex()
                 .debug_selector(|| "work-block-steps".to_string())
                 .pb_1()
-                .children(parts.into_iter().map(|part| {
-                    match part {
-                        Part::Step(step) => StepRow { step }.into_any_element(),
-                        Part::Narration(text) => div()
-                            .pr(px(ROW_PAD))
-                            .py_1()
-                            .pl(px(ROW_PAD + MARK + ROW_GAP))
-                            .text_color(muted)
-                            .line_clamp(4)
-                            .child(text)
-                            .into_any_element(),
-                    }
+                .children(parts.into_iter().map(|part| match part {
+                    Part::Step(step) => StepRow { step }.into_any_element(),
+                    Part::Narration(narration) => NarrationRow { narration }.into_any_element(),
                 }))
                 .into_any_element()
         });
@@ -542,7 +606,11 @@ mod tests {
                 Rc::new(move |_| {
                     vec![
                         step(1, "Read 3 files", false),
-                        Part::Narration("Now the tests.".into()),
+                        Part::Narration(Narration {
+                            key: ("narration", 1u64).into(),
+                            text: "Now the tests.".into(),
+                            state: None,
+                        }),
                         step(2, "Run the tests", true),
                     ]
                 }),
@@ -586,6 +654,81 @@ mod tests {
         );
         cx.run_until_parked();
         assert!(cx.debug_bounds("tool-details").is_some());
+    }
+
+    struct Said {
+        state: Entity<TextViewState>,
+    }
+
+    impl Render for Said {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let state = self.state.clone();
+            div().w(px(640.)).child(WorkBlockView::new(
+                ("block", 2u64),
+                Mark::Working,
+                "Working",
+                "1 step",
+                true,
+                Rc::new(move |_| {
+                    vec![Part::Narration(Narration {
+                        key: ("narration", 2u64).into(),
+                        text: "plain".into(),
+                        state: Some(state.clone()),
+                    })]
+                }),
+            ))
+        }
+    }
+
+    fn said<'a>(
+        text: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<TextViewState>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let state =
+            cx.update(|cx| cx.new(|cx| TextViewState::markdown(text, cx).selectable(false)));
+        let shown = state.clone();
+        let (_, cx) = cx.add_window_view(move |_, _| Said { state: shown });
+        cx.run_until_parked();
+        (state, cx)
+    }
+
+    #[gpui::test]
+    fn what_the_agent_says_between_steps_is_rendered_as_markdown(cx: &mut TestAppContext) {
+        let (state, cx) = said("## What's going on\n\nIt ran **twice**.", cx);
+        let text = cx.update(|_, cx| state.read(cx).rendered_text().as_str().to_string());
+        assert!(
+            text.contains("What's going on") && text.contains("twice"),
+            "{text}"
+        );
+        assert!(!text.contains("##") && !text.contains("**"), "{text}");
+        assert!(cx.debug_bounds("narration").is_some());
+        // Short enough to need no "Show more".
+        assert!(cx.debug_bounds("narration-more").is_none());
+    }
+
+    #[gpui::test]
+    fn a_long_narration_is_cut_with_a_show_more(cx: &mut TestAppContext) {
+        let long = (1..=30)
+            .map(|n| format!("Line {n} of what the agent wrote."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (_, cx) = said(&long, cx);
+        cx.run_until_parked();
+        let cut = cx.debug_bounds("narration").unwrap().size.height;
+        assert!(cut < px(400.), "{cut:?}");
+        let more = cx.debug_bounds("narration-more").expect("a Show more");
+        cx.simulate_click(more.center(), Modifiers::none());
+        cx.run_until_parked();
+        let open = cx.debug_bounds("narration").unwrap().size.height;
+        assert!(open > cut, "{open:?} {cut:?}");
+        let less = cx.debug_bounds("narration-more").expect("a Show less");
+        cx.simulate_click(less.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("narration").unwrap().size.height, cut);
     }
 
     #[gpui::test]

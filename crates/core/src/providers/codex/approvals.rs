@@ -152,11 +152,12 @@ impl CodexCodec {
             namespace: self.namespace,
             serial: self.next_approval,
         };
-        let (headline, risk) = summary(&action, &approval, &tool, &self.cwd);
+        let (headline, risks) = summary(&action, &approval, &tool, &self.cwd);
         let view = ApprovalRequest {
             key,
             headline,
-            risk,
+            risks,
+            model_headline: false,
             view: ApprovalView {
                 tool: tool.clone(),
                 kind,
@@ -224,7 +225,7 @@ impl CodexCodec {
                 pending.view.view.kind = ApprovalKind::FileChange {
                     path: file_path(tool),
                 };
-                (pending.view.headline, pending.view.risk) =
+                (pending.view.headline, pending.view.risks) =
                     summary(&pending.action, &pending.approval, tool, &self.cwd);
             }
             out.event(AgentEvent::ApprovalUpdated(pending.view.clone()));
@@ -236,21 +237,23 @@ fn summary(
     approval: &Approval,
     tool: &ToolDescriptor,
     project: &std::path::Path,
-) -> (String, Option<ApprovalRisk>) {
+) -> (String, Vec<ApprovalRisk>) {
     match action {
         Action::FileChange => file_change_summary(tool, project),
         Action::Command(_) => {
-            let mut risk = approval.command.as_deref().and_then(|command| {
-                approval_text::command_risk(
-                    command,
-                    Some(project),
-                    approval.cwd.as_deref().map(std::path::Path::new),
-                )
-            });
-            if approval.network.is_some() {
-                risk = Some(risk.map_or(ApprovalRisk::UsesNetwork, |r| {
-                    r.min(ApprovalRisk::UsesNetwork)
-                }));
+            let mut risks = approval
+                .command
+                .as_deref()
+                .map_or_else(Vec::new, |command| {
+                    approval_text::command_risks(
+                        command,
+                        Some(project),
+                        approval.cwd.as_deref().map(std::path::Path::new),
+                    )
+                });
+            if approval.network.is_some() && !risks.contains(&ApprovalRisk::UsesNetwork) {
+                risks.push(ApprovalRisk::UsesNetwork);
+                risks.sort();
             }
             let headline = if matches!(approval.kind, CommandKind::WriteStdin) {
                 "Send input to a running command".to_string()
@@ -261,7 +264,7 @@ fn summary(
                     .and_then(action_headline)
                     .unwrap_or_else(|| approval_text::run_headline(approval.command.as_deref()))
             };
-            (headline, risk)
+            (headline, risks)
         }
     }
 }
@@ -324,9 +327,9 @@ fn action_headline(actions: &Value) -> Option<String> {
 fn file_change_summary(
     tool: &ToolDescriptor,
     project: &std::path::Path,
-) -> (String, Option<ApprovalRisk>) {
+) -> (String, Vec<ApprovalRisk>) {
     let Some(changes) = tool.arguments.as_array().filter(|c| !c.is_empty()) else {
-        return ("Edit files".to_string(), None);
+        return ("Edit files".to_string(), Vec::new());
     };
     let kinds: Vec<&str> = changes
         .iter()
@@ -348,18 +351,18 @@ fn file_change_summary(
     } else {
         format!("Change {} files", changes.len())
     };
-    let risk = if kinds.contains(&"delete") {
-        Some(ApprovalRisk::DeletesFiles)
-    } else if changes.iter().any(|change| {
+    let mut risks = Vec::new();
+    if kinds.contains(&"delete") {
+        risks.push(ApprovalRisk::DeletesFiles);
+    }
+    if changes.iter().any(|change| {
         change["path"].as_str().is_some_and(|path| {
             path.starts_with('/') && approval_text::is_outside(project, Some(project), path, None)
         })
     }) {
-        Some(ApprovalRisk::OutsideProject)
-    } else {
-        None
-    };
-    (headline, risk)
+        risks.push(ApprovalRisk::OutsideProject);
+    }
+    (headline, risks)
 }
 fn file_path(tool: &ToolDescriptor) -> Option<String> {
     tool.arguments

@@ -303,6 +303,22 @@ fn kill_session(session: i32, identity: Option<(u64, u64)>) {
     }
 }
 
+/// The shell the terminal runs: the user's, or zsh.
+fn login_shell() -> std::path::PathBuf {
+    std::env::var_os("SHELL")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file())
+        .unwrap_or_else(|| "/bin/zsh".into())
+}
+
+/// The shell's name for the panel's tab ("zsh").
+pub fn shell_name() -> String {
+    login_shell().file_name().map_or_else(
+        || "shell".into(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
 pub struct TerminalPanel {
     session: Option<PtySession>,
     error: Option<String>,
@@ -316,10 +332,7 @@ pub struct TerminalPanel {
 
 impl TerminalPanel {
     pub fn new(cwd: &Path, cx: &mut Context<Self>) -> Self {
-        let shell = std::env::var_os("SHELL")
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_absolute() && path.is_file())
-            .unwrap_or_else(|| "/bin/zsh".into());
+        let shell = login_shell();
         let (session, error, updates) = match PtySession::open(cwd, &shell, &["-l", "-i"]) {
             Ok((session, updates)) => (Some(session), None, Some(updates)),
             Err(error) => (

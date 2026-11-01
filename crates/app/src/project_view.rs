@@ -539,7 +539,7 @@ impl ProjectView {
                         while requests.recv().await.is_ok() {
                             let _ = view.update_in(cx, |view, window, cx| {
                                 cx.activate(true);
-                                view.request_quit(window, cx);
+                                view.ask_to_quit(window, cx);
                             });
                         }
                     }));
@@ -630,15 +630,21 @@ impl ProjectView {
         blockers
     }
 
-    /// ⌘Q, ⌘W, the window's close button and macOS asking the app to quit all come here:
-    /// one confirmation when work would be lost, otherwise the app quits.
+    /// ⌘Q (the Quit action): one confirmation when work would be lost, otherwise the app quits.
+    /// A second ⌘Q while the question is up answers yes.
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.quit_phase == QuitPhase::Confirming {
             self.confirm_quit(window, cx);
             return;
         }
+        self.ask_to_quit(window, cx);
+    }
+
+    /// ⌘W, the window's close button and macOS asking the app to quit: the same question as
+    /// ⌘Q, but while it is up they only bring it forward. Only the Quit shortcut answers yes.
+    pub fn ask_to_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.quit_phase != QuitPhase::Running {
-            if self.quit_dialog {
+            if self.quit_dialog || self.confirm_dialog {
                 window.activate_window();
                 cx.activate(true);
             }
@@ -1967,6 +1973,14 @@ mod tests {
         );
         cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
         cx.run_until_parked();
+        // ⌘W, the close button and macOS asking to quit only keep the question up.
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.ask_to_quit(window, cx)));
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Confirming
+        );
         // ⌘Q again, with the question up, is the answer yes.
         cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
         cx.run_until_parked();

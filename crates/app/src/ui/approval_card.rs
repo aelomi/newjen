@@ -3,13 +3,14 @@ use std::{rc::Rc, time::Duration};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, ElementId, Entity, FontWeight,
     InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, px,
+    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use newjen_core::ApprovalIntent;
 
 use super::{IconName, Look, Size, button, ellipsis, icon};
 use gpui_kit::component::animation::{cubic_bezier, ease_out_cubic};
 use gpui_kit::component::tag::Tag;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 
 pub struct DockMetrics {
@@ -76,7 +77,9 @@ pub struct ApprovalCard {
     title: SharedString,
     headline: Option<SharedString>,
     queue: Option<SharedString>,
-    risk: Option<&'static str>,
+    risks: Vec<&'static str>,
+    /// The headline is Claude's own description of the command.
+    by_model: bool,
     glyph: IconName,
     detail: SharedString,
     on_answer: OnAnswer,
@@ -103,7 +106,8 @@ impl ApprovalCard {
             title: title.into(),
             headline: None,
             queue: None,
-            risk: None,
+            risks: Vec::new(),
+            by_model: false,
             glyph: IconName::Shield,
             detail: detail.into(),
             on_answer: Rc::new(on_answer),
@@ -136,9 +140,15 @@ impl ApprovalCard {
         self.queue = queue;
         self
     }
-    /// The small warning tag at the header's right end.
-    pub fn risk(mut self, risk: Option<&'static str>) -> Self {
-        self.risk = risk;
+    /// The small warning tags, most severe first: one sits at the header's right end, several
+    /// on a row under it.
+    pub fn risks(mut self, risks: Vec<&'static str>) -> Self {
+        self.risks = risks;
+        self
+    }
+    /// Says under the headline that Claude wrote it, and that the command below is what runs.
+    pub fn by_model(mut self, by_model: bool) -> Self {
+        self.by_model = by_model;
         self
     }
     /// The icon in the tile at the header's left end.
@@ -165,7 +175,8 @@ impl ApprovalCard {
             title: self.title.clone(),
             headline: self.headline.clone(),
             queue: self.queue.clone(),
-            risk: self.risk,
+            risks: self.risks.clone(),
+            by_model: self.by_model,
             glyph: self.glyph,
             detail: self.detail.clone(),
             on_answer: self.on_answer.clone(),
@@ -253,9 +264,28 @@ impl RenderOnce for ApprovalCard {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(c.foreground)
-                    .child(ellipsis(headline)),
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(c.foreground)
+                            .child(ellipsis(headline)),
+                    )
+                    .when(self.by_model, |column| {
+                        column.child(
+                            div()
+                                .id((self.id.clone(), "summary-by"))
+                                .debug_selector(|| "approval-summary-by".to_string())
+                                .text_xs()
+                                .text_color(c.muted_foreground)
+                                .child("Claude's summary")
+                                .tooltip(|window, cx| {
+                                    Tooltip::new(
+                                        "Written by Claude. The command below is what will run.",
+                                    )
+                                    .build(window, cx)
+                                }),
+                        )
+                    }),
             )
             .children(self.queue.map(|queue| {
                 div()
@@ -264,10 +294,25 @@ impl RenderOnce for ApprovalCard {
                     .text_color(c.muted_foreground)
                     .child(queue)
             }))
-            .children(
-                self.risk
-                    .map(|label| div().flex_none().child(Tag::danger().small().child(label))),
-            );
+            .children((self.risks.len() == 1).then(|| {
+                div()
+                    .flex_none()
+                    .child(Tag::danger().small().child(self.risks[0]))
+            }));
+        // Several tags share a row under the header, lined up with the headline.
+        let tags = (self.risks.len() > 1).then(|| {
+            div()
+                .debug_selector(|| "approval-risks".to_string())
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .pl(px(TILE + 12.))
+                .children(
+                    self.risks
+                        .iter()
+                        .map(|label| Tag::danger().small().child(*label)),
+                )
+        });
         let detail = (!self.edit).then(|| {
             div()
                 .id((self.id.clone(), "detail"))
@@ -327,6 +372,7 @@ impl RenderOnce for ApprovalCard {
             .bg(c.background)
             .text_sm()
             .child(header)
+            .children(tags)
             .children(detail)
             .children(self.preview)
             .children(self.note.map(|note| {
@@ -390,7 +436,8 @@ mod tests {
                 },
             )
             .headline("Run a very long command that does not fit on a single line of the card")
-            .risk(Some("Deletes files"))
+            .risks(vec!["Deletes files", "Uses the network"])
+            .by_model(true)
             .glyph(IconName::Trash)
             .on_mouse_answer({
                 let view = cx.entity();

@@ -1390,7 +1390,8 @@ mod tests {
                 remember: RememberScope::OnceOnly(crate::agent::OnceReason::NoSafeScope),
             },
             headline: String::new(),
-            risk: None,
+            risks: Vec::new(),
+            model_headline: false,
         })
     }
 

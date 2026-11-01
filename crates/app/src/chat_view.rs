@@ -44,7 +44,7 @@ use newjen_core::{ApprovalIntent, Item, Project, SessionConfig, Status, Store, T
 
 use crate::approval::{self, Room};
 pub use crate::chat_view::lifecycle::{Attention, QuitBlockers};
-use crate::format::{elapsed, fit_rows, short_path, text_rows, tilde};
+use crate::format::{elapsed, fit_rows, text_rows, tilde};
 use crate::keys::{
     self, JumpToNeedsYou, JumpToThread, KeyRoute, NewThread, NextThread, PreviousThread, Stop,
     ToggleSidebar,
@@ -161,14 +161,6 @@ enum CopyProgress {
     Made(Result<rift::Copy, CopyError>),
 }
 
-/// What the main column shows: the thread on screen, or the thread's terminal.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Panel {
-    #[default]
-    Thread,
-    Terminal,
-}
-
 /// Opens a thread of any loaded project (see `ProjectView::reveal_thread`).
 pub type OnOpenThread = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
@@ -179,7 +171,7 @@ struct Slot {
     /// half-typed text (and its undo history) stays with its thread.
     field: Option<Entity<TextareaState>>,
     replies: reply::Replies,
-    /// Its shell, once opened from the Terminal tab. It keeps running while the thread or the
+    /// Its shell, once opened from the header's terminal button. It keeps running while the thread or the
     /// project is out of sight, and stops with the thread (archive, quit, Close terminal).
     terminal: Option<Entity<TerminalPanel>>,
     /// What the thread last looked like, to notice the transitions worth a notification.
@@ -188,6 +180,10 @@ struct Slot {
     placeholder: SharedString,
     notice: Option<Notice>,
     messages: Entity<MessageScrollerState>,
+    /// The items that are rows of the message list, as of the last draw: a tool call or a reply
+    /// inside a work block is drawn by the block, and a row of nothing would still take the
+    /// list's gap.
+    shown: Vec<usize>,
     /// Feeds the thread its events. Dropping the slot (archive) stops it.
     _pump: Task<()>,
     /// Redraws the window whenever the thread changes.
@@ -213,7 +209,11 @@ pub struct ChatView {
     project_chooser: Option<OnPress>,
     thread_opener: Option<OnOpenThread>,
     visible: bool,
-    panel: Panel,
+    /// The terminal panel is out under the chat (its shell is the thread's `Slot::terminal`).
+    terminal_open: bool,
+    /// The keyboard was last in the shell, not the composer: where focus goes back to when
+    /// something else (the drawer, a dock) gives it up.
+    terminal_wanted: bool,
     /// Why desktop notifications cannot be shown, if they can't (`ProjectView` keeps it in
     /// step with the attention adapter).
     attention_note: Option<&'static str>,
@@ -269,7 +269,7 @@ pub struct ChatView {
     plan: rows::Plan,
     /// What `plan` was built from: the thread, its transcript revision and, while a turn runs,
     /// the whole seconds it has run.
-    plan_key: Option<(String, u64, Option<u64>)>,
+    plan_key: Option<(String, u64, Option<u64>, bool)>,
     /// That approval's path outside the thread's folder, if any (`approval::outside_path`).
     /// Worked out once when the request reaches the dock, because it reads the disk and
     /// `render` runs on every streamed frame.
@@ -313,7 +313,8 @@ impl ChatView {
             project_chooser: None,
             thread_opener: None,
             visible: true,
-            panel: Panel::Thread,
+            terminal_open: false,
+            terminal_wanted: false,
             attention_note: None,
             attention_note_dismissed: None,
             copy_peers: vec![],
@@ -518,16 +519,19 @@ impl ChatView {
     /// The keyboard goes to what the panel shows: the composer (or the root while the dock
     /// replaces it), or the terminal.
     fn focus_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let focus = match self.panel {
+        // The shell gets the keyboard back if that is where it was.
+        if self.terminal_open
+            && self.terminal_wanted
+            && let Some(terminal) = &self.slots[self.active].terminal
+        {
+            window.focus(&terminal.focus_handle(cx), cx);
+            return;
+        }
+        let focus = if self.composer_has_keys() && self.review_panel.is_none() {
             // The review panel stands in for the composer while it is open.
-            Panel::Thread if self.composer_has_keys() && self.review_panel.is_none() => {
-                self.field_focus(cx)
-            }
-            Panel::Terminal => self.slots[self.active]
-                .terminal
-                .as_ref()
-                .map(|terminal| terminal.focus_handle(cx)),
-            _ => None,
+            self.field_focus(cx)
+        } else {
+            None
         }
         .unwrap_or_else(|| self.root.clone());
         window.focus(&focus, cx);
@@ -649,6 +653,7 @@ impl ChatView {
             placeholder: SharedString::default(),
             notice: None,
             messages: cx.new(|cx| MessageScrollerState::new(0, cx)),
+            shown: Vec::new(),
             _pump: pump,
             _changes: changes,
         };
@@ -690,11 +695,7 @@ impl ChatView {
                 ) {
                     slot.notice = None;
                     let thread = slot.thread.read(cx);
-                    let count = Entry::count(
-                        thread.transcript().items().len(),
-                        thread.preparing().is_some(),
-                        false,
-                    );
+                    let count = Entry::count(slot.shown.len(), thread.preparing().is_some(), false);
                     slot.messages
                         .update(cx, |messages, cx| messages.reset(count, cx));
                 }
@@ -736,7 +737,7 @@ impl ChatView {
     /// ⌘N or the "New thread" row: a new draft on screen with the cursor in its composer. On
     /// a draft that has nothing typed yet, that draft is the new thread, so none pile up.
     fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.panel = Panel::Thread;
+        self.terminal_open = false;
         self.drawer_open = false;
         let composer = self.composer_text(self.active, cx);
         if self.is_empty_slot(self.active, &composer, cx) {
@@ -757,7 +758,7 @@ impl ChatView {
             return;
         }
         self.review_panel = None;
-        self.panel = Panel::Thread;
+        self.terminal_open = false;
         self.drawer_open = false;
         if target >= self.slots.len() {
             return;
@@ -822,7 +823,7 @@ impl ChatView {
         self.dock_request = None;
         self.making_copy_shown = false;
         self.sync_field(window, cx);
-        if self.panel != Panel::Thread {
+        if self.terminal_open && self.terminal_wanted {
             self.focus_panel(window, cx);
         } else if self.composer_has_keys() {
             let field = self.ensure_field(window, cx);
@@ -875,7 +876,7 @@ impl ChatView {
                 self.active = 0;
             }
         }
-        self.panel = Panel::Thread;
+        self.terminal_open = false;
         self.enter(window, cx);
     }
 
@@ -1110,9 +1111,11 @@ impl ChatView {
     /// while an approval is pending (so ⌘↵ and Esc reach `on_key_down`), back in the field
     /// afterwards, and a placeholder that fits the moment.
     fn sync_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.visible || self.panel != Panel::Thread {
+        if !self.visible {
             return;
         }
+        // While the shell has the keyboard, the dock and the composer change without taking it.
+        let shell_has_keys = self.terminal_focused(window, cx);
         let field = self.ensure_field(window, cx);
         let (front, outside, status, empty, making_copy) = {
             let thread = self.thread().read(cx);
@@ -1136,9 +1139,9 @@ impl ChatView {
                 .map(|_| cx.background_executor().now() + KEY_ANSWER_DELAY);
             match (&self.dock_request, &front) {
                 // The dock appears in place of the composer.
-                (None, Some(_)) => window.focus(&self.root, cx),
+                (None, Some(_)) if !shell_has_keys => window.focus(&self.root, cx),
                 // The last approval was answered: the composer is back.
-                (Some(_), None) => {
+                (Some(_), None) if !shell_has_keys => {
                     let handle = field.read(cx).focus_handle(cx);
                     window.focus(&handle, cx);
                 }
@@ -1150,7 +1153,7 @@ impl ChatView {
         self.dock_outside = outside;
         if making_copy != self.making_copy_shown {
             self.making_copy_shown = making_copy;
-            if self.dock_request.is_none() {
+            if self.dock_request.is_none() && !shell_has_keys {
                 if making_copy {
                     window.focus(&self.root, cx);
                 } else {
@@ -1695,8 +1698,8 @@ impl ChatView {
 
     /// Where a key press goes (see `keys::key_route`).
     fn key_route(&self, event: &KeyDownEvent, window: &Window, cx: &App) -> KeyRoute {
-        // Only the dock on screen takes ⌘↵ and Esc: never a dock hidden behind the terminal.
-        let pending = self.panel == Panel::Thread
+        // Only the dock on screen takes ⌘↵ and Esc, and not while the shell has the keyboard.
+        let pending = !self.terminal_focused(window, cx)
             && self
                 .thread()
                 .read(cx)
@@ -1744,7 +1747,7 @@ impl ChatView {
             KeyRoute::Ignore => cx.stop_propagation(),
             // The drawer's Esc was taken in the capture phase.
             KeyRoute::Pass
-                if self.panel == Panel::Thread
+                if !self.terminal_focused(window, cx)
                     && self.review_panel.is_some()
                     && review::is_land_key(event)
                     && !overlay_focused(window) =>
@@ -1891,26 +1894,53 @@ impl ChatView {
     /// Row `ix` of the message list: a transcript item, or the app notice after them.
     fn render_row(
         &mut self,
-        ix: usize,
+        list_ix: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The list's row, as the item (or the held message, the copy card, the notice) it is.
+        let ix = {
+            let slot = &self.slots[self.active];
+            match slot.shown.get(list_ix) {
+                Some(item) => *item,
+                None => {
+                    slot.thread.read(cx).transcript().items().len()
+                        + list_ix.saturating_sub(slot.shown.len())
+                }
+            }
+        };
         let on_restart: OnRestart = self.press(cx, |view, window, cx| view.restart(window, cx));
         let on_continue: OnRestart = self.press(cx, |view, window, cx| view.resume(window, cx));
         let on_send_again: OnRestart = self.press(cx, |view, window, cx| view.send(window, cx));
         let on_cancel: OnRestart = self.press(cx, |view, window, cx| view.stop(window, cx));
-        let unbuilt = {
+        let (unbuilt, narration_ids) = {
             let slot = &self.slots[self.active];
-            match slot.thread.read(cx).transcript().items().get(ix) {
-                Some(Item::Assistant { id, text, .. })
-                    if !slot.replies.contains(id) && self.plan.slot(ix) != rows::Slot::Hidden =>
-                {
-                    Some((*id, text.clone()))
-                }
-                _ => None,
+            let items = slot.thread.read(cx).transcript().items();
+            let mut unbuilt = Vec::new();
+            if let Some(Item::Assistant { id, text, .. }) = items.get(ix)
+                && !slot.replies.contains(id)
+            {
+                unbuilt.push((*id, text.clone()));
             }
+            // What the agent wrote between a block's steps is drawn as markdown by the block.
+            let mut narration_ids = Vec::new();
+            if let rows::Slot::Block(index) = self.plan.slot(ix)
+                && let Some(tools) = self.plan.tools(index)
+            {
+                for item in items.get(tools).unwrap_or_default() {
+                    if let Item::Assistant { id, text, .. } = item
+                        && !text.trim().is_empty()
+                    {
+                        narration_ids.push(*id);
+                        if !slot.replies.contains(id) {
+                            unbuilt.push((*id, text.clone()));
+                        }
+                    }
+                }
+            }
+            (unbuilt, narration_ids)
         };
-        if let Some((id, text)) = unbuilt {
+        for (id, text) in unbuilt {
             self.slots[self.active].replies.ensure(id, &text, cx);
         }
         let slot = &self.slots[self.active];
@@ -1945,7 +1975,11 @@ impl ChatView {
                     rows::Slot::Plain => None,
                 };
                 if let Some(index) = block {
-                    rows::work_block(&self.plan, index, &slot.thread, cx)
+                    let narrations = narration_ids
+                        .iter()
+                        .filter_map(|id| slot.replies.get(id).map(|reply| (*id, reply.state())))
+                        .collect();
+                    rows::work_block(&self.plan, index, &slot.thread, narrations, cx)
                 } else if limits::is_limit_error(item) {
                     rows::error(
                         ("limit-history", item.id()).into(),
@@ -2043,7 +2077,7 @@ impl ChatView {
             Entry::at(ix, items.len(), preparing.is_some(), notice.is_some()),
             Some(Entry::Notice)
         );
-        let first = ix == 0;
+        let first = list_ix == 0;
         // Center each row in the column, like the composer below it.
         div()
             .w_full()
@@ -2064,7 +2098,6 @@ impl ChatView {
         &self,
         placement: Placement,
         window_width: f32,
-        main_width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2087,10 +2120,7 @@ impl ChatView {
             let path = if making_copy {
                 String::new()
             } else {
-                short_path(
-                    &tilde(thread.cwd(), self.home.as_deref()),
-                    title_bar::path_budget(main_width),
-                )
+                tilde(thread.cwd(), self.home.as_deref())
             };
             Bar {
                 title: thread.title().to_string().into(),
@@ -2100,12 +2130,20 @@ impl ChatView {
                 show_list,
                 grants: thread.grant_views(),
                 grants_detail: thread.presentation().grants_detail,
-                pill: if making_copy {
-                    Some(title_bar::STARTING)
-                } else {
-                    title_bar::pill(thread.status(), thread.background_tasks().len())
-                },
                 background_tasks: thread.background_tasks().len(),
+                terminal: title_bar::TerminalToggle {
+                    shown: self.terminal_open,
+                    on_press: {
+                        let view = cx.weak_entity();
+                        Rc::new(move |_, window, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                if !view.quit_saving {
+                                    view.toggle_terminal(window, cx);
+                                }
+                            });
+                        })
+                    },
+                },
                 changes: None,
             }
         };
@@ -2207,7 +2245,7 @@ impl ChatView {
 
     /// Maps the thread on screen's items to rows (see `rows::Plan`). Drawn rows read it, so it
     /// is rebuilt before each draw of the list.
-    fn refresh_plan(&mut self, cx: &App) {
+    fn refresh_plan(&mut self, cx: &mut Context<Self>) {
         let thread = self.slots[self.active].thread.read(cx);
         let key = (
             thread.id().to_string(),
@@ -2215,17 +2253,46 @@ impl ChatView {
             thread
                 .turn_started_at()
                 .map(|started| started.elapsed().as_secs()),
+            // A refused limit replaces the last error row with its notice.
+            matches!(
+                thread.limit_event(),
+                Some(newjen_core::agent::RateLimitEvent::Rejected(_))
+            ),
         );
         if self.plan_key.as_ref() == Some(&key) {
             return;
         }
         self.plan_key = Some(key);
-        self.plan.refresh(
-            thread.id(),
-            thread.transcript().items(),
-            thread.work_blocks(),
-            Some(thread.cwd()),
-        );
+        let items = thread.transcript().items();
+        self.plan
+            .refresh(thread.id(), items, thread.work_blocks(), Some(thread.cwd()));
+        let limit = thread.limit_event();
+        let shown: Vec<usize> = (0..items.len())
+            .filter(|&ix| {
+                let item = &items[ix];
+                self.plan.slot(ix) != rows::Slot::Hidden
+                    && !limits::notice_replaces_error(item, ix + 1 == items.len(), limit)
+                    && !(matches!(item, Item::TurnEnd { stopped: true, .. })
+                        && self.plan.stop_is_in_block(ix))
+            })
+            .collect();
+        let slot = &mut self.slots[self.active];
+        // Rows keep the height they were measured at, so every row from the first one that is
+        // not the same item as before is measured again.
+        let kept = shown
+            .iter()
+            .zip(&slot.shown)
+            .take_while(|(now, before)| now == before)
+            .count();
+        let before = std::mem::replace(&mut slot.shown, shown).len();
+        if kept < before {
+            slot.messages.update(cx, |messages, cx| {
+                let end = before.min(messages.item_count());
+                if kept < end {
+                    messages.remeasure_items(kept..end, cx);
+                }
+            });
+        }
     }
 
     fn render_messages(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2233,7 +2300,7 @@ impl ChatView {
         let slot = &self.slots[self.active];
         let thread = slot.thread.read(cx);
         let count = Entry::count(
-            thread.transcript().items().len(),
+            slot.shown.len(),
             thread.preparing().is_some(),
             slot.notice.is_some(),
         );
@@ -2326,6 +2393,7 @@ impl ChatView {
             (request, waiting)
         };
         let risk = request.risk();
+        let risks = request.risks();
         let remember = request.view().remember.can_remember();
         let queue = (waiting > 1).then(|| SharedString::from(format!("1 of {waiting}")));
         let headline = request.headline().to_string();
@@ -2341,7 +2409,7 @@ impl ChatView {
         );
         // `sync_field` keeps `dock_outside` in step with the dock's request.
         let detail =
-            approval::card_detail(request.view(), self.dock_outside.as_deref(), room, risk);
+            approval::card_detail(request.view(), self.dock_outside.as_deref(), room, risks);
         let scope = approval::scope_row(&request.view().remember, detail.shortened, room.cols);
         let rule_cut = scope.once;
         let request_key = request.key();
@@ -2359,7 +2427,8 @@ impl ChatView {
             },
         )
         .glyph(approval::glyph(request.view(), risk))
-        .risk(risk.map(newjen_core::ApprovalRisk::label))
+        .risks(risks.iter().map(|risk| risk.label()).collect())
+        .by_model(request.headline_by_model())
         .queue(queue)
         .can_remember(remember);
         let card = if headline.is_empty() {
@@ -2735,6 +2804,16 @@ impl ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.terminal_open {
+            if self.terminal_focused(window, cx) {
+                self.terminal_wanted = true;
+            } else if self
+                .field_focus(cx)
+                .is_some_and(|field| field.contains_focused(window, cx))
+            {
+                self.terminal_wanted = false;
+            }
+        }
         let width = f32::from(window.viewport_size().width);
         // The drawer only exists in narrow windows; widening the window docks the list.
         if width >= sidebar::NARROW_WINDOW {
@@ -2765,28 +2844,21 @@ impl Render for ChatView {
                     && thread.preparing().is_none(),
             )
         };
-        let title_bar = self.render_title_bar(placement, width, main_width, window, cx);
-        let body = match self.panel {
-            Panel::Terminal => self.slots[self.active]
-                .terminal
-                .clone()
-                .map(IntoElement::into_any_element)
-                .unwrap_or_else(|| div().into_any_element()),
-            Panel::Thread if self.review_panel.is_some() => self.render_review(cx),
-            Panel::Thread if empty => self.render_empty_state(None, cx).into_any_element(),
-            Panel::Thread => self.render_messages(cx).into_any_element(),
+        let title_bar = self.render_title_bar(placement, width, window, cx);
+        let body = if self.review_panel.is_some() {
+            self.render_review(cx)
+        } else if empty {
+            self.render_empty_state(None, cx).into_any_element()
+        } else {
+            self.render_messages(cx).into_any_element()
         };
         let mut centred = false;
-        let bottom = if self.panel != Panel::Thread {
-            div().into_any_element()
-        } else {
-            match self.render_dock(main_width, window, cx) {
-                Some(dock) => dock,
-                None if self.review_panel.is_some() => div().into_any_element(),
-                None => {
-                    centred = empty;
-                    self.render_composer(window, cx)
-                }
+        let bottom = match self.render_dock(main_width, window, cx) {
+            Some(dock) => dock,
+            None if self.review_panel.is_some() => div().into_any_element(),
+            None => {
+                centred = empty;
+                self.render_composer(window, cx)
             }
         };
         let problem = self.render_save_problem(cx);
@@ -2891,13 +2963,14 @@ impl Render for ChatView {
                     .overflow_hidden()
             })
             .child(title_bar)
-            .child(self.render_panel_tabs(cx))
             .children(
-                (self.panel == Panel::Thread && self.dock_request.is_none())
+                self.dock_request
+                    .is_none()
                     .then(|| self.render_review_toolbar(cx)),
             )
             .child(body)
-            .children(tail);
+            .children(tail)
+            .children(self.render_terminal_panel(cx));
 
         // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
         // falls out of the window comes back through `reclaim_focus`.

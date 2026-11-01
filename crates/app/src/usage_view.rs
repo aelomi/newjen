@@ -82,6 +82,22 @@ pub fn credits_parts(summary: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The credits line for the popover: from 100 up a balance is rounded to whole credits with
+/// thousands separators ("66,389"), below it keeps its cents ("12.50").
+pub fn credits_line(credits: &newjen_core::usage::UsageCredits) -> (String, Option<String>) {
+    match credits.balance {
+        Some(balance) if !credits.unlimited && balance >= 100.0 => (
+            "Credits".into(),
+            Some(crate::format::thousands(balance.round() as usize)),
+        ),
+        _ => {
+            let summary = credits.summary();
+            let (label, value) = credits_parts(&summary);
+            (label.to_string(), value.map(str::to_string))
+        }
+    }
+}
+
 fn status_color(status: UsageStatus, cx: &App) -> Hsla {
     let colors = &cx.theme().colors;
     match status {
@@ -293,20 +309,18 @@ fn provider_sections(usages: &[ProviderUsage], now: i64, cx: &App) -> Vec<AnyEle
             section = section.child(window_row(usage.provider, window, now, cx));
         }
         if let Some(credits) = &usage.credits {
-            let summary = credits.summary();
-            let (label, value) = credits_parts(&summary);
-            section = section.child(
-                h_flex()
-                    .justify_between()
-                    .gap_2()
-                    .text_color(material.glass_muted)
-                    .child(label.to_string())
-                    .children(value.map(|value| {
-                        div()
-                            .text_color(cx.theme().popover_foreground)
-                            .child(value.to_string())
-                    })),
-            );
+            let (label, value) = credits_line(credits);
+            section =
+                section.child(
+                    h_flex()
+                        .justify_between()
+                        .gap_2()
+                        .text_color(material.glass_muted)
+                        .child(label)
+                        .children(value.map(|value| {
+                            div().text_color(cx.theme().popover_foreground).child(value)
+                        })),
+                );
         }
         sections.push(section.into_any_element());
     }
@@ -428,5 +442,24 @@ mod tests {
             ("Credits", Some("unlimited"))
         );
         assert_eq!(credits_parts("No credits"), ("No credits", None));
+    }
+
+    #[test]
+    fn a_large_credit_balance_reads_in_whole_credits_with_separators() {
+        let credits = |balance| newjen_core::usage::UsageCredits {
+            has_credits: true,
+            unlimited: false,
+            balance,
+        };
+        let line = |balance| credits_line(&credits(balance));
+        assert_eq!(
+            line(Some(66388.61)),
+            ("Credits".into(), Some("66,389".into()))
+        );
+        assert_eq!(line(Some(100.0)), ("Credits".into(), Some("100".into())));
+        assert_eq!(line(Some(1000.0)), ("Credits".into(), Some("1,000".into())));
+        assert_eq!(line(Some(12.5)), ("Credits".into(), Some("12.50".into())));
+        assert_eq!(line(Some(99.0)), ("Credits".into(), Some("99".into())));
+        assert_eq!(line(None), ("Credits".into(), Some("available".into())));
     }
 }
