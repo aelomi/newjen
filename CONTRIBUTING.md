@@ -23,7 +23,7 @@ The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](doc
 | Agents | Claude Code CLI over stream-json and Codex CLI (`codex app-server`), both in the MVP (decided 2026-10-31). Newjen detects which CLIs are installed without spending usage, and each thread picks one provider, model, effort and speed when it is created. `core` has one neutral event and approval model (`agent.rs`) with a Claude adapter and a Codex adapter under `providers/`. API-key providers and ACP agents come later. |
 | Isolation | **Rift** copy-on-write copies, **opt-in per thread**: by default a thread works in the project folder, and you choose a Rift copy when you want one. When chosen, it must be seamless. No git worktrees for now. |
 | Version control | **jj (Jujutsu)**, colocated with git. |
-| Hosting | **GitHub** (`github.com/EricRasputin/newjen`, CLI `gh`), moved from GitCafe on 2026-11-01 for GitHub Releases, hosted macOS CI and contributor familiarity. |
+| Hosting | **GitHub** (`github.com/aelomi/newjen`, in the Aelomi organization, CLI `gh`), moved from GitCafe on 2026-11-01 for GitHub Releases, hosted macOS CI and contributor familiarity. |
 | Storage | SQLite for app state, migrations by `user_version` in one append-only list (`store.rs`). The CLIs keep their own transcripts; Claude resumes with `--resume <session-id>`, Codex with `thread/resume`. |
 | CI | GitHub Actions, workflow in `.github/workflows/ci.yml`, on GitHub's hosted Apple Silicon macOS runners. |
 
@@ -158,7 +158,7 @@ jj bookmark set master -r @-                      # move master to the finished 
 jj git push --bookmark master                     # push to GitHub
 ```
 
-- The remote is `origin`, at `https://github.com/EricRasputin/newjen.git`. The default branch is `master`.
+- The remote is `origin`, at `https://github.com/aelomi/newjen.git`. The default branch is `master`.
 - Commit titles use [Conventional Commits](https://www.conventionalcommits.org): `type(scope): subject`, such as `fix(core): keep stdin open after an interrupt`.
 - Use `gh` for PRs, issues and CI (`gh pr`, `gh issue`, `gh run`).
 - Open pull requests with `gh pr create --head <bookmark> --base master`. jj leaves git without a current branch, so push the bookmark first and always pass `--head`.

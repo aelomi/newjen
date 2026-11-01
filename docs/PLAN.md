@@ -2,7 +2,7 @@
 
 Newjen is a macOS-only agent development environment: run many isolated Claude Code and Codex agents in parallel from a fast native app.
 
-- **Location:** `~/Newjen`, with remote `https://github.com/EricRasputin/newjen` (GitHub, public, default branch `master`). It moved from GitCafe on 2026-11-01.
+- **Location:** `~/Newjen`, with remote `https://github.com/aelomi/newjen` (GitHub, public, default branch `master`). It moved from GitCafe on 2026-11-01.
 - **Audience:** personal for now, with plans to open it to contributors later. Keep the repo contributor-ready: pick an open-source license early, keep a clear README and CONTRIBUTING.md, and avoid personal paths or secrets in code. Code signing and auto-updates come later.
 
 ## v1 goal
