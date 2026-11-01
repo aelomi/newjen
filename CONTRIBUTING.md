@@ -23,9 +23,9 @@ The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](doc
 | Agents | Claude Code CLI over stream-json and Codex CLI (`codex app-server`), both in the MVP (decided 2026-10-31). Newjen detects which CLIs are installed without spending usage, and each thread picks one provider, model, effort and speed when it is created. `core` has one neutral event and approval model (`agent.rs`) with a Claude adapter and a Codex adapter under `providers/`. API-key providers and ACP agents come later. |
 | Isolation | **Rift** copy-on-write copies, **opt-in per thread**: by default a thread works in the project folder, and you choose a Rift copy when you want one. When chosen, it must be seamless. No git worktrees for now. |
 | Version control | **jj (Jujutsu)**, colocated with git. |
-| Hosting | **GitCafe** (`git.cafe`, CLI `cafe`). **Never use GitHub or the `gh` CLI for this repo.** |
+| Hosting | **GitHub** (`github.com/EricRasputin/newjen`, CLI `gh`), moved from GitCafe on 2026-11-01 for GitHub Releases, hosted macOS CI and contributor familiarity. |
 | Storage | SQLite for app state, migrations by `user_version` in one append-only list (`store.rs`). The CLIs keep their own transcripts; Claude resumes with `--resume <session-id>`, Codex with `thread/resume`. |
-| CI | GitCafe Actions, workflow in `.github/workflows/ci.yml` (GitCafe reads GitHub Actions syntax from that folder). Runs on a self-hosted macOS runner. |
+| CI | GitHub Actions, workflow in `.github/workflows/ci.yml`, on GitHub's hosted Apple Silicon macOS runners. |
 
 
 ## Layout
@@ -155,10 +155,10 @@ Use **jj**, not raw git, for commits in this repo:
 jj describe -m "message"                         # describe the current change
 jj new                                            # start the next change
 jj bookmark set master -r @-                      # move master to the finished change
-jj git push --bookmark master                     # push to GitCafe
+jj git push --bookmark master                     # push to GitHub
 ```
 
-- The remote is `origin`, at `https://git.cafe/ericrasputin/newjen.git`. The default branch is `master`.
+- The remote is `origin`, at `https://github.com/EricRasputin/newjen.git`. The default branch is `master`.
 - Commit titles use [Conventional Commits](https://www.conventionalcommits.org): `type(scope): subject`, such as `fix(core): keep stdin open after an interrupt`.
-- Use `cafe` for PRs, issues and CI (`cafe pr`, `cafe ci`). Run `cafe --help` for the full command list.
-- Open pull requests with `cafe pr create`.
+- Use `gh` for PRs, issues and CI (`gh pr`, `gh issue`, `gh run`).
+- Open pull requests with `gh pr create --head <bookmark> --base master`. jj leaves git without a current branch, so push the bookmark first and always pass `--head`.

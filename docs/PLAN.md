@@ -2,7 +2,7 @@
 
 Newjen is a macOS-only agent development environment: run many isolated Claude Code and Codex agents in parallel from a fast native app.
 
-- **Location:** `~/Newjen`, with remote `https://git.cafe/ericrasputin/newjen` (GitCafe, public, default branch `master`).
+- **Location:** `~/Newjen`, with remote `https://github.com/EricRasputin/newjen` (GitHub, public, default branch `master`). It moved from GitCafe on 2026-11-01.
 - **Audience:** personal for now, with plans to open it to contributors later. Keep the repo contributor-ready: pick an open-source license early, keep a clear README and CONTRIBUTING.md, and avoid personal paths or secrets in code. Code signing and auto-updates come later.
 
 ## v1 goal
@@ -21,7 +21,7 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 | Agent | Claude Code CLI (`claude`) over stream-json and Codex CLI (`codex app-server`), both in the MVP (decided 2026-10-31) | Newjen detects which CLIs are installed without spending usage; each thread picks its provider, model, effort and speed. API-key providers and ACP later |
 | Isolation | Rift (`rift-snapshot`), an APFS copy-on-write copy, opt-in per thread | Installed. By default a thread works in the project folder; no git worktrees for now |
 | Version control | jj 0.46.0, colocated with git | Installed |
-| Code hosting | GitCafe (git.cafe), a normal git remote; `jj git push` | `cafe` 0.11.0 installed via Bun 1.4.4. Still needed: run `cafe auth login`. Private repos are free during the beta |
+| Code hosting | GitHub, a normal git remote; `jj git push` | Moved from GitCafe on 2026-11-01: GitCafe has no releases and no hosted macOS runners, and contributors know GitHub. `gh` is logged in |
 | Storage | SQLite (threads, settings); Claude keeps its own transcripts | Resume with `--resume <session-id>` |
 | Platform | macOS only | No signing or notarization until it's shared |
 
