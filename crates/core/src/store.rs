@@ -300,9 +300,38 @@ impl Unsaved {
 
 /// Failed writes per thread id, filled by the writer thread (see [`Unsaved`]).
 type UnsavedByThread = Arc<Mutex<HashMap<String, Unsaved>>>;
+type SaveObservers = Arc<Mutex<Vec<std::sync::Weak<Mutex<Option<String>>>>>>;
+
+/// Failures observed during one save operation, retained independently of retry records.
+#[derive(Clone)]
+pub struct SaveObservation(Arc<Mutex<Option<String>>>);
+
+impl SaveObservation {
+    pub fn failure(&self) -> Option<String> {
+        lock(&self.0).clone()
+    }
+}
+
+/// An immutable receipt for writes covered by a save operation.
+pub struct SaveReceipt {
+    done: mpsc::Receiver<Result<(), String>>,
+}
+
+impl SaveReceipt {
+    pub fn wait(self) -> Result<(), String> {
+        self.done
+            .recv()
+            .unwrap_or_else(|_| Err("the database writer stopped".into()))
+    }
+}
 
 /// One operation for the writer thread.
 enum Write {
+    #[cfg(test)]
+    Hold {
+        reached: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    },
     RememberAgent {
         project_id: i64,
         config: String,
@@ -319,6 +348,10 @@ enum Write {
         thread_id: String,
         rift_id: String,
         done: mpsc::Sender<Result<(), String>>,
+    },
+    DraftMessage {
+        thread_id: String,
+        message: String,
     },
     DeletePending(String),
     DeleteCopyCleanup(PathBuf),
@@ -370,6 +403,10 @@ enum Write {
     },
     /// Answered once every operation queued before it is done.
     Flush(mpsc::Sender<()>),
+    Receipt {
+        done: mpsc::Sender<Result<(), String>>,
+        failure: Arc<Mutex<Option<String>>>,
+    },
 }
 
 /// The database. Cheap to clone: every clone shares the same connections and writer thread,
@@ -392,6 +429,7 @@ struct Inner {
     errors_sender: Sender<WriteError>,
     /// What failed writes lost, for each thread to write again (see [`Store::take_unsaved`]).
     unsaved: UnsavedByThread,
+    observers: SaveObservers,
 }
 
 impl Store {
@@ -466,7 +504,14 @@ impl Store {
         let (writes, queue) = async_channel::unbounded();
         let (errors_sender, errors) = async_channel::unbounded();
         let unsaved = UnsavedByThread::default();
-        spawn_writer(write, queue, errors_sender.clone(), unsaved.clone());
+        let observers = Arc::default();
+        spawn_writer(
+            write,
+            queue,
+            errors_sender.clone(),
+            unsaved.clone(),
+            Arc::clone(&observers),
+        );
         Ok(Store {
             inner: Arc::new(Inner {
                 path,
@@ -475,6 +520,7 @@ impl Store {
                 errors,
                 errors_sender,
                 unsaved,
+                observers,
             }),
         })
     }
@@ -500,6 +546,41 @@ impl Store {
     /// Whether failed writes left anything unsaved for `thread_id`, without forgetting it.
     pub(crate) fn has_unsaved(&self, thread_id: &str) -> bool {
         lock(&self.inner.unsaved).contains_key(thread_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_writer(&self) -> mpsc::Sender<()> {
+        let (reached, wait) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        self.queue(Write::Hold {
+            reached,
+            release: held,
+        });
+        wait.recv().unwrap();
+        release
+    }
+
+    /// Observe errors before preparation begins, including failures before the barrier.
+    pub fn observe_saves(&self) -> SaveObservation {
+        let failure = SaveObservation(Arc::new(Mutex::new(None)));
+        lock(&self.inner.observers).push(Arc::downgrade(&failure.0));
+        failure
+    }
+
+    pub fn save_receipt(&self, failure: SaveObservation) -> SaveReceipt {
+        let (done, wait) = mpsc::channel();
+        self.queue(Write::Receipt {
+            done,
+            failure: failure.0,
+        });
+        SaveReceipt { done: wait }
+    }
+
+    pub fn update_pending_draft(&self, thread_id: &str, message: &str) {
+        self.queue(Write::DraftMessage {
+            thread_id: thread_id.into(),
+            message: message.into(),
+        });
     }
 
     /// Waits until every write queued so far is done, or `timeout` passes. Returns true if
@@ -813,7 +894,19 @@ impl Store {
     fn queue(&self, write: Write) {
         // The writer only stops once every `Store` is gone, so this cannot fail while `self`
         // exists, unless the writer thread itself crashed. Say so rather than lose the write.
+        let lost = lost_by(&write);
         if self.inner.writes.try_send(write).is_err() {
+            if let Some((id, lost)) = lost {
+                lock(&self.inner.unsaved).entry(id).or_default().merge(lost);
+            }
+            lock(&self.inner.observers).retain(|observer| {
+                if let Some(failure) = observer.upgrade() {
+                    lock(&failure).get_or_insert_with(|| "the database writer stopped".into());
+                    true
+                } else {
+                    false
+                }
+            });
             let _ = self.inner.errors_sender.try_send(WriteError {
                 detail: "the database writer stopped".to_string(),
             });
@@ -930,11 +1023,40 @@ fn spawn_writer(
     queue: Receiver<Write>,
     errors: Sender<WriteError>,
     unsaved: UnsavedByThread,
+    observers: SaveObservers,
 ) {
     thread::spawn(move || {
         while let Ok(write) = queue.recv_blocking() {
+            #[cfg(test)]
+            if let Write::Hold { reached, release } = write {
+                let _ = reached.send(());
+                let _ = release.recv();
+                continue;
+            }
+            if let Write::Receipt { done, failure } = write {
+                let result = lock(&failure).clone().map_or_else(
+                    || {
+                        if lock(&unsaved).is_empty() {
+                            Ok(())
+                        } else {
+                            Err("recent thread changes are not saved".into())
+                        }
+                    },
+                    Err,
+                );
+                let _ = done.send(result);
+                continue;
+            }
             let lost = lost_by(&write);
             if let Err(error) = run_write(&mut connection, write) {
+                lock(&observers).retain(|observer| {
+                    if let Some(failure) = observer.upgrade() {
+                        lock(&failure).get_or_insert_with(|| error.to_string());
+                        true
+                    } else {
+                        false
+                    }
+                });
                 // Recorded before the error is sent, so whoever sees the error finds it.
                 if let Some((thread_id, lost)) = lost {
                     lock(&unsaved).entry(thread_id).or_default().merge(lost);
@@ -951,6 +1073,8 @@ fn spawn_writer(
 /// redone: the thread is hidden for this run anyway, and shows again at the next launch.
 fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
     let (thread_id, lost) = match write {
+        #[cfg(test)]
+        Write::Hold { .. } => return None,
         Write::SaveThread(row) => (
             &row.id,
             Unsaved {
@@ -1002,10 +1126,12 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         | Write::CopyRemoved { .. }
         | Write::SavePending { .. }
         | Write::PendingId { .. }
+        | Write::DraftMessage { .. }
         | Write::DeletePending(_)
         | Write::DeleteCopyCleanup(_)
         | Write::DiscardPending(_)
-        | Write::Flush(_) => return None,
+        | Write::Flush(_)
+        | Write::Receipt { .. } => return None,
     };
     Some((thread_id.clone(), lost))
 }
@@ -1165,6 +1291,22 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
             )?;
         }
         // Everything queued before this is done (writes run in order).
+        Write::DraftMessage { thread_id, message } => {
+            connection.execute(
+                "UPDATE pending_copies SET message = ?2 WHERE thread_id = ?1 AND state != 'sent'",
+                params![
+                    thread_id,
+                    if message.trim().is_empty() {
+                        None
+                    } else {
+                        Some(message)
+                    }
+                ],
+            )?;
+        }
+        #[cfg(test)]
+        Write::Hold { .. } => unreachable!("handled at the writer boundary"),
+        Write::Receipt { .. } => unreachable!("handled at the writer boundary"),
         Write::Flush(done) => {
             let _ = done.send(());
         }
@@ -1533,5 +1675,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 0);
+    }
+    #[test]
+    fn save_receipt_reports_writer_disconnection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).unwrap();
+        let observed = store.observe_saves();
+        store.inner.writes.close();
+        let receipt = store.save_receipt(observed.clone());
+        assert!(receipt.wait().is_err());
+        assert!(observed.failure().is_some());
+    }
+    #[test]
+    fn quit_draft_update_preserves_making_copy_recovery_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).unwrap();
+        let project = store.open_project(dir.path()).unwrap();
+        store
+            .save_pending_copy(PendingCopy {
+                thread_id: "unfinished".into(),
+                project_id: project.id,
+                path: dir.path().join("unfinished-copy"),
+                intent: PendingIntent::Restore("held message".into()),
+                state: PendingState::MakingCopy,
+                rift_id: Some("owned-copy".into()),
+                created_at: 1,
+            })
+            .unwrap();
+        let release = store.hold_writer();
+        let observed = store.observe_saves();
+        store.update_pending_draft("unfinished", "restored composer");
+        let receipt = store.save_receipt(observed);
+        release.send(()).unwrap();
+        assert_eq!(receipt.wait(), Ok(()));
+        let reopened = Store::open_in(dir.path()).unwrap();
+        let pending = &reopened.pending_copies(project.id).unwrap()[0];
+        assert_eq!(pending.state, PendingState::MakingCopy);
+        assert_eq!(
+            pending.intent,
+            PendingIntent::Restore("restored composer".into())
+        );
+        assert_eq!(pending.rift_id.as_deref(), Some("owned-copy"));
+    }
+    #[test]
+    fn save_receipt_covers_late_loader_failure_after_an_earlier_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).unwrap();
+        let observed = store.observe_saves();
+        assert_eq!(store.save_receipt(observed.clone()).wait(), Ok(()));
+        let db = Connection::open(store.path()).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_loader BEFORE INSERT ON projects BEGIN SELECT RAISE(ABORT, 'loader write failed'); END;").unwrap();
+        store.queue(Write::UpsertProject {
+            path: "late-project".into(),
+            now: 0,
+        });
+        assert!(store.save_receipt(observed).wait().is_err());
     }
 }

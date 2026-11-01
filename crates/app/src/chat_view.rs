@@ -216,6 +216,7 @@ pub struct Startup {
 }
 
 pub struct ChatView {
+    quit_saving: bool,
     project_chooser: Option<OnPress>,
     thread_opener: Option<OnOpenThread>,
     visible: bool,
@@ -302,6 +303,7 @@ impl ChatView {
             }),
         ];
         let mut view = ChatView {
+            quit_saving: false,
             project_chooser: None,
             thread_opener: None,
             visible: true,
@@ -478,13 +480,16 @@ impl ChatView {
     /// back, say): the composer takes it, or the root while the dock replaces the composer, so
     /// the shortcuts keep working.
     fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         if !self.visible {
             return;
         }
         // Deferred: GPUI draws no new frame for focus that a focus-lost listener moves, so the
         // composer would not show its focus until the next redraw.
         cx.defer_in(window, |view, window, cx| {
-            if view.visible {
+            if view.visible && !view.quit_saving {
                 view.focus_panel(window, cx);
             }
         });
@@ -529,6 +534,44 @@ impl ChatView {
 
     /// At quit (⌘Q, or the window closed): settles and saves every thread and stops every
     /// `claude`, all at once (see `newjen_core::thread::finish_quit`).
+    pub fn set_quit_saving(&mut self, saving: bool, cx: &mut Context<Self>) {
+        self.quit_saving = saving;
+        if !saving {
+            for ix in 0..self.slots.len() {
+                self.sync_replies(ix, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn draft_for_test(&self, cx: &App) -> String {
+        self.composer_text(self.active, cx)
+    }
+
+    pub fn has_unsent_text(&self, cx: &App) -> bool {
+        self.slots.iter().enumerate().any(|(ix, slot)| {
+            keeps_draft(&self.composer_text(ix, cx)) || slot.thread.read(cx).preparing().is_some()
+        })
+    }
+
+    pub fn prepare_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Quitting> {
+        for slot in &mut self.slots {
+            let held = slot
+                .thread
+                .read(cx)
+                .preparing()
+                .map(|waiting| waiting.message().to_string());
+            if let Some(message) = held {
+                let field = slot
+                    .field
+                    .get_or_insert_with(|| cx.new(|cx| ui::composer_field(window, cx)));
+                field.update(cx, |field, cx| field.set_value(message, window, cx));
+            }
+        }
+        self.begin_quit(cx)
+    }
+
     pub fn begin_quit(&mut self, cx: &mut Context<Self>) -> Vec<Quitting> {
         for slot in &mut self.slots {
             if let Some(terminal) = slot.terminal.take() {
@@ -536,9 +579,9 @@ impl ChatView {
             }
         }
         for (ix, slot) in self.slots.iter().enumerate() {
-            if let Err(error) = slot.thread.read(cx).save_draft(&self.composer_text(ix, cx)) {
-                self.save_problem = Some(format!("Couldn't save the draft: {error:#}"));
-            }
+            slot.thread
+                .read(cx)
+                .queue_quit_draft(&self.composer_text(ix, cx));
         }
         self.slots
             .iter()
@@ -627,6 +670,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         if !self
             .slots
             .iter()
@@ -980,6 +1026,9 @@ impl ChatView {
     /// counting ("Working · 1m 12s") or once a minute ("4m ago"). Also follows macOS's Reduce
     /// Motion setting, which has no change notice of its own here.
     fn tick(&mut self, ticks: u64, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         gpui_kit::base::apply_system_reduce_motion(cx);
         let minute = ticks.is_multiple_of(MINUTE_TICKS);
         if minute {
@@ -1169,6 +1218,9 @@ impl ChatView {
 
     /// Sends the composer's text as the next message (Enter or the send button).
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         let field = self.ensure_field(window, cx);
         let text = field.read(cx).value().trim().to_string();
         if text.is_empty() || self.is_busy(cx) {
@@ -1194,6 +1246,9 @@ impl ChatView {
     /// whether it went out. If not, nothing was sent, the conversation is as it was (so the
     /// composer stays usable and keeps its text) and a notice says why.
     fn send_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.quit_saving {
+            return false;
+        }
         let thread = self.thread().clone();
         if self.review_loading || self.review_panel.is_some() {
             return false;
@@ -1407,7 +1462,9 @@ impl ChatView {
                 }
             };
             let _ = view.update_in(cx, |view, window, cx| {
-                view.copy_made(&thread, made, window, cx)
+                if !view.quit_saving {
+                    view.copy_made(&thread, made, window, cx);
+                }
             });
         })
         .detach();
@@ -1569,6 +1626,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         let Some(ix) = self.index_of(thread_id, cx) else {
             return;
         };
@@ -1685,6 +1745,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         if self.key_route(event, window, cx) == KeyRoute::CloseDrawer {
             self.drawer_open = false;
             cx.stop_propagation();
@@ -1696,6 +1759,9 @@ impl ChatView {
     /// focused element had its turn (the "bubble" phase), so a popover or menu that is open
     /// over the dock closes on Esc first, and the Esc never reaches the request.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         match self.key_route(event, window, cx) {
             KeyRoute::Answer(answer) => {
                 // An approval key while the dock is up is ours, even when it is ignored below.
@@ -1712,26 +1778,41 @@ impl ChatView {
     }
 
     fn on_stop(&mut self, _: &Stop, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         self.stop(window, cx);
     }
 
     fn on_new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         self.new_thread(window, cx);
     }
 
     fn on_previous(&mut self, _: &PreviousThread, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         if let Some(target) = sidebar::step(self.active, self.slots.len(), false) {
             self.show(target, window, cx);
         }
     }
 
     fn on_next(&mut self, _: &NextThread, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         if let Some(target) = sidebar::step(self.active, self.slots.len(), true) {
             self.show(target, window, cx);
         }
     }
 
     fn on_jump(&mut self, jump: &JumpToThread, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_saving {
+            return;
+        }
         if let Some(target) = sidebar::jump(jump.0, self.slots.len()) {
             self.show(target, window, cx);
         }
@@ -1743,6 +1824,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         self.toggle_sidebar(window, cx);
     }
 
@@ -1752,6 +1836,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         self.open_inbox(window, cx);
     }
 
@@ -1761,6 +1848,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         self.toggle_terminal(window, cx);
     }
 
@@ -1773,7 +1863,11 @@ impl ChatView {
     ) -> OnPress {
         let view = cx.weak_entity();
         Rc::new(move |window: &mut Window, cx: &mut App| {
-            let _ = view.update(cx, |view, cx| act(view, window, cx));
+            let _ = view.update(cx, |view, cx| {
+                if !view.quit_saving {
+                    act(view, window, cx);
+                }
+            });
         })
     }
 

@@ -313,6 +313,7 @@ pub enum Sent {
 #[derive(Debug)]
 #[must_use = "run it off the UI thread, then call Thread::finish_project"]
 pub struct ProjectJob {
+    completion: std::sync::mpsc::Sender<()>,
     cwd: PathBuf,
     thread_id: String,
     stopping: Vec<JoinHandle<()>>,
@@ -323,13 +324,16 @@ impl ProjectJob {
         for stopping in self.stopping {
             let _ = stopping.join();
         }
-        landing::prepare_project(tools, &self.cwd, &self.thread_id)
+        let result = landing::prepare_project(tools, &self.cwd, &self.thread_id);
+        let _ = self.completion.send(());
+        result
     }
 }
 
 #[derive(Debug)]
 #[must_use = "run it off the UI thread, then call Thread::finish_snapshot"]
 pub struct SnapshotJob {
+    completion: std::sync::mpsc::Sender<()>,
     cwd: PathBuf,
     title: String,
     thread_id: String,
@@ -342,7 +346,9 @@ impl SnapshotJob {
         for stopping in self.stopping {
             let _ = stopping.join();
         }
-        landing::snapshot(tools, &self.cwd, self.mode, &self.title, &self.thread_id)
+        let result = landing::snapshot(tools, &self.cwd, self.mode, &self.title, &self.thread_id);
+        let _ = self.completion.send(());
+        result
     }
 }
 
@@ -1028,12 +1034,15 @@ impl Thread {
         }
         self.end_session();
         self.snapshot = SnapshotState::Running;
+        let stopping = std::mem::take(&mut self.stopping);
+        let completion = self.track_background_work();
         Some(SnapshotJob {
+            completion,
             cwd: self.cwd.clone(),
             title: self.title.clone(),
             thread_id: self.id.clone(),
             mode: self.landing_mode,
-            stopping: std::mem::take(&mut self.stopping),
+            stopping,
         })
     }
 
@@ -1190,10 +1199,13 @@ impl Thread {
                 started_at: Instant::now(),
                 was_saved,
             });
+            let stopping = std::mem::take(&mut self.stopping);
+            let completion = self.track_background_work();
             return Ok(Sent::PreparingProject(ProjectJob {
+                completion,
                 cwd: self.cwd.clone(),
                 thread_id: self.id.clone(),
-                stopping: std::mem::take(&mut self.stopping),
+                stopping,
             }));
         }
         self.deliver(text)?;
@@ -1616,6 +1628,23 @@ impl Thread {
         Ok(())
     }
 
+    pub fn queue_quit_draft(&self, message: &str) {
+        let waiting = self.preparing();
+        let message = waiting
+            .as_ref()
+            .map_or(message, |waiting| waiting.message());
+        self.store.update_pending_draft(&self.id, message);
+    }
+
+    pub fn track_background_work(&mut self) -> std::sync::mpsc::Sender<()> {
+        let (done, wait) = std::sync::mpsc::channel();
+        self.stopping.push(std::thread::spawn(move || {
+            wait.recv()
+                .expect("background work stopped before completing");
+        }));
+        done
+    }
+
     /// The first half of [`Thread::shutdown_for_quit`]: settles and saves the thread and
     /// starts stopping its `claude`, without waiting for either. Pass what it returns for
     /// every thread to one [`finish_quit`] call.
@@ -1625,8 +1654,17 @@ impl Thread {
         {
             self.stopping.push(stopping);
         }
-        if self.preparing().is_some() {
+        if let Stage::PreparingProject(preparing) = &self.stage {
+            self.stage = if preparing.was_saved {
+                Stage::Saved
+            } else {
+                Stage::Draft
+            };
+        } else if self.preparing().is_some() {
             self.stage = Stage::Draft;
+        }
+        if matches!(self.snapshot, SnapshotState::Running) {
+            self.snapshot = SnapshotState::Pending;
         }
         if self.status().is_busy() || !self.background_tasks().is_empty() {
             if self.landing_mode == LandingMode::HarnessManaged && self.review_base.is_some() {
@@ -1964,6 +2002,107 @@ impl Thread {
 pub struct Quitting {
     thread_id: String,
     stopping: Vec<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct QuitCompletion {
+    saving: Result<(), String>,
+    stopping: Result<(), String>,
+}
+
+impl QuitCompletion {
+    fn disconnected() -> Self {
+        Self {
+            saving: Err("save completion disconnected".into()),
+            stopping: Err("work completion disconnected".into()),
+        }
+    }
+
+    fn outcome(&self) -> Result<(), String> {
+        self.saving.clone().and(self.stopping.clone())
+    }
+}
+
+/// Completion of persistence and process cleanup, independent of UI deadlines.
+pub struct QuitSave {
+    done: async_channel::Receiver<QuitCompletion>,
+    failure: crate::store::SaveObservation,
+    result: std::sync::Mutex<Option<QuitCompletion>>,
+}
+
+impl QuitSave {
+    pub fn start(
+        store: Store,
+        quitting: impl IntoIterator<Item = Quitting>,
+        failure: crate::store::SaveObservation,
+        settling: Vec<QuitSave>,
+    ) -> Self {
+        let quitting: Vec<_> = quitting.into_iter().collect();
+        let receipt = store.save_receipt(failure.clone());
+        let (done, wait) = async_channel::bounded(1);
+        let observed = failure.clone();
+        std::thread::spawn(move || {
+            let saving = receipt.wait();
+            let mut stopping = Ok(());
+            for old in settling {
+                stopping = stopping.and(old.completion().stopping);
+            }
+            for quitting in quitting {
+                for handle in quitting.stopping {
+                    if handle.join().is_err() {
+                        stopping = Err("work could not finish stopping".into());
+                    }
+                }
+            }
+            let final_result = store.save_receipt(observed).wait();
+            let _ = done.send_blocking(QuitCompletion {
+                saving: saving.and(final_result),
+                stopping,
+            });
+        });
+        Self {
+            done: wait,
+            failure,
+            result: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn completion(self) -> QuitCompletion {
+        if let Some(result) = self.result.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return result;
+        }
+        self.done
+            .recv_blocking()
+            .unwrap_or_else(|_| QuitCompletion::disconnected())
+    }
+
+    pub fn wait_blocking(self) -> Result<(), String> {
+        self.completion().outcome()
+    }
+
+    pub fn poll(&self) -> Option<Result<(), String>> {
+        let mut result = self.result.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(completed) = result.as_ref() {
+            return Some(completed.outcome());
+        }
+        if let Some(error) = self.failure.failure() {
+            return Some(Err(error));
+        }
+        match self.done.try_recv() {
+            Ok(completed) => {
+                let outcome = completed.outcome();
+                *result = Some(completed);
+                Some(outcome)
+            }
+            Err(async_channel::TryRecvError::Empty) => None,
+            Err(async_channel::TryRecvError::Closed) => {
+                let completed = QuitCompletion::disconnected();
+                let outcome = completed.outcome();
+                *result = Some(completed);
+                Some(outcome)
+            }
+        }
+    }
 }
 
 /// Why [`finish_quit`] could not confirm that the quitting threads were saved.
@@ -2347,8 +2486,7 @@ mod tests {
     fn quitting_flushes_writes_from_lazy_shutdowns() {
         let home = tempfile::tempdir().unwrap();
         let store = Store::open_in(home.path()).unwrap();
-        let database = rusqlite::Connection::open(store.path()).unwrap();
-        database.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let release = store.hold_writer();
         let quitting = std::iter::once_with(|| {
             store.set_unread("held", true);
             Quitting {
@@ -2357,8 +2495,8 @@ mod tests {
             }
         });
 
-        let result = finish_quit_within(&store, quitting, Duration::from_millis(50));
-        database.execute_batch("COMMIT;").unwrap();
+        let result = finish_quit_within(&store, quitting, Duration::ZERO);
+        release.send(()).unwrap();
         assert!(store.flush(Duration::from_secs(5)));
         assert_eq!(result, Err(QuitError::Unconfirmed));
     }
@@ -2367,14 +2505,12 @@ mod tests {
     fn an_unconfirmed_quit_still_waits_for_claude_to_stop() {
         let home = tempfile::tempdir().unwrap();
         let store = Store::open_in(home.path()).unwrap();
-        let database = rusqlite::Connection::open(store.path()).unwrap();
-        database.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let release = store.hold_writer();
         store.set_unread("held", true);
         let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = {
             let stopped = stopped.clone();
             thread::spawn(move || {
-                thread::sleep(Duration::from_millis(200));
                 stopped.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         };
@@ -2383,11 +2519,226 @@ mod tests {
             stopping: vec![stopping],
         };
 
-        let result = finish_quit_within(&store, [quitting], Duration::from_millis(50));
+        let result = finish_quit_within(&store, [quitting], Duration::ZERO);
         let joined = stopped.load(std::sync::atomic::Ordering::SeqCst);
-        database.execute_batch("COMMIT;").unwrap();
+        release.send(()).unwrap();
 
         assert_eq!(result, Err(QuitError::Unconfirmed));
         assert!(joined, "claude was still stopping when quitting returned");
+    }
+    #[test]
+    fn quit_save_waits_for_writer_and_cleanup_then_confirms_late() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let release = store.hold_writer();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let save = QuitSave::start(
+            store.clone(),
+            [Quitting {
+                thread_id: "test".into(),
+                stopping: vec![thread::spawn(move || {
+                    stopped.recv().unwrap();
+                })],
+            }],
+            store.observe_saves(),
+            vec![],
+        );
+        assert_eq!(save.poll(), None);
+        release.send(()).unwrap();
+        assert!(store.flush(Duration::from_secs(5)));
+        assert_eq!(save.poll(), None);
+        stop.send(()).unwrap();
+        assert_eq!(save.wait_blocking(), Ok(()));
+    }
+
+    #[test]
+    fn quit_save_failure_receipt_survives_retry_and_pending_draft_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let project = store.open_project(home.path()).unwrap();
+        let db = rusqlite::Connection::open(store.path()).unwrap();
+        let pending = PendingCopy {
+            thread_id: "held".into(),
+            project_id: project.id,
+            path: home.path().join("copy"),
+            intent: PendingIntent::Restore("my work".into()),
+            state: PendingState::Draft,
+            rift_id: None,
+            created_at: 0,
+        };
+        store.save_pending_copy(pending.clone()).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_draft BEFORE UPDATE ON pending_copies BEGIN SELECT RAISE(ABORT, 'draft failure'); END;").unwrap();
+        let failure = store.observe_saves();
+        store.update_pending_draft("held", "my work");
+        let receipt = store.save_receipt(failure);
+        assert!(store.flush(Duration::from_secs(5)));
+        db.execute_batch("DROP TRIGGER fail_draft;").unwrap();
+        store.save_pending_copy(pending).unwrap();
+        assert!(receipt.wait().is_err());
+        let retry = QuitSave::start(store.clone(), [], store.observe_saves(), vec![]);
+        assert_eq!(retry.wait_blocking(), Ok(()));
+        assert_eq!(
+            store.pending_copies(project.id).unwrap()[0].intent,
+            PendingIntent::Restore("my work".into())
+        );
+    }
+    #[test]
+    fn quit_save_checkpoint_failure_retains_debt_and_retry_reopens_saved_work() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let project = store.open_project(home.path()).unwrap();
+        let mut thread =
+            Thread::new_draft(store.clone(), &project, SessionConfig::new(home.path()));
+        thread.stage = Stage::Saved;
+        thread.transcript.push_user("keep this work");
+        let db = rusqlite::Connection::open(store.path()).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE INSERT ON thread_items BEGIN SELECT RAISE(ABORT, 'checkpoint failure'); END;").unwrap();
+        let observed = store.observe_saves();
+        let quitting = thread.begin_quit();
+        let save = QuitSave::start(store.clone(), [quitting], observed, vec![]);
+        assert!(save.wait_blocking().is_err());
+        assert!(store.has_unsaved(thread.id()));
+        db.execute_batch("DROP TRIGGER fail_checkpoint;").unwrap();
+        let observed = store.observe_saves();
+        let quitting = thread.begin_quit();
+        assert_eq!(
+            QuitSave::start(store.clone(), [quitting], observed, vec![]).wait_blocking(),
+            Ok(())
+        );
+        let reopened = Store::open_in(home.path()).unwrap();
+        assert_eq!(
+            reopened.items(thread.id()).unwrap().len(),
+            thread.transcript.items().len()
+        );
+        assert!(reopened.thread(thread.id()).unwrap().is_some());
+    }
+    #[test]
+    fn quit_save_includes_background_work_and_its_final_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let project = store.open_project(home.path()).unwrap();
+        let mut thread =
+            Thread::new_draft(store.clone(), &project, SessionConfig::new(home.path()));
+        thread.stage = Stage::Saved;
+        thread.transcript.push_user("background completion");
+        let completed = thread.track_background_work();
+        let observed = store.observe_saves();
+        let quitting = thread.begin_quit();
+        let save = QuitSave::start(store.clone(), [quitting], observed, vec![]);
+        assert!(store.flush(Duration::from_secs(5)));
+        assert_eq!(save.poll(), None);
+        thread.title = "finished in background".into();
+        thread.save();
+        completed.send(()).unwrap();
+        assert_eq!(save.wait_blocking(), Ok(()));
+        assert_eq!(
+            store.thread(thread.id()).unwrap().unwrap().title,
+            "finished in background"
+        );
+    }
+
+    #[test]
+    fn quit_save_fresh_attempt_waits_for_abandoned_attempt_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let (complete, wait) = std::sync::mpsc::channel();
+        let old = QuitSave::start(
+            store.clone(),
+            [Quitting {
+                thread_id: "old".into(),
+                stopping: vec![thread::spawn(move || {
+                    wait.recv().unwrap();
+                })],
+            }],
+            store.observe_saves(),
+            vec![],
+        );
+        let new = QuitSave::start(store.clone(), [], store.observe_saves(), vec![old]);
+        assert!(store.flush(Duration::from_secs(5)));
+        assert_eq!(new.poll(), None);
+        complete.send(()).unwrap();
+        assert_eq!(new.wait_blocking(), Ok(()));
+    }
+    #[test]
+    fn quit_save_abandoned_cleanup_reports_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let project = store.open_project(home.path()).unwrap();
+        let mut thread =
+            Thread::new_draft(store.clone(), &project, SessionConfig::new(home.path()));
+        let work = thread.track_background_work();
+        let quitting = thread.begin_quit();
+        let save = QuitSave::start(store.clone(), [quitting], store.observe_saves(), vec![]);
+        drop(work);
+        assert!(save.wait_blocking().is_err());
+    }
+    #[test]
+    fn quit_save_adoption_retains_abandoned_cleanup_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let project = store.open_project(home.path()).unwrap();
+        let mut thread =
+            Thread::new_draft(store.clone(), &project, SessionConfig::new(home.path()));
+        let work = thread.track_background_work();
+        let old = QuitSave::start(
+            store.clone(),
+            [thread.begin_quit()],
+            store.observe_saves(),
+            vec![],
+        );
+        let current = QuitSave::start(
+            store.clone(),
+            [thread.begin_quit()],
+            store.observe_saves(),
+            vec![old],
+        );
+        drop(work);
+        assert!(current.wait_blocking().is_err());
+    }
+
+    #[test]
+    fn quit_save_adoption_allows_repaired_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let project = store.open_project(home.path()).unwrap();
+        let mut thread =
+            Thread::new_draft(store.clone(), &project, SessionConfig::new(home.path()));
+        thread.stage = Stage::Saved;
+        thread.transcript.push_user("preserve this work");
+        let db = rusqlite::Connection::open(store.path()).unwrap();
+        db.execute_batch("CREATE TRIGGER refuse BEFORE INSERT ON thread_items BEGIN SELECT RAISE(ABORT, 'write failure'); END;").unwrap();
+        let observed = store.observe_saves();
+        let old = QuitSave::start(store.clone(), [thread.begin_quit()], observed, vec![]);
+        assert!(store.flush(Duration::from_secs(5)));
+        assert!(old.poll().unwrap().is_err());
+        db.execute_batch("DROP TRIGGER refuse;").unwrap();
+        let observed = store.observe_saves();
+        let current = QuitSave::start(store.clone(), [thread.begin_quit()], observed, vec![old]);
+        assert_eq!(current.wait_blocking(), Ok(()));
+        let reopened = Store::open_in(home.path()).unwrap();
+        assert_eq!(
+            reopened.items(thread.id()).unwrap().len(),
+            thread.transcript.items().len()
+        );
+    }
+
+    #[test]
+    fn quit_draft_preserves_the_message_held_for_copy_preparation() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let project = store.open_project(home.path()).unwrap();
+        let mut thread =
+            Thread::new_draft(store.clone(), &project, SessionConfig::new(home.path()));
+        thread.set_works_in(WorksIn::RiftCopy).unwrap();
+        let Sent::MakingCopy(job) = thread.send("held user message").unwrap() else {
+            panic!("copy preparation");
+        };
+        thread.queue_quit_draft("");
+        assert!(store.flush(Duration::from_secs(5)));
+        assert_eq!(
+            store.pending_copies(project.id).unwrap()[0].intent,
+            PendingIntent::Restore("held user message".into())
+        );
+        drop(job);
     }
 }

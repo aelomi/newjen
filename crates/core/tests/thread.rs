@@ -3293,7 +3293,7 @@ fn a_snapshot_failure_keeps_the_next_message_blocked_until_explicit_retry() {
     };
     thread.finish_project(job.run(&tools)).unwrap();
     finish_turn(&mut thread);
-    let _job = thread.take_snapshot_job().unwrap();
+    drop(thread.take_snapshot_job().unwrap());
     thread.finish_snapshot(Err(anyhow::anyhow!("disk full")));
     assert_eq!(thread.snapshot_error(), Some("disk full"));
     assert!(thread.send("second").is_err());

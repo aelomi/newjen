@@ -89,6 +89,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         if choice.is_deny() || self.edit_preview.is_none() {
             self.send_answer(request_id, choice, rule_cut, window, cx);
             return;
@@ -107,6 +110,9 @@ impl ChatView {
         cx.spawn_in(window, async move |view, cx| {
             let current = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
+                if view.quit_saving {
+                    return;
+                }
                 let Some(preview) = view
                     .edit_preview
                     .as_mut()
@@ -249,6 +255,9 @@ impl ChatView {
         cx.spawn_in(window, async move |view, cx| {
             let current = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
+                if view.quit_saving {
+                    return;
+                }
                 let Some(ix) = view.slots.iter().position(|slot| slot.thread == thread) else {
                     return;
                 };
@@ -283,6 +292,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         let job = thread.update(cx, |thread, _| thread.take_snapshot_job());
         let Some(job) = job else {
             return;
@@ -316,6 +328,12 @@ impl ChatView {
                 return;
             };
             let _ = view.update_in(cx, |view, window, cx| {
+                if view.quit_saving {
+                    return;
+                }
+                if thread.read(cx).preparing().is_none() {
+                    return;
+                }
                 let result = thread.update(cx, |thread, cx| {
                     let result = thread.finish_project(result);
                     cx.notify();
@@ -368,15 +386,24 @@ impl ChatView {
         let tools = self.tools.clone();
         self.review_loading = true;
         let stopping = self.thread().update(cx, |thread, _| thread.begin_quit());
+        let completion = self
+            .thread()
+            .update(cx, |thread, _| thread.track_background_work());
         let store = self.store.clone();
         let task = cx.background_spawn(async move {
-            thread::finish_quit(&store, [stopping])?;
-            landing::review(&tools, &cwd, &base)
+            let result = thread::finish_quit(&store, [stopping])
+                .map_err(anyhow::Error::from)
+                .and_then(|()| landing::review(&tools, &cwd, &base));
+            let _ = completion.send(());
+            result
         });
         cx.spawn_in(window, async move |view, cx| {
             let result = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
                 view.review_loading = false;
+                if view.quit_saving {
+                    return;
+                }
                 match result {
                     Ok(receipt) => view.show_review(id, receipt, mode, window, cx),
                     Err(error) => {
@@ -472,6 +499,9 @@ impl ChatView {
             cx.spawn_in(window, async move |view, cx| {
                 if question.await.ok() == Some(1) {
                     let _ = view.update_in(cx, |view, window, cx| {
+                        if view.quit_saving {
+                            return;
+                        }
                         view.perform_resolution(resolution, window, cx)
                     });
                 }
@@ -488,6 +518,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         let Resolution {
             id,
             receipt,
@@ -516,6 +549,9 @@ impl ChatView {
         };
         panel.busy = true;
         panel.message = "Checking and applying work…".into();
+        let completion = self.slots[ix]
+            .thread
+            .update(cx, |thread, _| thread.track_background_work());
         let tools = self.tools.clone();
         let task = cx.background_spawn(async move {
             match (integration, copy) {
@@ -536,6 +572,7 @@ impl ChatView {
                         if let Some(ix) = view.index_of(&id, cx) {
                             view.slots[ix].thread.update(cx, |thread, cx| { thread.finish_landing(); cx.notify(); });
                             view.review_panel = None;
+                            if view.quit_saving { cx.notify(); return; }
                             if integration.is_none() { view.archive(&id, window, cx); }
                             else {
                                 view.slots[ix].notice = Some(Notice::held("Work landed", "The work is in the project. Archive the thread when you are ready to close it.".into()));
@@ -547,6 +584,7 @@ impl ChatView {
                 }
                 cx.notify();
             });
+            let _ = completion.send(());
         }).detach();
         cx.notify();
     }
@@ -556,6 +594,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_saving {
+            return;
+        }
         if self.review_loading || self.review_panel.as_ref().is_some_and(|panel| panel.busy) {
             return;
         }
@@ -570,6 +611,9 @@ impl ChatView {
                 return;
             }
             let task = view.update_in(cx, |view, _, cx| {
+                if view.quit_saving {
+                    return None;
+                }
                 let ix = view.index_of(&id, cx)?;
                 let thread = view.slots[ix].thread.clone();
                 if !thread.read(cx).can_release_project_tracking()
@@ -580,9 +624,14 @@ impl ChatView {
                 }
                 view.review_loading = true;
                 let stopping = thread.update(cx, |thread, _| thread.begin_quit());
+                let completion = thread.update(cx, |thread, _| thread.track_background_work());
                 let store = view.store.clone();
                 cx.notify();
-                Some(cx.background_spawn(async move { thread::finish_quit(&store, [stopping]) }))
+                Some(cx.background_spawn(async move {
+                    let result = thread::finish_quit(&store, [stopping]);
+                    let _ = completion.send(());
+                    result
+                }))
             });
             let Ok(Some(task)) = task else {
                 return;
@@ -590,6 +639,9 @@ impl ChatView {
             let saved = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
                 view.review_loading = false;
+                if view.quit_saving {
+                    return;
+                }
                 let Some(ix) = view.index_of(&id, cx) else {
                     return;
                 };

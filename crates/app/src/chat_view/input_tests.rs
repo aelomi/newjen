@@ -2124,3 +2124,70 @@ fn closing_the_review_panel_returns_the_keyboard_to_the_composer(cx: &mut TestAp
     );
     finish(&chat, path, cx);
 }
+
+#[gpui::test]
+async fn review_completion_during_saving_does_not_disable_keep_open(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "review-during-quit", true);
+    cx.executor().allow_parking();
+    let quitting = cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let row = newjen_core::store::ThreadRow {
+                id: "review-probe".into(),
+                project_id: view.project.id,
+                workdir: path.clone(),
+                title: "Review probe".into(),
+                provider: "claude".into(),
+                conversation: newjen_core::agent::ConversationState::Established(
+                    "6f1c1f4e-2b1e-4c8e-9a51-0d9a7c2f3b10".into(),
+                ),
+                model: newjen_core::providers::ModelSelection::CliDefault,
+                effort: newjen_core::agent::EffortSelection::CliDefault,
+                speed: newjen_core::agent::Speed::Normal,
+                status: Status::Done,
+                unread: false,
+                created_at: 1,
+                updated_at: 1,
+                archived_at: None,
+                copy: None,
+                landing_mode: newjen_core::landing::LandingMode::HarnessManaged,
+                review_base: Some("a".repeat(40)),
+                landing_resolved: false,
+                snapshot_needed: false,
+            };
+            view.store.save_thread(row.clone());
+            assert!(view.store.flush(Duration::from_secs(5)));
+            let thread = Thread::load(
+                view.store.clone(),
+                &view.project,
+                row,
+                view.base_config.clone(),
+            )
+            .unwrap();
+            view.slots[0].thread = cx.new(|_| thread);
+            view.open_review(window, cx);
+            assert!(view.review_loading);
+            view.set_quit_saving(true, cx);
+            view.prepare_quit(window, cx)
+        })
+    });
+    let store = cx.update(|_, cx| chat.read(cx).store.clone());
+    let (done, wait) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        done.send_blocking(thread::finish_quit(&store, quitting))
+            .unwrap();
+    });
+    wait.recv().await.unwrap().unwrap();
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.set_quit_saving(false, cx);
+            let sent = view.send_text("preserved user work", window, cx);
+            assert!(sent, "the retained composer can send again");
+            assert!(
+                !view.review_loading,
+                "Keep open must clear completed review loading so the composer can send again"
+            );
+        })
+    });
+    finish(&chat, path, cx);
+}

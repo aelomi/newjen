@@ -1,4 +1,6 @@
+use gpui_kit::component::{WindowExt as _, dialog::DialogEntrance};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, IntoElement, ParentElement, PathPromptOptions,
@@ -30,6 +32,7 @@ enum QuitPhase {
     #[default]
     Running,
     Confirming,
+    Saving,
     Stopping,
 }
 
@@ -56,6 +59,20 @@ pub struct ProjectView {
     attention: Option<NativeAttention>,
     quit_guard: Option<NativeQuitGuard>,
     quit_phase: QuitPhase,
+    quit_attempt: u64,
+    quit_save: Option<thread::QuitSave>,
+    quit_observation: Option<newjen_core::store::SaveObservation>,
+    #[cfg(test)]
+    load_control: Option<async_channel::Receiver<()>>,
+    settling: Vec<thread::QuitSave>,
+    quit_elapsed: Duration,
+    quit_started: Option<std::time::Instant>,
+    #[cfg(test)]
+    quit_control: Option<async_channel::Receiver<Result<(), String>>>,
+    quit_failure: Option<String>,
+    quit_dialog: bool,
+    keep_open_focus: FocusHandle,
+    focus_quit_choice: bool,
     /// The badge count last shown, so AppKit is only asked when it changes.
     badge: usize,
     attention_note: Option<&'static str>,
@@ -118,6 +135,20 @@ impl ProjectView {
             attention: None,
             quit_guard: None,
             quit_phase: QuitPhase::Running,
+            quit_attempt: 0,
+            quit_save: None,
+            quit_observation: None,
+            #[cfg(test)]
+            load_control: None,
+            settling: Vec::new(),
+            quit_elapsed: Duration::ZERO,
+            quit_started: None,
+            #[cfg(test)]
+            quit_control: None,
+            quit_failure: None,
+            quit_dialog: false,
+            keep_open_focus: cx.focus_handle(),
+            focus_quit_choice: false,
             badge: 0,
             attention_note: None,
             #[cfg(test)]
@@ -150,10 +181,13 @@ impl ProjectView {
     }
 
     pub fn is_stopping(&self) -> bool {
-        self.quit_phase == QuitPhase::Stopping
+        matches!(self.quit_phase, QuitPhase::Saving | QuitPhase::Stopping)
     }
 
     pub fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase != QuitPhase::Running {
+            return;
+        }
         if self.opening.is_some() {
             self.pending = Some(path);
             return;
@@ -169,7 +203,13 @@ impl ProjectView {
             .collect();
         #[cfg(test)]
         let stand_in = self.stand_in.clone();
+        #[cfg(test)]
+        let load_control = self.load_control.take();
         let loading = cx.background_spawn(async move {
+            #[cfg(test)]
+            if let Some(control) = load_control {
+                control.recv().await.unwrap();
+            }
             let path = project_folder(&path)?;
             let project = store.open_project(&path)?;
             let loaded = match opened.iter().position(|opened| *opened == path) {
@@ -193,6 +233,20 @@ impl ProjectView {
             let loaded = loading.await;
             let _ = view.update_in(cx, |view, window, cx| {
                 view.opening = None;
+                if view.quit_phase == QuitPhase::Saving {
+                    let settling = view.quit_save.take().into_iter().collect();
+                    view.quit_save = Some(thread::QuitSave::start(
+                        view.store.clone(),
+                        [],
+                        view.quit_observation.as_ref().unwrap().clone(),
+                        settling,
+                    ));
+                    cx.notify();
+                    return;
+                }
+                if view.quit_phase != QuitPhase::Running {
+                    return;
+                }
                 match loaded {
                     Ok((loaded, recent)) => {
                         let index = match loaded {
@@ -293,6 +347,9 @@ impl ProjectView {
     /// Gives the keyboard to the shown project if the window's own handle has it: the chat
     /// view's shortcuts and approval keys only work with focus inside it.
     fn hand_focus_to_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_stopping() {
+            return;
+        }
         if let Some(active) = self.active
             && self.focus.is_focused(window)
         {
@@ -303,6 +360,9 @@ impl ProjectView {
     }
 
     fn show_projects(&mut self, _: &ShowProjects, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase != QuitPhase::Running {
+            return;
+        }
         if let Some(active) = self.active.take() {
             self.projects[active]
                 .chat
@@ -314,6 +374,9 @@ impl ProjectView {
     }
 
     fn pick_project(&mut self, _: &OpenProject, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase != QuitPhase::Running {
+            return;
+        }
         if self.picking || self.opening.is_some() {
             return;
         }
@@ -352,6 +415,9 @@ impl ProjectView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_phase != QuitPhase::Running {
+            return;
+        }
         self.open_project(action.0.clone(), window, cx);
     }
 
@@ -381,6 +447,12 @@ impl ProjectView {
     }
 
     pub fn quit(&mut self, cx: &mut Context<Self>) -> Result<(), thread::QuitError> {
+        if self.quit_phase == QuitPhase::Stopping {
+            return Ok(());
+        }
+        for old in std::mem::take(&mut self.settling) {
+            let _ = old.wait_blocking();
+        }
         let quitting: Vec<_> = self
             .projects
             .iter()
@@ -504,6 +576,9 @@ impl ProjectView {
 
     /// Brings `thread_id` on screen, switching to its project if needed.
     fn reveal_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase != QuitPhase::Running {
+            return;
+        }
         let Some(index) = self
             .projects
             .iter()
@@ -529,30 +604,46 @@ impl ProjectView {
     /// one confirmation when work would be lost, otherwise the app quits.
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.quit_phase != QuitPhase::Running {
+            if self.quit_dialog {
+                window.activate_window();
+                cx.activate(true);
+            }
             return;
         }
         let blockers = self.quit_blockers(cx);
-        if !blockers.any() {
-            self.quit_phase = QuitPhase::Stopping;
-            self.allow_quit();
-            cx.quit();
+        let unsent = self
+            .projects
+            .iter()
+            .any(|p| p.chat.read(cx).has_unsent_text(cx));
+        if !blockers.any() && !unsent {
+            self.start_saving(window, cx);
             return;
         }
         self.quit_phase = QuitPhase::Confirming;
+        let detail = format!(
+            "{}{}",
+            blockers.detail(),
+            if unsent {
+                "\nUnsent composer text will be discarded if you quit. Keep working to preserve it."
+            } else {
+                ""
+            }
+        );
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
             "Quit Newjen and stop its work?",
-            Some(&blockers.detail()),
+            Some(&detail),
             &["Keep working", "Quit and stop"],
             cx,
         );
-        cx.spawn(async move |view, cx| {
+        cx.spawn_in(window, async move |view, cx| {
             let confirmed = answer.await == Ok(1);
-            let _ = view.update(cx, |view, cx| {
+            let _ = view.update_in(cx, |view, window, cx| {
+                if view.quit_phase != QuitPhase::Confirming {
+                    return;
+                }
                 if confirmed {
-                    view.quit_phase = QuitPhase::Stopping;
-                    view.allow_quit();
-                    cx.quit();
+                    view.start_saving(window, cx);
                 } else {
                     view.quit_phase = QuitPhase::Running;
                 }
@@ -560,6 +651,187 @@ impl ProjectView {
             });
         })
         .detach();
+    }
+
+    fn start_saving(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quit_phase = QuitPhase::Saving;
+        self.quit_attempt += 1;
+        let attempt = self.quit_attempt;
+        self.quit_elapsed = Duration::ZERO;
+        self.quit_started = Some(cx.background_executor().now());
+        self.quit_failure = None;
+        self.focus_quit_choice = false;
+        window.focus(&self.focus, cx);
+        let failure = self.store.observe_saves();
+        self.quit_observation = Some(failure.clone());
+        let quitting: Vec<_> = self
+            .projects
+            .iter()
+            .flat_map(|p| {
+                p.chat.update(cx, |chat, cx| {
+                    chat.set_quit_saving(true, cx);
+                    chat.prepare_quit(window, cx)
+                })
+            })
+            .collect();
+        self.quit_save = Some(thread::QuitSave::start(
+            self.store.clone(),
+            quitting,
+            failure,
+            std::mem::take(&mut self.settling),
+        ));
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let mut delay = Duration::from_millis(25);
+            loop {
+                cx.background_executor().timer(delay).await;
+                let next = view
+                    .update_in(cx, |view, window, cx| {
+                        if view.quit_phase != QuitPhase::Saving || view.quit_attempt != attempt {
+                            return None;
+                        }
+                        let elapsed = cx.background_executor().now() - view.quit_started.unwrap();
+                        view.advance_saving(attempt, elapsed, window, cx);
+                        if view.quit_phase != QuitPhase::Saving {
+                            return None;
+                        }
+                        let until_boundary = [
+                            Duration::from_millis(300),
+                            Duration::from_secs(3),
+                            Duration::from_secs(10),
+                        ]
+                        .into_iter()
+                        .find(|deadline| *deadline > elapsed)
+                        .map(|deadline| deadline - elapsed);
+                        Some(
+                            until_boundary
+                                .unwrap_or(Duration::from_millis(25))
+                                .min(Duration::from_millis(25)),
+                        )
+                    })
+                    .ok()
+                    .flatten();
+                let Some(next) = next else {
+                    break;
+                };
+                delay = next;
+            }
+        })
+        .detach();
+    }
+
+    fn advance_saving(
+        &mut self,
+        attempt: u64,
+        elapsed: Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.quit_phase != QuitPhase::Saving || self.quit_attempt != attempt {
+            return;
+        }
+        if self.focus_quit_choice {
+            window.focus(&self.keep_open_focus, cx);
+            self.focus_quit_choice = false;
+        }
+        let had_choices =
+            self.quit_elapsed >= Duration::from_secs(10) || self.quit_failure.is_some();
+        self.quit_elapsed = elapsed;
+        if self.quit_failure.is_none() {
+            let result = self.quit_save.as_ref().and_then(|save| save.poll());
+            #[cfg(test)]
+            let result = if let Some(control) = &self.quit_control {
+                control.try_recv().ok()
+            } else {
+                result
+            };
+            match result {
+                Some(Ok(())) if self.opening.is_none() => {
+                    self.commit_quit(window, cx);
+                    return;
+                }
+                Some(Ok(())) => {}
+                Some(Err(error)) => self.quit_failure = Some(error),
+                None => {}
+            }
+        }
+        if !self.quit_dialog
+            && (self.quit_elapsed >= Duration::from_millis(300) || self.quit_failure.is_some())
+        {
+            self.quit_dialog = true;
+            window.activate_window();
+            cx.activate(true);
+            let view = cx.entity().downgrade();
+            window.open_dialog(cx, move |dialog, _, cx| {
+                let Some(entity) = view.upgrade() else { return dialog; };
+                let state = entity.read(cx);
+                let choices = state.quit_elapsed >= Duration::from_secs(10) || state.quit_failure.is_some();
+                let title = if state.quit_failure.is_some() { "Couldn't save your work" }
+                    else if state.quit_elapsed >= Duration::from_secs(10) { "Your work isn't confirmed saved" }
+                    else if state.quit_elapsed >= Duration::from_secs(3) { "Saving is taking longer than usual…" }
+                    else { "Saving your work…" };
+                let message = if choices { "Recent changes may be lost if you quit. Work will stay stopped if you keep Newjen open." }
+                    else { "Newjen is saving your changes and stopping work. Please keep this window open." };
+                let selector = if state.quit_failure.is_some() { "quit-failed" }
+                    else if choices { "quit-timed-out" }
+                    else if state.quit_elapsed >= Duration::from_secs(3) { "quit-slow" }
+                    else { "quit-saving" };
+                let keep_focus = state.keep_open_focus.clone();
+                let keep = view.clone();
+                let anyway = view.clone();
+                dialog.centered().entrance(DialogEntrance::None).close_button(false).overlay_closable(false).keyboard(false).on_ok(|_, _, _| false).on_cancel(|_, _, _| false)
+                    .title(div().debug_selector(move || selector.into()).child(title)).child(message)
+                    .when(choices, |dialog| dialog.footer(gpui_kit::base::h_flex().gap_2()
+                        .child(div().debug_selector(|| "quit-anyway-button".into()).child(ui::button("quit-anyway", "Quit anyway", ui::Look::Secondary, ui::Size::Md, cx)
+                            .on_click(move |_, window, cx| { let _ = anyway.update(cx, |view, cx| {
+                                if view.quit_attempt == attempt && view.quit_phase == QuitPhase::Saving { view.commit_quit(window, cx); }
+                            }); })))
+                        .child(div().debug_selector(|| "quit-keep-button".into()).child(ui::button("keep-newjen-open", "Keep Newjen open", ui::Look::Primary, ui::Size::Md, cx).track_focus(&keep_focus)
+                            .on_click(move |_, window, cx| { let _ = keep.update(cx, |view, cx| view.keep_open(attempt, window, cx)); }))) ))
+            });
+        }
+        if !had_choices
+            && (self.quit_elapsed >= Duration::from_secs(10) || self.quit_failure.is_some())
+        {
+            self.focus_quit_choice = true;
+        }
+        window.refresh();
+        cx.notify();
+    }
+
+    fn keep_open(&mut self, attempt: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase != QuitPhase::Saving || self.quit_attempt != attempt {
+            return;
+        }
+        self.quit_attempt += 1;
+        self.quit_phase = QuitPhase::Running;
+        if let Some(save) = self.quit_save.take() {
+            self.settling.push(save);
+        }
+        self.quit_dialog = false;
+        for p in &self.projects {
+            p.chat
+                .update(cx, |chat, cx| chat.set_quit_saving(false, cx));
+        }
+        window.close_dialog(cx);
+        if let Some(active) = self.active {
+            self.projects[active]
+                .chat
+                .update(cx, |chat, cx| chat.take_focus(window, cx));
+        } else {
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn commit_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quit_phase = QuitPhase::Stopping;
+        if self.quit_dialog {
+            window.close_dialog(cx);
+            self.quit_dialog = false;
+        }
+        self.allow_quit();
+        cx.quit();
     }
 
     fn allow_quit(&self) {
@@ -655,6 +927,12 @@ impl Render for ProjectView {
         };
         v_flex()
             .size_full()
+            .relative()
+            .capture_key_down(cx.listener(|view, _, _, cx| {
+                if view.is_stopping() && !view.quit_dialog {
+                    cx.stop_propagation();
+                }
+            }))
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::pick_project))
             .on_action(cx.listener(Self::show_projects))
@@ -693,6 +971,9 @@ impl Render for ProjectView {
                     )
                 },
             )
+            .when(self.is_stopping(), |root| {
+                root.child(div().absolute().inset_0().occlude())
+            })
             .when_some(self.opening.as_ref(), |root, _| {
                 root.child(div().flex_none().p_2().text_sm().child("Opening project…"))
             })
@@ -1004,16 +1285,17 @@ mod tests {
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         open(&shell, first, cx).await;
-        // Nothing to lose: the app quits without a question.
+        // Nothing to lose: saving starts without a question.
         cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
         assert!(!cx.has_pending_prompt());
         assert_eq!(
             cx.update(|_, cx| shell.read(cx).quit_phase),
-            QuitPhase::Stopping
+            QuitPhase::Saving
         );
-        cx.update(|_, cx| {
-            shell.update(cx, |view, _| view.quit_phase = QuitPhase::Running);
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| view.keep_open(view.quit_attempt, window, cx))
         });
+        cx.run_until_parked();
         // A terminal in the first project, then the second project on screen.
         cx.simulate_keystrokes("cmd-`");
         assert_eq!(
@@ -1049,7 +1331,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             cx.update(|_, cx| shell.read(cx).quit_phase),
-            QuitPhase::Stopping
+            QuitPhase::Saving
         );
         // Quitting stops the terminal with everything else.
         cx.update(|_, cx| shell.update(cx, |view, cx| view.quit(cx)))
@@ -1142,6 +1424,320 @@ mod tests {
         );
         cx.simulate_path_prompt_response(|_| None);
         cx.condition(&shell, |view, _| !view.picking).await;
+        finish(&shell, path, cx);
+    }
+    fn controlled_quit(
+        shell: &Entity<ProjectView>,
+        cx: &mut VisualTestContext,
+    ) -> async_channel::Sender<Result<(), String>> {
+        let (send, receive) = async_channel::unbounded();
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| {
+                view.quit_control = Some(receive);
+                view.request_quit(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        send
+    }
+
+    fn press_enter(cx: &mut VisualTestContext) {
+        let keystroke = gpui::Keystroke::parse("enter").unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        cx.run_until_parked();
+    }
+
+    fn elapse(cx: &mut VisualTestContext, millis: u64) {
+        cx.executor().advance_clock(Duration::from_millis(millis));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn quit_gate_deadlines_rebuild_one_dialog_and_late_success_exits(cx: &mut TestAppContext) {
+        let (shell, path, cx) = setup(cx, "quit-deadlines");
+        let completion = controlled_quit(&shell, cx);
+        let attempt = cx.update(|_, cx| shell.read(cx).quit_attempt);
+        elapse(cx, 299);
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        elapse(cx, 1);
+        assert!(cx.debug_bounds("quit-saving").is_some());
+        elapse(cx, 2700);
+        assert!(cx.debug_bounds("quit-slow").is_some());
+        for _ in 0..3 {
+            cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        }
+        assert_eq!(cx.update(|_, cx| shell.read(cx).quit_attempt), attempt);
+        elapse(cx, 7000);
+        assert!(cx.debug_bounds("quit-timed-out").is_some());
+        assert!(cx.debug_bounds("quit-keep-button").is_some());
+        completion.send_blocking(Ok(())).unwrap();
+        elapse(cx, 25);
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    fn quit_gate_keep_open_revokes_old_completion_and_allows_a_fresh_attempt(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx) = setup(cx, "quit-revoke");
+        let completion = controlled_quit(&shell, cx);
+        let old = cx.update(|_, cx| shell.read(cx).quit_attempt);
+        elapse(cx, 10025);
+        let keep = cx.debug_bounds("quit-keep-button").unwrap();
+        cx.simulate_click(keep.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        completion.send_blocking(Ok(())).unwrap();
+        elapse(cx, 100);
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| {
+                view.advance_saving(old, Duration::from_secs(20), window, cx)
+            })
+        });
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        let new = controlled_quit(&shell, cx);
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.keep_open(old, window, cx)));
+        new.send_blocking(Ok(())).unwrap();
+        elapse(cx, 25);
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    fn quit_gate_failure_shows_choices_immediately_and_force_quit_skips_shutdown_save(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx) = setup(cx, "quit-failure");
+        let completion = controlled_quit(&shell, cx);
+        completion.send_blocking(Err("disk failed".into())).unwrap();
+        elapse(cx, 25);
+        assert!(cx.debug_bounds("quit-failed").is_some());
+        let quit = cx.debug_bounds("quit-anyway-button").unwrap();
+        cx.simulate_click(quit.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
+        finish(&shell, path, cx);
+    }
+    #[gpui::test]
+    async fn quit_gate_blocks_silent_input_and_preserves_discarded_composer_on_keep_open(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx) = setup(cx, "quit-input");
+        let project = path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        open(&shell, project, cx).await;
+        cx.simulate_input("unfinished thought");
+        let (completion, receive) = async_channel::unbounded();
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| {
+                view.quit_control = Some(receive);
+                view.request_quit(window, cx);
+            })
+        });
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Keep working");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        cx.simulate_prompt_answer("Quit and stop");
+        cx.run_until_parked();
+        let draft = cx.update(|_, cx| shell.read(cx).projects[0].chat.read(cx).draft_for_test(cx));
+        cx.simulate_input("must not be inserted");
+        cx.simulate_keystrokes("cmd-enter cmd-n cmd-`");
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).projects[0].chat.read(cx).draft_for_test(cx)),
+            draft
+        );
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_blockers(cx).terminals),
+            0
+        );
+        elapse(cx, 10000);
+        elapse(cx, 25);
+        assert!(
+            cx.update(|window, cx| shell.read(cx).keep_open_focus.is_focused(window)),
+            "keep-open owns focus"
+        );
+        press_enter(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).projects[0].chat.read(cx).draft_for_test(cx)),
+            draft
+        );
+        completion.send_blocking(Ok(())).unwrap();
+        elapse(cx, 25);
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    fn quit_gate_fast_success_never_opens_dialog(cx: &mut TestAppContext) {
+        let (shell, path, cx) = setup(cx, "quit-fast");
+        let completion = controlled_quit(&shell, cx);
+        completion.send_blocking(Ok(())).unwrap();
+        elapse(cx, 25);
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    fn quit_gate_warning_fits_small_window_and_failure_keep_open_can_retry(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx) = setup(cx, "quit-small");
+        cx.simulate_resize(gpui::size(px(640.), px(480.)));
+        let completion = controlled_quit(&shell, cx);
+        completion.send_blocking(Err("disk failed".into())).unwrap();
+        elapse(cx, 25);
+        for selector in ["quit-failed", "quit-keep-button", "quit-anyway-button"] {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            assert!(
+                bounds.origin.x >= px(0.) && bounds.right() <= px(640.),
+                "{selector}: {bounds:?}"
+            );
+            assert!(
+                bounds.origin.y >= px(0.) && bounds.bottom() <= px(480.),
+                "{selector}: {bounds:?}"
+            );
+        }
+        elapse(cx, 25);
+        assert!(
+            cx.update(|window, cx| shell.read(cx).keep_open_focus.is_focused(window)),
+            "keep-open owns focus"
+        );
+        press_enter(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        let retry = controlled_quit(&shell, cx);
+        retry.send_blocking(Ok(())).unwrap();
+        elapse(cx, 25);
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
+        finish(&shell, path, cx);
+    }
+    #[gpui::test]
+    fn quit_gate_enter_and_escape_cannot_dismiss_brief_or_slow_saving(cx: &mut TestAppContext) {
+        let (shell, path, cx) = setup(cx, "quit-no-dismiss");
+        let _completion = controlled_quit(&shell, cx);
+        for millis in [300, 2700] {
+            elapse(cx, millis);
+            assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+            press_enter(cx);
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+            assert!(cx.update(|_, cx| shell.read(cx).quit_dialog));
+            assert_eq!(
+                cx.update(|_, cx| shell.read(cx).quit_phase),
+                QuitPhase::Saving
+            );
+        }
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| view.keep_open(view.quit_attempt, window, cx))
+        });
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn quit_gate_waits_for_project_loading_then_covers_loader_writes(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx) = setup(cx, "quit-loading");
+        let project = path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (release, held) = async_channel::unbounded();
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| {
+                view.load_control = Some(held);
+                view.open_project(project.clone(), window, cx);
+            })
+        });
+        let completion = controlled_quit(&shell, cx);
+        completion.send_blocking(Ok(())).unwrap();
+        elapse(cx, 25);
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Saving
+        );
+        assert!(cx.update(|_, cx| shell.read(cx).opening.is_some()));
+        release.send_blocking(()).unwrap();
+        cx.condition(&shell, |view, _| view.opening.is_none()).await;
+        let final_save =
+            cx.update(|_, cx| shell.update(cx, |view, _| view.quit_save.take().unwrap()));
+        let saved = final_save.wait_blocking();
+        assert_eq!(saved, Ok(()));
+        assert!(cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .store
+                .projects()
+                .unwrap()
+                .iter()
+                .any(|saved| saved.path == project.canonicalize().unwrap())
+        }));
+        completion.send_blocking(saved).unwrap();
+        elapse(cx, 25);
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
+        finish(&shell, path, cx);
+    }
+    #[gpui::test]
+    fn quit_gate_requires_an_explicit_keyboard_choice_to_quit_anyway(cx: &mut TestAppContext) {
+        let (shell, path, cx) = setup(cx, "quit-keyboard-choice");
+        let completion = controlled_quit(&shell, cx);
+        completion
+            .send_blocking(Err("write failed".into()))
+            .unwrap();
+        elapse(cx, 50);
+        assert!(cx.update(|window, cx| shell.read(cx).keep_open_focus.is_focused(window)));
+        cx.simulate_keystrokes("shift-tab");
+        press_enter(cx);
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Stopping
+        );
         finish(&shell, path, cx);
     }
 }

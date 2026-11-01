@@ -29476,6 +29476,4793 @@
           ]
         }
       ]
+    },
+    {
+      "type": "frame",
+      "id": "zEeWA",
+      "x": 1680,
+      "y": 12310,
+      "name": "Quit saving · brief",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1200,
+      "height": 760,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "children": [
+        {
+          "type": "frame",
+          "id": "bEOyl",
+          "name": "Sidebar",
+          "width": 240,
+          "height": "fill_container",
+          "fill": "$sunken",
+          "stroke": "$border",
+          "strokeWidth": {
+            "right": 1
+          },
+          "layout": "vertical",
+          "gap": 2,
+          "padding": [
+            0,
+            8,
+            8,
+            8
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "f46AT",
+              "name": "Header",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                6
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "w23X9",
+                  "name": "Traffic lights",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "TkVYh",
+                      "name": "Light",
+                      "fill": "#FF5F57",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "ylMlA",
+                      "name": "Light",
+                      "fill": "#FEBC2E",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "mCH6H",
+                      "name": "Light",
+                      "fill": "#28C840",
+                      "width": 12,
+                      "height": 12
+                    }
+                  ]
+                },
+                {
+                  "type": "icon",
+                  "id": "nXWoc",
+                  "name": "Toggle sidebar",
+                  "width": 15,
+                  "height": 15,
+                  "icon": "panel-left",
+                  "library": "lucide",
+                  "fill": "$fg-subtle"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "j8xMw",
+              "name": "Project",
+              "width": "fill_container",
+              "gap": 8,
+              "padding": [
+                8,
+                10,
+                10,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "g6iHdp",
+                  "name": "Folder",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "folder",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "VviRw",
+                  "name": "Name",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "mIwxh",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "B1ci0",
+              "name": "New thread",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 9,
+              "padding": [
+                7,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "Y3r8k",
+                  "name": "Plus",
+                  "width": 12,
+                  "height": 12,
+                  "icon": "plus",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "lqSQJ",
+                  "name": "Label",
+                  "fill": "$fg-muted",
+                  "content": "New thread",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "rijcT",
+                  "name": "Key",
+                  "fill": "$fg-subtle",
+                  "content": "⌘N",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "x0ucaw",
+              "name": "Gap",
+              "width": "fill_container",
+              "height": 6
+            },
+            {
+              "id": "JoKzl",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Fix the parser",
+              "width": "fill_container",
+              "fill": "$hover",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false,
+                  "fill": "$focus",
+                  "stroke": "#00000000",
+                  "strokeWidth": 0
+                },
+                "prjfO": {
+                  "content": "Fix the parser",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "type": "frame",
+                  "id": "XvGLg",
+                  "name": "Detail",
+                  "gap": 4,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "JMLhh",
+                      "name": "Copy",
+                      "width": 10,
+                      "height": 10,
+                      "icon": "copy",
+                      "library": "lucide",
+                      "fill": "$fg-subtle"
+                    },
+                    {
+                      "type": "text",
+                      "id": "EUbHk",
+                      "name": "Text",
+                      "fill": "$fg-subtle",
+                      "content": "Done · 2m ago",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "Ox5fY",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Add the SQLite store",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$focus"
+                },
+                "prjfO": {
+                  "content": "Add the SQLite store",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Working · 1m 12s"
+                }
+              }
+            },
+            {
+              "id": "TVnuK",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Rename the CLI flags",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$warning"
+                },
+                "prjfO": {
+                  "content": "Rename the CLI flags",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Needs approval · Bash"
+                }
+              }
+            },
+            {
+              "id": "ojApo",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Summarize the README",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$fg"
+                },
+                "prjfO": {
+                  "content": "Summarize the README",
+                  "fontWeight": "600"
+                },
+                "fNykS": {
+                  "content": "Done · 4m ago"
+                }
+              }
+            },
+            {
+              "id": "Ba9EC",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Upgrade gpui-pre",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$danger"
+                },
+                "prjfO": {
+                  "content": "Upgrade gpui-pre",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Failed · Claude exited"
+                }
+              }
+            },
+            {
+              "id": "do9KS",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Explore Rift copies",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "#00000000",
+                  "stroke": "$fg-subtle",
+                  "strokeWidth": 1.2
+                },
+                "prjfO": {
+                  "content": "Explore Rift copies",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Stopped when Newjen quit"
+                }
+              }
+            },
+            {
+              "id": "cbc5C",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Try the dark theme",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false
+                },
+                "prjfO": {
+                  "content": "Try the dark theme",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Yesterday"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "CNGKi",
+          "name": "Main",
+          "theme": {
+            "mode": "dark"
+          },
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "fill": "$bg",
+          "stroke": "$border",
+          "layout": "vertical",
+          "children": [
+            {
+              "type": "frame",
+              "id": "dapwM",
+              "name": "Title bar",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                14
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "ebooO",
+                  "name": "Spacer",
+                  "width": 160,
+                  "height": 12
+                },
+                {
+                  "type": "frame",
+                  "id": "DoPS3",
+                  "name": "Title",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Cflrs",
+                      "name": "App",
+                      "fill": "$fg",
+                      "content": "Fix the parser",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "J3pyzO",
+                      "name": "Rift tag",
+                      "fill": "$hover",
+                      "cornerRadius": 4,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "padding": [
+                        2,
+                        6
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "b6onGG",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "Rift copy",
+                          "fontFamily": "$font",
+                          "fontSize": 10,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "aOT5V",
+                      "name": "Path",
+                      "fill": "$fg-subtle",
+                      "content": "~/.rifts/Newjen/newjen-1a2b3c4d",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "ghwWy",
+                  "name": "Right",
+                  "width": 160,
+                  "gap": 6,
+                  "justifyContent": "end",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "ZLk2i",
+                      "x": 19,
+                      "y": 0,
+                      "name": "Grants chip",
+                      "enabled": false,
+                      "fill": "$hover",
+                      "cornerRadius": 10,
+                      "gap": 5,
+                      "padding": [
+                        3,
+                        9
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "wSJSB",
+                          "name": "Shield",
+                          "width": 11,
+                          "height": 11,
+                          "icon": "shield-check",
+                          "library": "lucide",
+                          "fill": "$fg-muted"
+                        },
+                        {
+                          "type": "text",
+                          "id": "IjaAS",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "2 allowed",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "lA4wn",
+                      "type": "ref",
+                      "ref": "hspXi",
+                      "name": "Status pill",
+                      "fill": "$hover",
+                      "descendants": {
+                        "FZ7D5": {
+                          "fill": "$fg-subtle"
+                        },
+                        "EPAWC": {
+                          "content": "Idle",
+                          "fill": "$fg-muted"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "LhNQK",
+              "name": "Transcript",
+              "clip": true,
+              "width": "fill_container",
+              "height": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                20,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "F9pRcP",
+                  "name": "Column",
+                  "width": 720,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "children": [
+                    {
+                      "id": "y3as7Q",
+                      "type": "ref",
+                      "ref": "d33VbP",
+                      "name": "User message",
+                      "width": "fill_container",
+                      "descendants": {
+                        "ky97F": {
+                          "content": "Fix the parser so it accepts trailing commas in arrays, and add a test."
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "csuDV",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "I'll find where arrays are parsed first.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "EdJPk",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "rg -n \"fn parse_array\" src"
+                        },
+                        "wbk6i": {
+                          "content": "0.1s"
+                        },
+                        "vtmRs": {
+                          "content": "src/parser.rs:212:    fn parse_array(&mut self) -> Result<Value> {"
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "lTGrT",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "The loop expects another value after every comma, so `[1, 2,]` fails. I'll let it stop at `]` instead, then add a test.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "bv9RX",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "cargo test -p parser"
+                        },
+                        "wbk6i": {
+                          "content": "8.4s"
+                        },
+                        "vtmRs": {
+                          "content": "test result: ok. 42 passed; 0 failed; 0 ignored"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "jlh7b",
+              "name": "Bottom",
+              "width": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                0,
+                0,
+                16,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "zhWdS",
+                  "type": "ref",
+                  "ref": "WBhlj",
+                  "name": "Composer",
+                  "stroke": "$border-strong",
+                  "descendants": {
+                    "ZkHfg": {
+                      "content": "Reply to Claude…",
+                      "fill": "$fg-disabled"
+                    },
+                    "L6HncB": {
+                      "content": "↵ send · ⇧↵ new line"
+                    },
+                    "eRKrN": {
+                      "opacity": 0.35
+                    },
+                    "qoQIl": {
+                      "icon": "arrow-up"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "rectangle",
+          "id": "jfepA",
+          "layoutPosition": "absolute",
+          "x": 0,
+          "y": 0,
+          "name": "Overlay",
+          "fill": "#00000066",
+          "width": 1200,
+          "height": 760
+        },
+        {
+          "type": "frame",
+          "id": "D1oBB3",
+          "layoutPosition": "absolute",
+          "x": 376,
+          "y": 326.5,
+          "name": "Quit saving dialog",
+          "width": 448,
+          "fill": "$bg",
+          "cornerRadius": 10,
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "effect": [
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 20
+              },
+              "blur": 25
+            },
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 8
+              },
+              "blur": 10
+            }
+          ],
+          "layout": "vertical",
+          "gap": 16,
+          "padding": 16,
+          "children": [
+            {
+              "type": "frame",
+              "id": "Vpgz8",
+              "name": "Header",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "FNGvr",
+                  "name": "Title",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Saving your work…",
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "vHtfX",
+                  "name": "Description",
+                  "fill": "$fg-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Newjen is saving your changes and stopping work. Please keep this window open.",
+                  "lineHeight": 1.5,
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "WI4ph",
+      "x": 1680,
+      "y": 13150,
+      "name": "Quit saving · slow",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1200,
+      "height": 760,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "children": [
+        {
+          "type": "frame",
+          "id": "KNcL5",
+          "name": "Sidebar",
+          "width": 240,
+          "height": "fill_container",
+          "fill": "$sunken",
+          "stroke": "$border",
+          "strokeWidth": {
+            "right": 1
+          },
+          "layout": "vertical",
+          "gap": 2,
+          "padding": [
+            0,
+            8,
+            8,
+            8
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "zfCpx",
+              "name": "Header",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                6
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "pkMqG",
+                  "name": "Traffic lights",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "dhloI",
+                      "name": "Light",
+                      "fill": "#FF5F57",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "f2iu3W",
+                      "name": "Light",
+                      "fill": "#FEBC2E",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "dssSk",
+                      "name": "Light",
+                      "fill": "#28C840",
+                      "width": 12,
+                      "height": 12
+                    }
+                  ]
+                },
+                {
+                  "type": "icon",
+                  "id": "x737Y",
+                  "name": "Toggle sidebar",
+                  "width": 15,
+                  "height": 15,
+                  "icon": "panel-left",
+                  "library": "lucide",
+                  "fill": "$fg-subtle"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "HsJpw",
+              "name": "Project",
+              "width": "fill_container",
+              "gap": 8,
+              "padding": [
+                8,
+                10,
+                10,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "OCtk0",
+                  "name": "Folder",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "folder",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "NkCLY",
+                  "name": "Name",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "P0WAwC",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "vcLIg",
+              "name": "New thread",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 9,
+              "padding": [
+                7,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "KMOsN",
+                  "name": "Plus",
+                  "width": 12,
+                  "height": 12,
+                  "icon": "plus",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "uvz57",
+                  "name": "Label",
+                  "fill": "$fg-muted",
+                  "content": "New thread",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "R9tjOS",
+                  "name": "Key",
+                  "fill": "$fg-subtle",
+                  "content": "⌘N",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "AsHiF",
+              "name": "Gap",
+              "width": "fill_container",
+              "height": 6
+            },
+            {
+              "id": "zWd4Z",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Fix the parser",
+              "width": "fill_container",
+              "fill": "$hover",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false,
+                  "fill": "$focus",
+                  "stroke": "#00000000",
+                  "strokeWidth": 0
+                },
+                "prjfO": {
+                  "content": "Fix the parser",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "type": "frame",
+                  "id": "bMjUi",
+                  "name": "Detail",
+                  "gap": 4,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "XcS3I",
+                      "name": "Copy",
+                      "width": 10,
+                      "height": 10,
+                      "icon": "copy",
+                      "library": "lucide",
+                      "fill": "$fg-subtle"
+                    },
+                    {
+                      "type": "text",
+                      "id": "s8kXC1",
+                      "name": "Text",
+                      "fill": "$fg-subtle",
+                      "content": "Done · 2m ago",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "pS7qY",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Add the SQLite store",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$focus"
+                },
+                "prjfO": {
+                  "content": "Add the SQLite store",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Working · 1m 12s"
+                }
+              }
+            },
+            {
+              "id": "kvvAF",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Rename the CLI flags",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$warning"
+                },
+                "prjfO": {
+                  "content": "Rename the CLI flags",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Needs approval · Bash"
+                }
+              }
+            },
+            {
+              "id": "qtLs5",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Summarize the README",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$fg"
+                },
+                "prjfO": {
+                  "content": "Summarize the README",
+                  "fontWeight": "600"
+                },
+                "fNykS": {
+                  "content": "Done · 4m ago"
+                }
+              }
+            },
+            {
+              "id": "Vbjl6",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Upgrade gpui-pre",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$danger"
+                },
+                "prjfO": {
+                  "content": "Upgrade gpui-pre",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Failed · Claude exited"
+                }
+              }
+            },
+            {
+              "id": "JzPEP",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Explore Rift copies",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "#00000000",
+                  "stroke": "$fg-subtle",
+                  "strokeWidth": 1.2
+                },
+                "prjfO": {
+                  "content": "Explore Rift copies",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Stopped when Newjen quit"
+                }
+              }
+            },
+            {
+              "id": "V9dmax",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Try the dark theme",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false
+                },
+                "prjfO": {
+                  "content": "Try the dark theme",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Yesterday"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "UGVt6",
+          "name": "Main",
+          "theme": {
+            "mode": "dark"
+          },
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "fill": "$bg",
+          "stroke": "$border",
+          "layout": "vertical",
+          "children": [
+            {
+              "type": "frame",
+              "id": "G5Zts",
+              "name": "Title bar",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                14
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "YOkJD",
+                  "name": "Spacer",
+                  "width": 160,
+                  "height": 12
+                },
+                {
+                  "type": "frame",
+                  "id": "GABC5",
+                  "name": "Title",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "D1YGm",
+                      "name": "App",
+                      "fill": "$fg",
+                      "content": "Fix the parser",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "YK4UD",
+                      "name": "Rift tag",
+                      "fill": "$hover",
+                      "cornerRadius": 4,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "padding": [
+                        2,
+                        6
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "kDELr",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "Rift copy",
+                          "fontFamily": "$font",
+                          "fontSize": 10,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "TefUi",
+                      "name": "Path",
+                      "fill": "$fg-subtle",
+                      "content": "~/.rifts/Newjen/newjen-1a2b3c4d",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "t8wGGQ",
+                  "name": "Right",
+                  "width": 160,
+                  "gap": 6,
+                  "justifyContent": "end",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "s8XPS9",
+                      "x": 19,
+                      "y": 0,
+                      "name": "Grants chip",
+                      "enabled": false,
+                      "fill": "$hover",
+                      "cornerRadius": 10,
+                      "gap": 5,
+                      "padding": [
+                        3,
+                        9
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "TKn7G",
+                          "name": "Shield",
+                          "width": 11,
+                          "height": 11,
+                          "icon": "shield-check",
+                          "library": "lucide",
+                          "fill": "$fg-muted"
+                        },
+                        {
+                          "type": "text",
+                          "id": "GpHea",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "2 allowed",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "vHHSM",
+                      "type": "ref",
+                      "ref": "hspXi",
+                      "name": "Status pill",
+                      "fill": "$hover",
+                      "descendants": {
+                        "FZ7D5": {
+                          "fill": "$fg-subtle"
+                        },
+                        "EPAWC": {
+                          "content": "Idle",
+                          "fill": "$fg-muted"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "kjyaG",
+              "name": "Transcript",
+              "clip": true,
+              "width": "fill_container",
+              "height": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                20,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "O6lntm",
+                  "name": "Column",
+                  "width": 720,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "children": [
+                    {
+                      "id": "M7sRb",
+                      "type": "ref",
+                      "ref": "d33VbP",
+                      "name": "User message",
+                      "width": "fill_container",
+                      "descendants": {
+                        "ky97F": {
+                          "content": "Fix the parser so it accepts trailing commas in arrays, and add a test."
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "bli5O",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "I'll find where arrays are parsed first.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "uhl3j",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "rg -n \"fn parse_array\" src"
+                        },
+                        "wbk6i": {
+                          "content": "0.1s"
+                        },
+                        "vtmRs": {
+                          "content": "src/parser.rs:212:    fn parse_array(&mut self) -> Result<Value> {"
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "b0XvLC",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "The loop expects another value after every comma, so `[1, 2,]` fails. I'll let it stop at `]` instead, then add a test.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "i89YC",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "cargo test -p parser"
+                        },
+                        "wbk6i": {
+                          "content": "8.4s"
+                        },
+                        "vtmRs": {
+                          "content": "test result: ok. 42 passed; 0 failed; 0 ignored"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "OqcvU",
+              "name": "Bottom",
+              "width": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                0,
+                0,
+                16,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "I9mmik",
+                  "type": "ref",
+                  "ref": "WBhlj",
+                  "name": "Composer",
+                  "stroke": "$border-strong",
+                  "descendants": {
+                    "ZkHfg": {
+                      "content": "Reply to Claude…",
+                      "fill": "$fg-disabled"
+                    },
+                    "L6HncB": {
+                      "content": "↵ send · ⇧↵ new line"
+                    },
+                    "eRKrN": {
+                      "opacity": 0.35
+                    },
+                    "qoQIl": {
+                      "icon": "arrow-up"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "rectangle",
+          "id": "GBuk8",
+          "layoutPosition": "absolute",
+          "x": 0,
+          "y": 0,
+          "name": "Overlay",
+          "fill": "#00000066",
+          "width": 1200,
+          "height": 760
+        },
+        {
+          "type": "frame",
+          "id": "R3rHIN",
+          "layoutPosition": "absolute",
+          "x": 376,
+          "y": 326.5,
+          "name": "Quit saving dialog",
+          "width": 448,
+          "fill": "$bg",
+          "cornerRadius": 10,
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "effect": [
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 20
+              },
+              "blur": 25
+            },
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 8
+              },
+              "blur": 10
+            }
+          ],
+          "layout": "vertical",
+          "gap": 16,
+          "padding": 16,
+          "children": [
+            {
+              "type": "frame",
+              "id": "gLoxg",
+              "name": "Header",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "q0F4Mb",
+                  "name": "Title",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Saving is taking longer than usual…",
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "njEls",
+                  "name": "Description",
+                  "fill": "$fg-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Newjen is saving your changes and stopping work. Please keep this window open.",
+                  "lineHeight": 1.5,
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "C6nw3D",
+      "x": 1680,
+      "y": 13990,
+      "name": "Quit saving · failed",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1200,
+      "height": 760,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "children": [
+        {
+          "type": "frame",
+          "id": "qbEHC",
+          "name": "Sidebar",
+          "width": 240,
+          "height": "fill_container",
+          "fill": "$sunken",
+          "stroke": "$border",
+          "strokeWidth": {
+            "right": 1
+          },
+          "layout": "vertical",
+          "gap": 2,
+          "padding": [
+            0,
+            8,
+            8,
+            8
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "WjTPC",
+              "name": "Header",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                6
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "T8XqK1",
+                  "name": "Traffic lights",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "AtsPA",
+                      "name": "Light",
+                      "fill": "#FF5F57",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "lZVxn",
+                      "name": "Light",
+                      "fill": "#FEBC2E",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "DE55d",
+                      "name": "Light",
+                      "fill": "#28C840",
+                      "width": 12,
+                      "height": 12
+                    }
+                  ]
+                },
+                {
+                  "type": "icon",
+                  "id": "G7qODm",
+                  "name": "Toggle sidebar",
+                  "width": 15,
+                  "height": 15,
+                  "icon": "panel-left",
+                  "library": "lucide",
+                  "fill": "$fg-subtle"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "DarSd",
+              "name": "Project",
+              "width": "fill_container",
+              "gap": 8,
+              "padding": [
+                8,
+                10,
+                10,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "QkNdh",
+                  "name": "Folder",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "folder",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "i2NOXh",
+                  "name": "Name",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "kmKAa",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "hywj1",
+              "name": "New thread",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 9,
+              "padding": [
+                7,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "CMHzN",
+                  "name": "Plus",
+                  "width": 12,
+                  "height": 12,
+                  "icon": "plus",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "q739S",
+                  "name": "Label",
+                  "fill": "$fg-muted",
+                  "content": "New thread",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "YVTWH",
+                  "name": "Key",
+                  "fill": "$fg-subtle",
+                  "content": "⌘N",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "wrPBn",
+              "name": "Gap",
+              "width": "fill_container",
+              "height": 6
+            },
+            {
+              "id": "uqitP",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Fix the parser",
+              "width": "fill_container",
+              "fill": "$hover",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false,
+                  "fill": "$focus",
+                  "stroke": "#00000000",
+                  "strokeWidth": 0
+                },
+                "prjfO": {
+                  "content": "Fix the parser",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "type": "frame",
+                  "id": "sRbv5",
+                  "name": "Detail",
+                  "gap": 4,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "BAo8i",
+                      "name": "Copy",
+                      "width": 10,
+                      "height": 10,
+                      "icon": "copy",
+                      "library": "lucide",
+                      "fill": "$fg-subtle"
+                    },
+                    {
+                      "type": "text",
+                      "id": "lkgg0",
+                      "name": "Text",
+                      "fill": "$fg-subtle",
+                      "content": "Done · 2m ago",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "rCeUr",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Add the SQLite store",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$focus"
+                },
+                "prjfO": {
+                  "content": "Add the SQLite store",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Working · 1m 12s"
+                }
+              }
+            },
+            {
+              "id": "v3CkL",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Rename the CLI flags",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$warning"
+                },
+                "prjfO": {
+                  "content": "Rename the CLI flags",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Needs approval · Bash"
+                }
+              }
+            },
+            {
+              "id": "aH0C0",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Summarize the README",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$fg"
+                },
+                "prjfO": {
+                  "content": "Summarize the README",
+                  "fontWeight": "600"
+                },
+                "fNykS": {
+                  "content": "Done · 4m ago"
+                }
+              }
+            },
+            {
+              "id": "xlCQS",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Upgrade gpui-pre",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$danger"
+                },
+                "prjfO": {
+                  "content": "Upgrade gpui-pre",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Failed · Claude exited"
+                }
+              }
+            },
+            {
+              "id": "THuZA",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Explore Rift copies",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "#00000000",
+                  "stroke": "$fg-subtle",
+                  "strokeWidth": 1.2
+                },
+                "prjfO": {
+                  "content": "Explore Rift copies",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Stopped when Newjen quit"
+                }
+              }
+            },
+            {
+              "id": "q3umg",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Try the dark theme",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false
+                },
+                "prjfO": {
+                  "content": "Try the dark theme",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Yesterday"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "X3T3Co",
+          "name": "Main",
+          "theme": {
+            "mode": "dark"
+          },
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "fill": "$bg",
+          "stroke": "$border",
+          "layout": "vertical",
+          "children": [
+            {
+              "type": "frame",
+              "id": "pn7v8",
+              "name": "Title bar",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                14
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "p932u7",
+                  "name": "Spacer",
+                  "width": 160,
+                  "height": 12
+                },
+                {
+                  "type": "frame",
+                  "id": "qoGRj",
+                  "name": "Title",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "uWn0j",
+                      "name": "App",
+                      "fill": "$fg",
+                      "content": "Fix the parser",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "u72L7",
+                      "name": "Rift tag",
+                      "fill": "$hover",
+                      "cornerRadius": 4,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "padding": [
+                        2,
+                        6
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "d9QP2",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "Rift copy",
+                          "fontFamily": "$font",
+                          "fontSize": 10,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "jd8lw",
+                      "name": "Path",
+                      "fill": "$fg-subtle",
+                      "content": "~/.rifts/Newjen/newjen-1a2b3c4d",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "W1BKuC",
+                  "name": "Right",
+                  "width": 160,
+                  "gap": 6,
+                  "justifyContent": "end",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "Q2sORF",
+                      "x": 19,
+                      "y": 0,
+                      "name": "Grants chip",
+                      "enabled": false,
+                      "fill": "$hover",
+                      "cornerRadius": 10,
+                      "gap": 5,
+                      "padding": [
+                        3,
+                        9
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "fVkov",
+                          "name": "Shield",
+                          "width": 11,
+                          "height": 11,
+                          "icon": "shield-check",
+                          "library": "lucide",
+                          "fill": "$fg-muted"
+                        },
+                        {
+                          "type": "text",
+                          "id": "FuxxT",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "2 allowed",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "sdnZT",
+                      "type": "ref",
+                      "ref": "hspXi",
+                      "name": "Status pill",
+                      "fill": "$hover",
+                      "descendants": {
+                        "FZ7D5": {
+                          "fill": "$fg-subtle"
+                        },
+                        "EPAWC": {
+                          "content": "Idle",
+                          "fill": "$fg-muted"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "t2B7jg",
+              "name": "Transcript",
+              "clip": true,
+              "width": "fill_container",
+              "height": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                20,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "tVXAV",
+                  "name": "Column",
+                  "width": 720,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "children": [
+                    {
+                      "id": "dkAMD",
+                      "type": "ref",
+                      "ref": "d33VbP",
+                      "name": "User message",
+                      "width": "fill_container",
+                      "descendants": {
+                        "ky97F": {
+                          "content": "Fix the parser so it accepts trailing commas in arrays, and add a test."
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "Azl6u",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "I'll find where arrays are parsed first.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "xvGgx",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "rg -n \"fn parse_array\" src"
+                        },
+                        "wbk6i": {
+                          "content": "0.1s"
+                        },
+                        "vtmRs": {
+                          "content": "src/parser.rs:212:    fn parse_array(&mut self) -> Result<Value> {"
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "BniQi",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "The loop expects another value after every comma, so `[1, 2,]` fails. I'll let it stop at `]` instead, then add a test.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "E8RMOh",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "cargo test -p parser"
+                        },
+                        "wbk6i": {
+                          "content": "8.4s"
+                        },
+                        "vtmRs": {
+                          "content": "test result: ok. 42 passed; 0 failed; 0 ignored"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "lGsP1",
+              "name": "Bottom",
+              "width": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                0,
+                0,
+                16,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "NWqfU",
+                  "type": "ref",
+                  "ref": "WBhlj",
+                  "name": "Composer",
+                  "stroke": "$border-strong",
+                  "descendants": {
+                    "ZkHfg": {
+                      "content": "Reply to Claude…",
+                      "fill": "$fg-disabled"
+                    },
+                    "L6HncB": {
+                      "content": "↵ send · ⇧↵ new line"
+                    },
+                    "eRKrN": {
+                      "opacity": 0.35
+                    },
+                    "qoQIl": {
+                      "icon": "arrow-up"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "rectangle",
+          "id": "LmjrT",
+          "layoutPosition": "absolute",
+          "x": 0,
+          "y": 0,
+          "name": "Overlay",
+          "fill": "#00000066",
+          "width": 1200,
+          "height": 760
+        },
+        {
+          "type": "frame",
+          "id": "oS2jq",
+          "layoutPosition": "absolute",
+          "x": 376,
+          "y": 304,
+          "name": "Quit saving dialog",
+          "width": 448,
+          "fill": "$bg",
+          "cornerRadius": 10,
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "effect": [
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 20
+              },
+              "blur": 25
+            },
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 8
+              },
+              "blur": 10
+            }
+          ],
+          "layout": "vertical",
+          "gap": 16,
+          "padding": 16,
+          "children": [
+            {
+              "type": "frame",
+              "id": "kmNni",
+              "name": "Header",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "nYkwu",
+                  "name": "Title",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Couldn't save your work",
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "h9BcxJ",
+                  "name": "Description",
+                  "fill": "$fg-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Recent changes may be lost if you quit. Work will stay stopped if you keep Newjen open.",
+                  "lineHeight": 1.5,
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "tdO79",
+              "name": "Footer",
+              "width": "fill_container",
+              "gap": 8,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "ejYWW",
+                  "name": "Cancel",
+                  "fill": "$surface",
+                  "cornerRadius": 6,
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "padding": [
+                    6,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "GXD8l",
+                      "name": "Label",
+                      "fill": "$fg",
+                      "content": "Quit anyway",
+                      "fontFamily": "$font",
+                      "fontSize": 14,
+                      "fontWeight": "500"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "uoSov",
+                  "name": "Archive and delete",
+                  "fill": "$accent",
+                  "cornerRadius": 6,
+                  "padding": [
+                    6,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "jIDUO",
+                      "name": "Label",
+                      "fill": "$on-accent",
+                      "content": "Keep Newjen open",
+                      "fontFamily": "$font",
+                      "fontSize": 14,
+                      "fontWeight": "500"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "GQ85W",
+      "x": 1680,
+      "y": 14830,
+      "name": "Quit saving · timeout",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1200,
+      "height": 760,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "children": [
+        {
+          "type": "frame",
+          "id": "v4h8s",
+          "name": "Sidebar",
+          "width": 240,
+          "height": "fill_container",
+          "fill": "$sunken",
+          "stroke": "$border",
+          "strokeWidth": {
+            "right": 1
+          },
+          "layout": "vertical",
+          "gap": 2,
+          "padding": [
+            0,
+            8,
+            8,
+            8
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "AGxru",
+              "name": "Header",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                6
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "sNHa8",
+                  "name": "Traffic lights",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "d7pnB",
+                      "name": "Light",
+                      "fill": "#FF5F57",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "gtD9E",
+                      "name": "Light",
+                      "fill": "#FEBC2E",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "OPhnG",
+                      "name": "Light",
+                      "fill": "#28C840",
+                      "width": 12,
+                      "height": 12
+                    }
+                  ]
+                },
+                {
+                  "type": "icon",
+                  "id": "kmeFl",
+                  "name": "Toggle sidebar",
+                  "width": 15,
+                  "height": 15,
+                  "icon": "panel-left",
+                  "library": "lucide",
+                  "fill": "$fg-subtle"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Mj3bl",
+              "name": "Project",
+              "width": "fill_container",
+              "gap": 8,
+              "padding": [
+                8,
+                10,
+                10,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "JTsac",
+                  "name": "Folder",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "folder",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "ZI5h5",
+                  "name": "Name",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "epxQn",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "BnRK1",
+              "name": "New thread",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 9,
+              "padding": [
+                7,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "u15zrr",
+                  "name": "Plus",
+                  "width": 12,
+                  "height": 12,
+                  "icon": "plus",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "GV64m",
+                  "name": "Label",
+                  "fill": "$fg-muted",
+                  "content": "New thread",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "vh7Ug",
+                  "name": "Key",
+                  "fill": "$fg-subtle",
+                  "content": "⌘N",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "QpLe6",
+              "name": "Gap",
+              "width": "fill_container",
+              "height": 6
+            },
+            {
+              "id": "FNOYx",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Fix the parser",
+              "width": "fill_container",
+              "fill": "$hover",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false,
+                  "fill": "$focus",
+                  "stroke": "#00000000",
+                  "strokeWidth": 0
+                },
+                "prjfO": {
+                  "content": "Fix the parser",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "type": "frame",
+                  "id": "S9VmDh",
+                  "name": "Detail",
+                  "gap": 4,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "UuFnW",
+                      "name": "Copy",
+                      "width": 10,
+                      "height": 10,
+                      "icon": "copy",
+                      "library": "lucide",
+                      "fill": "$fg-subtle"
+                    },
+                    {
+                      "type": "text",
+                      "id": "kTg6v",
+                      "name": "Text",
+                      "fill": "$fg-subtle",
+                      "content": "Done · 2m ago",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "RsZMx",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Add the SQLite store",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$focus"
+                },
+                "prjfO": {
+                  "content": "Add the SQLite store",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Working · 1m 12s"
+                }
+              }
+            },
+            {
+              "id": "U3oGw",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Rename the CLI flags",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$warning"
+                },
+                "prjfO": {
+                  "content": "Rename the CLI flags",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Needs approval · Bash"
+                }
+              }
+            },
+            {
+              "id": "k7hzC",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Summarize the README",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$fg"
+                },
+                "prjfO": {
+                  "content": "Summarize the README",
+                  "fontWeight": "600"
+                },
+                "fNykS": {
+                  "content": "Done · 4m ago"
+                }
+              }
+            },
+            {
+              "id": "hw2PC",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Upgrade gpui-pre",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$danger"
+                },
+                "prjfO": {
+                  "content": "Upgrade gpui-pre",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Failed · Claude exited"
+                }
+              }
+            },
+            {
+              "id": "thUP7",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Explore Rift copies",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "#00000000",
+                  "stroke": "$fg-subtle",
+                  "strokeWidth": 1.2
+                },
+                "prjfO": {
+                  "content": "Explore Rift copies",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Stopped when Newjen quit"
+                }
+              }
+            },
+            {
+              "id": "f7Zua",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Try the dark theme",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false
+                },
+                "prjfO": {
+                  "content": "Try the dark theme",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Yesterday"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "ORcfP",
+          "name": "Main",
+          "theme": {
+            "mode": "dark"
+          },
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "fill": "$bg",
+          "stroke": "$border",
+          "layout": "vertical",
+          "children": [
+            {
+              "type": "frame",
+              "id": "Y0R7z",
+              "name": "Title bar",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                14
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "g9KvX",
+                  "name": "Spacer",
+                  "width": 160,
+                  "height": 12
+                },
+                {
+                  "type": "frame",
+                  "id": "ZSHkD",
+                  "name": "Title",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Su7eW",
+                      "name": "App",
+                      "fill": "$fg",
+                      "content": "Fix the parser",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "tjBXd",
+                      "name": "Rift tag",
+                      "fill": "$hover",
+                      "cornerRadius": 4,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "padding": [
+                        2,
+                        6
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "e2FcC",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "Rift copy",
+                          "fontFamily": "$font",
+                          "fontSize": 10,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "Hw1A2",
+                      "name": "Path",
+                      "fill": "$fg-subtle",
+                      "content": "~/.rifts/Newjen/newjen-1a2b3c4d",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "zXpPn",
+                  "name": "Right",
+                  "width": 160,
+                  "gap": 6,
+                  "justifyContent": "end",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "RmU3x",
+                      "x": 19,
+                      "y": 0,
+                      "name": "Grants chip",
+                      "enabled": false,
+                      "fill": "$hover",
+                      "cornerRadius": 10,
+                      "gap": 5,
+                      "padding": [
+                        3,
+                        9
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "F4ZVsn",
+                          "name": "Shield",
+                          "width": 11,
+                          "height": 11,
+                          "icon": "shield-check",
+                          "library": "lucide",
+                          "fill": "$fg-muted"
+                        },
+                        {
+                          "type": "text",
+                          "id": "zGapg",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "2 allowed",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "ePIR2",
+                      "type": "ref",
+                      "ref": "hspXi",
+                      "name": "Status pill",
+                      "fill": "$hover",
+                      "descendants": {
+                        "FZ7D5": {
+                          "fill": "$fg-subtle"
+                        },
+                        "EPAWC": {
+                          "content": "Idle",
+                          "fill": "$fg-muted"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "lJw8c",
+              "name": "Transcript",
+              "clip": true,
+              "width": "fill_container",
+              "height": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                20,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "pq2hE",
+                  "name": "Column",
+                  "width": 720,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "children": [
+                    {
+                      "id": "KdVFk",
+                      "type": "ref",
+                      "ref": "d33VbP",
+                      "name": "User message",
+                      "width": "fill_container",
+                      "descendants": {
+                        "ky97F": {
+                          "content": "Fix the parser so it accepts trailing commas in arrays, and add a test."
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "t3QLD5",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "I'll find where arrays are parsed first.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "O4Hdq",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "rg -n \"fn parse_array\" src"
+                        },
+                        "wbk6i": {
+                          "content": "0.1s"
+                        },
+                        "vtmRs": {
+                          "content": "src/parser.rs:212:    fn parse_array(&mut self) -> Result<Value> {"
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "X3BpHR",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "The loop expects another value after every comma, so `[1, 2,]` fails. I'll let it stop at `]` instead, then add a test.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "ArNqy",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "cargo test -p parser"
+                        },
+                        "wbk6i": {
+                          "content": "8.4s"
+                        },
+                        "vtmRs": {
+                          "content": "test result: ok. 42 passed; 0 failed; 0 ignored"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "zyB84",
+              "name": "Bottom",
+              "width": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                0,
+                0,
+                16,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "KQw1E",
+                  "type": "ref",
+                  "ref": "WBhlj",
+                  "name": "Composer",
+                  "stroke": "$border-strong",
+                  "descendants": {
+                    "ZkHfg": {
+                      "content": "Reply to Claude…",
+                      "fill": "$fg-disabled"
+                    },
+                    "L6HncB": {
+                      "content": "↵ send · ⇧↵ new line"
+                    },
+                    "eRKrN": {
+                      "opacity": 0.35
+                    },
+                    "qoQIl": {
+                      "icon": "arrow-up"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "rectangle",
+          "id": "GZRMA",
+          "layoutPosition": "absolute",
+          "x": 0,
+          "y": 0,
+          "name": "Overlay",
+          "fill": "#00000066",
+          "width": 1200,
+          "height": 760
+        },
+        {
+          "type": "frame",
+          "id": "x9OjK",
+          "layoutPosition": "absolute",
+          "x": 376,
+          "y": 304,
+          "name": "Quit saving dialog",
+          "width": 448,
+          "fill": "$bg",
+          "cornerRadius": 10,
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "effect": [
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 20
+              },
+              "blur": 25
+            },
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 8
+              },
+              "blur": 10
+            }
+          ],
+          "layout": "vertical",
+          "gap": 16,
+          "padding": 16,
+          "children": [
+            {
+              "type": "frame",
+              "id": "yL8Pn",
+              "name": "Header",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "TTydp",
+                  "name": "Title",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Your work isn't confirmed saved",
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "f0JySk",
+                  "name": "Description",
+                  "fill": "$fg-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Recent changes may be lost if you quit. Work will stay stopped if you keep Newjen open.",
+                  "lineHeight": 1.5,
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "gF13o",
+              "name": "Footer",
+              "width": "fill_container",
+              "gap": 8,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "Z36VC",
+                  "name": "Cancel",
+                  "fill": "$surface",
+                  "cornerRadius": 6,
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "padding": [
+                    6,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "uFoCK",
+                      "name": "Label",
+                      "fill": "$fg",
+                      "content": "Quit anyway",
+                      "fontFamily": "$font",
+                      "fontSize": 14,
+                      "fontWeight": "500"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "vquOm",
+                  "name": "Archive and delete",
+                  "fill": "$accent",
+                  "cornerRadius": 6,
+                  "padding": [
+                    6,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "FJrbl",
+                      "name": "Label",
+                      "fill": "$on-accent",
+                      "content": "Keep Newjen open",
+                      "fontFamily": "$font",
+                      "fontSize": 14,
+                      "fontWeight": "500"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "rUSnc",
+      "x": 1680,
+      "y": 15670,
+      "name": "Quit saving · worst-case",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1200,
+      "height": 760,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "children": [
+        {
+          "type": "frame",
+          "id": "QVkW5",
+          "name": "Sidebar",
+          "width": 240,
+          "height": "fill_container",
+          "fill": "$sunken",
+          "stroke": "$border",
+          "strokeWidth": {
+            "right": 1
+          },
+          "layout": "vertical",
+          "gap": 2,
+          "padding": [
+            0,
+            8,
+            8,
+            8
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "y9XP2F",
+              "name": "Header",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                6
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "icFpf",
+                  "name": "Traffic lights",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "Uu9Rl",
+                      "name": "Light",
+                      "fill": "#FF5F57",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "D8esFN",
+                      "name": "Light",
+                      "fill": "#FEBC2E",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "c34eyW",
+                      "name": "Light",
+                      "fill": "#28C840",
+                      "width": 12,
+                      "height": 12
+                    }
+                  ]
+                },
+                {
+                  "type": "icon",
+                  "id": "jsftm",
+                  "name": "Toggle sidebar",
+                  "width": 15,
+                  "height": 15,
+                  "icon": "panel-left",
+                  "library": "lucide",
+                  "fill": "$fg-subtle"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "s5LR8B",
+              "name": "Project",
+              "width": "fill_container",
+              "gap": 8,
+              "padding": [
+                8,
+                10,
+                10,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "uHwCS",
+                  "name": "Folder",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "folder",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "s4UmS8",
+                  "name": "Name",
+                  "fill": "$fg",
+                  "content": "International…",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "EeH9A",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "textGrowth": "fixed-width-height",
+                  "width": 60,
+                  "height": 14,
+                  "content": "~/enterprise…",
+                  "fontFamily": "$mono",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "MIiqH",
+              "name": "New thread",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 9,
+              "padding": [
+                7,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "xkahG",
+                  "name": "Plus",
+                  "width": 12,
+                  "height": 12,
+                  "icon": "plus",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "AfjN5",
+                  "name": "Label",
+                  "fill": "$fg-muted",
+                  "content": "New thread",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "x7glq",
+                  "name": "Key",
+                  "fill": "$fg-subtle",
+                  "content": "⌘N",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "p2r6DB",
+              "name": "Gap",
+              "width": "fill_container",
+              "height": 6
+            },
+            {
+              "id": "BtLLT",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Fix the parser",
+              "width": "fill_container",
+              "fill": "$hover",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false,
+                  "fill": "$focus",
+                  "stroke": "#00000000",
+                  "strokeWidth": 0
+                },
+                "prjfO": {
+                  "content": "Fix the parser",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "type": "frame",
+                  "id": "ltFvZ",
+                  "name": "Detail",
+                  "gap": 4,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "j9Eh4m",
+                      "name": "Copy",
+                      "width": 10,
+                      "height": 10,
+                      "icon": "copy",
+                      "library": "lucide",
+                      "fill": "$fg-subtle"
+                    },
+                    {
+                      "type": "text",
+                      "id": "HnYDz",
+                      "name": "Text",
+                      "fill": "$fg-subtle",
+                      "content": "Done · 2m ago",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "g6rqR",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Add the SQLite store",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$focus"
+                },
+                "prjfO": {
+                  "content": "Add the SQLite store",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Working · 1m 12s"
+                }
+              }
+            },
+            {
+              "id": "Y91Ec",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Rename the CLI flags",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$warning"
+                },
+                "prjfO": {
+                  "content": "Rename the CLI flags",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Needs approval · Bash"
+                }
+              }
+            },
+            {
+              "id": "V6ffu",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Summarize the README",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$fg"
+                },
+                "prjfO": {
+                  "content": "Summarize the README",
+                  "fontWeight": "600"
+                },
+                "fNykS": {
+                  "content": "Done · 4m ago"
+                }
+              }
+            },
+            {
+              "id": "ikLI7",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Upgrade gpui-pre",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$danger"
+                },
+                "prjfO": {
+                  "content": "Upgrade gpui-pre",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Failed · Claude exited"
+                }
+              }
+            },
+            {
+              "id": "e4EtSc",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Explore Rift copies",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "#00000000",
+                  "stroke": "$fg-subtle",
+                  "strokeWidth": 1.2
+                },
+                "prjfO": {
+                  "content": "Explore Rift copies",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Stopped when Newjen quit"
+                }
+              }
+            },
+            {
+              "id": "Rl1Lu",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Try the dark theme",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false
+                },
+                "prjfO": {
+                  "content": "Try the dark theme",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Yesterday"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "pfWNm",
+          "name": "Main",
+          "theme": {
+            "mode": "dark"
+          },
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "fill": "$bg",
+          "stroke": "$border",
+          "layout": "vertical",
+          "children": [
+            {
+              "type": "frame",
+              "id": "zrWJR",
+              "name": "Title bar",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                14
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "fMXHM",
+                  "name": "Spacer",
+                  "width": 160,
+                  "height": 12
+                },
+                {
+                  "type": "frame",
+                  "id": "lGGFw",
+                  "name": "Title",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "e0prcL",
+                      "name": "App",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": 200,
+                      "content": "128 threads · Recent changes not saved",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "t3E4m",
+                      "name": "Rift tag",
+                      "fill": "$hover",
+                      "cornerRadius": 4,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "padding": [
+                        2,
+                        6
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "VfP5H",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "Rift copy",
+                          "fontFamily": "$font",
+                          "fontSize": 10,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "J11nC",
+                      "name": "Path",
+                      "fill": "$fg-subtle",
+                      "content": "~/.rifts/Newjen/newjen-1a2b3c4d",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "U7PBPi",
+                  "name": "Right",
+                  "width": 160,
+                  "gap": 6,
+                  "justifyContent": "end",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "dsQh3",
+                      "x": 19,
+                      "y": 0,
+                      "name": "Grants chip",
+                      "enabled": false,
+                      "fill": "$hover",
+                      "cornerRadius": 10,
+                      "gap": 5,
+                      "padding": [
+                        3,
+                        9
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "W7CY7X",
+                          "name": "Shield",
+                          "width": 11,
+                          "height": 11,
+                          "icon": "shield-check",
+                          "library": "lucide",
+                          "fill": "$fg-muted"
+                        },
+                        {
+                          "type": "text",
+                          "id": "A3Awxb",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "2 allowed",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "kBnxd",
+                      "type": "ref",
+                      "ref": "hspXi",
+                      "name": "Status pill",
+                      "fill": "$hover",
+                      "descendants": {
+                        "FZ7D5": {
+                          "fill": "$fg-subtle"
+                        },
+                        "EPAWC": {
+                          "content": "Idle",
+                          "fill": "$fg-muted"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "zRAyY",
+              "name": "Transcript",
+              "clip": true,
+              "width": "fill_container",
+              "height": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                20,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "RML3Y",
+                  "name": "Column",
+                  "width": 720,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "children": [
+                    {
+                      "id": "w64cMG",
+                      "type": "ref",
+                      "ref": "d33VbP",
+                      "name": "User message",
+                      "width": "fill_container",
+                      "descendants": {
+                        "ky97F": {
+                          "content": "Fix the parser so it accepts trailing commas in arrays, and add a test."
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "lbOob",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "I'll find where arrays are parsed first.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "ABTQw",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "rg -n \"fn parse_array\" src"
+                        },
+                        "wbk6i": {
+                          "content": "0.1s"
+                        },
+                        "vtmRs": {
+                          "content": "src/parser.rs:212:    fn parse_array(&mut self) -> Result<Value> {"
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "H4bvUB",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "The loop expects another value after every comma, so `[1, 2,]` fails. I'll let it stop at `]` instead, then add a test.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "E0oYF",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "cargo test -p parser"
+                        },
+                        "wbk6i": {
+                          "content": "8.4s"
+                        },
+                        "vtmRs": {
+                          "content": "test result: ok. 42 passed; 0 failed; 0 ignored"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "jUX6N",
+              "name": "Bottom",
+              "width": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                0,
+                0,
+                16,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "VNANu",
+                  "type": "ref",
+                  "ref": "WBhlj",
+                  "name": "Composer",
+                  "stroke": "$border-strong",
+                  "descendants": {
+                    "ZkHfg": {
+                      "content": "Reply to Claude…",
+                      "fill": "$fg-disabled"
+                    },
+                    "L6HncB": {
+                      "content": "↵ send · ⇧↵ new line"
+                    },
+                    "eRKrN": {
+                      "opacity": 0.35
+                    },
+                    "qoQIl": {
+                      "icon": "arrow-up"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "rectangle",
+          "id": "NMvXX",
+          "layoutPosition": "absolute",
+          "x": 0,
+          "y": 0,
+          "name": "Overlay",
+          "fill": "#00000066",
+          "width": 1200,
+          "height": 760
+        },
+        {
+          "type": "frame",
+          "id": "wU7ba",
+          "layoutPosition": "absolute",
+          "x": 376,
+          "y": 304,
+          "name": "Quit saving dialog",
+          "width": 448,
+          "fill": "$bg",
+          "cornerRadius": 10,
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "effect": [
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 20
+              },
+              "blur": 25
+            },
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 8
+              },
+              "blur": 10
+            }
+          ],
+          "layout": "vertical",
+          "gap": 16,
+          "padding": 16,
+          "children": [
+            {
+              "type": "frame",
+              "id": "EXnRT",
+              "name": "Header",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "D7h9Oe",
+                  "name": "Title",
+                  "fill": "$fg",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Couldn't save your work",
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "oLi7S",
+                  "name": "Description",
+                  "fill": "$fg-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Recent changes may be lost if you quit. Work will stay stopped if you keep Newjen open.",
+                  "lineHeight": 1.5,
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "lkBnY",
+              "name": "Footer",
+              "width": "fill_container",
+              "gap": 8,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "baJxd",
+                  "name": "Cancel",
+                  "fill": "$surface",
+                  "cornerRadius": 6,
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "padding": [
+                    6,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "MZWKR",
+                      "name": "Label",
+                      "fill": "$fg",
+                      "content": "Quit anyway",
+                      "fontFamily": "$font",
+                      "fontSize": 14,
+                      "fontWeight": "500"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "JgsEb",
+                  "name": "Archive and delete",
+                  "fill": "$accent",
+                  "cornerRadius": 6,
+                  "padding": [
+                    6,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "fGm0C",
+                      "name": "Label",
+                      "fill": "$on-accent",
+                      "content": "Keep Newjen open",
+                      "fontFamily": "$font",
+                      "fontSize": 14,
+                      "fontWeight": "500"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "c2H5Sy",
+      "x": 3720,
+      "y": 4718,
+      "name": "Quit confirmation · unsent text",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1200,
+      "height": 760,
+      "fill": "$bg",
+      "cornerRadius": 10,
+      "stroke": "$border",
+      "strokeWidth": 1,
+      "children": [
+        {
+          "type": "frame",
+          "id": "l4Ngi",
+          "name": "Sidebar",
+          "width": 240,
+          "height": "fill_container",
+          "fill": "$sunken",
+          "stroke": "$border",
+          "strokeWidth": {
+            "right": 1
+          },
+          "layout": "vertical",
+          "gap": 2,
+          "padding": [
+            0,
+            8,
+            8,
+            8
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "iP2hi",
+              "name": "Header",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                6
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "K0SYl",
+                  "name": "Traffic lights",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "uhp1E",
+                      "name": "Light",
+                      "fill": "#FF5F57",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "m2ysng",
+                      "name": "Light",
+                      "fill": "#FEBC2E",
+                      "width": 12,
+                      "height": 12
+                    },
+                    {
+                      "type": "ellipse",
+                      "id": "Yv6aE",
+                      "name": "Light",
+                      "fill": "#28C840",
+                      "width": 12,
+                      "height": 12
+                    }
+                  ]
+                },
+                {
+                  "type": "icon",
+                  "id": "kBrOH",
+                  "name": "Toggle sidebar",
+                  "width": 15,
+                  "height": 15,
+                  "icon": "panel-left",
+                  "library": "lucide",
+                  "fill": "$fg-subtle"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "yY1tA",
+              "name": "Project",
+              "width": "fill_container",
+              "gap": 8,
+              "padding": [
+                8,
+                10,
+                10,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "rRJ1Q",
+                  "name": "Folder",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "folder",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "VO1Oj",
+                  "name": "Name",
+                  "fill": "$fg",
+                  "content": "Newjen",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "YNPMm",
+                  "name": "Path",
+                  "fill": "$fg-subtle",
+                  "content": "~/Newjen",
+                  "fontFamily": "$mono",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "W0wm6u",
+              "name": "New thread",
+              "width": "fill_container",
+              "cornerRadius": 6,
+              "gap": 9,
+              "padding": [
+                7,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "NHDgs",
+                  "name": "Plus",
+                  "width": 12,
+                  "height": 12,
+                  "icon": "plus",
+                  "library": "lucide",
+                  "fill": "$fg-muted"
+                },
+                {
+                  "type": "text",
+                  "id": "m87a6t",
+                  "name": "Label",
+                  "fill": "$fg-muted",
+                  "content": "New thread",
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "B1w1h",
+                  "name": "Key",
+                  "fill": "$fg-subtle",
+                  "content": "⌘N",
+                  "fontFamily": "$font",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "hbwdn",
+              "name": "Gap",
+              "width": "fill_container",
+              "height": 6
+            },
+            {
+              "id": "R2ENef",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Fix the parser",
+              "width": "fill_container",
+              "fill": "$hover",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false,
+                  "fill": "$focus",
+                  "stroke": "#00000000",
+                  "strokeWidth": 0
+                },
+                "prjfO": {
+                  "content": "Fix the parser",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "type": "frame",
+                  "id": "kiAUU",
+                  "name": "Detail",
+                  "gap": 4,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "Ivn3g",
+                      "name": "Copy",
+                      "width": 10,
+                      "height": 10,
+                      "icon": "copy",
+                      "library": "lucide",
+                      "fill": "$fg-subtle"
+                    },
+                    {
+                      "type": "text",
+                      "id": "y6oxJ",
+                      "name": "Text",
+                      "fill": "$fg-subtle",
+                      "content": "Done · 2m ago",
+                      "fontFamily": "$font",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "J1T7qS",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Add the SQLite store",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$focus"
+                },
+                "prjfO": {
+                  "content": "Add the SQLite store",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Working · 1m 12s"
+                }
+              }
+            },
+            {
+              "id": "E23b85",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Rename the CLI flags",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$warning"
+                },
+                "prjfO": {
+                  "content": "Rename the CLI flags",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Needs approval · Bash"
+                }
+              }
+            },
+            {
+              "id": "wvcnI",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Summarize the README",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$fg"
+                },
+                "prjfO": {
+                  "content": "Summarize the README",
+                  "fontWeight": "600"
+                },
+                "fNykS": {
+                  "content": "Done · 4m ago"
+                }
+              }
+            },
+            {
+              "id": "jtOaI",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Upgrade gpui-pre",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "$danger"
+                },
+                "prjfO": {
+                  "content": "Upgrade gpui-pre",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Failed · Claude exited"
+                }
+              }
+            },
+            {
+              "id": "l1E1pC",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Explore Rift copies",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "fill": "#00000000",
+                  "stroke": "$fg-subtle",
+                  "strokeWidth": 1.2
+                },
+                "prjfO": {
+                  "content": "Explore Rift copies",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Stopped when Newjen quit"
+                }
+              }
+            },
+            {
+              "id": "Bf2I9",
+              "type": "ref",
+              "ref": "VImYQ",
+              "name": "Try the dark theme",
+              "width": "fill_container",
+              "descendants": {
+                "g5D8UH": {
+                  "enabled": false
+                },
+                "prjfO": {
+                  "content": "Try the dark theme",
+                  "fontWeight": "normal"
+                },
+                "fNykS": {
+                  "content": "Yesterday"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "wauz0",
+          "name": "Main",
+          "theme": {
+            "mode": "dark"
+          },
+          "clip": true,
+          "width": "fill_container",
+          "height": "fill_container",
+          "fill": "$bg",
+          "stroke": "$border",
+          "layout": "vertical",
+          "children": [
+            {
+              "type": "frame",
+              "id": "b30Jjp",
+              "name": "Title bar",
+              "width": "fill_container",
+              "height": 38,
+              "padding": [
+                0,
+                14
+              ],
+              "justifyContent": "space_between",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "Td7x6",
+                  "name": "Spacer",
+                  "width": 160,
+                  "height": 12
+                },
+                {
+                  "type": "frame",
+                  "id": "uovz5",
+                  "name": "Title",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Cybmt",
+                      "name": "App",
+                      "fill": "$fg",
+                      "content": "Fix the parser",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "vEYmu",
+                      "name": "Rift tag",
+                      "fill": "$hover",
+                      "cornerRadius": 4,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "padding": [
+                        2,
+                        6
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "y7pFyq",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "Rift copy",
+                          "fontFamily": "$font",
+                          "fontSize": 10,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "Gwv4w",
+                      "name": "Path",
+                      "fill": "$fg-subtle",
+                      "content": "~/.rifts/Newjen/newjen-1a2b3c4d",
+                      "fontFamily": "$mono",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "X5ltVG",
+                  "name": "Right",
+                  "width": 160,
+                  "gap": 6,
+                  "justifyContent": "end",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "c89Ik",
+                      "x": 19,
+                      "y": 0,
+                      "name": "Grants chip",
+                      "enabled": false,
+                      "fill": "$hover",
+                      "cornerRadius": 10,
+                      "gap": 5,
+                      "padding": [
+                        3,
+                        9
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "Kp1mu",
+                          "name": "Shield",
+                          "width": 11,
+                          "height": 11,
+                          "icon": "shield-check",
+                          "library": "lucide",
+                          "fill": "$fg-muted"
+                        },
+                        {
+                          "type": "text",
+                          "id": "zb0kN",
+                          "name": "Label",
+                          "fill": "$fg-muted",
+                          "content": "2 allowed",
+                          "fontFamily": "$font",
+                          "fontSize": 11,
+                          "fontWeight": "500"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "m14Ir",
+                      "type": "ref",
+                      "ref": "hspXi",
+                      "name": "Status pill",
+                      "fill": "$hover",
+                      "descendants": {
+                        "FZ7D5": {
+                          "fill": "$fg-subtle"
+                        },
+                        "EPAWC": {
+                          "content": "Idle",
+                          "fill": "$fg-muted"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "fGWkH",
+              "name": "Transcript",
+              "clip": true,
+              "width": "fill_container",
+              "height": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                20,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "xMOrP",
+                  "name": "Column",
+                  "width": 720,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "children": [
+                    {
+                      "id": "EqnYB",
+                      "type": "ref",
+                      "ref": "d33VbP",
+                      "name": "User message",
+                      "width": "fill_container",
+                      "descendants": {
+                        "ky97F": {
+                          "content": "Fix the parser so it accepts trailing commas in arrays, and add a test."
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "ZP3H8",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "I'll find where arrays are parsed first.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "wup17",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "rg -n \"fn parse_array\" src"
+                        },
+                        "wbk6i": {
+                          "content": "0.1s"
+                        },
+                        "vtmRs": {
+                          "content": "src/parser.rs:212:    fn parse_array(&mut self) -> Result<Value> {"
+                        }
+                      }
+                    },
+                    {
+                      "type": "text",
+                      "id": "MAVAd",
+                      "name": "Assistant text",
+                      "fill": "$fg",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "The loop expects another value after every comma, so `[1, 2,]` fails. I'll let it stop at `]` instead, then add a test.",
+                      "lineHeight": 1.6,
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "id": "L5Ofj",
+                      "type": "ref",
+                      "ref": "K4tZ3x",
+                      "name": "Tool step",
+                      "width": "fill_container",
+                      "descendants": {
+                        "pZfWK": {
+                          "icon": "circle-check",
+                          "fill": "$success"
+                        },
+                        "I5WFkd": {
+                          "content": "Bash"
+                        },
+                        "IusEe": {
+                          "content": "cargo test -p parser"
+                        },
+                        "wbk6i": {
+                          "content": "8.4s"
+                        },
+                        "vtmRs": {
+                          "content": "test result: ok. 42 passed; 0 failed; 0 ignored"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "orZ2Q",
+              "name": "Bottom",
+              "width": "fill_container",
+              "layout": "vertical",
+              "padding": [
+                0,
+                0,
+                16,
+                0
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "M9repV",
+                  "type": "ref",
+                  "ref": "WBhlj",
+                  "name": "Composer",
+                  "stroke": "$border-strong",
+                  "descendants": {
+                    "ZkHfg": {
+                      "content": "Reply to Claude…",
+                      "fill": "$fg-disabled"
+                    },
+                    "L6HncB": {
+                      "content": "↵ send · ⇧↵ new line"
+                    },
+                    "eRKrN": {
+                      "opacity": 0.35
+                    },
+                    "qoQIl": {
+                      "icon": "arrow-up"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "rectangle",
+          "id": "ZeBmN",
+          "layoutPosition": "absolute",
+          "x": 0,
+          "y": 0,
+          "name": "Overlay",
+          "fill": "#00000066",
+          "width": 1200,
+          "height": 760
+        },
+        {
+          "type": "frame",
+          "id": "QtJ2A",
+          "layoutPosition": "absolute",
+          "x": 376,
+          "y": 299,
+          "name": "Unsent text quit confirmation",
+          "width": 448,
+          "fill": "$bg",
+          "cornerRadius": 10,
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "effect": [
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 20
+              },
+              "blur": 25
+            },
+            {
+              "type": "shadow",
+              "shadowType": "outer",
+              "color": "#0000001A",
+              "offset": {
+                "x": 0,
+                "y": 8
+              },
+              "blur": 10
+            }
+          ],
+          "layout": "vertical",
+          "gap": 20,
+          "padding": 24,
+          "children": [
+            {
+              "type": "frame",
+              "id": "GAFfG",
+              "name": "Header",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "Fxi07",
+                  "name": "Title",
+                  "fill": "$fg",
+                  "content": "Quit Newjen and stop its work?",
+                  "fontFamily": "$font",
+                  "fontSize": 16,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "UoKQZ",
+                  "name": "Description",
+                  "fill": "$fg-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "Unsent text in 2 threads will be discarded. Running agents and terminals will stop.",
+                  "lineHeight": 1.5,
+                  "fontFamily": "$font",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "ogcNt",
+              "name": "Footer",
+              "width": "fill_container",
+              "gap": 8,
+              "justifyContent": "end",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "ygBfS",
+                  "name": "Cancel",
+                  "fill": "$surface",
+                  "cornerRadius": 6,
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "padding": [
+                    6,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "dwg3J",
+                      "name": "Label",
+                      "fill": "$fg",
+                      "content": "Keep working",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "500"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "QNQZZ",
+                  "name": "Archive and delete",
+                  "fill": "$danger",
+                  "cornerRadius": 6,
+                  "padding": [
+                    6,
+                    12
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Pw8Ff",
+                      "name": "Label",
+                      "fill": "$on-accent",
+                      "content": "Quit and stop",
+                      "fontFamily": "$font",
+                      "fontSize": 13,
+                      "fontWeight": "500"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
     }
   ],
   "themes": {
