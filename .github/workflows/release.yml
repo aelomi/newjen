@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag, such as v0.1.0-alpha.1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Release metadata
+        id: meta
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          tag = os.environ["RELEASE_TAG"]
+          number = r"(?:0|[1-9][0-9]*)"
+          pattern = rf"v({number}\.{number}\.{number}(?:-(?:alpha|beta|rc)(?:\.{number})?)?)"
+          match = re.fullmatch(pattern, tag)
+          if not match:
+              raise SystemExit("Expected vMAJOR.MINOR.PATCH with optional -alpha.N, -beta.N, or -rc.N")
+          version = match[1]
+          prerelease = version.startswith("0.") or "-" in version
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+              output.write(f"asset=Newjen-{version}-arm64.zip\n")
+              output.write(f"prerelease={str(prerelease).lower()}\n")
+          PY
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Metal shader compiler
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+
+      - name: jj and Rift
+        run: |
+          brew install jj
+          npm install --global rift-snapshot@0.0.13
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Bundle and checksum
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          scripts/bundle-app.sh "$VERSION"
+          (cd dist && shasum -a 256 "$ASSET" > "$ASSET.sha256")
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          flags=(--latest)
+          if [[ "$PRERELEASE" == true ]]; then
+            flags=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" "dist/$ASSET" "dist/$ASSET.sha256" \
+            --verify-tag --title "Newjen $VERSION" --generate-notes \
+            --notes "Apple Silicon only. Ad-hoc signed, without Developer ID signing or notarization. The Homebrew cask removes quarantine on install. See the README for installation instructions." \
+            "${flags[@]}"
+
+      - name: Check out master for cask update
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: master
+          fetch-depth: 0
+          path: release-tap
+
+      - name: Update cask on master
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+
+          version = os.environ["VERSION"]
+          checksum = hashlib.sha256(Path("dist", os.environ["ASSET"]).read_bytes()).hexdigest()
+          cask = Path("release-tap/Casks/newjen.rb")
+          text = cask.read_text()
+          for field, value in (("version", version), ("sha256", checksum)):
+              text, count = re.subn(rf'^  {field} "[^"]+"$', f'  {field} "{value}"', text, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one {field} stanza in {cask}")
+          cask.write_text(text)
+          PYTHON
+          git -C release-tap config user.name 'github-actions[bot]'
+          git -C release-tap config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C release-tap add -- Casks/newjen.rb
+          if git -C release-tap diff --cached --quiet; then
+            echo "Cask already matches this release."
+            exit 0
+          fi
+          test "$(git -C release-tap diff --cached --name-only)" = Casks/newjen.rb
+          git -C release-tap commit -m "chore(cask): update Newjen to $VERSION"
+          if ! git -C release-tap push origin HEAD:master; then
+            echo "::notice::Cask push failed. Fetching master, rebasing, and retrying once."
+            git -C release-tap fetch origin master
+            if ! git -C release-tap rebase origin/master; then
+              git -C release-tap rebase --abort
+              echo "::error::Release published, but cask update conflicts with master. Update Casks/newjen.rb manually from the release checksum."
+              exit 1
+            fi
+            if ! git -C release-tap push origin HEAD:master; then
+              echo "::error::Release published, but cask push failed after one retry. Check branch rules and Actions Contents write access; update Casks/newjen.rb manually."
+              exit 1
+            fi
+          fi

@@ -170,3 +170,38 @@ jj git push --bookmark master                     # push to GitHub
 - Commit titles use [Conventional Commits](https://www.conventionalcommits.org): `type(scope): subject`, such as `fix(core): keep stdin open after an interrupt`.
 - Use `gh` for PRs, issues and CI (`gh pr`, `gh issue`, `gh run`).
 - Open pull requests with `gh pr create --head <bookmark> --base master`. jj leaves git without a current branch, so push the bookmark first and always pass `--head`.
+
+## Releasing
+
+The repository doubles as the Homebrew tap. The cask lives in `Casks/newjen.rb`.
+The release workflow uses the built-in `GITHUB_TOKEN` with `contents: write` for releases and cask updates.
+No separate tap repository or token secret is needed. Repository rules must allow Actions to push a cask update to `master`.
+
+Use tags such as `v0.1.0-alpha.1`, `v0.1.0-beta.1`, `v0.1.0-rc.1`, or `v0.1.0`.
+Version numbers have three numeric components without leading zeroes.
+The optional suffix is `alpha`, `beta`, or `rc`, optionally followed by a numeric component such as `.1`.
+Every `0.x` version and every version with a suffix becomes a GitHub pre-release.
+Versions from `1.0.0` without a suffix become stable releases.
+
+After the release changes land, create and push a version tag pointing at the commit to release.
+A tag push runs `.github/workflows/release.yml` on GitHub's hosted Apple Silicon macOS runner.
+You can also run **Release** from the Actions tab and enter an existing version tag.
+Manual dispatch builds that tag, even if you select a different workflow branch.
+The tag must contain the release workflow and `scripts/bundle-app.sh`.
+
+The workflow runs the same build, test, format, and Clippy gates as CI.
+It calls `scripts/bundle-app.sh <version>` to build an ad-hoc-signed app without Developer ID signing or notarization.
+It publishes `Newjen-<version>-arm64.zip` and `Newjen-<version>-arm64.zip.sha256` through `gh release create`.
+It then checks out `master`, updates only the cask's version and SHA-256, and commits that file with a bot identity.
+If a push fails, it fetches `master`, rebases, and retries once. Conflicts or another rejected push fail with recovery instructions.
+
+The cask commit cannot trigger a release because the release push trigger matches only tags.
+GitHub also suppresses push workflows for commits made with `GITHUB_TOKEN`, so the cask commit does not start CI.
+CI's `master` push and pull request triggers do not publish releases.
+
+The initial cask has an all-zero checksum until the first successful release updates it.
+This placeholder fails checksum verification instead of accepting an unverified download.
+Check the release and cask before announcing it. The cask tracks whichever version you release, including pre-releases.
+Do not reuse a published tag or replace its assets. Publish a new version to correct a release.
+If only the cask update fails, copy the version and checksum from the published asset into `Casks/newjen.rb` and commit that change.
+Do not rerun publication for an existing release.
