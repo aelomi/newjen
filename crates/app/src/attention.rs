@@ -209,11 +209,7 @@ impl Drop for NativeAttention {
 }
 
 fn begin_authorization(authorization: &AtomicU8) -> bool {
-    authorization
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-            (state != REQUESTING).then_some(REQUESTING)
-        })
-        .is_ok()
+    authorization.swap(REQUESTING, Ordering::AcqRel) != REQUESTING
 }
 
 fn badge_label(count: usize) -> Option<String> {
