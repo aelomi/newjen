@@ -149,6 +149,10 @@ impl ProjectView {
         view
     }
 
+    pub fn is_stopping(&self) -> bool {
+        self.quit_phase == QuitPhase::Stopping
+    }
+
     pub fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.opening.is_some() {
             self.pending = Some(path);

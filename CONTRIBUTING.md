@@ -37,7 +37,7 @@ crates/
           #   providers/: detection (`detect.rs`), the Claude adapter (stream-json) and the Codex adapter (app-server JSON-RPC).
           #   session.rs, thread.rs, transcript.rs: one process per thread, its lifecycle and the rendered transcript.
           #   rift.rs: Rift copies. landing.rs, edits.rs: jj snapshots, review, landing and edit previews.
-          #   store.rs: SQLite. instance.rs: the single-instance lock. env.rs: the login shell's PATH.
+          #   store.rs: SQLite. instance.rs: the single-instance lock and local launch handoff. env.rs: the login shell's PATH.
   app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
           #   src/project_view.rs: the window, its loaded projects, the Dock badge, notifications and the quit gate.
           #   src/chat_view.rs (+ chat_view/): one project's threads, composer, approval dock, picker, review pane, inbox.
@@ -144,6 +144,8 @@ cargo test --workspace --locked       # all tests; no network or login needed (R
 cargo test -p newjen-core -- --ignored   # live tests against the real claude and codex CLIs (use your logins)
 cargo build --release                 # optimized build
 ```
+
+A second launch with the same data folder opens or switches to the requested project in the running window. Without a project, it brings that window to the front. Separate `NEWJEN_HOME` folders run independently. A successful handoff exits quietly with code 0. If the running instance cannot accept the request before the timeout, the launcher exits with code 1 and reports an error. In an app bundle, macOS folder-open and reopen events use the running window. The bundle must declare `public.folder` in `CFBundleDocumentTypes` to accept project folders.
 
 The first build takes about 1–2 minutes and creates a `target/` folder of several GB. Later builds are incremental.
 

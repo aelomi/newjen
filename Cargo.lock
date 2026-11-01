@@ -232,6 +232,7 @@ dependencies = [
  "portable-pty",
  "serde_json",
  "tempfile",
+ "url",
 ]
 
 [[package]]

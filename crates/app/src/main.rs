@@ -19,13 +19,14 @@ mod title_bar;
 mod ui;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::{
     App, AppContext, Bounds, Context, IntoElement, Menu, MenuItem, OsAction, PromptLevel, QuitMode,
     Render, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
 };
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
-use newjen_core::instance::InstanceLock;
+use newjen_core::instance::{HandoffError, Instance, LaunchRequest, PendingLaunch, Startup};
 use newjen_core::{Project, Store, orphans, store};
 
 use crate::assets::AppAssets;
@@ -39,58 +40,90 @@ use gpui_kit::component::ActiveTheme as _;
 
 fn main() {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let project = project_dir();
-    // One Newjen per data folder: a second one would drive the same threads and store. Only
-    // the owner reaps crashed `claude` processes and opens the database. Without its database
-    // Newjen cannot run; it still starts GPUI to say so in a window, because started from
-    // Finder or the Dock there is no terminal to read the line.
-    let (instance, startup) = match acquire_instance() {
-        Ok(instance) => {
+    let project = project_dir().map(std::path::absolute).transpose();
+    let request = match &project {
+        Ok(Some(path)) => LaunchRequest::OpenProject(path.clone()),
+        _ => LaunchRequest::Activate,
+    };
+    let acquired = project.map_err(anyhow::Error::from).and_then(|_| {
+        let folder = store::default_dir()?;
+        Instance::start(&folder, &request)
+    });
+    let (instance, startup) = match acquired {
+        Ok(Startup::Forwarded) => return,
+        Ok(Startup::Owner(instance)) => {
             orphans::reap();
             let startup =
                 Store::open_in(instance.directory()).map_err(|problem| StartupProblem::Database {
                     problem,
                     folder: instance.directory().to_path_buf(),
                 });
-            (Some(instance), startup)
+            (Some(Arc::new(instance)), startup)
         }
-        Err(problem) => (None, Err(problem)),
+        Err(problem) if problem.is::<HandoffError>() => {
+            eprintln!("newjen: {problem:#}");
+            std::process::exit(1);
+        }
+        Err(problem) => (None, Err(StartupProblem::Ownership(problem))),
+    };
+    let project = match request {
+        LaunchRequest::Activate => None,
+        LaunchRequest::OpenProject(path) => Some(path),
     };
     if let Err(problem) = &startup {
         eprintln!("newjen: {}: {}", problem.title(), problem.detail());
     }
 
-    gpui_platform::application()
+    let (launches, received) = async_channel::bounded(16);
+    let application = gpui_platform::application()
         .with_assets(AppAssets(gpui_kit::assets::Assets))
-        // Closing the window quits the app (on macOS GPUI otherwise keeps running).
-        .with_quit_mode(QuitMode::LastWindowClosed)
-        .run(move |cx: &mut App| {
-            gpui_kit::init(cx);
-            // Match the system's light/dark mode from the first frame (no flash).
-            gpui_kit::component::Theme::change(cx.window_appearance(), None, cx);
-            // And its Reduce Motion setting; the chat view's clock keeps it in step.
-            gpui_kit::base::apply_system_reduce_motion(cx);
-
-            keys::bind(cx);
-            install_menus(cx);
-
-            let opened = match startup {
-                Ok(store) => open_window(store, home, project, cx),
-                Err(problem) => show_startup_problem(&problem, cx),
-            };
-            if let Err(error) = opened {
-                eprintln!("newjen: could not open the window: {error:#}");
-                cx.quit();
-                return;
+        .with_quit_mode(QuitMode::LastWindowClosed);
+    let opened_urls = launches.clone();
+    application.on_open_urls(move |urls| {
+        for url in urls {
+            match project_url(&url) {
+                Ok(path) => send_launch(&opened_urls, LaunchRequest::OpenProject(path)),
+                Err(error) => eprintln!("newjen: could not open project URL: {error:#}"),
             }
-            cx.activate(true);
-        });
+        }
+    });
+    let ipc_launches = launches.clone();
+    application.on_reopen(move |_| send_launch(&launches, LaunchRequest::Activate));
+    let running_instance = instance.clone();
+    application.run(move |cx: &mut App| {
+        gpui_kit::init(cx);
+        // Match the system's light/dark mode from the first frame (no flash).
+        gpui_kit::component::Theme::change(cx.window_appearance(), None, cx);
+        // And its Reduce Motion setting; the chat view's clock keeps it in step.
+        gpui_kit::base::apply_system_reduce_motion(cx);
+
+        keys::bind(cx);
+        install_menus(cx);
+
+        let opened = match startup {
+            Ok(store) => open_window(
+                store,
+                home,
+                project,
+                received,
+                ipc_launches,
+                running_instance.unwrap(),
+                cx,
+            ),
+            Err(problem) => show_startup_problem(&problem, cx),
+        };
+        if let Err(error) = opened {
+            eprintln!("newjen: could not open the window: {error:#}");
+            cx.quit();
+            return;
+        }
+        cx.activate(true);
+    });
     drop(instance);
 }
 
 enum StartupProblem {
-    AlreadyRunning(PathBuf),
-    Lock(anyhow::Error),
+    Ownership(anyhow::Error),
     Database {
         problem: anyhow::Error,
         folder: PathBuf,
@@ -100,23 +133,15 @@ enum StartupProblem {
 impl StartupProblem {
     fn title(&self) -> &'static str {
         match self {
-            Self::AlreadyRunning(_) => "Newjen is already running",
-            Self::Lock(_) => "Newjen couldn't lock its data folder",
+            Self::Ownership(_) => "Newjen couldn't open its data folder",
             Self::Database { .. } => "Newjen couldn't open its thread database",
         }
     }
 
     fn detail(&self) -> String {
         match self {
-            Self::AlreadyRunning(folder) => format!(
-                "Newjen is already using {}. Switch to the running Newjen window and open the \
-                 project there (File > Open Project). Set NEWJEN_HOME to use a separate data \
-                 folder.",
-                folder.display()
-            ),
-            Self::Lock(problem) => format!(
-                "{problem:#}.\n\nCheck that the data folder can be written to, then try again. \
-                 Set NEWJEN_HOME to use another folder."
+            Self::Ownership(problem) => format!(
+                "{problem:#}.\n\nCheck that the project and data folders are valid and writable, then try again. Set NEWJEN_HOME to use another data folder."
             ),
             Self::Database { problem, folder } => {
                 database_problem_detail(problem, &folder.display().to_string())
@@ -125,11 +150,36 @@ impl StartupProblem {
     }
 }
 
-fn acquire_instance() -> Result<InstanceLock, StartupProblem> {
-    let folder = store::default_dir().map_err(StartupProblem::Lock)?;
-    InstanceLock::try_acquire(&folder)
-        .map_err(StartupProblem::Lock)?
-        .ok_or(StartupProblem::AlreadyRunning(folder))
+enum LaunchEvent {
+    Local(LaunchRequest),
+    Forwarded(PendingLaunch),
+}
+
+fn send_launch(sender: &async_channel::Sender<LaunchEvent>, request: LaunchRequest) {
+    if let Err(error) = sender.try_send(LaunchEvent::Local(request)) {
+        eprintln!("newjen: could not accept the launch: {error}");
+    }
+}
+
+fn project_url(value: &str) -> anyhow::Result<PathBuf> {
+    let url = url::Url::parse(value)?;
+    anyhow::ensure!(
+        url.scheme() == "file",
+        "only folder file URLs are supported"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "folder URL has a query or fragment"
+    );
+    let path = url
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("invalid local folder URL"))?;
+    anyhow::ensure!(path.is_absolute(), "folder URL must be absolute");
+    anyhow::ensure!(
+        !path.as_os_str().as_encoded_bytes().contains(&0),
+        "folder URL contains a null byte"
+    );
+    Ok(path)
 }
 
 /// The menu bar and the app-wide actions behind it, so Newjen behaves like any Mac app
@@ -223,9 +273,6 @@ fn check_project(project: &Path) -> Result<(), String> {
     }
 }
 
-/// When Newjen cannot start (another Newjen owns the data folder, or the thread database
-/// cannot be opened): a plain window with a native alert that says what went wrong, and quits
-/// when it is dismissed.
 fn show_startup_problem(problem: &StartupProblem, cx: &mut App) -> anyhow::Result<()> {
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
     cx.on_action(|_: &CloseWindow, cx: &mut App| cx.quit());
@@ -282,6 +329,9 @@ fn open_window(
     store: Store,
     home: Option<PathBuf>,
     project: Option<PathBuf>,
+    received: async_channel::Receiver<LaunchEvent>,
+    forwarded: async_channel::Sender<LaunchEvent>,
+    instance: Arc<Instance>,
     cx: &mut App,
 ) -> anyhow::Result<()> {
     let options = WindowOptions {
@@ -315,9 +365,64 @@ fn open_window(
         });
         view
     })?;
-    // ⌘Q and ⌘W ask first when work would be lost. They act on the window that was opened,
-    // not the active one: minimized, the window is not active, yet the keys still arrive.
-    // A key press is handled while GPUI is busy with the window, hence `defer`.
+    let target = view.downgrade();
+    cx.spawn(async move |cx| {
+        loop {
+            let owner = instance.clone();
+            match cx
+                .background_executor()
+                .spawn(async move { owner.receive() })
+                .await
+            {
+                Ok(Some(request)) => match forwarded.try_send(LaunchEvent::Forwarded(request)) {
+                    Ok(()) | Err(async_channel::TrySendError::Full(_)) => {}
+                    Err(async_channel::TrySendError::Closed(_)) => break,
+                },
+                Ok(None) => {}
+                Err(error) => eprintln!("newjen: could not receive launch: {error:#}"),
+            }
+        }
+    })
+    .detach();
+    cx.spawn(async move |cx| {
+        while let Ok(event) = received.recv().await {
+            let request = match &event {
+                LaunchEvent::Local(request) => request.clone(),
+                LaunchEvent::Forwarded(pending) if !pending.is_expired() => {
+                    pending.request().clone()
+                }
+                LaunchEvent::Forwarded(_) => continue,
+            };
+            let accepted = window_handle.update(cx, |_, window, cx| {
+                target.update(cx, |view, cx| {
+                    if view.is_stopping() {
+                        return false;
+                    }
+                    match request {
+                        LaunchRequest::Activate => {}
+                        LaunchRequest::OpenProject(path) => view.open_project(path, window, cx),
+                    }
+                    window.activate_window();
+                    cx.activate(true);
+                    true
+                })
+            });
+            match accepted {
+                Ok(Ok(true)) => {
+                    if let LaunchEvent::Forwarded(pending) = event {
+                        let _ = cx
+                            .background_executor()
+                            .spawn(async move { pending.accept() })
+                            .await;
+                    }
+                }
+                Ok(Ok(false)) => {}
+                _ => break,
+            }
+        }
+    })
+    .detach();
+    // Quit targets this window even when minimized, and defers past the key event's update.
     let asking = view.downgrade();
     let request = move |cx: &mut App| {
         let view = asking.clone();
@@ -344,6 +449,27 @@ fn open_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_urls_decode_spaces_unicode_and_reject_unsupported_urls() {
+        assert_eq!(
+            project_url("file:///tmp/project%20with%20spaces").unwrap(),
+            PathBuf::from("/tmp/project with spaces")
+        );
+        assert_eq!(
+            project_url("file:///tmp/%E6%97%A5%E6%9C%AC%E8%AA%9E").unwrap(),
+            PathBuf::from("/tmp/日本語")
+        );
+        for value in [
+            "https://example.com/project",
+            "newjen://project",
+            "file://remote/tmp/project",
+            "file:///tmp/project?other=1",
+            "file:///tmp/%00",
+        ] {
+            assert!(project_url(value).is_err(), "accepted {value}");
+        }
+    }
 
     #[test]
     fn a_database_problem_says_what_and_where() {
