@@ -40,7 +40,8 @@ crates/
           #   store.rs: SQLite. instance.rs: the single-instance lock and local launch handoff. env.rs: the login shell's PATH.
   app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
           #   src/project_view.rs: the window, its loaded projects, the Dock badge, notifications and the quit gate.
-          #   src/chat_view.rs (+ chat_view/): one project's threads, composer, approval dock, picker, review pane, inbox.
+          #   src/chat_view.rs (+ chat_view/): one project's threads, composer, approval dock, picker, review pane, terminal tab.
+          #   src/sidebar.rs, src/usage_view.rs: the thread list (grouped by what needs you) and its usage popover.
           #   src/terminal.rs: the per-thread terminal panel. src/attention.rs: AppKit badge and notification adapters.
           #   src/theme.rs: the sidebar width, the card inset and radius, and the material tokens. src/ui/: approval card, tool card, pulse, thin Kit helpers and style wrappers (`card`, `glass_title_bar`, `card_title_bar`).
           #   src/assets.rs: extra Kit icons. THIRD-PARTY-NOTICES.md: embedded Lucide icon licenses.

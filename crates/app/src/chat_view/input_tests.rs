@@ -1724,18 +1724,6 @@ async fn a_denial_note_is_sent_from_its_own_field_and_cleared_for_the_next_reque
     finish(&chat, path, cx);
 }
 
-fn request_key(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> newjen_core::ApprovalKey {
-    cx.update(|_, cx| {
-        chat.read(cx)
-            .thread()
-            .read(cx)
-            .transcript()
-            .pending_approval()
-            .unwrap()
-            .key()
-    })
-}
-
 /// A second project in the same window, as `ProjectView` makes one: it sees `peers` and is
 /// out of sight until shown.
 fn peer_project(
@@ -1777,16 +1765,14 @@ fn peer_project(
 }
 
 #[gpui::test]
-async fn inbox_answers_the_captured_thread_in_any_project_without_selecting_it(
+async fn cmd_j_goes_to_the_next_thread_that_needs_you_here_then_in_another_project(
     cx: &mut TestAppContext,
 ) {
-    let (chat, path, cx) = setup(cx, "inbox-routing", true);
+    let (chat, path, cx) = setup(cx, "jump-needs-you", true);
     cx.simulate_input("first thread");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
     let first = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
-    let first_request = request_id(&chat, cx);
-    let first_key = request_key(&chat, cx);
     // The second waiting thread is in another loaded project, out of sight.
     let peer = peer_project("other", true, vec![&chat], &path, cx);
     cx.update(|window, cx| {
@@ -1796,75 +1782,34 @@ async fn inbox_answers_the_captured_thread_in_any_project_without_selecting_it(
     });
     pending(&peer, cx).await;
     let second = cx.update(|_, cx| peer.read(cx).thread().read(cx).id().to_string());
-    let second_key = request_key(&peer, cx);
-    assert_ne!(second_key, first_key);
     let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
     let seen = opened.clone();
-    cx.update(|window, cx| {
-        chat.update(cx, |view, cx| {
+    cx.update(|_, cx| {
+        chat.update(cx, |view, _| {
             view.set_copy_peers(vec![peer.downgrade()]);
             view.set_thread_opener(std::rc::Rc::new(move |id, _, _| {
                 seen.borrow_mut().push(id.to_string())
             }));
-            assert_eq!(view.waiting_threads(cx), 1);
-            assert_eq!(view.waiting_everywhere(cx), 2);
-            assert_eq!(view.quit_blockers(cx).waiting, 1);
-            view.open_inbox(window, cx);
-            // Another request's key never answers this one.
-            view.answer_thread(
-                &first,
-                Some(second_key),
-                ApprovalIntent::AllowOnce,
-                window,
-                cx,
-            );
         })
     });
-    assert_eq!(answers(&path).len(), 0);
-    cx.run_until_parked();
-    let selector = |thread: &str, button: &str| -> &'static str {
-        Box::leak(format!("inbox-{thread}-{button}").into_boxed_str())
-    };
-    assert!(
-        cx.debug_bounds(selector(&first, "always")).is_none(),
-        "the inbox offers no session grant"
-    );
-    click(cx, selector(&second, "once"));
+    // Only the thread on screen needs you here: ⌘J goes to the other project's.
+    cx.simulate_keystrokes("cmd-j");
+    assert_eq!(opened.borrow().as_slice(), std::slice::from_ref(&second));
+    // A new draft takes the screen: ⌘J goes back to the waiting thread, in this project.
+    cx.simulate_keystrokes("cmd-n");
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert!(view.thread().read(cx).is_draft());
+        assert_eq!(view.thread_order(cx), vec![0, 1]);
+        assert_eq!(view.needs_you(cx), vec![false, true]);
+    });
+    cx.simulate_keystrokes("cmd-j");
     cx.update(|_, cx| {
         let view = chat.read(cx);
         assert_eq!(view.thread().read(cx).id(), first);
-        assert_eq!(view.panel, Panel::Inbox);
+        assert_eq!(view.panel, Panel::Thread);
     });
-    wait_answers(cx, &path, 1).await;
-    assert_eq!(
-        answers(&path)[0]["response"]["response"]["behavior"],
-        "allow"
-    );
-    assert_eq!(request_id(&chat, cx), first_request);
-    assert_eq!(request_id(&peer, cx), "second-tool");
-    cx.simulate_keystrokes("escape");
-    cx.simulate_keystrokes("cmd-enter");
-    assert_eq!(
-        answers(&path).len(),
-        1,
-        "inbox keys must not answer the hidden dock"
-    );
-    click(cx, selector(&first, "deny"));
-    wait_answers(cx, &path, 2).await;
-    assert_eq!(
-        answers(&path)[1]["response"]["response"]["behavior"],
-        "deny"
-    );
-    cx.run_until_parked();
-    assert_eq!(request_id(&chat, cx), "second-tool");
-    // "Open thread" on another project's row goes through the window, which switches
-    // projects; this project's own rows open here.
-    click(cx, selector(&second, "open"));
-    assert_eq!(opened.borrow().as_slice(), std::slice::from_ref(&second));
-    assert!(cx.update(|_, cx| chat.read(cx).panel == Panel::Inbox));
-    click(cx, selector(&first, "open"));
     assert_eq!(opened.borrow().len(), 1);
-    assert!(cx.update(|_, cx| chat.read(cx).panel == Panel::Thread));
     cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
         .unwrap();
     finish(&chat, path, cx);
@@ -1877,14 +1822,6 @@ fn closing_the_drawer_restores_focus_to_the_visible_panel(cx: &mut TestAppContex
     cx.simulate_resize(size(px(700.), px(600.)));
     cx.simulate_keystrokes("cmd-b");
     assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
-    cx.simulate_keystrokes("cmd-shift-a");
-    cx.run_until_parked();
-    cx.update(|window, cx| {
-        assert!(!window.has_active_sheet(cx));
-        assert_eq!(chat.read(cx).panel, Panel::Inbox);
-        assert!(chat.read(cx).root.is_focused(window));
-    });
-    cx.simulate_keystrokes("cmd-b");
     cx.simulate_keystrokes("cmd-`");
     cx.run_until_parked();
     cx.update(|window, cx| {
@@ -2283,5 +2220,65 @@ fn the_review_shows_the_selected_file_only(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let shown = cx.update(|_, cx| chat.read(cx).review_shown(cx));
     assert_eq!(shown, Some((1, 2, vec!["b.toml".to_string()])));
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn the_sidebar_groups_threads_and_the_project_row_sets_the_landing_mode(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "sidebar-groups", true);
+    cx.run_until_parked();
+    for selector in [
+        "switch-project",
+        "new-thread",
+        "usage-trigger",
+        "thread-row",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+    // The first message starts a thread that waits for an approval: "Needs you".
+    cx.simulate_input("first thread");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert_eq!(
+            view.sidebar_entries(cx),
+            vec![
+                sidebar::Entry::Header {
+                    group: SidebarGroup::NeedsYou,
+                    count: 1
+                },
+                sidebar::Entry::Thread(0)
+            ]
+        );
+    });
+    // The project's landing mode changes the open draft too.
+    cx.simulate_keystrokes("cmd-n");
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.set_project_landing(LandingMode::AgentManaged, cx);
+            assert_eq!(view.project.landing_mode, LandingMode::AgentManaged);
+            let draft = view.thread().read(cx);
+            assert!(draft.is_draft());
+            assert_eq!(draft.landing_mode(), LandingMode::AgentManaged);
+            // The thread already sent keeps its own mode.
+            assert_eq!(
+                view.slots[1].thread.read(cx).landing_mode(),
+                LandingMode::HarnessManaged
+            );
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("thread-row").is_some());
+    // The usage row opens its panel, and a click elsewhere closes it.
+    assert!(cx.debug_bounds("usage-panel").is_none());
+    click(cx, "usage-trigger");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("usage-panel").is_some());
+    click(cx, "thread-row");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("usage-panel").is_none());
     finish(&chat, path, cx);
 }

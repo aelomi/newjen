@@ -1132,7 +1132,7 @@ impl ProjectView {
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.open_project(path.clone(), window, cx)
                         }))
-                        .child(ui::monogram(&name, cx))
+                        .child(ui::monogram_large(&name, cx))
                         .child(
                             v_flex().flex_1().min_w_0().child(ui::ellipsis(name)).child(
                                 ui::middle_ellipsis(shown)

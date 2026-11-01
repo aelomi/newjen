@@ -84,10 +84,8 @@ pub struct ApprovalCard {
     preview: Option<AnyElement>,
     edit: bool,
     ready: bool,
-    once_only: bool,
     remember: bool,
     ghost: bool,
-    selector_prefix: String,
     note: Option<Entity<gpui_kit::base::input::TextareaState>>,
 }
 
@@ -113,23 +111,10 @@ impl ApprovalCard {
             preview: None,
             edit: false,
             ready: true,
-            once_only: false,
             remember: true,
             ghost: false,
-            selector_prefix: String::new(),
             note: None,
         }
-    }
-    /// Only Allow once and Deny: the inbox never grants for a thread (that stays in the
-    /// thread's own dock, where the scope row explains what is remembered).
-    pub fn once_only(mut self) -> Self {
-        self.once_only = true;
-        self
-    }
-    /// Puts `prefix` before the buttons' debug selectors, so tests can tell cards apart.
-    pub fn selectors(mut self, prefix: impl Into<String>) -> Self {
-        self.selector_prefix = prefix.into();
-        self
     }
     pub fn preview(mut self, preview: Option<AnyElement>, ready: bool) -> Self {
         self.edit = preview.is_some();
@@ -188,10 +173,8 @@ impl ApprovalCard {
             preview: None,
             edit: false,
             ready: true,
-            once_only: self.once_only,
             remember: self.remember,
             ghost: true,
-            selector_prefix: String::new(),
             note: None,
         }
     }
@@ -226,7 +209,7 @@ impl RenderOnce for ApprovalCard {
                       keys: Option<(&'static str, gpui::Hsla)>| {
             let on_answer = self.on_answer.clone();
             let on_exit = on_exit.clone();
-            let selector = format!("{}{id}", self.selector_prefix);
+            let selector = id.to_string();
             let mut button = button((self.id.clone(), id), label, look, Size::Md, cx)
                 .disabled(!self.ready && !answer.is_deny());
             if !ghost {
@@ -300,7 +283,7 @@ impl RenderOnce for ApprovalCard {
                 .text_color(c.muted_foreground)
                 .child(self.detail)
         });
-        let remember = self.remember && !self.edit && !self.once_only;
+        let remember = self.remember && !self.edit;
         let actions = div()
             .flex()
             .flex_wrap()

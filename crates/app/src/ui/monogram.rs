@@ -5,28 +5,54 @@ use gpui_kit::component::ActiveTheme as _;
 fn hash(name: &str) -> u32 {
     name.to_lowercase()
         .bytes()
-        .fold(2_166_136_261, |hash, byte| {
-            (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+        .fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
         })
 }
 
-/// The tile's color: Kit's blue, green, yellow, red or cyan, picked by the name's hash. Kit has
-/// no orange, purple or pink.
+fn palette(cx: &App) -> [Hsla; 6] {
+    let colors = &cx.theme().colors;
+    [
+        colors.blue,
+        colors.green,
+        colors.yellow,
+        colors.red,
+        colors.magenta,
+        colors.cyan,
+    ]
+}
+
+/// A color for `name`, the same every time, from Kit's palette.
 pub fn monogram_color(name: &str, cx: &App) -> Hsla {
-    let theme = cx.theme();
-    let palette = [theme.blue, theme.green, theme.yellow, theme.red, theme.cyan];
+    let palette = palette(cx);
     palette[hash(name) as usize % palette.len()]
 }
 
 fn initial(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
+    name.chars()
+        .find(|c| !c.is_whitespace())
         .map_or_else(|| "?".to_string(), |first| first.to_uppercase().to_string())
 }
 
-/// A rounded tile with the name's first letter, tinted by `monogram_color`.
+/// The first letter of `name` on a small tinted tile, for the project row.
 pub fn monogram(name: &str, cx: &App) -> impl IntoElement {
+    let color = monogram_color(name, cx);
+    div()
+        .flex_none()
+        .size(px(22.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .bg(color.opacity(0.22))
+        .text_color(color)
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .child(initial(name))
+}
+
+/// The same tile, larger and outlined, for the project chooser.
+pub fn monogram_large(name: &str, cx: &App) -> impl IntoElement {
     let color = monogram_color(name, cx);
     div()
         .flex()
@@ -55,6 +81,7 @@ mod tests {
         assert_eq!(hash(""), 2_166_136_261);
         assert_eq!(hash("a"), 0xe40c_292c);
         assert_eq!(hash("Newjen"), hash("newjen"));
+        assert_ne!(hash("newjen"), hash("aelomi"));
     }
 
     #[gpui::test]
@@ -64,8 +91,7 @@ mod tests {
             Theme::change(gpui::WindowAppearance::Dark, None, cx);
             assert_eq!(monogram_color("newjen", cx), monogram_color("newjen", cx));
             assert_eq!(monogram_color("NewJen", cx), monogram_color("newjen", cx));
-            let theme = cx.theme();
-            let palette = [theme.blue, theme.green, theme.yellow, theme.red, theme.cyan];
+            let palette = palette(cx);
             for name in [
                 "newjen",
                 "pstack",
@@ -80,7 +106,7 @@ mod tests {
             let distinct: std::collections::HashSet<_> =
                 ["newjen", "pstack", "rift", "aelomi-site", "dotfiles"]
                     .iter()
-                    .map(|name| hash(name) as usize % 5)
+                    .map(|name| hash(name) as usize % palette.len())
                     .collect();
             assert!(distinct.len() >= 3);
         });

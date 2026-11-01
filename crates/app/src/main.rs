@@ -17,6 +17,7 @@ mod terminal;
 mod theme;
 mod title_bar;
 mod ui;
+mod usage_view;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,8 +33,8 @@ use newjen_core::{Project, Store, orphans, store};
 
 use crate::assets::AppAssets;
 use crate::keys::{
-    CloseWindow, Hide, HideOthers, JumpToThread, Minimize, NewThread, NextThread, OpenProject,
-    OpenRecentProject, PreviousThread, Quit, ShowApprovals, ShowProjects, ToggleSidebar,
+    CloseWindow, Hide, HideOthers, JumpToNeedsYou, JumpToThread, Minimize, NewThread, NextThread,
+    OpenProject, OpenRecentProject, PreviousThread, Quit, ShowProjects, ToggleSidebar,
     ToggleTerminal,
 };
 use crate::project_view::ProjectView;
@@ -228,6 +229,7 @@ fn update_menus(recent: &[Project], cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Previous Thread", PreviousThread),
             MenuItem::action("Next Thread", NextThread),
+            MenuItem::action("Next Thread Needing You", JumpToNeedsYou),
             // ⌘1 to ⌘9, by place in the list. macOS shows each item's key from its binding.
             MenuItem::submenu(
                 Menu::new("Go to Thread").items((0..keys::JUMP_KEYS.len()).map(|place| {
@@ -247,7 +249,6 @@ fn update_menus(recent: &[Project], cx: &mut App) {
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
-            MenuItem::action("Approvals Inbox", ShowApprovals),
             MenuItem::action("Toggle Terminal", ToggleTerminal),
         ]),
         Menu::new("Window").items([

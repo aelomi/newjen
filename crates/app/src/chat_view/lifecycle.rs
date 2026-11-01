@@ -178,14 +178,9 @@ impl ChatView {
             .collect()
     }
 
-    /// Row `ix`'s thread changed: keeps its inbox row's facts in step and reports the
-    /// transitions `ProjectView` turns into a badge count and notifications.
-    pub(super) fn observe_attention(
-        &mut self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Row `ix`'s thread changed: reports the transitions `ProjectView` turns into a badge
+    /// count and notifications.
+    pub(super) fn observe_attention(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) {
         let (next, new_request, id, title) = {
             let slot = &self.slots[ix];
             let thread = slot.thread.read(cx);
@@ -197,14 +192,6 @@ impl ChatView {
                 thread.title().to_string(),
             )
         };
-        if new_request {
-            let thread = self.slots[ix].thread.read(cx);
-            self.slots[ix].inbox_outside = thread
-                .transcript()
-                .pending_approval()
-                .and_then(|request| approval::outside_path(request.view(), thread.cwd()));
-            self.prepare_slot_preview(ix, window, cx);
-        }
         let slot = &mut self.slots[ix];
         let previous = std::mem::replace(&mut slot.observed, next.clone());
         if new_request || (next.status.is_busy() && !previous.status.is_busy()) {

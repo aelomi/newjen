@@ -1,26 +1,31 @@
-//! The thread list on the left (screens 8–12 of `design/newjen.pen`): the project, "New
-//! thread", and one row per thread with a dot and a line saying how it is doing.
+//! The thread list on the left: the project switcher, threads grouped by what needs you, and
+//! the usage footer (see `design/newjen.pen` and the v3 mocks).
 //!
-//! The decisions come first as plain functions, tested without a window: what a row says,
-//! where the list sits at each window width, which thread ⌘⇧] goes to. The elements that draw
-//! them come after; the chat view wires them to the threads.
+//! The decisions come first as plain functions, tested without a window: which group a row
+//! sits in and in what order, what a row says, where the list sits at each window width, which
+//! thread ⌘J goes to. The elements that draw them come after; the chat view wires them to the
+//! threads.
 
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, ElementId, Font, FontWeight, IntoElement, ParentElement, Pixels, SharedString,
-    Styled, TextRun, Window, div, font, prelude::*, px,
+    AnyElement, App, ElementId, FontWeight, IntoElement, MouseButton, ParentElement, Pixels,
+    SharedString, Styled, Window, div, prelude::*, px,
 };
-use gpui_kit::base::v_flex;
+use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, list::ListItem};
 use newjen_core::Status;
+use newjen_core::landing::LandingMode;
+use newjen_core::steps::SidebarGroup;
 use newjen_core::transcript::STOPPED_ON_QUIT;
 
-use crate::format::{elapsed, relative_time, short_path};
+use crate::format::{elapsed, relative_time};
 use crate::theme::SIDEBAR;
-use crate::ui::{self, IconName, ListRow, Pulse};
-use gpui_kit::component::ActiveTheme as _;
+use crate::ui::{self, IconName};
 
 /// Below this window width the list hides, so the chat keeps the whole window (screen 11). ⌘B
 /// then opens it as a drawer over the chat.
@@ -28,6 +33,9 @@ pub const NARROW_WINDOW: f32 = 760.0;
 
 /// The detail line of a thread with no message yet.
 pub const DRAFT_DETAIL: &str = "No messages yet";
+
+/// What a draft's second line says in the list.
+pub const DRAFT_LINE: &str = "Draft";
 
 /// A thread waiting for an approval, in its row ("Needs approval · Bash") and in the title
 /// bar's pill on the same screen.
@@ -168,6 +176,164 @@ pub fn row_look(facts: &RowFacts, now_ms: i64) -> RowLook {
     }
 }
 
+/// The groups, top to bottom.
+pub const GROUPS: [SidebarGroup; 3] = [
+    SidebarGroup::NeedsYou,
+    SidebarGroup::Working,
+    SidebarGroup::Done,
+];
+
+/// A section header's label.
+pub fn group_label(group: SidebarGroup) -> &'static str {
+    match group {
+        SidebarGroup::NeedsYou => "Needs you",
+        SidebarGroup::Working => "Working",
+        SidebarGroup::Done => "Done",
+    }
+}
+
+/// A count in a header: "7", or "99+" from 100 up.
+pub fn count_label(count: usize) -> String {
+    if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    }
+}
+
+/// One line of the list: a section's header or a thread (its index in the view's thread order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    Header { group: SidebarGroup, count: usize },
+    Thread(usize),
+}
+
+/// The list from the threads' `(draft, group)`, in the view's thread order: drafts first and
+/// without a header, then a header and its threads for each group that has any, in
+/// [`GROUPS`] order. A group keeps its threads in the view's order, so a thread that moves
+/// between groups slots in by age, not by when it changed.
+pub fn display_order(threads: &[(bool, SidebarGroup)]) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = threads
+        .iter()
+        .enumerate()
+        .filter(|(_, (draft, _))| *draft)
+        .map(|(ix, _)| Entry::Thread(ix))
+        .collect();
+    for group in GROUPS {
+        let members: Vec<usize> = threads
+            .iter()
+            .enumerate()
+            .filter(|(_, (draft, of))| !draft && *of == group)
+            .map(|(ix, _)| ix)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        entries.push(Entry::Header {
+            group,
+            count: members.len(),
+        });
+        entries.extend(members.into_iter().map(Entry::Thread));
+    }
+    entries
+}
+
+/// The threads in the order the list shows them: what ⌘1 to ⌘9 and ⌘⇧[ ⌘⇧] count through.
+pub fn thread_order(entries: &[Entry]) -> Vec<usize> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Thread(ix) => Some(*ix),
+            Entry::Header { .. } => None,
+        })
+        .collect()
+}
+
+/// Where thread `ix` sits among `entries` (headers count), to scroll to it.
+pub fn entry_of(entries: &[Entry], ix: usize) -> Option<usize> {
+    entries.iter().position(|entry| *entry == Entry::Thread(ix))
+}
+
+/// ⌘J: the thread that needs you after `active` in the list's order, wrapping around. `order`
+/// is [`thread_order`], and `needs[ix]` says whether thread `ix` is in the "Needs you" group.
+/// `None` when nothing else needs you (the thread on screen needs no jump to itself).
+pub fn next_needs_you(order: &[usize], active: usize, needs: &[bool]) -> Option<usize> {
+    let from = order
+        .iter()
+        .position(|ix| *ix == active)
+        .map_or(0, |at| at + 1);
+    (0..order.len())
+        .map(|offset| order[(from + offset) % order.len()])
+        .find(|ix| *ix != active && needs.get(*ix).copied().unwrap_or(false))
+}
+
+/// A row's time on the right: "now", "4m", "1h", "3d", "2w", "11mo", "2y".
+pub fn compact_time(then_ms: i64, now_ms: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let secs = (now_ms - then_ms).max(0) / 1000;
+    if secs < MINUTE {
+        "now".to_string()
+    } else if secs < HOUR {
+        format!("{}m", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{}h", secs / HOUR)
+    } else if secs < 14 * DAY {
+        format!("{}d", secs / DAY)
+    } else if secs < 60 * DAY {
+        format!("{}w", secs / (7 * DAY))
+    } else if secs < 365 * DAY {
+        format!("{}mo", secs / (30 * DAY))
+    } else {
+        format!("{}y", secs / (365 * DAY))
+    }
+}
+
+/// What the row's status icon shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// An approval, a usage limit or a question waits for you.
+    Attention,
+    Failed,
+    Working,
+    Done,
+    Draft,
+}
+
+pub fn mark(group: SidebarGroup, look: &RowLook, draft: bool) -> Mark {
+    if draft {
+        return Mark::Draft;
+    }
+    match group {
+        SidebarGroup::NeedsYou if look.dot == Dot::Failed => Mark::Failed,
+        SidebarGroup::NeedsYou => Mark::Attention,
+        SidebarGroup::Working => Mark::Working,
+        SidebarGroup::Done => Mark::Done,
+    }
+}
+
+/// The row's second line: what the thread is doing (core's activity line), else the row look's
+/// own words. A finished thread's look only says how long ago, which the row's time already
+/// does, so it says "Done".
+pub fn detail_line(
+    activity: Option<String>,
+    look: &RowLook,
+    group: SidebarGroup,
+    draft: bool,
+) -> String {
+    if draft {
+        return DRAFT_LINE.to_string();
+    }
+    if let Some(line) = activity.filter(|line| !line.trim().is_empty()) {
+        return line;
+    }
+    match (group, look.dot) {
+        (SidebarGroup::Done, Dot::None | Dot::Unread) => "Done".to_string(),
+        _ => look.detail.clone(),
+    }
+}
+
 /// Where the thread list is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -243,8 +409,8 @@ pub fn shifted(ix: usize, removed: usize) -> usize {
 }
 
 /// Whether the list counts as empty: nothing in it but one draft, the thread on screen. Then
-/// it shows [`EMPTY_LIST`] under a highlighted "New thread" row rather than a lone "New
-/// thread" row (screen 12, "Empty"). A draft kept beside saved threads is a row of its own.
+/// it shows [`EMPTY_LIST`] under that draft's row. A draft kept beside saved threads is a row
+/// of its own.
 pub fn is_empty_list(drafts: &[bool]) -> bool {
     drafts.len() <= 1 && drafts.iter().all(|draft| *draft)
 }
@@ -258,83 +424,15 @@ pub fn hidden_needs_you(statuses: &[Status], active: usize) -> bool {
         .any(|(ix, status)| ix != active && *status == Status::Waiting)
 }
 
-/// The gap between the project's name and its path (`gap_2`).
-const NAME_GAP: f32 = 8.0;
-/// A path shorter than this many characters says nothing useful, so it is left out.
-const PATH_MIN_CHARS: usize = 6;
-
-/// The project row's path after a name `name_width` pixels wide, in `room` pixels: its `~/path`
-/// cut in the middle to what fits (at `path_char` pixels a character), or none when the name
-/// takes the room (screen 12). The name is never cut for the path's sake.
-pub fn project_path(path: &str, name_width: f32, path_char: f32, room: f32) -> Option<String> {
-    let left = room - name_width - NAME_GAP;
-    let path_chars = (left / path_char.max(1.0)).max(0.0) as usize;
-    (path_chars >= PATH_MIN_CHARS).then(|| short_path(path, path_chars))
-}
-
-/// How wide `text` is in `font` at `size`, as the window's text system lays it out, with the
-/// fallback fonts it picks for characters the font lacks (Chinese or Japanese names, emoji).
-fn measured(text: &str, font: Font, size: Pixels, window: &Window) -> f32 {
-    let run = TextRun {
-        len: text.len(),
-        font,
-        color: gpui::black(),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let line =
-        window
-            .text_system()
-            .shape_line(SharedString::from(text.to_string()), size, &[run], None);
-    f32::from(line.width)
-}
-
 // -------------------------------------------------------------------------------------------
 // Elements
 // -------------------------------------------------------------------------------------------
 
-/// The narrowest a thread row's menu gets.
+/// The narrowest a row's menu gets.
 const MENU_WIDTH: Pixels = px(200.);
 
-/// The size of a row's dot, and of the box that keeps every title lined up whether or not it
-/// has a dot.
-const DOT: f32 = 7.0;
-const DOT_BOX: f32 = 10.0;
-
-/// The dot before a title. `id` keys the working pulse.
-pub fn dot(dot: Dot, id: ElementId, cx: &App) -> AnyElement {
-    let colors = &cx.theme().colors;
-    let solid = |color| div().size(px(DOT)).rounded_full().bg(color);
-    let mark = match dot {
-        Dot::None => None,
-        Dot::Approval => Some(solid(colors.warning).into_any_element()),
-        Dot::Failed => Some(solid(colors.danger).into_any_element()),
-        Dot::Unread => Some(solid(colors.foreground).into_any_element()),
-        Dot::Stopped => Some(
-            div()
-                .size(px(DOT))
-                .rounded_full()
-                .border_1()
-                .border_color(crate::theme::material(cx).glass_muted)
-                .into_any_element(),
-        ),
-        // A thin ring that widens and fades, and none under Reduce Motion.
-        Dot::Working => Some(
-            Pulse::new(id)
-                .size(px(DOT))
-                .child(solid(colors.ring))
-                .into_any_element(),
-        ),
-    };
-    div()
-        .size(px(DOT_BOX))
-        .flex()
-        .items_center()
-        .justify_center()
-        .children(mark)
-        .into_any_element()
-}
+/// A title longer than this may be cut in the list, so it gets a tooltip with the whole of it.
+const TITLE_TOOLTIP_CHARS: usize = 24;
 
 /// The top of the docked list, under the traffic lights: room for them (unless the window is
 /// full screen, where they hide), then the button that hides the list. Drags the window like
@@ -359,55 +457,125 @@ pub fn toggle_button(
         .into_any_element()
 }
 
-/// The project: a folder icon, its name and, when there is room after it, its `~/path`.
-/// `room` is the width its text has.
-pub fn project_row(name: &str, path: &str, room: f32, window: &Window, cx: &App) -> AnyElement {
-    let colors = &cx.theme().colors;
-    let mut name_font = font(cx.theme().font_family.clone());
-    name_font.weight = FontWeight::SEMIBOLD;
-    let name_width = measured(name, name_font, cx.theme().font_size, window);
-    let path_char = measured(
-        "0",
-        font(cx.theme().mono_font_family.clone()),
-        gpui::rems(0.75).to_pixels(window.rem_size()),
-        window,
-    );
-    let path = project_path(path, name_width, path_char, room);
-    div()
+/// A change of the project's landing mode, from the project row's menu.
+pub type OnLanding = Rc<dyn Fn(LandingMode, &mut Window, &mut App)>;
+
+/// The project row's callbacks and state.
+pub struct ProjectBar {
+    pub name: SharedString,
+    pub landing: LandingMode,
+    /// Opens the project chooser; `None` when no chooser is wired.
+    pub on_switch: Option<OnPress>,
+    pub on_new_thread: OnPress,
+    pub on_landing: OnLanding,
+}
+
+/// The project switcher and the new-thread button. A click on the project opens the chooser;
+/// a right click offers the project's landing setting.
+pub fn project_bar(bar: ProjectBar, cx: &App) -> AnyElement {
+    let material = crate::theme::material(cx);
+    let ProjectBar {
+        name,
+        landing,
+        on_switch,
+        on_new_thread,
+        on_landing,
+    } = bar;
+    let chooser = on_switch.clone();
+    let switcher = div()
+        .id("switch-project")
+        .debug_selector(|| "switch-project".to_string())
+        .flex_1()
+        .min_w_0()
         .flex()
         .items_center()
         .gap_2()
-        .px_2p5()
-        .pt_2()
-        .pb_2p5()
-        .child(ui::icon(
-            IconName::Folder,
-            gpui_kit::component::Size::Small,
-            crate::theme::material(cx).glass_muted,
-        ))
+        .px_1p5()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(move |row| row.bg(material.glass_hover))
+        .child(ui::monogram(&name, cx))
         .child(
-            // The name keeps its width; only a name wider than the whole row is cut.
-            div()
-                .flex_none()
-                .max_w(px(room.max(0.0)))
-                .text_base()
+            ui::ellipsis(name)
+                .flex_1()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.foreground)
-                .child(ui::ellipsis(name.to_string())),
+                .text_base(),
         )
-        .children(path.map(|path| {
-            // The path gives way instead: if its characters are wider than estimated (say
-            // Japanese folder names), the row cuts it further in its middle.
-            div()
-                .min_w_0()
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_xs()
-                .text_color(crate::theme::material(cx).glass_muted)
-                .child(ui::middle_ellipsis(path))
-        }))
+        .child(ui::icon(
+            IconName::ChevronsUpDown,
+            gpui_kit::component::Size::Small,
+            material.glass_muted,
+        ))
+        .when_some(on_switch, |row, chooser| {
+            row.on_click(move |_, window, cx| chooser(window, cx))
+        })
+        .context_menu(move |menu, _, _| {
+            let harness = on_landing.clone();
+            let agent = on_landing.clone();
+            let chooser = chooser.clone();
+            menu.min_w(MENU_WIDTH)
+                .item(PopupMenuItem::label("Landing"))
+                .item(
+                    PopupMenuItem::new(HARNESS_LANDING)
+                        .checked(landing == LandingMode::HarnessManaged)
+                        .on_click(move |_, window, cx| {
+                            harness(LandingMode::HarnessManaged, window, cx)
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(AGENT_LANDING)
+                        .checked(landing == LandingMode::AgentManaged)
+                        .on_click(move |_, window, cx| {
+                            agent(LandingMode::AgentManaged, window, cx)
+                        }),
+                )
+                .when_some(chooser, |menu, chooser| {
+                    menu.item(PopupMenuItem::separator()).item(
+                        PopupMenuItem::new("Switch project…")
+                            .on_click(move |_, window, cx| chooser(window, cx)),
+                    )
+                })
+        });
+    h_flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .pt_1()
+        .pb_2()
+        .child(switcher)
+        .child(
+            ui::icon_button("new-thread", IconName::SquarePen, "New thread (⌘N)", cx)
+                .debug_selector(|| "new-thread".to_string())
+                .on_click(move |_, window, cx| on_new_thread(window, cx)),
+        )
         .into_any_element()
 }
 
+pub const HARNESS_LANDING: &str = "Harness manages jj";
+pub const AGENT_LANDING: &str = "Agent manages jj";
+
+/// The panel of rows under the project bar: scrolls, and `scroll` brings a row into view. The
+/// rows are its first children (the scrollbar comes last), so a row's place is its index.
+pub fn list_panel(
+    scroll: &gpui::ScrollHandle,
+    entries: Vec<AnyElement>,
+) -> gpui::Stateful<gpui::Div> {
+    use gpui_kit::component::scroll::ScrollableElement as _;
+    div()
+        .id("threads")
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .children(entries)
+        .vertical_scrollbar(scroll)
+}
+
+/// The column: the header under the traffic lights, then the list and the footer.
 pub fn column(header: AnyElement, list: Vec<AnyElement>, cx: &App) -> gpui::Div {
     let theme = cx.theme();
     v_flex()
@@ -417,36 +585,6 @@ pub fn column(header: AnyElement, list: Vec<AnyElement>, cx: &App) -> gpui::Div 
         .text_color(theme.sidebar_foreground)
         .child(header)
         .child(v_flex().flex_1().min_h_0().px_2().children(list))
-}
-
-/// "+ New thread ⌘N", in the quiet color. Highlighted (in the text color) while the empty
-/// list's draft is on screen.
-pub fn new_thread_row(selected: bool, on_press: OnPress, cx: &App) -> AnyElement {
-    let colors = &cx.theme().colors;
-    let ink = if selected {
-        colors.foreground
-    } else {
-        crate::theme::material(cx).glass_muted
-    };
-    let row = ListRow {
-        title: "New thread".into(),
-        detail: None,
-        detail_icon: None,
-        leading: Some(
-            ui::icon(IconName::Plus, gpui_kit::component::Size::XSmall, ink).into_any_element(),
-        ),
-        trailing: Some("⌘N".into()),
-        strong: false,
-        quiet: !selected,
-        selected,
-    };
-    ui::list_row(
-        "new-thread",
-        row,
-        move |_, window, cx| on_press(window, cx),
-        cx,
-    )
-    .into_any_element()
 }
 
 /// "No threads yet. Your first message starts one."
@@ -460,53 +598,139 @@ pub fn empty_caption(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// "Needs you 2": a small muted label and its count.
+pub fn section_header(group: SidebarGroup, count: usize, cx: &App) -> AnyElement {
+    h_flex()
+        .flex_none()
+        .items_baseline()
+        .gap_1p5()
+        .px_2p5()
+        .pt_3()
+        .pb_1()
+        .text_xs()
+        .text_color(crate::theme::material(cx).glass_muted)
+        .child(group_label(group))
+        .child(div().opacity(0.7).child(count_label(count)))
+        .into_any_element()
+}
+
 /// What one thread row shows.
 pub struct Row {
-    /// The thread's id, which keys the row's state (its menu, its pulse).
+    /// The thread's id, which keys the row's state (its menu).
     pub id: SharedString,
     pub title: SharedString,
-    pub look: RowLook,
+    pub mark: Mark,
+    pub detail: String,
+    /// The second line in the warning color: something waits for you.
+    pub attention: bool,
+    /// How long ago, on the right; none for a draft.
+    pub time: Option<String>,
+    /// The thread works in a Rift copy.
+    pub in_copy: bool,
+    /// The title in the semibold weight: a finished turn you have not seen.
+    pub strong: bool,
     /// The thread on screen.
     pub selected: bool,
     pub archivable: bool,
 }
 
-/// One thread: its dot, its title (cut with "…") and its detail line. A click shows it; a
-/// right click offers "Archive thread".
+fn mark_icon(mark: Mark, cx: &App) -> AnyElement {
+    let colors = &cx.theme().colors;
+    let size = gpui_kit::component::Size::Small;
+    let muted = crate::theme::material(cx).glass_muted;
+    match mark {
+        Mark::Attention => ui::icon(IconName::CircleAlert, size, colors.warning).into_any_element(),
+        Mark::Failed => ui::icon(IconName::CircleAlert, size, colors.danger).into_any_element(),
+        Mark::Working => Spinner::new()
+            .with_size(size)
+            .color(colors.cyan)
+            .into_any_element(),
+        Mark::Done => ui::icon(IconName::CircleCheck, size, muted).into_any_element(),
+        Mark::Draft => ui::icon(IconName::SquarePen, size, muted).into_any_element(),
+    }
+}
+
+/// One thread: its status icon, its title (cut with "…") and time, and what it does now. A
+/// click shows it; a right click offers "Archive thread".
 pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) -> AnyElement {
-    let lead = dot(
-        row.look.dot,
-        (ElementId::from("pulse"), row.id.clone()).into(),
-        cx,
-    );
-    let archivable = row.archivable;
-    let look = ListRow {
-        title: row.title,
-        detail: Some(row.look.detail),
-        detail_icon: row.look.copy.then_some(IconName::Copy),
-        leading: Some(lead),
-        trailing: None,
-        strong: row.look.strong,
-        quiet: false,
-        selected: row.selected,
+    let colors = &cx.theme().colors;
+    let material = crate::theme::material(cx);
+    let detail_color = if row.attention {
+        colors.warning
+    } else {
+        material.glass_muted
     };
-    ui::list_row(
-        (ElementId::from("thread-row"), row.id),
-        look,
-        move |_, window, cx| on_press(window, cx),
-        cx,
-    )
-    .debug_selector(|| "thread-row".to_string())
-    .context_menu(move |menu, _, _| {
-        let on_archive = on_archive.clone();
-        menu.min_w(MENU_WIDTH).item(
-            PopupMenuItem::new("Archive thread")
-                .icon(IconName::Archive)
-                .disabled(!archivable)
-                .on_click(move |_, window, cx| on_archive(window, cx)),
+    let archivable = row.archivable;
+    let label = format!("{}: {}", row.title, row.detail);
+    let full_title = row.title.clone();
+    let cut = full_title.chars().count() > TITLE_TOOLTIP_CHARS;
+    let line = h_flex()
+        .items_center()
+        .gap_1()
+        .min_w_0()
+        .text_sm()
+        .text_color(detail_color)
+        .children(row.in_copy.then(|| {
+            ui::icon(
+                IconName::Layers,
+                gpui_kit::component::Size::XSmall,
+                detail_color,
+            )
+            .flex_none()
+        }))
+        .child(ui::ellipsis(row.detail));
+    let title = h_flex()
+        .items_center()
+        .gap_2()
+        .child(
+            ui::ellipsis(row.title)
+                .flex_1()
+                .when(row.strong, |title| title.font_weight(FontWeight::SEMIBOLD)),
         )
-    })
-    .into_any_element()
+        .children(row.time.map(|time| {
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(material.glass_muted)
+                .child(time)
+        }));
+    ListItem::new((ElementId::from("thread-row"), row.id))
+        .w_full()
+        .px_2p5()
+        .py_1p5()
+        .rounded_lg()
+        .selected(row.selected)
+        .accessibility_label(label)
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+        .on_click(move |_, window, cx| on_press(window, cx))
+        .when(cut, |row| {
+            row.tooltip(move |window, cx| Tooltip::new(full_title.clone()).build(window, cx))
+        })
+        .child(
+            h_flex()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .child(mark_icon(row.mark, cx)),
+                )
+                .child(v_flex().flex_1().min_w_0().child(title).child(line)),
+        )
+        .debug_selector(|| "thread-row".to_string())
+        .context_menu(move |menu, _, _| {
+            let on_archive = on_archive.clone();
+            menu.min_w(MENU_WIDTH).item(
+                PopupMenuItem::new("Archive thread")
+                    .icon(IconName::Archive)
+                    .disabled(!archivable)
+                    .on_click(move |_, window, cx| on_archive(window, cx)),
+            )
+        })
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -748,33 +972,135 @@ mod tests {
         assert!(!hidden_needs_you(&[Status::Working, Status::Failed], 0));
     }
 
+    use SidebarGroup::{Done, NeedsYou, Working};
+
     #[test]
-    fn a_long_project_name_takes_the_row_from_its_path() {
-        // The docked list's row: 182 px for the text, 6.6 px a mono character.
-        let (room, char) = (182.0, 6.6);
+    fn the_list_goes_drafts_then_needs_you_working_done_without_empty_groups() {
+        // slot order is newest first: a draft, then threads in mixed groups.
+        let threads = [
+            (false, Done),
+            (true, Done),
+            (false, Working),
+            (false, NeedsYou),
+            (false, Done),
+            (false, NeedsYou),
+        ];
         assert_eq!(
-            project_path("~/Newjen", 50.0, char, room).as_deref(),
-            Some("~/Newjen")
+            display_order(&threads),
+            vec![
+                Entry::Thread(1),
+                Entry::Header {
+                    group: NeedsYou,
+                    count: 2
+                },
+                Entry::Thread(3),
+                Entry::Thread(5),
+                Entry::Header {
+                    group: Working,
+                    count: 1
+                },
+                Entry::Thread(2),
+                Entry::Header {
+                    group: Done,
+                    count: 2
+                },
+                Entry::Thread(0),
+                Entry::Thread(4),
+            ]
         );
-        let path = project_path("~/Developer/clients/acme/platform/app", 22.0, char, room)
-            .expect("room for a short path");
-        assert!(
-            path.ends_with("/platform/app") || path.ends_with("/app"),
-            "{path}"
-        );
-        assert!(
-            path.chars().count() as f32 * char <= room - 22.0 - NAME_GAP,
-            "{path}"
-        );
-        // A name as wide as the row leaves no path, whatever the path.
-        assert_eq!(project_path("~/x", room, char, room), None);
-        // What decides is the name's measured width, not its number of characters: a
-        // ten-character Japanese name drawn 130 px wide leaves room for a stub only.
+        let order = thread_order(&display_order(&threads));
+        assert_eq!(order, vec![1, 3, 5, 2, 0, 4]);
+        assert_eq!(entry_of(&display_order(&threads), 2), Some(5));
+        // A group with no thread has no header.
         assert_eq!(
-            project_path("~/日本語のプロジェクト", 150.0, char, room),
-            None
+            display_order(&[(false, Working)]),
+            vec![
+                Entry::Header {
+                    group: Working,
+                    count: 1
+                },
+                Entry::Thread(0)
+            ]
         );
-        let stub = project_path("~/日本語のプロジェクト", 130.0, char, room);
-        assert!(stub.is_some_and(|stub| stub.chars().count() <= 6));
+        assert!(display_order(&[]).is_empty());
+    }
+
+    #[test]
+    fn jumping_to_what_needs_you_goes_to_the_next_one_and_wraps() {
+        // Display order 1, 3, 5, 2, 0, 4; threads 3 and 5 need you.
+        let order = [1, 3, 5, 2, 0, 4];
+        let mut needs = [false; 6];
+        needs[3] = true;
+        needs[5] = true;
+        assert_eq!(next_needs_you(&order, 1, &needs), Some(3));
+        assert_eq!(next_needs_you(&order, 3, &needs), Some(5));
+        // After the last one it wraps to the first.
+        assert_eq!(next_needs_you(&order, 5, &needs), Some(3));
+        assert_eq!(next_needs_you(&order, 4, &needs), Some(3));
+        // Only the thread on screen needs you: nowhere to go.
+        needs[5] = false;
+        assert_eq!(next_needs_you(&order, 3, &needs), None);
+        assert_eq!(next_needs_you(&order, 0, &needs), Some(3));
+        needs[3] = false;
+        assert_eq!(next_needs_you(&order, 0, &needs), None);
+        assert_eq!(next_needs_you(&[], 0, &[]), None);
+    }
+
+    #[test]
+    fn counts_stop_at_99() {
+        assert_eq!(count_label(0), "0");
+        assert_eq!(count_label(99), "99");
+        assert_eq!(count_label(100), "99+");
+        assert_eq!(count_label(12_345), "99+");
+    }
+
+    #[test]
+    fn the_time_on_a_row_is_short() {
+        let ago = |secs: i64| compact_time(NOW - secs * 1000, NOW);
+        assert_eq!(ago(5), "now");
+        assert_eq!(ago(120), "2m");
+        assert_eq!(ago(3600), "1h");
+        assert_eq!(ago(86_400 * 3), "3d");
+        assert_eq!(ago(86_400 * 21), "3w");
+        assert_eq!(ago(86_400 * 330), "11mo");
+        assert_eq!(ago(86_400 * 800), "2y");
+        // A clock that moved back reads as now.
+        assert_eq!(compact_time(NOW + 5000, NOW), "now");
+    }
+
+    #[test]
+    fn the_second_line_prefers_the_activity_and_never_repeats_the_time() {
+        let done = row_look(&facts(Status::Done), NOW);
+        assert_eq!(
+            detail_line(Some("Answered".into()), &done, Done, false),
+            "Answered"
+        );
+        assert_eq!(detail_line(None, &done, Done, false), "Done");
+        assert_eq!(detail_line(Some("  ".into()), &done, Done, false), "Done");
+        let mut waiting = facts(Status::Waiting);
+        waiting.waiting_tool = Some("Bash".into());
+        let look = row_look(&waiting, NOW);
+        assert_eq!(
+            detail_line(None, &look, NeedsYou, false),
+            "Needs approval · Bash"
+        );
+        assert_eq!(detail_line(None, &done, Done, true), "Draft");
+    }
+
+    #[test]
+    fn the_status_icon_follows_the_group() {
+        let failed = row_look(
+            &RowFacts {
+                failure: Some("x".into()),
+                ..facts(Status::Failed)
+            },
+            NOW,
+        );
+        let done = row_look(&facts(Status::Done), NOW);
+        assert_eq!(mark(NeedsYou, &failed, false), Mark::Failed);
+        assert_eq!(mark(NeedsYou, &done, false), Mark::Attention);
+        assert_eq!(mark(Working, &done, false), Mark::Working);
+        assert_eq!(mark(Done, &done, false), Mark::Done);
+        assert_eq!(mark(Done, &done, true), Mark::Draft);
     }
 }

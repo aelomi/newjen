@@ -20,16 +20,14 @@ mod limits;
 mod picker;
 mod review;
 
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Subscription,
-    Task, UniformListScrollHandle, Window, WindowControlArea, div, font, prelude::*, px,
-    uniform_list,
+    MouseButton, ParentElement, Pixels, Render, ScrollHandle, SharedString, Styled, Subscription,
+    Task, Window, WindowControlArea, div, font, prelude::*, px,
 };
 use gpui_kit::base::input::{InputAccessibility, TextareaState};
 use gpui_kit::base::{h_flex, v_flex};
@@ -37,7 +35,9 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use newjen_core::agent::NoteDelivery;
+use newjen_core::landing::LandingMode;
 use newjen_core::rift::{self, CopyError, Tools};
+use newjen_core::steps::SidebarGroup;
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
 use newjen_core::{ApprovalIntent, Item, Project, SessionConfig, Status, Store, Thread, ToolState};
@@ -46,7 +46,8 @@ use crate::approval::{self, Room};
 pub use crate::chat_view::lifecycle::{Attention, QuitBlockers};
 use crate::format::{elapsed, fit_rows, short_path, text_rows, tilde};
 use crate::keys::{
-    self, JumpToThread, KeyRoute, NewThread, NextThread, PreviousThread, Stop, ToggleSidebar,
+    self, JumpToNeedsYou, JumpToThread, KeyRoute, NewThread, NextThread, PreviousThread, Stop,
+    ToggleSidebar,
 };
 use crate::reply;
 use crate::rows::{self, OnRestart};
@@ -57,6 +58,7 @@ use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
 use crate::ui;
 use crate::ui::DOCK_METRICS;
 use crate::ui::MessageList;
+use crate::usage_view::UsageMenu;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::TITLE_BAR_HEIGHT;
 use gpui_kit::component::message_scroller::MessageScrollerState;
@@ -75,14 +77,6 @@ struct DockGhost {
 /// before its dock is even visible. (A held key is handled separately: its repeats never
 /// answer anything, see `keys::approval_key`.) Mouse clicks are not affected.
 const KEY_ANSWER_DELAY: Duration = Duration::from_millis(300);
-
-/// The list column's side padding (`px_2`, see `sidebar::column`).
-const LIST_PADDING: f32 = 16.0;
-/// The drawer's side padding: Kit's `Sheet` pads its body 16 px a side.
-const DRAWER_PADDING: f32 = 32.0;
-/// The project row's side padding (`px_2p5`) and its folder icon with the gap after it: what
-/// its text has left of the list's width.
-const PROJECT_ROW_CHROME: f32 = 20.0 + 14.0 + 8.0;
 
 /// How often the clock ticks: it keeps "Working · 1m 12s" counting.
 const TICK: Duration = Duration::from_secs(1);
@@ -167,13 +161,11 @@ enum CopyProgress {
     Made(Result<rift::Copy, CopyError>),
 }
 
-/// What the main column shows: the thread on screen, the approvals inbox across every loaded
-/// project, or the thread's terminal.
+/// What the main column shows: the thread on screen, or the thread's terminal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Panel {
     #[default]
     Thread,
-    Inbox,
     Terminal,
 }
 
@@ -192,12 +184,6 @@ struct Slot {
     terminal: Option<Entity<TerminalPanel>>,
     /// What the thread last looked like, to notice the transitions worth a notification.
     observed: lifecycle::Observed,
-    /// The pending approval's path outside the thread's folder, for the inbox row
-    /// (`approval::outside_path` reads the disk, so once per request).
-    inbox_outside: Option<String>,
-    /// The pending file edit's diff for the inbox row, with the same requirement as the dock:
-    /// an allow is checked against the file as it is now.
-    preview: Option<review::ApprovalPreview>,
     /// The placeholder currently set on that field, to avoid resetting it every event.
     placeholder: SharedString,
     notice: Option<Notice>,
@@ -229,7 +215,7 @@ pub struct ChatView {
     visible: bool,
     panel: Panel,
     /// Why desktop notifications cannot be shown, if they can't (`ProjectView` keeps it in
-    /// step with the attention adapter); the inbox says so.
+    /// step with the attention adapter).
     attention_note: Option<&'static str>,
     copy_peers: Vec<gpui::WeakEntity<ChatView>>,
     store: Store,
@@ -237,9 +223,8 @@ pub struct ChatView {
     base_config: SessionConfig,
     picker: picker::Picker,
     picker_focus: FocusHandle,
-    /// The project folder's name and its path for display, e.g. `Newjen` and `~/Newjen`.
+    /// The project folder's name, e.g. `Newjen`.
     project_name: SharedString,
-    project_label: SharedString,
     home: Option<PathBuf>,
     tools: Tools,
     /// Every thread, in list order (newest first). Never empty: with no saved thread, a draft.
@@ -251,7 +236,8 @@ pub struct ChatView {
     /// The list floats over the chat (narrow windows, after ⌘B).
     drawer_open: bool,
     drawer_focus: FocusHandle,
-    list_scroll: UniformListScrollHandle,
+    list_scroll: ScrollHandle,
+    usage: Entity<UsageMenu>,
     save_problem: Option<String>,
     /// Focus target while an approval is pending (the dock replaces the composer, so the field
     /// is not on screen), so ⌘↵ and Esc reach us.
@@ -305,7 +291,6 @@ impl ChatView {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| project.path.display().to_string());
-        let project_label = tilde(&project.path, home.as_deref());
         let tasks = vec![clock(cx)];
         let grants_focus = cx.focus_handle();
         let focus = [
@@ -329,7 +314,6 @@ impl ChatView {
             picker: picker::Picker::default(),
             picker_focus: cx.focus_handle(),
             project_name: project_name.into(),
-            project_label: project_label.into(),
             home,
             tools,
             slots: Vec::new(),
@@ -337,7 +321,8 @@ impl ChatView {
             sidebar_hidden: false,
             drawer_open: false,
             drawer_focus: cx.focus_handle(),
-            list_scroll: UniformListScrollHandle::new(),
+            list_scroll: ScrollHandle::new(),
+            usage: cx.new(|_| UsageMenu::new()),
             save_problem: problem,
             root: cx.focus_handle(),
             grants_open: false,
@@ -520,7 +505,7 @@ impl ChatView {
     }
 
     /// The keyboard goes to what the panel shows: the composer (or the root while the dock
-    /// replaces it), the terminal, or the root for the inbox.
+    /// replaces it), or the terminal.
     fn focus_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
         let focus = match self.panel {
             // The review panel stands in for the composer while it is open.
@@ -625,10 +610,6 @@ impl ChatView {
     /// events.
     fn add_slot(&mut self, thread: Thread, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         let observed = lifecycle::Observed::of(&thread);
-        let inbox_outside = thread
-            .transcript()
-            .pending_approval()
-            .and_then(|request| approval::outside_path(request.view(), thread.cwd()));
         let events = thread.events();
         let thread = cx.new(|_| thread);
         let weak = thread.downgrade();
@@ -654,8 +635,6 @@ impl ChatView {
             replies: Default::default(),
             terminal: None,
             observed,
-            inbox_outside,
-            preview: None,
             placeholder: SharedString::default(),
             notice: None,
             messages: cx.new(|cx| MessageScrollerState::new(0, cx)),
@@ -665,7 +644,6 @@ impl ChatView {
         let at = at.min(self.slots.len());
         self.slots.insert(at, slot);
         self.sync_replies(at, cx);
-        self.prepare_slot_preview(at, window, cx);
         let thread = self.slots[at].thread.clone();
         self.run_snapshot(&thread, window, cx);
     }
@@ -840,8 +818,10 @@ impl ChatView {
             let handle = field.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         }
-        self.list_scroll
-            .scroll_to_item(self.active, ScrollStrategy::Nearest);
+        let entries = self.sidebar_entries(cx);
+        if let Some(at) = sidebar::entry_of(&entries, self.active) {
+            self.list_scroll.scroll_to_item(at);
+        }
         cx.notify();
     }
 
@@ -1000,12 +980,8 @@ impl ChatView {
         None
     }
 
-    fn render_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let list = self.render_list(
-            f32::from(SIDEBAR) - DRAWER_PADDING - PROJECT_ROW_CHROME,
-            window,
-            cx,
-        );
+    fn render_drawer(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let list = self.render_list(cx);
         v_flex()
             .size_full()
             .key_context(keys::CONTEXT)
@@ -1025,7 +1001,7 @@ impl ChatView {
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_jump))
             .on_action(cx.listener(Self::on_toggle_sidebar))
-            .on_action(cx.listener(Self::on_show_approvals))
+            .on_action(cx.listener(Self::on_jump_to_needs_you))
             .on_action(cx.listener(Self::on_toggle_terminal))
             .children(list)
             .into_any_element()
@@ -1623,35 +1599,6 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Answers `thread_id`'s pending approval from the inbox, whichever thread is on screen.
-    /// `key` names the request the button belonged to, so a stale click answers nothing.
-    pub(super) fn answer_thread(
-        &mut self,
-        thread_id: &str,
-        key: Option<newjen_core::ApprovalKey>,
-        choice: ApprovalIntent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.quit_saving {
-            return;
-        }
-        let Some(ix) = self.index_of(thread_id, cx) else {
-            return;
-        };
-        let thread = self.slots[ix].thread.clone();
-        let sent = thread.update(cx, |thread, cx| {
-            let sent = thread.answer(key, choice);
-            cx.notify();
-            sent
-        });
-        self.slots[ix].notice = notice_after(sent, thread.read(cx).presentation().answer_failed);
-        if ix == self.active {
-            self.sync_field(window, cx);
-        }
-        cx.notify();
-    }
-
     /// ⌘. or the stop button: deny-and-stop a pending approval, otherwise stop the turn. While
     /// a Rift copy is made, it cancels that instead and the message comes back.
     fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1732,7 +1679,7 @@ impl ChatView {
 
     /// Where a key press goes (see `keys::key_route`).
     fn key_route(&self, event: &KeyDownEvent, window: &Window, cx: &App) -> KeyRoute {
-        // Only the dock on screen takes ⌘↵ and Esc: never a dock hidden behind the inbox.
+        // Only the dock on screen takes ⌘↵ and Esc: never a dock hidden behind the terminal.
         let pending = self.panel == Panel::Thread
             && self
                 .thread()
@@ -1811,26 +1758,72 @@ impl ChatView {
         if self.quit_saving {
             return;
         }
-        if let Some(target) = sidebar::step(self.active, self.slots.len(), false) {
-            self.show(target, window, cx);
-        }
+        self.step_thread(false, window, cx);
     }
 
     fn on_next(&mut self, _: &NextThread, window: &mut Window, cx: &mut Context<Self>) {
         if self.quit_saving {
             return;
         }
-        if let Some(target) = sidebar::step(self.active, self.slots.len(), true) {
-            self.show(target, window, cx);
-        }
+        self.step_thread(true, window, cx);
     }
 
     fn on_jump(&mut self, jump: &JumpToThread, window: &mut Window, cx: &mut Context<Self>) {
         if self.quit_saving {
             return;
         }
-        if let Some(target) = sidebar::jump(jump.0, self.slots.len()) {
+        let order = self.thread_order(cx);
+        if let Some(place) = sidebar::jump(jump.0, order.len()) {
+            self.show(order[place], window, cx);
+        }
+    }
+
+    /// ⌘⇧[ and ⌘⇧]: the thread before or after the one on screen, in the order the list shows.
+    fn step_thread(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.thread_order(cx);
+        let Some(at) = order.iter().position(|ix| *ix == self.active) else {
+            return;
+        };
+        if let Some(place) = sidebar::step(at, order.len(), forward) {
+            self.show(order[place], window, cx);
+        }
+    }
+
+    /// ⌘J: the next thread that needs you, here or in another loaded project. No motion: it
+    /// starts at the keyboard.
+    fn on_jump_to_needs_you(
+        &mut self,
+        _: &JumpToNeedsYou,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.quit_saving {
+            return;
+        }
+        let order = self.thread_order(cx);
+        let needs = self.needs_you(cx);
+        if let Some(target) = sidebar::next_needs_you(&order, self.active, &needs) {
             self.show(target, window, cx);
+            return;
+        }
+        let Some(opener) = self.thread_opener.clone() else {
+            return;
+        };
+        let elsewhere = self
+            .copy_peers
+            .iter()
+            .filter_map(|peer| peer.upgrade())
+            .find_map(|peer| {
+                let peer = peer.read(cx);
+                let first = sidebar::next_needs_you(
+                    &peer.thread_order(cx),
+                    usize::MAX,
+                    &peer.needs_you(cx),
+                )?;
+                Some(peer.slots[first].thread.read(cx).id().to_string())
+            });
+        if let Some(id) = elsewhere {
+            opener(&id, window, cx);
         }
     }
 
@@ -1844,18 +1837,6 @@ impl ChatView {
             return;
         }
         self.toggle_sidebar(window, cx);
-    }
-
-    fn on_show_approvals(
-        &mut self,
-        _: &keys::ShowApprovals,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.quit_saving {
-            return;
-        }
-        self.open_inbox(window, cx);
     }
 
     fn on_toggle_terminal(
@@ -2494,84 +2475,138 @@ impl ChatView {
         )
     }
 
-    /// The list's content: the project, "New thread", then the threads (or, with none yet, a
-    /// line saying so). `room` is the width the project row's text has.
-    fn render_list(&self, room: f32, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let drafts: Vec<bool> = self
-            .slots
+    /// Each thread's `(draft, group)`, in the view's thread order.
+    fn sidebar_groups(&self, cx: &App) -> Vec<(bool, SidebarGroup)> {
+        let now = now_ms() / 1000;
+        self.slots
             .iter()
-            .map(|slot| slot.thread.read(cx).is_draft())
-            .collect();
-        let empty = sidebar::is_empty_list(&drafts);
-        let new_thread = self.press(cx, |view, window, cx| view.new_thread(window, cx));
-        let threads = if empty {
-            sidebar::empty_caption(cx)
-        } else {
-            uniform_list(
-                "threads",
-                self.slots.len(),
-                cx.processor(|view, range: Range<usize>, _window, cx| {
-                    view.render_thread_rows(range, cx)
-                }),
-            )
-            .track_scroll(&self.list_scroll)
-            .flex_1()
-            .min_h_0()
-            .into_any_element()
+            .map(|slot| {
+                let thread = slot.thread.read(cx);
+                (thread.is_draft(), thread.sidebar_group(now))
+            })
+            .collect()
+    }
+
+    fn sidebar_entries(&self, cx: &App) -> Vec<sidebar::Entry> {
+        sidebar::display_order(&self.sidebar_groups(cx))
+    }
+
+    /// The threads in the order the list shows them.
+    fn thread_order(&self, cx: &App) -> Vec<usize> {
+        sidebar::thread_order(&self.sidebar_entries(cx))
+    }
+
+    /// Whether each thread is in the "Needs you" group.
+    fn needs_you(&self, cx: &App) -> Vec<bool> {
+        self.sidebar_groups(cx)
+            .into_iter()
+            .map(|(_, group)| group == SidebarGroup::NeedsYou)
+            .collect()
+    }
+
+    /// Changes the landing mode new threads in the project start with, and the mode of the
+    /// drafts that are open (a thread already sent keeps its own).
+    fn set_project_landing(&mut self, mode: LandingMode, cx: &mut Context<Self>) {
+        if self.quit_saving || self.project.landing_mode == mode {
+            return;
+        }
+        self.store.set_project_landing_mode(self.project.id, mode);
+        self.project.landing_mode = mode;
+        for slot in &self.slots {
+            slot.thread.update(cx, |thread, _| {
+                if thread.is_draft() {
+                    let _ = thread.follow_project_landing_mode(mode);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    /// The list's content: the project row, the threads by group (or, with none yet, a line
+    /// saying so) and the usage row.
+    fn render_list(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let groups = self.sidebar_groups(cx);
+        let drafts: Vec<bool> = groups.iter().map(|(draft, _)| *draft).collect();
+        let entries = sidebar::display_order(&groups);
+        let mut rows = self.render_entries(&entries, cx);
+        if sidebar::is_empty_list(&drafts) {
+            rows.push(sidebar::empty_caption(cx));
+        }
+        let view = cx.weak_entity();
+        let bar = sidebar::ProjectBar {
+            name: self.project_name.clone(),
+            landing: self.project.landing_mode,
+            on_switch: self.project_chooser.clone(),
+            on_new_thread: self.press(cx, |view, window, cx| view.new_thread(window, cx)),
+            on_landing: Rc::new(move |mode, _, cx| {
+                let _ = view.update(cx, |view, cx| view.set_project_landing(mode, cx));
+            }),
         };
         vec![
-            div()
-                .id("switch-project")
-                .debug_selector(|| "switch-project".to_string())
-                .cursor_pointer()
-                .when_some(self.project_chooser.clone(), |row, chooser| {
-                    row.on_click(move |_, window, cx| chooser(window, cx))
-                })
-                .child(sidebar::project_row(
-                    &self.project_name,
-                    &self.project_label,
-                    room,
-                    window,
-                    cx,
-                ))
-                .into_any_element(),
-            sidebar::new_thread_row(empty, new_thread, cx),
-            // The gap under "New thread", as in the mock.
-            div().flex_none().h(px(6.0)).into_any_element(),
-            threads,
+            sidebar::project_bar(bar, cx),
+            sidebar::list_panel(&self.list_scroll, rows).into_any_element(),
+            self.usage.clone().into_any_element(),
         ]
     }
 
-    /// The thread rows in `range`, for the list (`uniform_list` asks only for the rows on
-    /// screen, so hundreds of threads cost no more than a screenful).
-    fn render_thread_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_entries(
+        &self,
+        entries: &[sidebar::Entry],
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let now = Instant::now();
-        let now_ms = now_ms();
-        range
-            .filter_map(|ix| {
-                let slot = self.slots.get(ix)?;
-                let (id, row) = {
-                    let thread = slot.thread.read(cx);
-                    let id = SharedString::from(thread.id().to_string());
-                    let row = sidebar::Row {
-                        id: id.clone(),
-                        title: thread.title().to_string().into(),
-                        look: sidebar::row_look(&row_facts(thread, now), now_ms),
-                        selected: ix == self.active,
-                        archivable: thread.preparing().is_none(),
-                    };
-                    (id, row)
-                };
-                let shown = id.clone();
-                let on_press = self.press(cx, move |view, window, cx| {
-                    view.show_thread(&shown, window, cx)
-                });
-                let on_archive = self.press(cx, move |view, window, cx| {
-                    view.ask_to_archive(&id, window, cx)
-                });
-                Some(sidebar::thread_row(row, on_press, on_archive, cx))
+        entries
+            .iter()
+            .filter_map(|entry| match *entry {
+                sidebar::Entry::Header { group, count } => {
+                    Some(sidebar::section_header(group, count, cx))
+                }
+                sidebar::Entry::Thread(ix) => self.render_thread_row(ix, now, cx),
             })
             .collect()
+    }
+
+    fn render_thread_row(
+        &self,
+        ix: usize,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let now_ms = now_ms();
+        let slot = self.slots.get(ix)?;
+        let (id, row) = {
+            let thread = slot.thread.read(cx);
+            let id = SharedString::from(thread.id().to_string());
+            let draft = thread.is_draft();
+            let group = thread.sidebar_group(now_ms / 1000);
+            let look = sidebar::row_look(&row_facts(thread, now), now_ms);
+            let row = sidebar::Row {
+                id: id.clone(),
+                title: thread.title().to_string().into(),
+                mark: sidebar::mark(group, &look, draft),
+                detail: sidebar::detail_line(
+                    thread.activity_line(now_ms / 1000),
+                    &look,
+                    group,
+                    draft,
+                ),
+                attention: group == SidebarGroup::NeedsYou,
+                time: (!draft).then(|| sidebar::compact_time(thread.updated_at(), now_ms)),
+                in_copy: look.copy,
+                strong: look.strong,
+                selected: ix == self.active,
+                archivable: thread.preparing().is_none(),
+            };
+            (id, row)
+        };
+        let shown = id.clone();
+        let on_press = self.press(cx, move |view, window, cx| {
+            view.show_thread(&shown, window, cx)
+        });
+        let on_archive = self.press(cx, move |view, window, cx| {
+            view.ask_to_archive(&id, window, cx)
+        });
+        Some(sidebar::thread_row(row, on_press, on_archive, cx))
     }
 }
 
@@ -2609,7 +2644,6 @@ impl Render for ChatView {
         };
         let title_bar = self.render_title_bar(placement, width, main_width, window, cx);
         let body = match self.panel {
-            Panel::Inbox => self.render_inbox(window, cx),
             Panel::Terminal => self.slots[self.active]
                 .terminal
                 .clone()
@@ -2677,8 +2711,7 @@ impl Render for ChatView {
         let docked = (placement == Placement::Docked).then(|| {
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
             let header = sidebar::header(toggle, window, cx);
-            let room = sidebar_px - LIST_PADDING - PROJECT_ROW_CHROME;
-            let list = self.render_list(room, window, cx);
+            let list = self.render_list(cx);
             sidebar::column(header, list, cx)
         });
         use gpui_kit::component::{Placement as SheetPlacement, WindowExt as _};
@@ -2766,7 +2799,7 @@ impl Render for ChatView {
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_jump))
             .on_action(cx.listener(Self::on_toggle_sidebar))
-            .on_action(cx.listener(Self::on_show_approvals))
+            .on_action(cx.listener(Self::on_jump_to_needs_you))
             .on_action(cx.listener(Self::on_toggle_terminal))
             .flex()
             .text_color(fg)

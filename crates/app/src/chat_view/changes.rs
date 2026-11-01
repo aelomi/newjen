@@ -324,9 +324,8 @@ impl ChatView {
     /// Whether the thread on screen has changes to show, and whether the card fits beside
     /// the chat in a window `width` pixels wide with the list docked.
     fn changes_facts(&self, placement: Placement, width: f32, cx: &App) -> (bool, bool) {
-        let has = self.changes.summary(self.thread().read(cx)).is_some()
-            && self.review_panel.is_none()
-            && self.panel != Panel::Inbox;
+        let has =
+            self.changes.summary(self.thread().read(cx)).is_some() && self.review_panel.is_none();
         let room = width - f32::from(SIDEBAR) - 2.0 * f32::from(CARD_INSET) - CARD_WIDTH;
         (
             has,

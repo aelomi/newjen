@@ -21,7 +21,8 @@ gpui_kit::assets::icon_assets!(
         FileCode,
         Layers,
         Sparkles,
-        Sparkle
+        Sparkle,
+        SquarePen
     ]
 );
 gpui_kit::assets::icon_assets!(ApprovalIcons, [Trash, FilePen, Terminal, Plug]);
@@ -92,6 +93,7 @@ mod tests {
             IconName::Plug,
             IconName::Square,
             IconName::SquareCheck,
+            IconName::SquarePen,
             IconName::TriangleAlert,
         ] {
             let path = icon.path();

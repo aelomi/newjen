@@ -47,6 +47,7 @@ pub struct Detail {
 /// lines with the middle cut, so the end of the command (often the part that actually runs
 /// things) is always visible before you approve it. A last row warns about `outside`, the path
 /// from [`outside_path`] (passed in, so drawing a frame never touches the disk).
+#[cfg(test)]
 pub fn detail(request: &ApprovalView, outside: Option<&str>, room: Room) -> Detail {
     detail_in(request, outside, room, Style::Listed)
 }
