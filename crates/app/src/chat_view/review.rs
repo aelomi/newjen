@@ -694,7 +694,7 @@ impl ChatView {
                         cx.listener(move |view, _, _, cx| {
                             let result = view
                                 .thread()
-                                .update(cx, |thread, _| thread.set_landing_mode(next));
+                                .update(cx, |thread, _| thread.follow_project_landing_mode(next));
                             view.slots[view.active].notice =
                                 notice_after(result, "Couldn't change landing mode");
                             cx.notify();
@@ -710,7 +710,7 @@ impl ChatView {
                         cx,
                     )
                     .on_click(cx.listener(move |view, _, _, cx| {
-                        view.store.set_default_landing_mode(view.project.id, mode);
+                        view.store.set_project_landing_mode(view.project.id, mode);
                         view.project.landing_mode = mode;
                         cx.notify();
                     })),

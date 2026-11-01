@@ -644,7 +644,20 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn set_default_landing_mode(&self, project_id: i64, mode: LandingMode) {
+    /// The mode new threads in the project start with.
+    pub fn landing_mode(&self, project_id: i64) -> Result<LandingMode> {
+        self.reader()
+            .query_row(
+                "SELECT landing_mode FROM projects WHERE id = ?1",
+                params![project_id],
+                |row| saved_landing_mode(row, 0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("unknown project {project_id}"))
+    }
+
+    /// Sets the mode new threads in the project start with. Existing threads keep theirs.
+    pub fn set_project_landing_mode(&self, project_id: i64, mode: LandingMode) {
         self.queue(Write::SetLandingMode { project_id, mode });
     }
 

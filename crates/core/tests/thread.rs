@@ -226,6 +226,17 @@ impl Fixture {
         Thread::new_draft(self.store.clone(), &self.project, self.config.clone())
     }
 
+    fn draft_in_mode(&self, mode: newjen_core::landing::LandingMode) -> Thread {
+        self.store.set_project_landing_mode(self.project.id, mode);
+        assert!(self.store.flush(FLUSH));
+        let project = self
+            .store
+            .open_project(&self.project.path)
+            .expect("the project is saved");
+        assert_eq!(project.landing_mode, mode);
+        Thread::new_draft(self.store.clone(), &project, self.config.clone())
+    }
+
     /// The thread as a relaunched Newjen would load it from the store.
     fn reload(&self, id: &str) -> Thread {
         assert!(self.store.flush(FLUSH));
@@ -3244,16 +3255,46 @@ fn archiving_project_preparation_invalidates_its_held_message() {
 }
 
 #[test]
+fn a_new_thread_takes_the_projects_landing_mode_and_a_sent_thread_keeps_its_own() {
+    use newjen_core::landing::LandingMode;
+    let fixture = Fixture::new();
+    assert_eq!(fixture.draft().landing_mode(), LandingMode::HarnessManaged);
+
+    let mut agent = fixture.draft_in_mode(LandingMode::AgentManaged);
+    assert_eq!(agent.landing_mode(), LandingMode::AgentManaged);
+    agent.send("first").unwrap();
+    finish_turn(&mut agent);
+    let id = agent.id().to_string();
+
+    fixture
+        .store
+        .set_project_landing_mode(fixture.project.id, LandingMode::HarnessManaged);
+    assert!(fixture.store.flush(FLUSH));
+    assert_eq!(
+        fixture.store.landing_mode(fixture.project.id).unwrap(),
+        LandingMode::HarnessManaged
+    );
+    assert_eq!(agent.landing_mode(), LandingMode::AgentManaged);
+    assert!(
+        agent
+            .follow_project_landing_mode(LandingMode::HarnessManaged)
+            .is_err()
+    );
+    assert_eq!(
+        fixture.reload(&id).landing_mode(),
+        LandingMode::AgentManaged
+    );
+    assert_eq!(fixture.draft().landing_mode(), LandingMode::HarnessManaged);
+}
+
+#[test]
 fn agent_managed_project_prepares_a_baseline_but_does_not_schedule_turn_snapshots() {
     let fixture = Fixture::new();
     let Some(tools) = init_thread_jj(&fixture) else {
         return;
     };
     let before = newjen_core::landing::head(&tools, &fixture.project.path).unwrap();
-    let mut thread = fixture.draft();
-    thread
-        .set_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
-        .unwrap();
+    let mut thread = fixture.draft_in_mode(newjen_core::landing::LandingMode::AgentManaged);
     assert!(
         thread
             .session_config()
@@ -3276,7 +3317,7 @@ fn agent_managed_project_prepares_a_baseline_but_does_not_schedule_turn_snapshot
     assert!(thread.take_snapshot_job().is_none());
     assert!(
         thread
-            .set_landing_mode(newjen_core::landing::LandingMode::HarnessManaged)
+            .follow_project_landing_mode(newjen_core::landing::LandingMode::HarnessManaged)
             .is_err()
     );
 }
@@ -3535,11 +3576,11 @@ fn landing_instructions_are_sent_only_where_landing_is_available() {
         "a git-only folder is never snapshotted"
     );
     thread
-        .set_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
+        .follow_project_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
         .unwrap();
     assert_eq!(told(&thread), None);
     thread
-        .set_landing_mode(newjen_core::landing::LandingMode::HarnessManaged)
+        .follow_project_landing_mode(newjen_core::landing::LandingMode::HarnessManaged)
         .unwrap();
     std::fs::remove_dir(fixture.project.path.join(".git")).unwrap();
     thread.send("hello").unwrap();
@@ -3568,10 +3609,7 @@ fn agent_managed_threads_are_told_to_record_and_bookmark_their_work_with_jj() {
     let Some(tools) = init_thread_jj(&fixture) else {
         return;
     };
-    let mut thread = fixture.draft();
-    thread
-        .set_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
-        .unwrap();
+    let mut thread = fixture.draft_in_mode(newjen_core::landing::LandingMode::AgentManaged);
     let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
         panic!("prepare");
     };

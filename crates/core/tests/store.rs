@@ -405,7 +405,11 @@ fn landing_settings_and_review_state_survive_reopen() {
     let project = store
         .open_project(std::path::Path::new("/tmp/landing-project"))
         .unwrap();
-    store.set_default_landing_mode(project.id, LandingMode::AgentManaged);
+    assert_eq!(
+        store.landing_mode(project.id).unwrap(),
+        LandingMode::HarnessManaged
+    );
+    store.set_project_landing_mode(project.id, LandingMode::AgentManaged);
     let mut row = thread_row("landing", project.id, 1);
     row.landing_mode = LandingMode::AgentManaged;
     row.review_base = Some("abc123".to_string());
@@ -420,4 +424,9 @@ fn landing_settings_and_review_state_survive_reopen() {
         store.open_project(&project.path).unwrap().landing_mode,
         LandingMode::AgentManaged
     );
+    assert_eq!(
+        store.landing_mode(project.id).unwrap(),
+        LandingMode::AgentManaged
+    );
+    assert!(store.landing_mode(project.id + 1000).is_err());
 }

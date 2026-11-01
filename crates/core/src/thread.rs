@@ -989,9 +989,11 @@ impl Thread {
         self.landing_mode
     }
 
-    pub fn set_landing_mode(&mut self, mode: LandingMode) -> Result<()> {
+    /// Updates a draft to the project's current landing mode after the project setting
+    /// changes. A thread that has been sent keeps the mode it started with.
+    pub fn follow_project_landing_mode(&mut self, mode: LandingMode) -> Result<()> {
         if !self.is_draft() {
-            bail!("only a new thread can choose its landing mode");
+            bail!("only a new thread follows the project's landing mode");
         }
         self.landing_mode = mode;
         Ok(())
