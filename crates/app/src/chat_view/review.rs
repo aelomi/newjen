@@ -370,7 +370,7 @@ impl ChatView {
         let stopping = self.thread().update(cx, |thread, _| thread.begin_quit());
         let store = self.store.clone();
         let task = cx.background_spawn(async move {
-            thread::finish_quit(&store, [stopping]);
+            thread::finish_quit(&store, [stopping])?;
             landing::review(&tools, &cwd, &base)
         });
         cx.spawn_in(window, async move |view, cx| {
@@ -582,19 +582,23 @@ impl ChatView {
                 let stopping = thread.update(cx, |thread, _| thread.begin_quit());
                 let store = view.store.clone();
                 cx.notify();
-                Some(cx.background_spawn(async move {
-                    thread::finish_quit(&store, [stopping]);
-                }))
+                Some(cx.background_spawn(async move { thread::finish_quit(&store, [stopping]) }))
             });
             let Ok(Some(task)) = task else {
                 return;
             };
-            task.await;
+            let saved = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
                 view.review_loading = false;
                 let Some(ix) = view.index_of(&id, cx) else {
                     return;
                 };
+                if let Err(error) = saved {
+                    view.slots[ix].notice =
+                        Some(Notice::held("Couldn't close the thread", error.to_string()));
+                    cx.notify();
+                    return;
+                }
                 let result = view.slots[ix].thread.update(cx, |thread, cx| {
                     let result = thread.release_project_tracking();
                     cx.notify();

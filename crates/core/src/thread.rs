@@ -49,6 +49,7 @@
 //! never tried again by itself. (claude itself starts a turn when a background task it ran
 //! finishes; [`Thread::apply`] follows that turn like any other.)
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1585,15 +1586,14 @@ impl Thread {
 
     /// At quit: stops `claude`. If a turn was running, an approval waiting or a background task
     /// running, the thread is first settled exactly as a relaunch would settle it (status
-    /// Stopped, the "Stopped when Newjen quit" notice) and saved, waiting at most
-    /// [`QUIT_FLUSH_TIMEOUT`] for the disk.
+    /// Stopped, the "Stopped when Newjen quit" notice) and saved, as [`finish_quit`] describes.
     /// If Newjen is killed instead, the relaunch does the same from the last checkpoint.
     ///
     /// For one thread. To quit several, call [`Thread::begin_quit`] on each and then
     /// [`finish_quit`] once, so their processes stop together rather than one after another.
-    pub fn shutdown_for_quit(&mut self) {
+    pub fn shutdown_for_quit(&mut self) -> Result<(), QuitError> {
         let quitting = self.begin_quit();
-        finish_quit(&self.store, [quitting]);
+        finish_quit(&self.store, [quitting])
     }
 
     pub fn save_draft(&self, message: &str) -> Result<()> {
@@ -1638,6 +1638,7 @@ impl Thread {
         self.save();
         self.end_session();
         Quitting {
+            thread_id: self.id.clone(),
             stopping: std::mem::take(&mut self.stopping),
         }
     }
@@ -1957,21 +1958,78 @@ impl Thread {
     }
 }
 
-/// What [`Thread::begin_quit`] leaves for [`finish_quit`]: the thread's `claude` processes
-/// that are still stopping.
+/// What [`Thread::begin_quit`] leaves for [`finish_quit`]: the thread and its `claude`
+/// processes that are still stopping.
 #[must_use = "pass it to `finish_quit`, which waits for the processes and the disk"]
 pub struct Quitting {
+    thread_id: String,
     stopping: Vec<JoinHandle<()>>,
 }
 
+/// Why [`finish_quit`] could not confirm that the quitting threads were saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuitError {
+    /// The database did not confirm the queued writes in time, or its writer stopped.
+    Unconfirmed,
+    /// The queued writes finished, but some for these threads (by id) failed.
+    Failed(Vec<String>),
+}
+
+impl fmt::Display for QuitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QuitError::Unconfirmed => write!(
+                f,
+                "the database did not confirm the last writes in time, so recent thread changes may be lost"
+            ),
+            QuitError::Failed(ids) => write!(
+                f,
+                "saving failed for {} thread(s) ({}), so their recent changes may be lost",
+                ids.len(),
+                ids.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QuitError {}
+
 /// The second half of quitting (see [`Thread::begin_quit`]): waits at most
-/// [`QUIT_FLUSH_TIMEOUT`] for `store` to write what is queued, and for the `claude` processes
-/// to stop. They all stop at the same time, so this takes about as long as the slowest one
-/// (about 150 ms at most), however many threads there are.
-pub fn finish_quit(store: &Store, quitting: impl IntoIterator<Item = Quitting>) {
-    store.flush(QUIT_FLUSH_TIMEOUT);
-    for stopping in quitting.into_iter().flat_map(|quitting| quitting.stopping) {
-        let _ = stopping.join();
+/// [`QUIT_FLUSH_TIMEOUT`] for `store` to write what is queued, then always joins the process
+/// and copy cleanup threads. The timeout does not bound those joins.
+///
+/// Only thread writes are checked for failure, not project or Rift copy writes.
+pub fn finish_quit(
+    store: &Store,
+    quitting: impl IntoIterator<Item = Quitting>,
+) -> Result<(), QuitError> {
+    finish_quit_within(store, quitting, QUIT_FLUSH_TIMEOUT)
+}
+
+fn finish_quit_within(
+    store: &Store,
+    quitting: impl IntoIterator<Item = Quitting>,
+    timeout: Duration,
+) -> Result<(), QuitError> {
+    let flushed = store.flush(timeout);
+    let mut thread_ids = Vec::new();
+    for quitting in quitting {
+        for stopping in quitting.stopping {
+            let _ = stopping.join();
+        }
+        thread_ids.push(quitting.thread_id);
+    }
+    if !flushed {
+        return Err(QuitError::Unconfirmed);
+    }
+    let failed: Vec<String> = thread_ids
+        .into_iter()
+        .filter(|id| store.has_unsaved(id))
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(QuitError::Failed(failed))
     }
 }
 
@@ -2282,5 +2340,33 @@ mod tests {
             ]
         );
         assert!(!resume.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn an_unconfirmed_quit_still_waits_for_claude_to_stop() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let database = rusqlite::Connection::open(store.path()).unwrap();
+        database.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        store.set_unread("held", true);
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = {
+            let stopped = stopped.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let quitting = Quitting {
+            thread_id: "held".to_string(),
+            stopping: vec![stopping],
+        };
+
+        let result = finish_quit_within(&store, [quitting], Duration::from_millis(50));
+        let joined = stopped.load(std::sync::atomic::Ordering::SeqCst);
+        database.execute_batch("COMMIT;").unwrap();
+
+        assert_eq!(result, Err(QuitError::Unconfirmed));
+        assert!(joined, "claude was still stopping when quitting returned");
     }
 }

@@ -83,7 +83,8 @@ fn escape_closes_the_drawer_before_the_field_handles_it(cx: &mut TestAppContext)
         cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
         "keep this draft"
     );
-    cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }
 #[gpui::test]
@@ -118,7 +119,8 @@ fn early_approval_keys_back_off_from_the_latest_press(cx: &mut TestAppContext) {
     });
     cx.executor().advance_clock(Duration::from_millis(1));
     assert!(cx.update(|_, cx| chat.update(cx, |view, cx| view.keys_ready(cx))));
-    cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }
 
@@ -272,7 +274,8 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
 }
 
 fn finish(chat: &Entity<ChatView>, path: PathBuf, cx: &mut VisualTestContext) {
-    cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }
 
@@ -920,7 +923,7 @@ async fn startup_restores_a_pending_copy_message_to_a_rift_draft(cx: &mut TestAp
     let copy = job.run(&tools, |_| {}).unwrap();
     let startup = cx.update(|_, cx| {
         chat.update(cx, |view, cx| {
-            view.quit(cx);
+            view.quit(cx).unwrap();
             Startup {
                 store: view.store.clone(),
                 project: view.project.clone(),
@@ -1076,7 +1079,7 @@ async fn an_emptied_recovered_draft_is_discarded_on_quit(cx: &mut TestAppContext
     };
     let s1 = cx.update(|_, cx| {
         chat.update(cx, |view, cx| {
-            view.quit(cx);
+            view.quit(cx).unwrap();
             startup(view)
         })
     });
@@ -1095,7 +1098,7 @@ async fn an_emptied_recovered_draft_is_discarded_on_quit(cx: &mut TestAppContext
     );
     let restored = cx.update(|_, cx| {
         second.update(cx, |view, cx| {
-            view.quit(cx);
+            view.quit(cx).unwrap();
             startup(view)
         })
     });
@@ -1121,7 +1124,7 @@ async fn an_emptied_recovered_draft_is_discarded_on_quit(cx: &mut TestAppContext
     });
     let s2 = cx.update(|_, cx| {
         second.update(cx, |view, cx| {
-            view.quit(cx);
+            view.quit(cx).unwrap();
             startup(view)
         })
     });
@@ -1373,8 +1376,10 @@ async fn a_busy_project_in_the_same_repository_blocks_a_peers_copy(cx: &mut Test
             .copy_hold(unrelated.read(cx).thread(), cx)
             .is_none()
     }));
-    cx.update(|_, cx| unrelated.update(cx, |view, cx| view.quit(cx)));
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| unrelated.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     finish(&busy, path, cx);
     std::fs::remove_dir_all(unrelated_path).unwrap();
 }
@@ -1432,7 +1437,8 @@ fn a_project_folder_send_waits_for_an_overlapping_copy_job(cx: &mut TestAppConte
     assert!(preparing);
     assert!(!allowed);
     drop(job);
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     finish(&copying, path, cx);
     assert!(
         !started,
@@ -1514,7 +1520,8 @@ async fn a_busy_rift_folder_cannot_be_copied_as_another_project(cx: &mut TestApp
         assert_eq!(rift::project_root(&view.project.path).0, running.cwd());
         view.copy_hold(view.thread(), cx).is_some()
     });
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     finish(&busy, path, cx);
     assert!(
         blocked,
@@ -1589,7 +1596,8 @@ async fn archive_preserves_a_copy_used_by_another_loaded_project(cx: &mut TestAp
     );
     assert!(copy.path.is_dir());
     assert!(cx.update(|_, cx| peer.read(cx).thread().read(cx).status().is_busy()));
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     finish(&owner, path, cx);
 }
 
@@ -1614,7 +1622,8 @@ async fn archive_rechecks_copy_users_before_deleting(cx: &mut TestAppContext) {
         id
     );
     assert!(copy.path.is_dir());
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     finish(&owner, path, cx);
 }
 
@@ -1791,7 +1800,8 @@ async fn inbox_answers_the_captured_thread_in_any_project_without_selecting_it(
     click(cx, selector(&first, "open"));
     assert_eq!(opened.borrow().len(), 1);
     assert!(cx.update(|_, cx| chat.read(cx).panel == Panel::Thread));
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     finish(&chat, path, cx);
 }
 
@@ -1883,7 +1893,8 @@ fn a_terminal_keeps_its_draft_and_working_folder_until_closed(cx: &mut TestAppCo
             assert_eq!(hold.title, "Close the project terminal first");
         })
     });
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     finish(&chat, path, cx);
 }
 
@@ -1917,7 +1928,8 @@ async fn a_second_project_folder_thread_in_the_same_repository_is_refused(cx: &m
         let thread = peer.read(cx).thread().read(cx);
         !thread.has_session() && thread.preparing().is_none()
     }));
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
     finish(&chat, path, cx);
 }
 

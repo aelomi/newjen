@@ -336,7 +336,7 @@ fn relaunch_resumes_the_server_id_in_the_saved_workdir_without_an_automatic_turn
     thread.send("First").unwrap();
     finish(&mut thread);
     let id = thread.id().to_owned();
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     lab.flush();
     let row = lab.store.thread(&id).unwrap().unwrap();
     let mut loaded =
@@ -440,7 +440,7 @@ fn a_refused_sent_checkpoint_never_delivers_the_held_message_to_codex() {
         .unwrap();
     let failed = thread.finish_copy(Ok(copy.clone())).unwrap_err();
     assert_eq!(failed.message, "Do not deliver without the checkpoint");
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(thread.transcript().items().is_empty());
     assert!(!lab.input().iter().any(|m| m["method"] == "turn/start"));
     lab.flush();
@@ -557,7 +557,7 @@ fn loading_codex_from_the_apps_default_transport_selects_the_codex_executable() 
     let mut thread = lab.draft();
     thread.send("Save").unwrap();
     finish(&mut thread);
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     lab.flush();
     let row = lab.store.thread(thread.id()).unwrap().unwrap();
     let loaded = Thread::load(
@@ -618,7 +618,7 @@ fn live_codex_thread_reply() {
         thread.transcript().items()
     );
     assert!(reply(&thread).contains("Hello Newjen"));
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
 }
 
 #[test]
@@ -928,7 +928,7 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
 
     let conversation = thread.conversation();
     assert!(matches!(conversation, ConversationState::Established(_)));
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(store.flush(Duration::from_secs(5)));
     drop(thread);
     let row = store.thread(&id).unwrap().unwrap();

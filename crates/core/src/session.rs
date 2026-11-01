@@ -35,8 +35,7 @@ use crate::env::{Cli, find_cli, is_executable};
 use crate::orphans;
 use crate::protocol::{self, Incoming};
 
-/// How long `shutdown` waits after SIGTERM before it sends SIGKILL. Kept short because GPUI
-/// gives the whole app about 200 ms to quit.
+/// How long `shutdown` waits after SIGTERM before it sends SIGKILL.
 const GRACE_PERIOD: Duration = Duration::from_millis(140);
 
 /// When claude exits on its own (a crash), how long the tools it left running get after

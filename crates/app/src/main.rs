@@ -435,11 +435,14 @@ fn open_window(
     let quit = request.clone();
     cx.on_action(move |_: &Quit, cx| quit(cx));
     cx.on_action(move |_: &CloseWindow, cx| request(cx));
-    // Quitting settles and saves every thread and stops every agent and terminal. GPUI
-    // allows about 200 ms for this. The hook keeps the view alive itself: closing the window
-    // drops the window's hold on it before the app quits.
+    // Quitting settles and saves every thread and stops every agent and terminal. GPUI runs
+    // this hook to completion; its 200 ms limit applies only to the returned future. The hook
+    // keeps the view alive itself: closing the window drops the window's hold on it before the
+    // app quits.
     cx.on_app_quit(move |cx| {
-        view.update(cx, |view, cx| view.quit(cx));
+        if let Err(error) = view.update(cx, |view, cx| view.quit(cx)) {
+            eprintln!("newjen: warning: {error}");
+        }
         async {}
     })
     .detach();

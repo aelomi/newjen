@@ -98,7 +98,7 @@ fn saved_choices_survive_relaunch_and_unknown_providers_stay_unavailable() {
     transport.extra_args = vec![];
     let mut thread = Thread::new_draft(store.clone(), &project, transport);
     thread.send("saved message").unwrap();
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(store.flush(Duration::from_secs(5)));
     let mut row = store.thread(thread.id()).unwrap().unwrap();
     row.model = ModelSelection::Model {

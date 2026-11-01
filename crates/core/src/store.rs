@@ -36,9 +36,8 @@ use crate::transcript::Status;
 /// The database file's name inside the Newjen folder.
 pub const DB_FILE: &str = "newjen.db";
 
-/// How long [`Store::flush`] may wait at quit. GPUI gives the whole app about 200 ms to quit,
-/// and stopping claude processes needs some of that.
-pub const QUIT_FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
+/// The database wait budget at quit, separate from SQLite's per-write [`BUSY_TIMEOUT`].
+pub const QUIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long opening a project may wait for its row to be written. Only at startup.
 const OPEN_PROJECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -498,8 +497,14 @@ impl Store {
         lock(&self.inner.unsaved).remove(thread_id)
     }
 
+    /// Whether failed writes left anything unsaved for `thread_id`, without forgetting it.
+    pub(crate) fn has_unsaved(&self, thread_id: &str) -> bool {
+        lock(&self.inner.unsaved).contains_key(thread_id)
+    }
+
     /// Waits until every write queued so far is done, or `timeout` passes. Returns true if
-    /// everything was written (or failed and was reported) in time.
+    /// everything was written (or failed and was reported) in time, false if `timeout` passed
+    /// or the writer stopped.
     pub fn flush(&self, timeout: Duration) -> bool {
         let (done, wait) = mpsc::channel();
         if self.inner.writes.try_send(Write::Flush(done)).is_err() {

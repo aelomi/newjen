@@ -528,8 +528,7 @@ impl ChatView {
     }
 
     /// At quit (⌘Q, or the window closed): settles and saves every thread and stops every
-    /// `claude`, all at once (see `newjen_core::thread::finish_quit`). GPUI gives the whole app
-    /// about 200 ms; this takes about as long as the slowest `claude` takes to stop.
+    /// `claude`, all at once (see `newjen_core::thread::finish_quit`).
     pub fn begin_quit(&mut self, cx: &mut Context<Self>) -> Vec<Quitting> {
         for slot in &mut self.slots {
             if let Some(terminal) = slot.terminal.take() {
@@ -548,9 +547,9 @@ impl ChatView {
     }
 
     #[cfg(test)]
-    pub fn quit(&mut self, cx: &mut Context<Self>) {
+    pub fn quit(&mut self, cx: &mut Context<Self>) -> Result<(), thread::QuitError> {
         let quitting = self.begin_quit(cx);
-        thread::finish_quit(&self.store, quitting);
+        thread::finish_quit(&self.store, quitting)
     }
 
     /// The row on screen and its composer text, for the window's tests.

@@ -380,13 +380,13 @@ impl ProjectView {
         .detach();
     }
 
-    pub fn quit(&mut self, cx: &mut Context<Self>) {
+    pub fn quit(&mut self, cx: &mut Context<Self>) -> Result<(), thread::QuitError> {
         let quitting: Vec<_> = self
             .projects
             .iter()
             .flat_map(|project| project.chat.update(cx, |chat, cx| chat.begin_quit(cx)))
             .collect();
-        thread::finish_quit(&self.store, quitting);
+        thread::finish_quit(&self.store, quitting)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -766,7 +766,8 @@ mod tests {
     }
 
     fn finish(shell: &Entity<ProjectView>, path: PathBuf, cx: &mut VisualTestContext) {
-        cx.update(|_, cx| shell.update(cx, |view, cx| view.quit(cx)));
+        cx.update(|_, cx| shell.update(cx, |view, cx| view.quit(cx)))
+            .unwrap();
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -1051,7 +1052,8 @@ mod tests {
             QuitPhase::Stopping
         );
         // Quitting stops the terminal with everything else.
-        cx.update(|_, cx| shell.update(cx, |view, cx| view.quit(cx)));
+        cx.update(|_, cx| shell.update(cx, |view, cx| view.quit(cx)))
+            .unwrap();
         assert_eq!(
             cx.update(|_, cx| shell.read(cx).quit_blockers(cx).terminals),
             0

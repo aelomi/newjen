@@ -48,7 +48,8 @@ use newjen_core::rift::{Copy, CopyError, Tools};
 use newjen_core::session::{SessionConfig, SessionEvent};
 use newjen_core::store::{Project, Store};
 use newjen_core::thread::{
-    CONTINUE_MESSAGE, IDLE_TIMEOUT, NEW_THREAD_TITLE, Removal, Sent, Thread, WorksIn, finish_quit,
+    CONTINUE_MESSAGE, IDLE_TIMEOUT, NEW_THREAD_TITLE, QuitError, Removal, Sent, Thread, WorksIn,
+    finish_quit,
 };
 use newjen_core::transcript::{
     BACKGROUND_STOPPED_NOTE, Item, STOPPED_TOOL_NOTE, Status, ToolState,
@@ -1010,7 +1011,7 @@ fn idle_shutdown_waits_30_minutes_and_never_cuts_a_turn_short() {
     thread.send("three").unwrap();
     assert!(!thread.idle_check(Instant::now() + IDLE_TIMEOUT * 2));
     assert!(thread.has_session());
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
 }
 
 #[test]
@@ -1097,7 +1098,7 @@ fn quitting_mid_turn_saves_the_thread_as_stopped() {
     let mut thread = fixture.draft();
     send_and_wait_for_approval(&mut thread, "make a file");
     let started = Instant::now();
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(started.elapsed() < Duration::from_millis(400));
     assert!(!thread.has_session());
     assert_eq!(thread.status(), Status::Stopped);
@@ -1117,7 +1118,7 @@ fn quitting_an_idle_thread_changes_nothing() {
     thread.send("one").unwrap();
     finish_turn(&mut thread);
     let before = thread.transcript().items().to_vec();
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(!thread.has_session());
     let relaunched = fixture.reload(thread.id());
     assert_eq!(relaunched.transcript().items(), before.as_slice());
@@ -1125,7 +1126,7 @@ fn quitting_an_idle_thread_changes_nothing() {
 
     // A draft has nothing to save.
     let mut draft = fixture.draft();
-    draft.shutdown_for_quit();
+    draft.shutdown_for_quit().unwrap();
     assert!(fixture.store.flush(FLUSH));
     assert_eq!(fixture.store.threads(fixture.project.id).unwrap().len(), 1);
 }
@@ -1412,7 +1413,7 @@ fn quitting_while_claude_works_saves_the_thread_as_stopped() {
     assert_eq!(thread.status(), Status::Working);
     assert!(thread.transcript().pending_approval().is_none());
 
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(!thread.has_session());
     assert_eq!(thread.status(), Status::Stopped);
     assert_eq!(kinds(&thread), ["user", "tool", "assistant", "stopped"]);
@@ -1448,7 +1449,7 @@ fn quitting_many_threads_stops_their_claudes_together() {
 
     let started = Instant::now();
     let quitting: Vec<_> = threads.iter_mut().map(Thread::begin_quit).collect();
-    finish_quit(&fixture.store, quitting);
+    finish_quit(&fixture.store, quitting).unwrap();
     let took = started.elapsed();
     // One after another this would take at least 5 × 140 ms.
     assert!(took < Duration::from_millis(450), "took {took:?}");
@@ -1473,14 +1474,37 @@ fn quitting_waits_for_a_write_queued_just_before() {
     database.execute_batch("BEGIN IMMEDIATE;").unwrap();
     thread.set_active(true);
     let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(200));
         database.execute_batch("COMMIT;").unwrap();
     });
     // Nothing new to save at quit, but it still waits for what is queued.
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     release.join().unwrap();
     let row = fixture.store.thread(thread.id()).unwrap().unwrap();
     assert!(!row.unread);
+}
+
+#[test]
+fn quitting_reports_a_thread_whose_last_write_failed() {
+    let fixture = Fixture::new();
+    fixture.switch("hang", true);
+    let mut thread = fixture.draft();
+    thread.send("go").unwrap();
+    fixture.wait_for_messages(1);
+    assert!(fixture.store.flush(FLUSH));
+
+    fixture
+        .database()
+        .execute_batch(
+            "CREATE TRIGGER refuse BEFORE INSERT ON thread_items
+                 BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;",
+        )
+        .unwrap();
+    assert_eq!(
+        thread.shutdown_for_quit(),
+        Err(QuitError::Failed(vec![thread.id().to_string()]))
+    );
+    assert!(!thread.has_session());
 }
 
 #[test]
@@ -1728,7 +1752,7 @@ fn a_turn_claude_starts_by_itself_is_a_turn_like_any_other() {
 fn quitting_while_a_background_task_runs_says_it_was_stopped() {
     let fixture = Fixture::new();
     let mut thread = thread_with_a_background_task(&fixture);
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(!thread.has_session());
     assert!(thread.background_tasks().is_empty());
     assert_eq!(thread.status(), Status::Stopped);
@@ -1779,7 +1803,7 @@ fn a_finished_background_task_leaves_nothing_to_stop_at_quit() {
     let fixture = Fixture::new();
     let mut thread = thread_with_a_background_task(&fixture);
     finish_the_background_task(&mut thread, &fixture);
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert_eq!(thread.status(), Status::Done);
     let relaunched = fixture.reload(thread.id());
     assert_eq!(relaunched.status(), Status::Done);
@@ -1985,7 +2009,7 @@ fn continuing_a_thread_quit_before_claude_started_sends_the_message_again() {
     let mut thread = fixture.draft();
     thread.send("Fix the login bug").unwrap();
     fixture.wait_for_messages(1);
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     let mut relaunched = fixture.reload(thread.id());
     drop(thread);
     assert_eq!(kinds(&relaunched), ["user", "stopped"]);
@@ -2019,7 +2043,7 @@ fn continuing_a_started_thread_quit_before_claude_started_the_turn_sends_the_mes
     fixture.switch("never_init", true);
     thread.send("second").unwrap();
     fixture.wait_for_messages(2);
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     let mut relaunched = fixture.reload(thread.id());
     drop(thread);
     assert_eq!(
@@ -2339,8 +2363,8 @@ fn a_new_copy_waits_for_agents_busy_in_the_project_folder_and_for_another_copy()
     in_copy.finish_copy(Ok(fixture.fake_copy())).unwrap();
     assert!(in_copy.status().is_busy());
     assert!(!in_copy.blocks_copy_creation(), "it works in its own copy");
-    busy.shutdown_for_quit();
-    in_copy.shutdown_for_quit();
+    busy.shutdown_for_quit().unwrap();
+    in_copy.shutdown_for_quit().unwrap();
     assert!(!busy.blocks_copy_creation(), "stopped");
     fixture.switch("hang", false);
 
@@ -2378,7 +2402,7 @@ fn quit_before_copy_completion_recovers_the_message_without_a_send() {
         let (mut thread, job) = fixture.preparing("Fix the login bug");
         let copy = job.run(&tools, |_| {}).unwrap();
         match exit {
-            Exit::Quit => thread.shutdown_for_quit(),
+            Exit::Quit => thread.shutdown_for_quit().unwrap(),
             Exit::Crash => {}
         }
         drop(thread);
@@ -2432,7 +2456,7 @@ fn quit_after_a_failed_first_send_cleans_the_copy_and_restores_the_message() {
     );
     assert!(thread.is_draft());
     assert!(thread.send("edited retry").is_err());
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
     assert_eq!(
         pending[0].intent,
@@ -2510,7 +2534,7 @@ fn sending_a_recovered_draft_in_the_project_folder_clears_its_pending_record() {
             .unwrap()
             .is_empty()
     );
-    recovered.shutdown_for_quit();
+    recovered.shutdown_for_quit().unwrap();
 }
 
 #[test]
@@ -2595,7 +2619,8 @@ fn a_failed_first_thread_write_never_sweeps_a_copy_with_work() {
     finish_turn(&mut thread);
     assert_eq!(fixture.messages_received(), ["Refactor the parser"]);
     std::fs::write(copy.workdir.join("parser.rs"), "fn parse() {}\n").unwrap();
-    thread.shutdown_for_quit();
+    let id = thread.id().to_string();
+    assert_eq!(thread.shutdown_for_quit(), Err(QuitError::Failed(vec![id])));
     drop(thread);
     assert!(fixture.store.flush(FLUSH));
     assert!(
@@ -2639,7 +2664,7 @@ fn a_failed_sent_checkpoint_returns_the_message_without_sending_it() {
     fixture.database().execute_batch("CREATE TRIGGER refuse_sent BEFORE INSERT ON pending_copies WHEN NEW.state = 'sent' BEGIN SELECT RAISE(ABORT, 'disk full'); END;").unwrap();
     let failed = thread.finish_copy(Ok(copy.clone())).unwrap_err();
     assert_eq!(failed.message, "keep this message");
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(fixture.messages_received().is_empty());
     assert!(
         fixture
@@ -2706,7 +2731,7 @@ fn quitting_stops_rift_and_postcreate_hooks_before_recovery_for(
         .unwrap();
     let group = String::from_utf8(group.stdout).unwrap().trim().to_string();
     assert!(newjen_core::orphans::registry_dir().join(&group).exists());
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(!newjen_core::orphans::registry_dir().join(&group).exists());
     let deadline = Instant::now() + Duration::from_secs(2);
     while newjen_core::orphans::start_time(pid as u32).is_some() && Instant::now() < deadline {
@@ -2745,7 +2770,7 @@ fn a_copy_job_not_yet_started_never_runs_rift_after_quit_for(
     };
     let (mut thread, job) = fixture.preparing("wait for setup");
     let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(job.run(&tools, |_| {}).is_err());
     assert!(!pending[0].path.exists());
 }
@@ -2799,7 +2824,7 @@ fn quitting_lets_a_running_jj_finish_and_prevents_the_copy_start_for(
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(started.exists());
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(!running.is_finished());
     std::fs::write(release, "finish").unwrap();
     assert!(running.join().unwrap().is_err());
@@ -2959,7 +2984,7 @@ fn failed_attempt_stays_tracked(works_in: WorksIn, failure: CleanupFailure) {
             .is_empty()
     );
     Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &real_tools).unwrap();
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
 }
 
 #[test]
@@ -3298,7 +3323,7 @@ fn relaunch_requires_a_snapshot_before_sending_after_an_interrupted_jj_turn() {
     assert!(fixture.store.flush(FLUSH));
     let row = fixture.store.thread(thread.id()).unwrap().unwrap();
     assert!(row.status.is_busy());
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     let mut loaded = Thread::load(
         fixture.store.clone(),
         &fixture.project,
@@ -3360,7 +3385,7 @@ fn graceful_quit_keeps_the_snapshot_requirement_for_partial_work() {
         thread.session_started()
     });
     std::fs::write(fixture.project.path.join("partial.txt"), "partial\n").unwrap();
-    thread.shutdown_for_quit();
+    thread.shutdown_for_quit().unwrap();
     assert!(fixture.store.flush(FLUSH));
     let row = fixture.store.thread(thread.id()).unwrap().unwrap();
     assert_eq!(row.status, Status::Stopped);
