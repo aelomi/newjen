@@ -2065,3 +2065,38 @@ fn thread_jump_keys_work_while_the_review_panel_is_open(cx: &mut TestAppContext)
     );
     finish(&chat, path, cx);
 }
+
+/// Closing the review panel gives the keyboard back to the composer, which took its place.
+#[gpui::test]
+fn closing_the_review_panel_returns_the_keyboard_to_the_composer(cx: &mut TestAppContext) {
+    use newjen_core::landing::{LandingMode, Review};
+    let (chat, path, cx) = setup(cx, "review-close-focus", false);
+    cx.simulate_input("a draft");
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let id = view.thread().read(cx).id().to_string();
+            let receipt = Review {
+                base: "base".into(),
+                head: "head".into(),
+                patch: String::new(),
+                truncated: false,
+            };
+            view.show_review(id, receipt, LandingMode::HarnessManaged, window, cx);
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|window, cx| chat.read(cx).root.is_focused(window)));
+    click(cx, "close-review");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| chat.read(cx).review_panel.is_none()));
+    assert!(
+        composer_focused(&chat, cx),
+        "the composer has the keyboard again once the panel closes"
+    );
+    cx.simulate_input(" continues");
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "a draft continues"
+    );
+    finish(&chat, path, cx);
+}

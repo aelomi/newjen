@@ -537,7 +537,10 @@ impl ChatView {
                             view.slots[ix].thread.update(cx, |thread, cx| { thread.finish_landing(); cx.notify(); });
                             view.review_panel = None;
                             if integration.is_none() { view.archive(&id, window, cx); }
-                            else { view.slots[ix].notice = Some(Notice::held("Work landed", "The work is in the project. Archive the thread when you are ready to close it.".into())); }
+                            else {
+                                view.slots[ix].notice = Some(Notice::held("Work landed", "The work is in the project. Archive the thread when you are ready to close it.".into()));
+                                view.focus_panel(window, cx);
+                            }
                         }
                     }
                     Err(error) => if let Some(panel) = view.review_panel.as_mut() { panel.busy = false; panel.message = format!("{error:#}"); },
@@ -769,9 +772,11 @@ impl ChatView {
                             ui::Size::Sm,
                             cx,
                         )
-                        .on_click(cx.listener(|view, _, _, cx| {
+                        .debug_selector(|| "close-review".to_string())
+                        .on_click(cx.listener(|view, _, window, cx| {
                             if !view.review_panel.as_ref().is_some_and(|panel| panel.busy) {
                                 view.review_panel = None;
+                                view.focus_panel(window, cx);
                                 cx.notify();
                             }
                         })),
