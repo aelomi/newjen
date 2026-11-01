@@ -70,6 +70,32 @@ pub fn turn_caption(duration_ms: Option<u64>, cost_usd: Option<f64>, stopped: bo
     caption
 }
 
+/// A count with thousands separators: `12408` → "12,408".
+pub fn thousands(count: usize) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (ix, digit) in digits.chars().enumerate() {
+        if ix > 0 && (digits.len() - ix).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// The quiet line under an answer: the model and how hard it thinks, "Opus 5.5 · High".
+pub fn model_footer(model: &str, effort: Option<&str>, fast: bool) -> String {
+    let mut line = model.to_string();
+    if let Some(effort) = effort {
+        line.push_str(" · ");
+        line.push_str(effort);
+    }
+    if fast {
+        line.push_str(" · Fast");
+    }
+    line
+}
+
 /// How long something has been going, in whole units for a line that ticks once a second:
 /// "12s", "1m 12s", "3h 12m".
 pub fn elapsed(secs: u64) -> String {
@@ -383,6 +409,28 @@ mod tests {
         assert_eq!(turn_caption(Some(4_523_417), None, false), "Done in 1h 15m");
         assert_eq!(turn_caption(None, None, false), "Done");
         assert_eq!(turn_caption(Some(1_000), Some(0.5), true), "Stopped");
+    }
+
+    #[test]
+    fn counts_get_thousands_separators() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(12_408), "12,408");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn the_answer_footer_names_the_model_and_effort() {
+        assert_eq!(
+            model_footer("Opus 5.5", Some("High"), false),
+            "Opus 5.5 · High"
+        );
+        assert_eq!(model_footer("Claude", None, false), "Claude");
+        assert_eq!(
+            model_footer("GPT 6.1 Sol", Some("High"), true),
+            "GPT 6.1 Sol · High · Fast"
+        );
     }
 
     #[test]

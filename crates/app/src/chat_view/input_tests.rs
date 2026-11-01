@@ -775,6 +775,124 @@ fn while_its_copy_is_made_the_thread_shows_it_and_cannot_be_archived(cx: &mut Te
 }
 
 #[gpui::test]
+async fn a_turns_tool_calls_fold_into_one_live_work_block(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "work-block", true);
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    // The running turn shows its steps, and the call that waits for an answer is one of them.
+    assert!(cx.debug_bounds("work-block").is_some());
+    assert!(cx.debug_bounds("work-block-steps").is_some());
+    assert!(cx.debug_bounds("tool-header").is_none());
+    let (calls, hidden, blocks) = cx.update(|_, cx| {
+        let view = chat.read(cx);
+        let items = view.thread().read(cx).transcript().items();
+        let calls = items
+            .iter()
+            .filter(|item| matches!(item, Item::Tool { .. }))
+            .count();
+        let slots = (0..items.len()).map(|ix| view.plan.slot(ix));
+        (
+            calls,
+            slots
+                .clone()
+                .filter(|slot| *slot == rows::Slot::Hidden)
+                .count(),
+            slots
+                .filter(|slot| matches!(slot, rows::Slot::Block(_)))
+                .count(),
+        )
+    });
+    assert!(calls >= 1);
+    assert_eq!(blocks, 1);
+    assert_eq!(hidden, calls - 1);
+    // Closing the block hides the steps and opening it brings them back.
+    click(cx, "work-block-header");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("work-block-steps").is_none());
+    click(cx, "work-block-header");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("work-block-steps").is_some());
+    click(cx, "once");
+    click(cx, "once");
+    wait_answers(cx, &path, 2).await;
+    cx.simulate_keystrokes("cmd-.");
+    cx.condition(&chat, |view, cx| !view.is_busy(cx)).await;
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn the_copy_card_has_a_cancel_that_stops_the_copy(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "copy-card", false);
+    let thread = cx.update(|_, cx| chat.read(cx).thread().clone());
+    let job = cx.update(|_, cx| {
+        thread.update(cx, |thread, cx| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            let sent = thread.send("fix the parser");
+            cx.notify();
+            match sent {
+                Ok(Sent::MakingCopy(job)) => job,
+                other => panic!("expected a copy job, got {other:?}"),
+            }
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("making-copy").is_some());
+    click(cx, "copy-cancel");
+    assert!(cx.update(|_, cx| thread.read(cx).preparing().unwrap().cancelled()));
+    let failed = job.run(&Tools::find(), |_| {}).unwrap_err();
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.copy_made(&thread, Err(failed), window, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("making-copy").is_none());
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "fix the parser"
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn a_failed_copy_notice_hides_its_log_until_asked(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "failed-log", false);
+    let thread = cx.update(|_, cx| chat.read(cx).thread().clone());
+    let job = cx.update(|_, cx| {
+        thread.update(cx, |thread, _| {
+            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            match thread.send("fix the parser") {
+                Ok(Sent::MakingCopy(job)) => job,
+                other => panic!("expected a copy job, got {other:?}"),
+            }
+        })
+    });
+    drop(job);
+    let failed = CopyError::Failed {
+        command: "rift create".to_string(),
+        detail: "postcreate hook failed (exit 1)".to_string(),
+        output: vec!["npm ERR! code ERESOLVE".to_string()],
+    };
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.copy_made(&thread, Err(failed), window, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("error-notice").is_some());
+    assert!(cx.debug_bounds("retry").is_some());
+    let closed = cx.debug_bounds("error-notice").unwrap().size.height;
+    click(cx, "show-log");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("error-notice").unwrap().size.height > closed);
+    click(cx, "show-log");
+    cx.run_until_parked();
+    assert_eq!(cx.debug_bounds("error-notice").unwrap().size.height, closed);
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
 fn a_failed_copy_names_what_failed(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "failed-copy", false);
     let thread = cx.update(|_, cx| chat.read(cx).thread().clone());

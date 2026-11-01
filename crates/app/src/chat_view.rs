@@ -262,6 +262,9 @@ pub struct ChatView {
     /// The root has the keyboard while the thread on screen waits for its Rift copy: the
     /// composer is disabled until then.
     making_copy_shown: bool,
+    /// How the thread on screen's items become rows: its turns' tool calls fold into work
+    /// blocks (see `rows::Plan`).
+    plan: rows::Plan,
     /// That approval's path outside the thread's folder, if any (`approval::outside_path`).
     /// Worked out once when the request reaches the dock, because it reads the disk and
     /// `render` runs on every streamed frame.
@@ -336,6 +339,7 @@ impl ChatView {
             review_loading: false,
             changes: Default::default(),
             making_copy_shown: false,
+            plan: rows::Plan::default(),
             dock_outside: None,
             keys_ready_at: None,
             _tasks: tasks,
@@ -1882,10 +1886,13 @@ impl ChatView {
         let on_restart: OnRestart = self.press(cx, |view, window, cx| view.restart(window, cx));
         let on_continue: OnRestart = self.press(cx, |view, window, cx| view.resume(window, cx));
         let on_send_again: OnRestart = self.press(cx, |view, window, cx| view.send(window, cx));
+        let on_cancel: OnRestart = self.press(cx, |view, window, cx| view.stop(window, cx));
         let unbuilt = {
             let slot = &self.slots[self.active];
             match slot.thread.read(cx).transcript().items().get(ix) {
-                Some(Item::Assistant { id, text, .. }) if !slot.replies.contains(id) => {
+                Some(Item::Assistant { id, text, .. })
+                    if !slot.replies.contains(id) && self.plan.slot(ix) != rows::Slot::Hidden =>
+                {
                     Some((*id, text.clone()))
                 }
                 _ => None,
@@ -1915,7 +1922,19 @@ impl ChatView {
                 {
                     return div().into_any_element();
                 }
-                if limits::is_limit_error(item) {
+                if matches!(item, Item::TurnEnd { stopped: true, .. })
+                    && self.plan.stop_is_in_block(ix)
+                {
+                    return div().into_any_element();
+                }
+                let block = match self.plan.slot(ix) {
+                    rows::Slot::Hidden => return div().into_any_element(),
+                    rows::Slot::Block(index) => Some(index),
+                    rows::Slot::Plain => None,
+                };
+                if let Some(index) = block {
+                    rows::work_block(&self.plan, index, &slot.thread, cx)
+                } else if limits::is_limit_error(item) {
                     rows::error(
                         ("limit-history", item.id()).into(),
                         &format!("{} usage limit reached", thread.presentation().label),
@@ -1925,34 +1944,60 @@ impl ChatView {
                         cx,
                     )
                 } else {
+                    let footer = matches!(item, Item::TurnEnd { .. })
+                        .then(|| rows::footer_for(self.model_footer(thread), items, ix));
                     rows::item(
                         item,
-                        slot.replies.get(&item.id()).map(|reply| reply.view(cx)),
-                        retry,
-                        resume,
-                        rows::stopped_resends(items, ix),
+                        rows::ItemCtx {
+                            reply: slot.replies.get(&item.id()).map(|reply| reply.view(cx)),
+                            retry,
+                            resume,
+                            resends: rows::stopped_resends(items, ix),
+                            idle: !busy,
+                            again: rows::can_resend(items, busy, thread.continue_resends())
+                                .then_some(&on_continue),
+                            footer: footer.as_ref(),
+                        },
                         cx,
                     )
                 }
             }
             Some(Entry::HeldMessage) => preparing.map_or_else(
                 || div().into_any_element(),
-                |preparing| ui::user(preparing.message().to_string(), cx).into_any_element(),
+                |preparing| {
+                    ui::user_pending(
+                        "held".into(),
+                        preparing.message().to_string(),
+                        ui::Pending::Held,
+                        cx,
+                    )
+                },
             ),
             Some(Entry::MakingCopy) => preparing.map_or_else(
                 || div().into_any_element(),
                 |preparing| {
                     let took = Instant::now().saturating_duration_since(preparing.started_at());
-                    rows::preparing_work(
-                        if thread.works_in() == WorksIn::RiftCopy {
-                            "Creating a Rift copy"
-                        } else {
-                            "Preparing the project"
-                        },
-                        &elapsed(took.as_secs()),
-                        preparing.last_line(),
-                        cx,
-                    )
+                    let took = elapsed(took.as_secs());
+                    if thread.works_in() == WorksIn::RiftCopy {
+                        rows::copy_card(
+                            rows::CopyCard {
+                                project: &self.project_name,
+                                took: &took,
+                                last_line: preparing.last_line(),
+                                snapshotting: thread.blocks_project_send(),
+                                cancelling: preparing.cancelled(),
+                                on_cancel: on_cancel.clone(),
+                            },
+                            cx,
+                        )
+                    } else {
+                        rows::preparing_work(
+                            "Preparing the project",
+                            &took,
+                            preparing.last_line(),
+                            cx,
+                        )
+                    }
                 },
             ),
             Some(Entry::Notice) => match notice {
@@ -2123,7 +2168,45 @@ impl ChatView {
             .children(composer)
     }
 
-    fn render_messages(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The model and effort the thread on screen runs on, "Opus 5.5 · High", for the line under
+    /// each answer.
+    fn model_footer(&self, thread: &Thread) -> Option<String> {
+        use newjen_core::providers::ModelSelection;
+        let config = thread.agent_config()?;
+        let status = self
+            .picker
+            .statuses
+            .iter()
+            .find(|status| status.provider == config.provider);
+        let model = match &config.model {
+            ModelSelection::Model { id } => status
+                .and_then(|status| newjen_core::picker::selected_model(config, status))
+                .map_or_else(|| id.clone(), |model| model.label.clone()),
+            ModelSelection::CliDefault => config.provider.presentation().label.to_string(),
+        };
+        let effort = (config.effort != newjen_core::EffortSelection::CliDefault)
+            .then(|| newjen_core::picker::effort_label(&config.effort));
+        Some(crate::format::model_footer(
+            &model,
+            effort.as_deref(),
+            config.speed == newjen_core::Speed::Fast,
+        ))
+    }
+
+    /// Maps the thread on screen's items to rows (see `rows::Plan`). Drawn rows read it, so it
+    /// is rebuilt before each draw of the list.
+    fn refresh_plan(&mut self, cx: &App) {
+        let thread = self.slots[self.active].thread.read(cx);
+        self.plan.refresh(
+            thread.id(),
+            thread.transcript().items(),
+            thread.work_blocks(),
+            Some(thread.cwd()),
+        );
+    }
+
+    fn render_messages(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_plan(cx);
         let slot = &self.slots[self.active];
         let thread = slot.thread.read(cx);
         let count = Entry::count(

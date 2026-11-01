@@ -97,6 +97,80 @@ impl ToolCard {
     }
 }
 
+/// A tool call's raw arguments and its result or error, as the cards and the work block's
+/// expanded rows show them.
+#[derive(IntoElement)]
+pub struct ToolBody {
+    id: ElementId,
+    arguments: Option<SharedString>,
+    result: Option<SharedString>,
+    failed: bool,
+}
+
+impl ToolBody {
+    pub fn new(id: impl Into<ElementId>) -> Self {
+        Self {
+            id: id.into(),
+            arguments: None,
+            result: None,
+            failed: false,
+        }
+    }
+
+    pub fn arguments(mut self, json: Option<SharedString>) -> Self {
+        self.arguments = json;
+        self
+    }
+
+    pub fn result(mut self, text: Option<SharedString>, failed: bool) -> Self {
+        self.result = text;
+        self.failed = failed;
+        self
+    }
+}
+
+impl RenderOnce for ToolBody {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.theme();
+        let failed = self.failed;
+        let label = |text: &'static str| {
+            div()
+                .text_size(gpui::rems(0.75))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.muted_foreground)
+                .child(text)
+        };
+        div()
+            .debug_selector(|| "tool-details".to_string())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(self.arguments.map(|json| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(label("Arguments"))
+                    .child(CodeBlock::new((self.id.clone(), "arguments"), json).language("json"))
+            }))
+            .children(self.result.map(|text| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(label(if failed { "Error" } else { "Result" }))
+                    .child(if failed {
+                        div()
+                            .text_color(colors.danger)
+                            .child(text)
+                            .into_any_element()
+                    } else {
+                        CodeBlock::new((self.id.clone(), "result"), text).into_any_element()
+                    })
+            }))
+    }
+}
+
 impl RenderOnce for ToolCard {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = window.use_keyed_state((self.id.clone(), "open"), cx, |_, _| false);
@@ -105,13 +179,6 @@ impl RenderOnce for ToolCard {
         let failed = self.status == StepState::Failed;
         let mark = step_mark(self.status, cx);
         let colors = cx.theme();
-        let label = |text: &'static str| {
-            div()
-                .text_size(gpui::rems(0.75))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(colors.muted_foreground)
-                .child(text)
-        };
         Collapsible::new()
             .open(open && opens)
             .rounded(cx.theme().radius)
@@ -153,40 +220,11 @@ impl RenderOnce for ToolCard {
                 }),
             )
             .content(
-                div()
-                    .debug_selector(|| "tool-details".to_string())
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .px_3()
-                    .pt_1()
-                    .pb_3()
-                    .children(self.arguments.map(|json| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(label("Arguments"))
-                            .child(
-                                CodeBlock::new((self.id.clone(), "arguments"), json)
-                                    .language("json"),
-                            )
-                    }))
-                    .children(self.result.map(|text| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(label(if failed { "Error" } else { "Result" }))
-                            .child(if failed {
-                                div()
-                                    .text_color(colors.danger)
-                                    .child(text)
-                                    .into_any_element()
-                            } else {
-                                CodeBlock::new((self.id.clone(), "result"), text).into_any_element()
-                            })
-                    })),
+                div().px_3().pt_1().pb_3().child(
+                    ToolBody::new(self.id.clone())
+                        .arguments(self.arguments)
+                        .result(self.result, failed),
+                ),
             )
     }
 }

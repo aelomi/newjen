@@ -29,10 +29,12 @@ mod step;
 mod tool_card;
 pub use code::CodeBlock;
 pub use copy::CopyButton;
-pub use message::{ErrorNotice, assistant, user};
+pub use message::{ErrorNotice, Pending, assistant, user, user_pending};
 pub use motion::Chevron;
-pub use step::{StepState, step_mark};
-pub use tool_card::ToolCard;
+pub use step::{
+    Detail, Mark, Part, QuietMark, StepState, StepView, WorkBlockView, mark, step_mark,
+};
+pub use tool_card::{ToolBody, ToolCard};
 
 mod message_list;
 pub use message_list::MessageList;
