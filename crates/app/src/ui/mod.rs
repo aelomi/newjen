@@ -39,4 +39,4 @@ mod composer;
 pub use composer::{Composer, Footer, composer_field};
 
 mod approval_card;
-pub use approval_card::{ApprovalCard, DOCK_METRICS, approval_dock};
+pub use approval_card::{ApprovalCard, DOCK_METRICS, EXIT_FADE, approval_dock};

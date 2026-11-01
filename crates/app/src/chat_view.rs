@@ -64,6 +64,12 @@ use gpui_kit::component::message_scroller::MessageScrollerState;
 /// The conversation column is capped at this width and centered, as in the mocks.
 const COLUMN_WIDTH: Pixels = px(720.0);
 
+/// The answered approval card kept on screen while it fades (`ui::EXIT_FADE`).
+struct DockGhost {
+    request: newjen_core::ApprovalKey,
+    card: Rc<ui::ApprovalCard>,
+}
+
 /// ⌘↵ and Esc are ignored for this long after a new approval appears, and for this long after
 /// each ignored press. Without it a quick double-tap could answer the next queued request
 /// before its dock is even visible. (A held key is handled separately: its repeats never
@@ -250,9 +256,14 @@ pub struct ChatView {
     /// Focus target while an approval is pending (the dock replaces the composer, so the field
     /// is not on screen), so ⌘↵ and Esc reach us.
     root: FocusHandle,
-    /// The "N allowed" popover is open, and the focus it takes while it is.
+    /// The allowed-rules popover is open, and the focus it takes while it is.
     grants_open: bool,
     grants_focus: FocusHandle,
+    /// It was opened with the mouse, so it slides in; a key press opens it at once.
+    grants_pointer: bool,
+    /// The card a mouse click has just answered, fading out over the composer that took its
+    /// place (a key press leaves none).
+    dock_ghost: Option<DockGhost>,
     /// The approval the dock is showing, to notice when a new one takes its place.
     dock_request: Option<newjen_core::ApprovalKey>,
     /// The optional reason for a denial, typed under the approval card (see
@@ -330,6 +341,8 @@ impl ChatView {
             root: cx.focus_handle(),
             grants_open: false,
             grants_focus,
+            grants_pointer: false,
+            dock_ghost: None,
             dock_request: None,
             denial_note: None,
             edit_preview: None,
@@ -2065,14 +2078,17 @@ impl ChatView {
             },
         );
         let view = cx.weak_entity();
-        let on_open: OnGrantsOpen = Rc::new(move |open, _, cx| {
+        let on_open: OnGrantsOpen = Rc::new(move |open, window, cx| {
+            let pointer = !window.last_input_was_keyboard();
             let _ = view.update(cx, |view, cx| {
                 view.grants_open = open;
+                view.grants_pointer = open && pointer;
                 cx.notify();
             });
         });
         let grants = Grants {
             open: self.grants_open,
+            pointer: self.grants_pointer,
             focus: self.grants_focus.clone(),
             on_open,
             on_revoke,
@@ -2211,13 +2227,23 @@ impl ChatView {
                 .count();
             (request, waiting)
         };
-        let mut title = approval::title(request.view());
-        if waiting > 1 {
-            title.push_str(&format!(" (1 of {waiting})"));
-        }
-        let (title, room) = self.dock_room(&title, main_width, window, cx);
+        let risk = request.risk();
+        let remember = request.view().remember.can_remember();
+        let queue = (waiting > 1).then(|| SharedString::from(format!("1 of {waiting}")));
+        let headline = request.headline().to_string();
+        let (_, room) = self.dock_room(
+            if headline.is_empty() {
+                request.view().question.as_str()
+            } else {
+                &headline
+            },
+            main_width,
+            window,
+            cx,
+        );
         // `sync_field` keeps `dock_outside` in step with the dock's request.
-        let detail = approval::detail(request.view(), self.dock_outside.as_deref(), room);
+        let detail =
+            approval::card_detail(request.view(), self.dock_outside.as_deref(), room, risk);
         let scope = approval::scope_row(&request.view().remember, detail.shortened, room.cols);
         let rule_cut = scope.once;
         let request_key = request.key();
@@ -2226,14 +2252,23 @@ impl ChatView {
         let answered_id = request_key;
         let card = ui::ApprovalCard::new(
             (ElementId::from("approval"), request_id.clone()),
-            title,
+            approval::title(request.view()),
             detail.text,
             move |answer, window, cx| {
                 let _ = view.update(cx, |view, cx| {
                     view.answer(Some(answered_id), answer, rule_cut, window, cx)
                 });
             },
-        );
+        )
+        .glyph(approval::glyph(request.view(), risk))
+        .risk(risk.map(newjen_core::ApprovalRisk::label))
+        .queue(queue)
+        .can_remember(remember);
+        let card = if headline.is_empty() {
+            card
+        } else {
+            card.headline(headline)
+        };
         let card = card.preview(
             self.render_edit_preview(f32::from(window.viewport_size().height), cx),
             !self
@@ -2246,7 +2281,57 @@ impl ChatView {
         } else {
             card
         };
-        Some(ui::approval_dock(card, rows::scope(&scope, cx)))
+        let card = if card.is_edit() || cx.reduce_motion() {
+            card
+        } else {
+            let ghost = Rc::new(card.exit_ghost());
+            let view = cx.weak_entity();
+            card.on_mouse_answer(move |_, cx| {
+                let ghost = ghost.clone();
+                let _ = view.update(cx, |view, cx| {
+                    view.keep_answered_card(answered_id, ghost, cx)
+                });
+            })
+        };
+        Some(ui::approval_dock(
+            card,
+            remember.then(|| rows::scope(&scope, cx)),
+        ))
+    }
+
+    /// Keeps `card`, which a mouse click just answered, on screen while it fades out. Nothing
+    /// to keep if the request is still waiting (the answer was held back).
+    fn keep_answered_card(
+        &mut self,
+        request: newjen_core::ApprovalKey,
+        card: Rc<ui::ApprovalCard>,
+        cx: &mut Context<Self>,
+    ) {
+        let waiting = self
+            .thread()
+            .read(cx)
+            .transcript()
+            .pending_approval()
+            .is_some_and(|pending| pending.key() == request);
+        if waiting {
+            return;
+        }
+        self.dock_ghost = Some(DockGhost { request, card });
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(ui::EXIT_FADE).await;
+            let _ = view.update(cx, |view, cx| {
+                if view
+                    .dock_ghost
+                    .as_ref()
+                    .is_some_and(|ghost| ghost.request == request)
+                {
+                    view.dock_ghost = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2638,12 +2723,22 @@ impl Render for ChatView {
                     .pb(px(DOCK_METRICS.bottom_padding))
                     .child(
                         v_flex()
+                            .relative()
                             .w_full()
                             .max_w(COLUMN_WIDTH)
                             .gap(px(DOCK_METRICS.scope_gap))
                             .children(problem)
                             .children(limit_notice)
-                            .child(bottom),
+                            .child(bottom)
+                            .children(self.dock_ghost.as_ref().map(|ghost| {
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .pb(px(DOCK_METRICS.scope_gap + 18.))
+                                    .child(ghost.card.exit_ghost())
+                            })),
                     ),
             );
 

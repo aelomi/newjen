@@ -1,15 +1,20 @@
 //! The bar across the top of the chat (screens 8–11): the thread's title and folder in the
-//! middle; the "N allowed" chip with its list of remembered rules and the status pill on the
+//! middle; the shield with its list of rules allowed in the thread and the status pill on the
 //! right; and, while the thread list is out of sight, the button that brings it back on the
 //! left.
 //!
 use std::rc::Rc;
 
+use std::time::Duration;
+
 use gpui::{
-    Anchor, AnyElement, App, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, RenderOnce, SharedString, Styled, Window, div, prelude::*, px,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, BoxShadow, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div,
+    hsla, prelude::*, px,
 };
 use gpui_kit::base::{FocusTrapElement as _, Selectable, h_flex, v_flex};
+use gpui_kit::component::ThemeStyled as _;
+use gpui_kit::component::animation::ease_out_cubic;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{Sizable as _, tag::Tag};
 use newjen_core::{GrantId, GrantView, Status};
@@ -54,6 +59,8 @@ pub struct Grants {
     pub focus: FocusHandle,
     pub on_open: OnGrantsOpen,
     pub on_revoke: OnRevoke,
+    /// The popover was opened with the mouse, so it slides in.
+    pub pointer: bool,
 }
 
 /// What the bar shows.
@@ -248,15 +255,16 @@ fn status_pill(pill: Pill) -> AnyElement {
     }
 }
 
-/// "🛡 2 allowed": opens the list of the thread's remembered rules. Tab stays inside it; Esc, a
-/// press outside or focus moving elsewhere closes it.
+/// A shield with the count of rules allowed in this thread: opens the list of them. Tab stays
+/// inside it; Esc, a press outside or focus moving elsewhere closes it.
 fn grants_popover(
     grants: Vec<GrantView>,
     detail: &'static str,
     background_tasks: usize,
     state: Grants,
 ) -> AnyElement {
-    let label = format!("{} allowed", grants.len());
+    let label = grants.len().to_string();
+    let pointer = state.pointer;
     let on_open = state.on_open;
     let on_revoke = state.on_revoke;
     let focus = state.focus.clone();
@@ -264,21 +272,61 @@ fn grants_popover(
         .anchor(Anchor::TopLeft)
         .trigger(GrantsChip { label })
         .overlay_closable(false)
+        .appearance(false)
         .open(state.open)
         .on_open_change(move |open, window, cx| on_open(*open, window, cx))
         .track_focus(&state.focus)
         .content(move |_, window, cx| {
             let dismiss = cx.listener(|state, _, window, cx| state.dismiss(window, cx));
             let panel = grants_panel(&grants, detail, background_tasks, &on_revoke, window, cx);
-            div()
+            let inner = div()
                 .child(panel)
                 .on_mouse_down_out(dismiss)
-                .focus_trap("grants-trap", &focus)
+                .focus_trap("grants-trap", &focus);
+            let surface = div().relative().popover_style(cx).p_3().child(inner);
+            if pointer {
+                // The shadow is raised with the cube of the fade, as Kit's own dropdowns do,
+                // so it never shows through the glass while it is still see-through.
+                let ink = cx.theme().foreground.alpha(0.1);
+                surface
+                    .with_animation(
+                        "grants-enter",
+                        Animation::new(POPOVER_ENTER).with_easing(ease_out_cubic),
+                        move |surface, t| {
+                            surface
+                                .top(px(POPOVER_RISE * (t - 1.)))
+                                .opacity(t)
+                                .shadow(surface_shadow(ink, t * t * t))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                surface.into_any_element()
+            }
         })
         .into_any_element()
 }
 
-/// The chip that opens the popover.
+const POPOVER_ENTER: Duration = Duration::from_millis(150);
+const POPOVER_RISE: f32 = 4.;
+
+/// The hairline ring and soft shadow of a Kit popover, at `strength` of their ink.
+fn surface_shadow(ring: gpui::Hsla, strength: f32) -> Vec<BoxShadow> {
+    let ink = hsla(0., 0., 0., 0.1 * strength);
+    vec![
+        BoxShadow::new(px(0.), px(0.), ring.alpha(ring.a * strength))
+            .blur_radius(px(0.))
+            .spread_radius(px(1.)),
+        BoxShadow::new(px(0.), px(4.), ink)
+            .blur_radius(px(3.))
+            .spread_radius(px(-1.)),
+        BoxShadow::new(px(0.), px(2.), ink)
+            .blur_radius(px(2.))
+            .spread_radius(px(-2.)),
+    ]
+}
+
+/// The shield button that opens the popover.
 #[derive(IntoElement)]
 struct GrantsChip {
     label: String,
@@ -297,9 +345,11 @@ impl Selectable for GrantsChip {
 impl RenderOnce for GrantsChip {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         Button::new("grants-chip")
-            .label(self.label)
+            .label(self.label.clone())
             .icon(IconName::Shield)
             .ghost()
+            .tooltip("Allowed in this thread")
+            .accessibility_label(format!("{} allowed in this thread", self.label))
             .debug_selector(|| "grants-chip".to_string())
     }
 }
@@ -330,7 +380,7 @@ fn grants_panel(
                 .text_base()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors.foreground)
-                .child("Always allowed in this thread"),
+                .child("Allowed in this thread"),
         )
         .child(
             div()
@@ -436,6 +486,7 @@ mod tests {
                 focus: self.focus.clone(),
                 on_open: Rc::new(|_, _, _| {}),
                 on_revoke: Rc::new(|_, _, _| {}),
+                pointer: false,
             };
             div().w_full().child(render(bar, grants, window, cx))
         }

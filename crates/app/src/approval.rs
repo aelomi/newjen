@@ -4,9 +4,12 @@
 
 use std::path::{Path, PathBuf};
 
-use newjen_core::{ApprovalKind, ApprovalView, OnceReason, RememberScope, RuleMeaning};
+use newjen_core::{
+    ApprovalKind, ApprovalRisk, ApprovalView, OnceReason, RememberScope, RuleMeaning,
+};
 
 use crate::format::{cap, fit_rows, middle, short_path};
+use crate::ui::IconName;
 
 /// How many lines of detail the dock shows at most before it cuts the rest (for tools other
 /// than Bash, whose arguments are one line of JSON or a file path).
@@ -32,7 +35,7 @@ pub fn title(request: &ApprovalView) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detail {
     pub text: String,
-    /// The Bash command was shortened. Only matters when "Always allow" remembers that exact
+    /// The Bash command was shortened. Only matters when "Allow in this thread" remembers that exact
     /// command (see [`scope_row`]); other tools' arguments are cut freely, because their rule
     /// does not depend on them.
     pub shortened: bool,
@@ -45,21 +48,60 @@ pub struct Detail {
 /// things) is always visible before you approve it. A last row warns about `outside`, the path
 /// from [`outside_path`] (passed in, so drawing a frame never touches the disk).
 pub fn detail(request: &ApprovalView, outside: Option<&str>, room: Room) -> Detail {
+    detail_in(request, outside, room, Style::Listed)
+}
+
+/// The detail under the approval card's headline: the bare command (the purpose is the
+/// headline already) and, when the risk tag does not already say "Outside the project", a last
+/// row for the path outside it.
+pub fn card_detail(
+    request: &ApprovalView,
+    outside: Option<&str>,
+    room: Room,
+    risk: Option<ApprovalRisk>,
+) -> Detail {
+    let style = if risk == Some(ApprovalRisk::OutsideProject) {
+        Style::CardTagged
+    } else {
+        Style::Card
+    };
+    detail_in(request, outside, room, style)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Style {
+    /// The inbox: `$ command`, the purpose under it, "Outside the project: <path>".
+    Listed,
+    /// The card: the command alone, "Outside the project: <path>".
+    Card,
+    /// The card, when its tag already says "Outside the project": just the path.
+    CardTagged,
+}
+
+fn detail_in(request: &ApprovalView, outside: Option<&str>, room: Room, style: Style) -> Detail {
     // The warning gets its row first: it matters more than the purpose.
-    let outside = outside.map(|path| outside_line(path, room.cols));
+    let outside = outside.map(|path| match style {
+        Style::CardTagged => short_path(path, room.cols.max(12)),
+        _ => outside_line(path, room.cols),
+    });
     let rows = room
         .rows
         .saturating_sub(usize::from(outside.is_some()))
         .max(1);
+    let listed = style == Style::Listed;
     let (mut text, shortened) = if let ApprovalKind::Command {
         command: Some(command),
         purpose,
     } = &request.kind
     {
         // The purpose gets one row, unless the room is so small the command needs it.
-        let purpose = purpose.as_deref().filter(|_| rows >= 3);
+        let purpose = purpose.as_deref().filter(|_| listed && rows >= 3);
         let command_rows = rows - usize::from(purpose.is_some());
-        let full = format!("$ {command}");
+        let full = if listed {
+            format!("$ {command}")
+        } else {
+            command.clone()
+        };
         let mut text = fit_rows(&full, room.cols, command_rows);
         // Only the command counts as shortened: the purpose is Claude's comment, not what runs.
         let shortened = text != full;
@@ -75,7 +117,8 @@ pub fn detail(request: &ApprovalView, outside: Option<&str>, room: Room) -> Deta
         };
         let full = specific
             .unwrap_or_else(|| serde_json::to_string(&request.tool.arguments).unwrap_or_default());
-        // Not a command: whether this was cut never decides what "Always allow" remembers.
+        // Not a command: whether this was cut never decides what "Allow in this thread"
+        // remembers.
         let text = fit_rows(&cap(&full, DETAIL_LINES, DETAIL_CHARS), room.cols, rows);
         (text, false)
     };
@@ -84,6 +127,27 @@ pub fn detail(request: &ApprovalView, outside: Option<&str>, room: Room) -> Deta
         text.push_str(&outside);
     }
     Detail { text, shortened }
+}
+
+/// The icon in the card's tile: what kind of action this is.
+pub fn glyph(request: &ApprovalView, risk: Option<ApprovalRisk>) -> IconName {
+    if risk == Some(ApprovalRisk::DeletesFiles) {
+        return IconName::Trash;
+    }
+    match &request.kind {
+        ApprovalKind::FileChange { .. } => IconName::FilePen,
+        ApprovalKind::Command { .. } => IconName::Terminal,
+        ApprovalKind::OtherTool => {
+            let name = request.tool.name.to_ascii_lowercase();
+            if name.starts_with("mcp__") {
+                IconName::Plug
+            } else if name.contains("web") {
+                IconName::Globe
+            } else {
+                IconName::Shield
+            }
+        }
+    }
 }
 
 /// The path the CLI says this call touches, if it lies outside `project`. This reads the disk
@@ -123,14 +187,14 @@ fn resolve(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// The quiet row under the dock that says what "Always allow" will do, before the click:
+/// The quiet row under the dock that says what "Allow in this thread" will do, before the click:
 /// `before`, then `code` in the mono font (the rule that is remembered), then `after`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeRow {
     pub before: String,
     pub code: Option<String>,
     pub after: String,
-    /// The remembered rule could not be shown in full, so "Always allow" must be sent as
+    /// The remembered rule could not be shown in full, so "Allow in this thread" must be sent as
     /// allow once: nothing is remembered that the user could not read.
     pub once: bool,
 }
@@ -142,7 +206,7 @@ pub fn scope_row(scope: &RememberScope, command_shortened: bool, cols: usize) ->
     // `cut`: the answer itself must be downgraded here (core already sends allow once for the
     // `OnceOnly` cases, so they need no help).
     let once = |why: &str, cut: bool| ScopeRow {
-        before: format!("Always allow works once here{why}"),
+        before: format!("Allow in this thread works once here{why}"),
         code: None,
         after: String::new(),
         once: cut,
@@ -159,15 +223,15 @@ pub fn scope_row(scope: &RememberScope, command_shortened: bool, cols: usize) ->
         } => (labels, meaning, *shown_in_detail),
     };
     // The thread keeps the rule (core saves it and gives it to every later `claude` of this
-    // thread), so it lasts "for this thread", not just for this claude process.
+    // thread), so it lasts for the thread, not just for this claude process.
     // In a rule, `*` matches more than this one call, so say that in words. For Bash it stands
     // for any arguments; for other tools it is a path or domain pattern.
     let after = match meaning {
-        RuleMeaning::Arguments => " (any arguments) for this thread",
-        RuleMeaning::Pattern => " (a pattern) for this thread",
-        RuleMeaning::Exact | RuleMeaning::OneTool => " for this thread",
+        RuleMeaning::Arguments => " (any arguments)",
+        RuleMeaning::Pattern => " (a pattern)",
+        RuleMeaning::Exact | RuleMeaning::OneTool => "",
     };
-    const BEFORE: &str = "Always allow remembers ";
+    const BEFORE: &str = "Allow in this thread remembers ";
     let room = cols.saturating_sub(BEFORE.len() + after.len()).max(12);
     // One line: a multi-line command's line breaks are shown as ↵.
     let full = rules.join(", ").replace('\n', " ↵ ");
@@ -280,6 +344,69 @@ mod tests {
     }
 
     #[test]
+    fn the_card_shows_the_bare_command_without_its_purpose() {
+        let ask = request(
+            "Bash",
+            json!({"command": "rm a.rs b.rs", "description": "Delete"}),
+        );
+        assert_eq!(card_detail(&ask, None, ROOMY, None).text, "rm a.rs b.rs");
+        let mut ask = request("Bash", json!({"command": "touch new.txt"}));
+        ask.affected_path = Some("/elsewhere/new.txt".to_string());
+        assert_eq!(
+            card_detail(&ask, Some("/elsewhere/new.txt"), ROOMY, None).text,
+            "touch new.txt\nOutside the project: /elsewhere/new.txt"
+        );
+        // The tag already says "Outside the project", so the row keeps only the path.
+        assert_eq!(
+            card_detail(
+                &ask,
+                Some("/elsewhere/new.txt"),
+                ROOMY,
+                Some(ApprovalRisk::OutsideProject)
+            )
+            .text,
+            "touch new.txt\n/elsewhere/new.txt"
+        );
+        let long = (1..=40)
+            .map(|n| format!("echo {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cut = card_detail(
+            &request("Bash", json!({ "command": long })),
+            None,
+            ROOMY,
+            None,
+        );
+        assert!(
+            cut.shortened && cut.text.ends_with("echo 40"),
+            "{}",
+            cut.text
+        );
+    }
+
+    #[test]
+    fn the_tile_icon_names_the_kind_of_action() {
+        let bash = request("Bash", json!({"command": "ls"}));
+        assert_eq!(glyph(&bash, None), IconName::Terminal);
+        assert_eq!(
+            glyph(&bash, Some(ApprovalRisk::DeletesFiles)),
+            IconName::Trash
+        );
+        assert_eq!(
+            glyph(&request("Edit", json!({"file_path": "a.rs"})), None),
+            IconName::FilePen
+        );
+        assert_eq!(
+            glyph(&request("mcp__linear__search", json!({})), None),
+            IconName::Plug
+        );
+        assert_eq!(
+            glyph(&request("WebFetch", json!({})), None),
+            IconName::Globe
+        );
+    }
+
+    #[test]
     fn edits_name_the_file_relative_to_the_project() {
         let mut ask = request("Edit", json!({"file_path": "/work/app/src/main.rs"}));
         ask.kind = ApprovalKind::FileChange {
@@ -355,7 +482,7 @@ mod tests {
         let row = scope_row(&scope, true, 80);
         assert_eq!(
             row.before,
-            "Always allow works once here — the command was shortened to fit"
+            "Allow in this thread works once here — the command was shortened to fit"
         );
         assert!(row.once);
     }
@@ -380,7 +507,7 @@ mod tests {
         let row = scope_row(&long, false, 80);
         assert_eq!(
             row.before,
-            "Always allow works once here — the rule was shortened to fit"
+            "Allow in this thread works once here — the rule was shortened to fit"
         );
         assert!(row.once);
 
@@ -402,7 +529,7 @@ mod tests {
         let exact = rules(vec!["touch notes.md".to_string()], RuleMeaning::Exact, true);
         assert_eq!(
             text(scope_row(&exact, false, 80)),
-            "Always allow remembers `touch notes.md` for this thread"
+            "Allow in this thread remembers `touch notes.md`"
         );
         let wildcard = rules(
             vec!["npm test *".to_string()],
@@ -411,7 +538,7 @@ mod tests {
         );
         assert_eq!(
             text(scope_row(&wildcard, false, 80)),
-            "Always allow remembers `npm test *` (any arguments) for this thread"
+            "Allow in this thread remembers `npm test *` (any arguments)"
         );
         // Outside Bash, `*` is a path or domain pattern, not "any arguments".
         let domains = rules(
@@ -421,7 +548,7 @@ mod tests {
         );
         assert_eq!(
             text(scope_row(&domains, false, 80)),
-            "Always allow remembers `domain:*.example.com` (a pattern) for this thread"
+            "Allow in this thread remembers `domain:*.example.com` (a pattern)"
         );
         assert_eq!(
             text(scope_row(
@@ -429,7 +556,7 @@ mod tests {
                 false,
                 80
             )),
-            "Always allow works once here — no safe rule for edits"
+            "Allow in this thread works once here — no safe rule for edits"
         );
         assert_eq!(
             text(scope_row(
@@ -437,10 +564,10 @@ mod tests {
                 false,
                 80
             )),
-            "Always allow works once here"
+            "Allow in this thread works once here"
         );
         // A long command is cut in its middle to keep the row to one line; the detail above
-        // shows it in full, so "Always allow" still remembers it.
+        // shows it in full, so "Allow in this thread" still remembers it.
         let command = format!("echo {}done", "x".repeat(200));
         let long = rules(vec![command.clone()], RuleMeaning::Exact, true);
         let row = scope_row(&long, false, 80);

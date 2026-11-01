@@ -462,6 +462,24 @@ fn f6_and_tab_traverse_without_editing_the_composer(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn a_clicked_answer_leaves_a_fading_card_that_blocks_nothing(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "dock-ghost", true);
+    cx.update(|_, cx| cx.set_reduce_motion(false));
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    click(cx, "once");
+    assert!(cx.update(|_, cx| chat.read(cx).dock_ghost.is_some()));
+    // The next request's own buttons still take the click through the fading card.
+    click(cx, "once");
+    wait_answers(cx, &path, 2).await;
+    cx.executor().advance_clock(crate::ui::EXIT_FADE);
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| chat.read(cx).dock_ghost.is_none()));
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
 async fn reply_copy_and_chrome_clicks_preserve_keyboard_behavior(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "click-focus", true);
     cx.simulate_input("two approvals");

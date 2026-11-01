@@ -16,16 +16,21 @@ gpui_kit::assets::icon_assets!(
         ChevronDown
     ]
 );
+gpui_kit::assets::icon_assets!(ApprovalIcons, [Trash, FilePen, Terminal, Plug]);
 pub struct AppAssets<T>(pub T);
 impl<T: AssetSource> AssetSource for AppAssets<T> {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some(data) = AppIcons.load(path)? {
             return Ok(Some(data));
         }
+        if let Some(data) = ApprovalIcons.load(path)? {
+            return Ok(Some(data));
+        }
         self.0.load(path)
     }
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut names = AppIcons.list(path)?;
+        names.extend(ApprovalIcons.list(path)?);
         names.extend(self.0.list(path)?);
         names.sort();
         names.dedup();
@@ -61,6 +66,10 @@ mod tests {
             IconName::Plus,
             IconName::RefreshCw,
             IconName::Shield,
+            IconName::Trash,
+            IconName::FilePen,
+            IconName::Terminal,
+            IconName::Plug,
             IconName::Square,
             IconName::SquareCheck,
             IconName::TriangleAlert,
