@@ -2011,6 +2011,7 @@ fn finish_quit_within(
     quitting: impl IntoIterator<Item = Quitting>,
     timeout: Duration,
 ) -> Result<(), QuitError> {
+    let quitting: Vec<_> = quitting.into_iter().collect();
     let flushed = store.flush(timeout);
     let mut thread_ids = Vec::new();
     for quitting in quitting {
@@ -2340,6 +2341,26 @@ mod tests {
             ]
         );
         assert!(!resume.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn quitting_flushes_writes_from_lazy_shutdowns() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).unwrap();
+        let database = rusqlite::Connection::open(store.path()).unwrap();
+        database.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let quitting = std::iter::once_with(|| {
+            store.set_unread("held", true);
+            Quitting {
+                thread_id: "held".to_string(),
+                stopping: vec![],
+            }
+        });
+
+        let result = finish_quit_within(&store, quitting, Duration::from_millis(50));
+        database.execute_batch("COMMIT;").unwrap();
+        assert!(store.flush(Duration::from_secs(5)));
+        assert_eq!(result, Err(QuitError::Unconfirmed));
     }
 
     #[test]
