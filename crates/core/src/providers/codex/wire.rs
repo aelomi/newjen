@@ -121,6 +121,8 @@ pub(super) struct Approval {
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub reason: Option<String>,
+    #[serde(rename = "commandActions")]
+    pub actions: Option<Value>,
     #[serde(default)]
     pub kind: CommandKind,
     #[serde(rename = "networkApprovalContext")]

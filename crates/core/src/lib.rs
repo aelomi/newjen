@@ -15,6 +15,7 @@
 //! the core can be tested headlessly.
 
 pub mod agent;
+mod approval_text;
 pub mod changes;
 pub mod edits;
 pub mod env;
@@ -32,8 +33,8 @@ pub mod transcript;
 pub mod usage;
 
 pub use agent::{
-    ApprovalIntent, ApprovalKey, ApprovalKind, ApprovalRequest, ApprovalView, GrantId,
-    GrantLifetime, GrantView, OnceReason, RememberScope, RuleMeaning, ToolDisposition,
+    ApprovalIntent, ApprovalKey, ApprovalKind, ApprovalRequest, ApprovalRisk, ApprovalView,
+    GrantId, GrantLifetime, GrantView, OnceReason, RememberScope, RuleMeaning, ToolDisposition,
 };
 pub use env::{Cli, find_cli, resolved_path};
 pub use session::{Conversation, Session, SessionConfig, SessionEvent};

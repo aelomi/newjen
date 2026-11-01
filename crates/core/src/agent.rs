@@ -144,6 +144,30 @@ pub enum RememberScope {
         shown_in_detail: bool,
     },
 }
+impl RememberScope {
+    pub fn can_remember(&self) -> bool {
+        matches!(self, Self::Rules { .. })
+    }
+}
+/// A short warning on an approval, only ever set when the request itself shows it. Variants run
+/// from most to least severe; a request that shows several carries the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ApprovalRisk {
+    DeletesFiles,
+    RewritesHistory,
+    OutsideProject,
+    UsesNetwork,
+}
+impl ApprovalRisk {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DeletesFiles => "Deletes files",
+            Self::RewritesHistory => "Rewrites history",
+            Self::OutsideProject => "Outside the project",
+            Self::UsesNetwork => "Uses the network",
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalKind {
     Command {
@@ -167,6 +191,8 @@ pub struct ApprovalView {
 pub struct ApprovalRequest {
     pub(crate) key: ApprovalKey,
     pub(crate) view: ApprovalView,
+    pub(crate) headline: String,
+    pub(crate) risk: Option<ApprovalRisk>,
 }
 impl ApprovalRequest {
     pub fn key(&self) -> ApprovalKey {
@@ -174,6 +200,14 @@ impl ApprovalRequest {
     }
     pub fn view(&self) -> &ApprovalView {
         &self.view
+    }
+    /// One plain sentence for the card ("Delete 3 files"). `view().question` stays the fixed
+    /// question for accessibility text.
+    pub fn headline(&self) -> &str {
+        &self.headline
+    }
+    pub fn risk(&self) -> Option<ApprovalRisk> {
+        self.risk
     }
 }
 #[derive(Debug)]

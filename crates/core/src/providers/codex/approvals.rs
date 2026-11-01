@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 use super::{CodecOutput, CodexCodec, wire::*};
 use crate::agent::*;
+use crate::approval_text;
 use crate::edits::{EditProposal, FileChange};
 
 #[derive(Debug)]
@@ -151,8 +152,11 @@ impl CodexCodec {
             namespace: self.namespace,
             serial: self.next_approval,
         };
+        let (headline, risk) = summary(&action, &approval, &tool, &self.cwd);
         let view = ApprovalRequest {
             key,
+            headline,
+            risk,
             view: ApprovalView {
                 tool: tool.clone(),
                 kind,
@@ -220,10 +224,142 @@ impl CodexCodec {
                 pending.view.view.kind = ApprovalKind::FileChange {
                     path: file_path(tool),
                 };
+                (pending.view.headline, pending.view.risk) =
+                    summary(&pending.action, &pending.approval, tool, &self.cwd);
             }
             out.event(AgentEvent::ApprovalUpdated(pending.view.clone()));
         }
     }
+}
+fn summary(
+    action: &Action,
+    approval: &Approval,
+    tool: &ToolDescriptor,
+    project: &std::path::Path,
+) -> (String, Option<ApprovalRisk>) {
+    match action {
+        Action::FileChange => file_change_summary(tool, project),
+        Action::Command(_) => {
+            let mut risk = approval.command.as_deref().and_then(|command| {
+                approval_text::command_risk(
+                    command,
+                    Some(project),
+                    approval.cwd.as_deref().map(std::path::Path::new),
+                )
+            });
+            if approval.network.is_some() {
+                risk = Some(risk.map_or(ApprovalRisk::UsesNetwork, |r| {
+                    r.min(ApprovalRisk::UsesNetwork)
+                }));
+            }
+            let headline = if matches!(approval.kind, CommandKind::WriteStdin) {
+                "Send input to a running command".to_string()
+            } else {
+                approval
+                    .actions
+                    .as_ref()
+                    .and_then(action_headline)
+                    .unwrap_or_else(|| approval_text::run_headline(approval.command.as_deref()))
+            };
+            (headline, risk)
+        }
+    }
+}
+/// A sentence from Codex's parsed `commandActions`, only when every action is the same known
+/// kind (read, search or list); anything else, including `unknown`, gets no sentence.
+fn action_headline(actions: &Value) -> Option<String> {
+    let actions = actions.as_array().filter(|actions| !actions.is_empty())?;
+    let kind = actions[0]["type"].as_str()?;
+    if actions
+        .iter()
+        .any(|action| action["type"].as_str() != Some(kind))
+    {
+        return None;
+    }
+    let text = |action: &Value, field: &str| {
+        action[field]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    match kind {
+        "read" => {
+            let mut names: Vec<String> = actions
+                .iter()
+                .filter_map(|action| {
+                    text(action, "name").or_else(|| {
+                        text(action, "path").and_then(|path| approval_text::file_name(&path))
+                    })
+                })
+                .collect();
+            names.sort();
+            names.dedup();
+            match names.as_slice() {
+                [] => Some("Read files".to_string()),
+                [name] => Some(format!("Read {name}")),
+                names => Some(format!("Read {} files", names.len())),
+            }
+        }
+        "search" => match actions.as_slice() {
+            [only] => Some(match text(only, "query") {
+                Some(query) => format!("Search for \"{query}\""),
+                None => "Search files".to_string(),
+            }),
+            _ => Some("Search files".to_string()),
+        },
+        "listFiles" | "list_files" => match actions.as_slice() {
+            [only] => Some(match text(only, "path").filter(|path| path != ".") {
+                Some(path) => format!(
+                    "List files in {}",
+                    approval_text::file_name(&path).unwrap_or(path)
+                ),
+                None => "List files".to_string(),
+            }),
+            _ => Some("List files".to_string()),
+        },
+        _ => None,
+    }
+}
+fn file_change_summary(
+    tool: &ToolDescriptor,
+    project: &std::path::Path,
+) -> (String, Option<ApprovalRisk>) {
+    let Some(changes) = tool.arguments.as_array().filter(|c| !c.is_empty()) else {
+        return ("Edit files".to_string(), None);
+    };
+    let kinds: Vec<&str> = changes
+        .iter()
+        .map(|change| change["kind"]["type"].as_str().unwrap_or("update"))
+        .collect();
+    let verb = |kind: &str| match kind {
+        "add" => "Create",
+        "delete" => "Delete",
+        _ => "Edit",
+    };
+    let headline = if let [change] = changes.as_slice() {
+        let file = change["path"]
+            .as_str()
+            .and_then(approval_text::file_name)
+            .unwrap_or_else(|| "a file".to_string());
+        format!("{} {file}", verb(kinds[0]))
+    } else if kinds.iter().all(|kind| *kind == kinds[0]) {
+        format!("{} {} files", verb(kinds[0]), changes.len())
+    } else {
+        format!("Change {} files", changes.len())
+    };
+    let risk = if kinds.contains(&"delete") {
+        Some(ApprovalRisk::DeletesFiles)
+    } else if changes.iter().any(|change| {
+        change["path"].as_str().is_some_and(|path| {
+            path.starts_with('/') && approval_text::is_outside(project, Some(project), path, None)
+        })
+    }) {
+        Some(ApprovalRisk::OutsideProject)
+    } else {
+        None
+    };
+    (headline, risk)
 }
 fn file_path(tool: &ToolDescriptor) -> Option<String> {
     tool.arguments

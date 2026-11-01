@@ -1,7 +1,8 @@
 use crate::agent::{
-    ApprovalIntent, ApprovalKey, ApprovalKind, ApprovalReply, ApprovalRequest, ApprovalView,
-    OnceReason, RememberScope, RuleMeaning,
+    ApprovalIntent, ApprovalKey, ApprovalKind, ApprovalReply, ApprovalRequest, ApprovalRisk,
+    ApprovalView, OnceReason, RememberScope, RuleMeaning,
 };
+use crate::approval_text;
 use crate::protocol::{self, PermissionAnswer, PermissionRequest, SessionScope};
 use crate::store::Grant;
 use std::collections::VecDeque;
@@ -57,9 +58,12 @@ impl Approvals {
             remembered,
             grants,
         });
+        let (headline, risk) = summary(request, cwd);
         ApprovalRequest {
             key,
             view: view(request, cwd),
+            headline,
+            risk,
         }
     }
     pub(super) fn cancel(&mut self, id: &str) -> Option<ApprovalKey> {
@@ -146,6 +150,67 @@ pub(crate) fn edit_proposal(
     }
     .unwrap_or(FileChange::Unavailable);
     Some(EditProposal { path, change })
+}
+
+fn summary(request: &PermissionRequest, cwd: Option<&Path>) -> (String, Option<ApprovalRisk>) {
+    let field = |name: &str| request.input.get(name).and_then(serde_json::Value::as_str);
+    let outside =
+        |raw: &str| cwd.is_some_and(|cwd| approval_text::is_outside(cwd, Some(cwd), raw, None));
+    let mut risk = request
+        .blocked_path
+        .as_deref()
+        .filter(|path| Path::new(path).is_absolute() && outside(path))
+        .map(|_| ApprovalRisk::OutsideProject);
+    let name = request.tool_name.as_str();
+    let headline = match name {
+        "Bash" => {
+            let command = field("command");
+            if let Some(found) =
+                command.and_then(|command| approval_text::command_risk(command, cwd, cwd))
+            {
+                risk = Some(risk.map_or(found, |current| current.min(found)));
+            }
+            request
+                .description
+                .as_deref()
+                .or_else(|| field("description"))
+                .and_then(approval_text::sentence)
+                .unwrap_or_else(|| approval_text::run_headline(command))
+        }
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+            let path = field("file_path").or_else(|| field("notebook_path"));
+            if path.is_some_and(outside) {
+                risk = Some(ApprovalRisk::OutsideProject);
+            }
+            let file = path.and_then(approval_text::file_name);
+            match (name, file) {
+                ("Write", Some(file)) => {
+                    let absent = path.is_some_and(|path| {
+                        let path = Path::new(path);
+                        let full = if path.is_absolute() {
+                            Some(path.to_path_buf())
+                        } else {
+                            cwd.map(|cwd| cwd.join(path))
+                        };
+                        full.is_some_and(|full| matches!(full.try_exists(), Ok(false)))
+                    });
+                    format!("{} {file}", if absent { "Create" } else { "Write" })
+                }
+                ("Write", None) => "Write a file".to_string(),
+                (_, Some(file)) => format!("Edit {file}"),
+                (_, None) => "Edit a file".to_string(),
+            }
+        }
+        "WebFetch" => match field("url").and_then(approval_text::host_of) {
+            Some(host) => format!("Open {host}"),
+            None => "Open a web page".to_string(),
+        },
+        _ => match approval_text::mcp_parts(name) {
+            Some((server, tool)) => format!("Use {server} {tool}"),
+            None => format!("Use {}", request.display_name),
+        },
+    };
+    (headline, risk)
 }
 
 fn view(request: &PermissionRequest, cwd: Option<&Path>) -> ApprovalView {
@@ -454,5 +519,211 @@ mod tests {
             None,
         );
         assert_eq!(mcp.view().question, "Allow Claude to use linear · search?");
+    }
+
+    fn requests_from_fixtures() -> Vec<PermissionRequest> {
+        let mut found = vec![];
+        for entry in
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).unwrap()
+        {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+            {
+                continue;
+            }
+            for line in std::fs::read_to_string(path).unwrap().lines() {
+                let line: serde_json::Value = serde_json::from_str(line).unwrap();
+                if line["dir"] != "out" {
+                    continue;
+                }
+                if let Incoming::PermissionRequest(request) =
+                    Incoming::from_value(line["msg"].clone())
+                {
+                    found.push(request);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn recorded_requests_get_a_sentence_from_claudes_description_and_no_invented_risk() {
+        let cwd = Path::new("/tmp/project");
+        let requests = requests_from_fixtures();
+        assert!(requests.len() >= 6);
+        let mut bash = 0;
+        for request in requests {
+            let mut approvals = Approvals::default();
+            let shown = approvals.request(&request, Some(cwd));
+            assert!(!shown.headline().is_empty());
+            assert_eq!(shown.risk(), None, "{}", shown.headline());
+            if request.tool_name == "Bash" {
+                bash += 1;
+                let description = request.description.as_deref().unwrap();
+                assert_eq!(
+                    shown.headline(),
+                    approval_text::sentence(description).unwrap()
+                );
+                assert!(shown.headline().starts_with(|c: char| c.is_uppercase()));
+            } else {
+                assert_eq!(request.tool_name, "Write");
+                assert!(
+                    ["Create a.txt", "Write a.txt"].contains(&shown.headline()),
+                    "{}",
+                    shown.headline()
+                );
+            }
+            assert!(shown.view().question.starts_with("Allow "));
+        }
+        assert!(bash >= 5);
+    }
+
+    fn headline(
+        tool: &str,
+        input: serde_json::Value,
+        cwd: Option<&Path>,
+    ) -> (String, Option<ApprovalRisk>) {
+        let shown = Approvals::default().request(&request("r1", tool, input), cwd);
+        (shown.headline().to_string(), shown.risk())
+    }
+
+    #[test]
+    fn claude_headlines_and_risks_by_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(cwd.join("old.rs"), "x").unwrap();
+        let on = Some(cwd);
+        let abs = |name: &str| cwd.join(name).display().to_string();
+        let cases: Vec<(&str, serde_json::Value, &str, Option<ApprovalRisk>)> = vec![
+            (
+                "Bash",
+                json!({"command":"rm -rf build", "description":"  delete the build folder.\nmore"}),
+                "Delete the build folder",
+                Some(ApprovalRisk::DeletesFiles),
+            ),
+            (
+                "Bash",
+                json!({"command":"cd sub && cargo test"}),
+                "Run cargo",
+                None,
+            ),
+            (
+                "Bash",
+                json!({"command":"git push --force", "description":"Force push"}),
+                "Force push",
+                Some(ApprovalRisk::RewritesHistory),
+            ),
+            (
+                "Bash",
+                json!({"command":"cat /etc/hosts"}),
+                "Run cat",
+                Some(ApprovalRisk::OutsideProject),
+            ),
+            (
+                "Bash",
+                json!({"command":"curl https://example.com"}),
+                "Run curl",
+                Some(ApprovalRisk::UsesNetwork),
+            ),
+            ("Bash", json!({"description":"."}), "Run a command", None),
+            (
+                "Edit",
+                json!({"file_path":abs("old.rs")}),
+                "Edit old.rs",
+                None,
+            ),
+            (
+                "MultiEdit",
+                json!({"file_path":"src/lib.rs"}),
+                "Edit lib.rs",
+                None,
+            ),
+            (
+                "NotebookEdit",
+                json!({"notebook_path":abs("n.ipynb")}),
+                "Edit n.ipynb",
+                None,
+            ),
+            ("Edit", json!({}), "Edit a file", None),
+            (
+                "Write",
+                json!({"file_path":abs("old.rs")}),
+                "Write old.rs",
+                None,
+            ),
+            (
+                "Write",
+                json!({"file_path":abs("new.rs")}),
+                "Create new.rs",
+                None,
+            ),
+            (
+                "Write",
+                json!({"file_path":"rel.rs"}),
+                "Create rel.rs",
+                None,
+            ),
+            ("Write", json!({}), "Write a file", None),
+            (
+                "Write",
+                json!({"file_path":"/etc/newjen-test-absent"}),
+                "Create newjen-test-absent",
+                Some(ApprovalRisk::OutsideProject),
+            ),
+            (
+                "Edit",
+                json!({"file_path":"../escape.rs"}),
+                "Edit escape.rs",
+                Some(ApprovalRisk::OutsideProject),
+            ),
+            (
+                "WebFetch",
+                json!({"url":"https://Docs.Example.com:8443/a?b=1"}),
+                "Open docs.example.com",
+                None,
+            ),
+            ("WebFetch", json!({"url":""}), "Open a web page", None),
+            (
+                "mcp__linear__list_issues",
+                json!({"query":"billing"}),
+                "Use linear list_issues",
+                None,
+            ),
+            ("Glob", json!({"pattern":"*.rs"}), "Use Glob", None),
+        ];
+        for (tool, input, expected, expected_risk) in cases {
+            assert_eq!(
+                headline(tool, input.clone(), on),
+                (expected.to_string(), expected_risk),
+                "{tool} {input}"
+            );
+        }
+        assert_eq!(
+            headline("Bash", json!({"command":"cat /etc/hosts"}), None).1,
+            None,
+            "no working directory, no outside tag"
+        );
+    }
+
+    #[test]
+    fn a_blocked_path_outside_the_working_directory_is_flagged() {
+        let mut ask = request("r1", "Bash", json!({"command":"touch a"}));
+        ask.blocked_path = Some("/srv/a".into());
+        let outside = Approvals::default().request(&ask, Some(Path::new("/work")));
+        assert_eq!(outside.risk(), Some(ApprovalRisk::OutsideProject));
+        ask.blocked_path = Some("/work/a".into());
+        let inside = Approvals::default().request(&ask, Some(Path::new("/work")));
+        assert_eq!(inside.risk(), None);
+    }
+
+    #[test]
+    fn the_session_button_follows_what_would_be_remembered() {
+        let mut approvals = Approvals::default();
+        let bash = approvals.request(&request("r1", "Bash", json!({"command":"touch a"})), None);
+        assert!(bash.view().remember.can_remember());
+        let edit = approvals.request(&request("r2", "Write", json!({"file_path":"a"})), None);
+        assert!(!edit.view().remember.can_remember());
     }
 }

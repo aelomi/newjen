@@ -76,7 +76,7 @@ pub(super) enum PendingRpc {
 pub struct CodexCodec {
     pub(super) state: CodexRuntime,
     config: AgentConfig,
-    cwd: PathBuf,
+    pub(super) cwd: PathBuf,
     resume: Option<String>,
     instructions: Option<String>,
     next_rpc: i64,

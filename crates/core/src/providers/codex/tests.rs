@@ -1390,3 +1390,236 @@ fn a_denial_note_is_kept_because_codex_decisions_carry_no_text() {
     assert_eq!(out.messages[0]["result"], json!({"decision":"decline"}));
     assert!(!out.messages[0].to_string().contains("message"));
 }
+
+fn pending(codec: &mut CodexCodec, extra: Value) -> (String, Option<ApprovalRisk>) {
+    let mut t = Transcript::new();
+    start(codec, &mut t);
+    ask(codec, &mut t, json!(1), true, extra);
+    let request = t.pending_approval().unwrap();
+    (request.headline().to_string(), request.risk())
+}
+
+#[test]
+fn recorded_command_approvals_say_what_runs_and_tag_nothing_invented() {
+    let mut seen = 0;
+    for name in ["read-only", "workspace-write", "runtime-command-accept"] {
+        let path = format!(
+            "{}/tests/fixtures/codex/{name}.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let line: Value = serde_json::from_str(line).unwrap();
+            if line["dir"] != "out"
+                || line["msg"]["method"] != "item/commandExecution/requestApproval"
+            {
+                continue;
+            }
+            let params = line["msg"]["params"].clone();
+            let command = params["command"].as_str().unwrap().to_string();
+            let inner = command
+                .strip_prefix("/bin/zsh -lc '")
+                .and_then(|rest| rest.strip_suffix('\''))
+                .unwrap_or(&command);
+            let program = inner.split(' ').next().unwrap();
+            let extra = json!({"command":params["command"],"cwd":"/tmp/newjen-codex-scratch","commandActions":params["commandActions"]});
+            let mut codec = ready();
+            let (headline, risk) = pending(&mut codec, extra);
+            assert_eq!(headline, format!("Run {program}"), "{command}");
+            assert_eq!(risk, None, "{command}");
+            seen += 1;
+        }
+    }
+    assert!(seen >= 5);
+}
+
+#[test]
+fn command_headlines_come_from_action_types_else_the_first_word() {
+    let read = |name: &str| json!({"type":"read","command":"cat","name":name,"path":format!("/work/src/{name}")});
+    let cases = [
+        (
+            json!({"command":"cat a.rs","commandActions":[read("a.rs")]}),
+            "Read a.rs",
+        ),
+        (
+            json!({"commandActions":[read("a.rs"), read("a.rs")]}),
+            "Read a.rs",
+        ),
+        (
+            json!({"commandActions":[read("a.rs"), read("b.rs")]}),
+            "Read 2 files",
+        ),
+        (
+            json!({"commandActions":[{"type":"read","path":"/work/x/c.rs"}]}),
+            "Read c.rs",
+        ),
+        (
+            json!({"commandActions":[{"type":"search","command":"rg","query":"fn main","path":null}]}),
+            "Search for \"fn main\"",
+        ),
+        (
+            json!({"commandActions":[{"type":"search","command":"rg","query":null}]}),
+            "Search files",
+        ),
+        (
+            json!({"commandActions":[{"type":"listFiles","command":"ls","path":"src/app"}]}),
+            "List files in app",
+        ),
+        (
+            json!({"commandActions":[{"type":"listFiles","command":"ls","path":null}]}),
+            "List files",
+        ),
+        (
+            json!({"commandActions":[read("a.rs"), {"type":"search","command":"rg","query":"x"}]}),
+            "Run touch",
+        ),
+        (
+            json!({"commandActions":[{"type":"unknown","command":"touch a"}]}),
+            "Run touch",
+        ),
+        (json!({"commandActions":[]}), "Run touch"),
+        (json!({"commandActions":"junk"}), "Run touch"),
+        (
+            json!({"command":"/bin/zsh -lc 'cd sub && cargo test'"}),
+            "Run cargo",
+        ),
+        (
+            json!({"kind":"writeStdin","command":null}),
+            "Send input to a running command",
+        ),
+        (json!({"command":null}), "Run a command"),
+    ];
+    for (extra, expected) in cases {
+        let mut codec = ready();
+        assert_eq!(pending(&mut codec, extra.clone()).0, expected, "{extra}");
+    }
+}
+
+#[test]
+fn command_risks_follow_the_command_and_codexs_network_context() {
+    let cases = [
+        (
+            json!({"command":"/bin/zsh -lc 'rm -rf build'"}),
+            Some(ApprovalRisk::DeletesFiles),
+        ),
+        (
+            json!({"command":"git reset --hard"}),
+            Some(ApprovalRisk::RewritesHistory),
+        ),
+        (
+            json!({"command":"cat /etc/hosts"}),
+            Some(ApprovalRisk::OutsideProject),
+        ),
+        (
+            json!({"command":"cat ../../x","cwd":"/tmp/newjen-codex-scratch/a"}),
+            Some(ApprovalRisk::OutsideProject),
+        ),
+        (
+            json!({"command":"cat ../x","cwd":"/tmp/newjen-codex-scratch/a"}),
+            None,
+        ),
+        (
+            json!({"command":"curl https://example.com"}),
+            Some(ApprovalRisk::UsesNetwork),
+        ),
+        (
+            json!({"command":"touch a","networkApprovalContext":{"host":"example.com"}}),
+            Some(ApprovalRisk::UsesNetwork),
+        ),
+        (
+            json!({"command":"rm a","networkApprovalContext":{"host":"example.com"}}),
+            Some(ApprovalRisk::DeletesFiles),
+        ),
+        (json!({"command":"touch a"}), None),
+    ];
+    for (extra, expected) in cases {
+        let mut codec = ready();
+        assert_eq!(pending(&mut codec, extra.clone()).1, expected, "{extra}");
+    }
+}
+
+#[test]
+fn file_change_headlines_and_risks_follow_the_changes_and_update_in_place() {
+    let mut c = ready();
+    let mut t = Transcript::new();
+    start(&mut c, &mut t);
+    ask(&mut c, &mut t, json!(1), false, json!({"grantRoot":"/"}));
+    let shown = |t: &Transcript| {
+        let request = t.pending_approval().unwrap();
+        (request.headline().to_string(), request.risk())
+    };
+    assert_eq!(shown(&t), ("Edit files".to_string(), None));
+    let update = |kind: &str, path: &str| json!({"path":path,"kind":{"type":kind,"move_path":null},"diff":"-a\n+b"});
+    let cases = [
+        (
+            json!([update("update", "/tmp/newjen-codex-scratch/a.rs")]),
+            "Edit a.rs",
+            None,
+        ),
+        (
+            json!([update("add", "/tmp/newjen-codex-scratch/new.rs")]),
+            "Create new.rs",
+            None,
+        ),
+        (
+            json!([update("delete", "/tmp/newjen-codex-scratch/old.rs")]),
+            "Delete old.rs",
+            Some(ApprovalRisk::DeletesFiles),
+        ),
+        (
+            json!([
+                update("update", "/tmp/newjen-codex-scratch/a"),
+                update("update", "/tmp/newjen-codex-scratch/b"),
+                update("update", "/tmp/newjen-codex-scratch/c")
+            ]),
+            "Edit 3 files",
+            None,
+        ),
+        (
+            json!([
+                update("add", "/tmp/newjen-codex-scratch/a"),
+                update("add", "/tmp/newjen-codex-scratch/b")
+            ]),
+            "Create 2 files",
+            None,
+        ),
+        (
+            json!([
+                update("add", "/tmp/newjen-codex-scratch/a"),
+                update("update", "/tmp/newjen-codex-scratch/b")
+            ]),
+            "Change 2 files",
+            None,
+        ),
+        (
+            json!([
+                update("update", "/tmp/newjen-codex-scratch/a"),
+                update("delete", "/tmp/newjen-codex-scratch/b")
+            ]),
+            "Change 2 files",
+            Some(ApprovalRisk::DeletesFiles),
+        ),
+        (
+            json!([update("update", "/etc/hosts")]),
+            "Edit hosts",
+            Some(ApprovalRisk::OutsideProject),
+        ),
+        (
+            json!([update("update", "/tmp/newjen-codex-scratch/src/a.rs")]),
+            "Edit a.rs",
+            None,
+        ),
+    ];
+    for (changes, headline, risk) in cases {
+        notification(
+            &mut c,
+            &mut t,
+            "item/fileChange/patchUpdated",
+            json!({"threadId":"thread","turnId":"turn","itemId":"tool","changes":changes}),
+        );
+        assert_eq!(shown(&t), (headline.to_string(), risk), "{changes}");
+        assert_eq!(
+            t.pending_approval().unwrap().view().question,
+            "Allow these file changes once?"
+        );
+    }
+}
