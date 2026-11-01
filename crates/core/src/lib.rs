@@ -27,6 +27,7 @@ pub mod protocol;
 pub mod providers;
 pub mod rift;
 pub mod session;
+pub mod steps;
 pub mod store;
 pub mod thread;
 pub mod transcript;

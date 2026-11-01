@@ -375,6 +375,11 @@ impl Transcript {
         self.session_id.as_deref()
     }
 
+    /// The folder tool summaries are shown relative to, once known.
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
+    }
+
     /// The model the CLI reported for this session.
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()

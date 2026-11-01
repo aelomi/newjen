@@ -784,7 +784,7 @@ fn recorded_ready(rows: &[Value], resume: Option<String>) -> (CodexCodec, Transc
     t.apply(&out.batch);
     (c, t)
 }
-fn replay(name: &str, turns: usize, decisions: usize, stops: usize) {
+fn replay(name: &str, turns: usize, decisions: usize, stops: usize) -> Transcript {
     let rows = fixture(name);
     let (mut c, mut t) = recorded_ready(&rows, None);
     let mut request_ids = std::collections::HashMap::<ValueKey, Value>::new();
@@ -917,6 +917,7 @@ fn replay(name: &str, turns: usize, decisions: usize, stops: usize) {
             ..
         }
     )));
+    t
 }
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ValueKey(String);
@@ -1622,4 +1623,57 @@ fn file_change_headlines_and_risks_follow_the_changes_and_update_in_place() {
             "Allow these file changes once?"
         );
     }
+}
+
+#[test]
+fn recorded_codex_turns_read_as_plain_english_steps() {
+    use crate::steps::{WorkState, activity_line, work_blocks};
+    let read_only = work_blocks(&replay("read-only", 9, 10, 2), None);
+    assert_eq!(read_only.len(), 9);
+    let labels = |blocks: &[crate::steps::WorkBlock]| -> Vec<String> {
+        blocks
+            .iter()
+            .flat_map(|block| block.steps.iter().map(|step| step.label.headline.clone()))
+            .collect()
+    };
+    let labels_read_only = labels(&read_only);
+    assert!(!labels_read_only.is_empty());
+    assert_eq!(
+        labels_read_only[..3],
+        [
+            "Ran touch once.txt",
+            "Run touch denied.txt",
+            "Run touch cancelled.txt"
+        ],
+        "{labels_read_only:?}"
+    );
+    assert!(
+        read_only
+            .iter()
+            .any(|block| block.state == WorkState::Stopped)
+    );
+
+    let transcript = replay("workspace-write", 2, 6, 0);
+    let blocks = work_blocks(&transcript, None);
+    assert_eq!(blocks.len(), 2);
+    let all = labels(&blocks);
+    assert!(
+        all.contains(&"Ran touch workspace.txt".to_string()),
+        "{all:?}"
+    );
+    assert!(
+        all.contains(&"Created patch-workspace.txt".to_string()),
+        "{all:?}"
+    );
+    let patch = blocks
+        .iter()
+        .flat_map(|block| &block.steps)
+        .find(|step| step.label.headline == "Created patch-workspace.txt")
+        .unwrap();
+    assert_eq!(patch.state, ToolState::Done);
+    assert_eq!(patch.label.detail, None);
+    assert!(matches!(
+        activity_line(&transcript).as_deref(),
+        Some("Answered")
+    ));
 }
