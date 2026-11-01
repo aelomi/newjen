@@ -8,6 +8,7 @@ use std::thread;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::changes::{self, ChangeSummary};
 use crate::rift::{Copy, Tools};
 
 pub const MAX_PATCH_BYTES: usize = 100_000;
@@ -138,6 +139,51 @@ pub fn review(tools: &Tools, cwd: &Path, base: &str) -> Result<Review> {
         patch,
         truncated: output.truncated,
     })
+}
+
+/// Per-file counts of everything the thread changed since `base`, up to the last snapshot. One
+/// read-only jj call whose output is counted as it streams, so a large diff costs no memory.
+pub fn changed_files(tools: &Tools, cwd: &Path, base: &str) -> Result<ChangeSummary> {
+    ensure!(
+        available(cwd),
+        "Landing currently requires a jj repository colocated with git"
+    );
+    validate_commit(base)?;
+    let from = format!("{base} & ::@");
+    let mut command = jj_command(tools, cwd);
+    command.args([
+        "diff",
+        "--ignore-working-copy",
+        "--git",
+        "--context",
+        "0",
+        "--from",
+        &from,
+        "--to",
+        "@",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Cannot start jj")?;
+    let out = child.stdout.take().expect("piped stdout");
+    let err = child.stderr.take().expect("piped stderr");
+    let stderr = thread::spawn(move || read_bounded(err, 16_000));
+    let counted = changes::count_git_diff(std::io::BufReader::new(out));
+    if counted.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let (stderr, _) = stderr
+        .join()
+        .map_err(|_| anyhow!("Command error reader failed"))??;
+    ensure!(
+        status.success(),
+        "jj failed: {}",
+        String::from_utf8_lossy(&stderr).trim()
+    );
+    Ok(counted?)
 }
 
 pub fn land_copy(

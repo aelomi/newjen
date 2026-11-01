@@ -14,6 +14,7 @@
 //! the core can be tested headlessly.
 
 pub mod agent;
+pub mod changes;
 pub mod edits;
 pub mod env;
 pub mod instance;

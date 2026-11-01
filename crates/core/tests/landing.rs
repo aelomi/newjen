@@ -680,3 +680,77 @@ fn landing_a_copy_after_the_project_rewrote_its_base_leaves_no_divergent_change(
     landing::cleanup_remote(&lab.tools, &repo, THREAD).unwrap();
     rift::remove(&lab.tools, &copy.source, &copy.path, &copy.rift_id).unwrap();
 }
+
+#[test]
+fn changed_files_counts_each_file_across_snapshots_without_touching_the_repo() {
+    use newjen_core::changes::ChangeKind;
+    let Some(lab) = Lab::new() else { return };
+    let repo = lab.repo();
+    std::fs::write(repo.join("gone.txt"), "x\ny\nz\n").unwrap();
+    std::fs::write(repo.join("moved.txt"), "1\n2\n3\n4\n").unwrap();
+    lab.jj(&repo, &["commit", "-m", "more base"]);
+    let base = landing::prepare_project(&lab.tools, &repo, THREAD).unwrap();
+    assert!(
+        landing::changed_files(&lab.tools, &repo, &base)
+            .unwrap()
+            .is_empty()
+    );
+
+    std::fs::write(repo.join("base.txt"), "base\nmore\nlines\n").unwrap();
+    std::fs::write(repo.join("new file.txt"), "a\nb\n").unwrap();
+    std::fs::write(repo.join("pic.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
+    std::fs::remove_file(repo.join("gone.txt")).unwrap();
+    lab.snap(&repo);
+    std::fs::rename(repo.join("moved.txt"), repo.join("renamed.txt")).unwrap();
+    std::fs::write(repo.join("new file.txt"), "a\nb\nc\n").unwrap();
+    lab.snap(&repo);
+
+    let operations = lab.jj(
+        &repo,
+        &[
+            "op",
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-T",
+            "id",
+        ],
+    );
+    let summary = landing::changed_files(&lab.tools, &repo, &base).unwrap();
+    assert_eq!(
+        operations,
+        lab.jj(
+            &repo,
+            &[
+                "op",
+                "log",
+                "--ignore-working-copy",
+                "--no-graph",
+                "-T",
+                "id"
+            ]
+        ),
+        "reading changes must not write an operation"
+    );
+    let got: Vec<_> = summary
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.kind, f.added, f.removed, f.binary))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("base.txt", ChangeKind::Modified, 2, 0, false),
+            ("gone.txt", ChangeKind::Deleted, 0, 3, false),
+            ("new file.txt", ChangeKind::Added, 3, 0, false),
+            ("pic.bin", ChangeKind::Added, 0, 0, true),
+            ("renamed.txt", ChangeKind::Renamed, 0, 0, false),
+        ]
+    );
+    assert_eq!(summary.files[4].old_path.as_deref(), Some("moved.txt"));
+    assert_eq!((summary.added(), summary.removed()), (5, 3));
+
+    let error = landing::changed_files(&lab.tools, &repo, &"1".repeat(40)).unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert!(landing::changed_files(&lab.tools, &repo, "not-a-commit").is_err());
+}
