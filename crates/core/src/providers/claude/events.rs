@@ -368,6 +368,9 @@ impl ClaudeEvents {
                     _ => crate::agent::RateLimitEvent::Updated(snapshot),
                 };
                 events.push(AgentEvent::RateLimit(limit));
+                if let Some(usage) = crate::usage::ProviderUsage::from_claude_rate_limit(info) {
+                    events.push(AgentEvent::ProviderUsage(usage));
+                }
                 if status == "rejected" {
                     self.finish();
                     events.push(AgentEvent::TurnFinished {

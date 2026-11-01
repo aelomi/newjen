@@ -669,6 +669,7 @@ impl Transcript {
         match event {
             AgentEvent::UsageUpdated(usage) => self.usage = Some(usage.clone()),
             AgentEvent::RateLimit(limit) => self.rate_limit = Some(limit.clone()),
+            AgentEvent::ProviderUsage(_) => {}
             AgentEvent::ToolOutput { id, update } => {
                 if let Some(Item::Tool { output, .. }) = self.find_tool_mut(id) {
                     match update {

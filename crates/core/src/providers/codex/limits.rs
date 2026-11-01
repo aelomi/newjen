@@ -58,6 +58,9 @@ impl CodexCodec {
             RateLimitEvent::Updated(snapshot)
         };
         out.event(AgentEvent::RateLimit(event));
+        out.event(AgentEvent::ProviderUsage(
+            crate::usage::ProviderUsage::from_codex_snapshot(&bucket, &limit),
+        ));
         if rejected {
             self.fail("Usage limit reached", "Codex reports a usage or spend limit. Reset information is shown when reported; nothing resumes automatically.", out);
         }

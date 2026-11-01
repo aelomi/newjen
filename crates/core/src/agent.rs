@@ -52,6 +52,7 @@ pub enum AgentEvent {
     },
     UsageUpdated(Usage),
     RateLimit(RateLimitEvent),
+    ProviderUsage(crate::usage::ProviderUsage),
     UserConfirmed,
     ConversationEstablished(String),
     ModelReported(String),

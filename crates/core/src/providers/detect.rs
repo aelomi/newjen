@@ -324,10 +324,12 @@ fn detect_at(
                 },
             }
         };
-    ProviderStatus {
+    let status = ProviderStatus {
         provider,
         availability,
-    }
+    };
+    crate::usage::record_status(&status);
+    status
 }
 
 fn command(binary: &PathBuf) -> Command {

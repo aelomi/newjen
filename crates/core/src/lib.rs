@@ -9,6 +9,7 @@
 //! - [`store`]: the SQLite database that keeps threads across relaunches.
 //! - [`orphans`]: cleans up `claude` processes left behind by a crash.
 //! - [`rift`]: makes and removes the Rift copies threads can work in.
+//! - [`usage`]: the latest plan and usage-window report each CLI gave.
 //!
 //! This crate must never depend on GPUI or GPUI Kit, so the UI layer could be replaced and
 //! the core can be tested headlessly.
@@ -28,6 +29,7 @@ pub mod session;
 pub mod store;
 pub mod thread;
 pub mod transcript;
+pub mod usage;
 
 pub use agent::{
     ApprovalIntent, ApprovalKey, ApprovalKind, ApprovalRequest, ApprovalView, GrantId,

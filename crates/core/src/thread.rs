@@ -1731,8 +1731,10 @@ impl Thread {
             )
         });
         for event in &batch.events {
-            if let crate::agent::AgentEvent::RateLimit(report) = event {
-                self.limit = Some(report.clone());
+            match event {
+                crate::agent::AgentEvent::RateLimit(report) => self.limit = Some(report.clone()),
+                crate::agent::AgentEvent::ProviderUsage(usage) => crate::usage::record(usage),
+                _ => {}
             }
         }
         self.transcript.apply(&batch);
