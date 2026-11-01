@@ -61,7 +61,7 @@ impl Provider {
     }
     fn install_hint(self) -> String {
         match self {
-            Self::Claude => "Install the Claude CLI: https://code.claude.com/docs/en/setup",
+            Self::Claude => "Install the `claude` CLI: https://code.claude.com/docs/en/setup",
             Self::Codex => "Install the Codex CLI: https://developers.openai.com/codex/cli/. Newjen never uses the copy bundled in the ChatGPT desktop app.",
         }.into()
     }

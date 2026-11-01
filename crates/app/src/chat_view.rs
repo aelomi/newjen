@@ -3065,7 +3065,7 @@ mod tests {
             "{}",
             notice.detail
         );
-        assert!(!notice.detail.contains("Install Claude Code"));
+        assert!(!notice.detail.contains("Install the `claude` CLI"));
     }
 
     fn failed(kind: io::ErrorKind) -> anyhow::Error {
@@ -3083,7 +3083,7 @@ mod tests {
             None,
         );
         assert!(missing.detail.contains("could not find `/opt/bin/claude`"));
-        assert!(missing.detail.contains("Install Claude Code"));
+        assert!(missing.detail.contains("Install the `claude` CLI"));
 
         let denied = spawn_notice(
             &failed(io::ErrorKind::PermissionDenied),
@@ -3092,7 +3092,7 @@ mod tests {
             None,
         );
         assert!(denied.detail.contains("not allowed to run"));
-        assert!(!denied.detail.contains("Install Claude Code"));
+        assert!(!denied.detail.contains("Install the `claude` CLI"));
 
         let other = spawn_notice(
             &failed(io::ErrorKind::OutOfMemory),
@@ -3105,7 +3105,7 @@ mod tests {
                 .detail
                 .starts_with("could not start `claude` in /work")
         );
-        assert!(!other.detail.contains("Install Claude Code"));
+        assert!(!other.detail.contains("Install the `claude` CLI"));
     }
 }
 

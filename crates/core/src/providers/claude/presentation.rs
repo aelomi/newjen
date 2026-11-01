@@ -160,7 +160,7 @@ impl Default for crate::agent::AgentPresentation {
             answer_failed: "Could not send your answer to Claude",
             stop_failed: "Could not stop Claude",
             start_failed: "Could not start Claude",
-            installation_hint: "Install Claude Code and run `claude` once in a terminal to log in, then try again. Set NEWJEN_CLAUDE to use another path.",
+            installation_hint: "Install the `claude` CLI: https://code.claude.com/docs/en/setup. Run `claude` in your terminal to log in, then try again. Set NEWJEN_CLAUDE to use another path.",
             unreachable_note: "Claude could not be reached.",
             send_detail_prefix: "Newjen could not send the message to the claude process",
             interrupt_title: "Claude didn't stop, so Newjen ended the session",
@@ -173,8 +173,6 @@ impl Default for crate::agent::AgentPresentation {
 
 #[cfg(test)]
 mod tests {
-    /// Newjen runs Claude Code but must not wear its name: the UI labels say "Claude". Only
-    /// the install hint names the product the user has to install.
     #[test]
     fn ui_labels_do_not_say_claude_code() {
         let p = crate::agent::AgentPresentation::default();
@@ -189,6 +187,7 @@ mod tests {
             p.answer_failed,
             p.stop_failed,
             p.start_failed,
+            p.installation_hint,
             p.unreachable_note,
             p.send_detail_prefix,
             p.interrupt_title,

@@ -124,8 +124,12 @@ fn not_installed_has_actionable_hints() {
             panic!("{status:?}")
         };
         assert!(hint.contains("https://"));
-        if provider == Provider::Codex {
-            assert!(hint.contains("desktop app"));
+        match provider {
+            Provider::Claude => {
+                assert!(hint.starts_with("Install the `claude` CLI"));
+                assert!(!hint.contains("Claude Code"));
+            }
+            Provider::Codex => assert!(hint.contains("desktop app")),
         }
     }
 }
