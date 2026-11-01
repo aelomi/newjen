@@ -1009,7 +1009,7 @@ fn turn_end(
         .into_any_element()
 }
 
-/// The quiet line under the approval dock saying what "Always allow" does, with the remembered
+/// The quiet line under the approval dock saying what "Allow in this thread" does, with the remembered
 /// rule in the mono font. Kept to one line (the rule is already cut to fit, see
 /// `approval::scope_row`), because the dock counts it as exactly one row.
 pub fn scope(row: &ScopeRow, cx: &App) -> AnyElement {

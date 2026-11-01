@@ -73,7 +73,7 @@ pub struct Bar {
     /// Set while the thread list is out of sight: the button that shows it, and whether
     /// another thread waits for an approval (an amber dot on the button).
     pub show_list: Option<(OnPress, bool)>,
-    /// The thread's "Always allow" rules.
+    /// The thread's "Allow in this thread" rules.
     pub grants: Vec<GrantView>,
     pub grants_detail: &'static str,
     pub pill: Option<Pill>,

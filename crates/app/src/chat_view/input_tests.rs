@@ -579,7 +579,7 @@ async fn the_new_thread_screen_centres_the_composer_and_a_working_thread_offers_
     assert!(cx.debug_bounds("stop").is_some());
     assert!(cx.debug_bounds("works-in").is_none());
     assert!(cx.debug_bounds("agent-picker").is_none());
-    assert_eq!(placeholder(cx), "Queue a follow-up…");
+    assert_eq!(placeholder(cx), "Claude is working…");
     finish(&chat, path, cx);
 }
 
@@ -2338,6 +2338,41 @@ fn the_review_shows_the_selected_file_only(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let shown = cx.update(|_, cx| chat.read(cx).review_shown(cx));
     assert_eq!(shown, Some((1, 2, vec!["b.toml".to_string()])));
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn the_project_chevron_opens_a_menu_with_the_landing_modes(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "project-menu", false);
+    cx.run_until_parked();
+    let landing =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| chat.read(cx).project.landing_mode);
+    assert_eq!(landing(cx), LandingMode::HarnessManaged);
+    click(cx, "project-menu");
+    cx.run_until_parked();
+    assert!(cx.update(|window, _| overlay_focused(window)));
+    cx.simulate_keystrokes("down down down enter");
+    cx.run_until_parked();
+    assert_eq!(landing(cx), LandingMode::AgentManaged);
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn a_dismissed_notification_note_stays_dismissed(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "attention-note", false);
+    assert!(cx.debug_bounds("attention-note").is_none());
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.set_attention_note(Some("Off"), cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("attention-note").is_some());
+    click(cx, "dismiss-attention-note");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("attention-note").is_none());
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.set_attention_note(Some("Off"), cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("attention-note").is_none());
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.set_attention_note(Some("Other"), cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("attention-note").is_some());
     finish(&chat, path, cx);
 }
 

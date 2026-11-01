@@ -14,7 +14,7 @@ use gpui::{
     SharedString, Styled, Window, div, prelude::*, px,
 };
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, list::ListItem};
@@ -470,8 +470,39 @@ pub struct ProjectBar {
     pub on_landing: OnLanding,
 }
 
-/// The project switcher and the new-thread button. A click on the project opens the chooser;
-/// a right click offers the project's landing setting.
+/// The project menu: the chooser, then the project's landing setting.
+fn project_menu(
+    menu: PopupMenu,
+    landing: LandingMode,
+    on_landing: &OnLanding,
+    chooser: &Option<OnPress>,
+) -> PopupMenu {
+    let harness = on_landing.clone();
+    let agent = on_landing.clone();
+    menu.min_w(MENU_WIDTH)
+        .when_some(chooser.clone(), |menu, chooser| {
+            menu.item(
+                PopupMenuItem::new("Switch project…")
+                    .on_click(move |_, window, cx| chooser(window, cx)),
+            )
+            .item(PopupMenuItem::separator())
+        })
+        .item(PopupMenuItem::label("Landing"))
+        .item(
+            PopupMenuItem::new(HARNESS_LANDING)
+                .checked(landing == LandingMode::HarnessManaged)
+                .on_click(move |_, window, cx| harness(LandingMode::HarnessManaged, window, cx)),
+        )
+        .item(
+            PopupMenuItem::new(AGENT_LANDING)
+                .checked(landing == LandingMode::AgentManaged)
+                .on_click(move |_, window, cx| agent(LandingMode::AgentManaged, window, cx)),
+        )
+}
+
+/// The project switcher and the new-thread button. A click on the project's name opens the
+/// chooser; the chevron beside it, and a right click on the name, open the project menu with
+/// the chooser and the project's landing setting.
 pub fn project_bar(bar: ProjectBar, cx: &App) -> AnyElement {
     let material = crate::theme::material(cx);
     let ProjectBar {
@@ -482,6 +513,8 @@ pub fn project_bar(bar: ProjectBar, cx: &App) -> AnyElement {
         on_landing,
     } = bar;
     let chooser = on_switch.clone();
+    let menu_landing = on_landing.clone();
+    let menu_chooser = on_switch.clone();
     let switcher = div()
         .id("switch-project")
         .debug_selector(|| "switch-project".to_string())
@@ -502,41 +535,13 @@ pub fn project_bar(bar: ProjectBar, cx: &App) -> AnyElement {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_base(),
         )
-        .child(ui::icon(
-            IconName::ChevronsUpDown,
-            gpui_kit::component::Size::Small,
-            material.glass_muted,
-        ))
         .when_some(on_switch, |row, chooser| {
             row.on_click(move |_, window, cx| chooser(window, cx))
         })
-        .context_menu(move |menu, _, _| {
-            let harness = on_landing.clone();
-            let agent = on_landing.clone();
-            let chooser = chooser.clone();
-            menu.min_w(MENU_WIDTH)
-                .item(PopupMenuItem::label("Landing"))
-                .item(
-                    PopupMenuItem::new(HARNESS_LANDING)
-                        .checked(landing == LandingMode::HarnessManaged)
-                        .on_click(move |_, window, cx| {
-                            harness(LandingMode::HarnessManaged, window, cx)
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new(AGENT_LANDING)
-                        .checked(landing == LandingMode::AgentManaged)
-                        .on_click(move |_, window, cx| {
-                            agent(LandingMode::AgentManaged, window, cx)
-                        }),
-                )
-                .when_some(chooser, |menu, chooser| {
-                    menu.item(PopupMenuItem::separator()).item(
-                        PopupMenuItem::new("Switch project…")
-                            .on_click(move |_, window, cx| chooser(window, cx)),
-                    )
-                })
-        });
+        .context_menu(move |menu, _, _| project_menu(menu, landing, &on_landing, &chooser));
+    let chevron = ui::icon_button("project-menu", IconName::ChevronsUpDown, "Project menu", cx)
+        .debug_selector(|| "project-menu".to_string())
+        .dropdown_menu(move |menu, _, _| project_menu(menu, landing, &menu_landing, &menu_chooser));
     h_flex()
         .flex_none()
         .items_center()
@@ -545,10 +550,34 @@ pub fn project_bar(bar: ProjectBar, cx: &App) -> AnyElement {
         .pt_1()
         .pb_2()
         .child(switcher)
+        .child(chevron)
         .child(
             ui::icon_button("new-thread", IconName::SquarePen, "New thread (⌘N)", cx)
                 .debug_selector(|| "new-thread".to_string())
                 .on_click(move |_, window, cx| on_new_thread(window, cx)),
+        )
+        .into_any_element()
+}
+
+/// A quiet line above the usage row saying why desktop notifications are off, with a button
+/// that hides it.
+pub fn attention_note(note: &'static str, on_dismiss: OnPress, cx: &App) -> AnyElement {
+    h_flex()
+        .id("attention-note")
+        .debug_selector(|| "attention-note".to_string())
+        .flex_none()
+        .items_start()
+        .gap_1()
+        .pl_2p5()
+        .pr_1()
+        .py_1p5()
+        .text_xs()
+        .text_color(crate::theme::material(cx).glass_muted)
+        .child(div().flex_1().min_w_0().child(note))
+        .child(
+            ui::icon_button("dismiss-attention-note", IconName::Close, "Dismiss", cx)
+                .debug_selector(|| "dismiss-attention-note".to_string())
+                .on_click(move |_, window, cx| on_dismiss(window, cx)),
         )
         .into_any_element()
 }

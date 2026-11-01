@@ -9,7 +9,8 @@ mod text;
 pub use button::{Look, Size, button, button_with_icon, icon_button};
 pub use chrome::{card, card_title_bar, glass_title_bar};
 pub use gpui_kit::assets::IconName;
-pub use monogram::{monogram, monogram_large};
+#[allow(unused_imports)]
+pub use monogram::{monogram, monogram_color, monogram_large};
 pub use status::{AgentState, Tone, agent_pill, status_badge};
 pub use text::{caption, ellipsis, key_caps, middle_ellipsis, title};
 

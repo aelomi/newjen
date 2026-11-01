@@ -568,7 +568,7 @@ impl ProjectView {
         self.sync_attention_note(cx);
     }
 
-    /// Tells every project's inbox why desktop notifications are off, when they are.
+    /// Tells every project's sidebar why desktop notifications are off, when they are.
     fn sync_attention_note(&mut self, cx: &mut Context<Self>) {
         let note = self
             .attention

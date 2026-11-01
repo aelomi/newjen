@@ -217,6 +217,8 @@ pub struct ChatView {
     /// Why desktop notifications cannot be shown, if they can't (`ProjectView` keeps it in
     /// step with the attention adapter).
     attention_note: Option<&'static str>,
+    /// The note the owner dismissed; a different note shows again.
+    attention_note_dismissed: Option<&'static str>,
     copy_peers: Vec<gpui::WeakEntity<ChatView>>,
     store: Store,
     project: Project,
@@ -310,6 +312,7 @@ impl ChatView {
             visible: true,
             panel: Panel::Thread,
             attention_note: None,
+            attention_note_dismissed: None,
             copy_peers: vec![],
             store,
             project,
@@ -1172,7 +1175,12 @@ impl ChatView {
                 .presentation()
                 .reply_placeholder
                 .to_string(),
-            Status::Working | Status::Waiting => "Queue a follow-up…".to_string(),
+            Status::Working | Status::Waiting => self
+                .thread()
+                .read(cx)
+                .presentation()
+                .working_placeholder
+                .to_string(),
             _ if empty => "Ask for a change…".to_string(),
             _ => self
                 .thread()
@@ -1555,7 +1563,7 @@ impl ChatView {
 
     /// Answers the pending approval. `request_id` is the request the button belonged to; a
     /// stale click (that request was already answered) does nothing. `rule_cut` says the dock
-    /// could not show the remembered rule in full (`ScopeRow::once`), so "Always allow" is sent
+    /// could not show the remembered rule in full (`ScopeRow::once`), so "Allow in this thread" is sent
     /// as allow once (see `sent_answer`).
     fn send_answer(
         &mut self,
@@ -1576,7 +1584,7 @@ impl ChatView {
             cx.notify();
             sent
         });
-        // No note after the click when "Always allow" acts once: the scope row under the dock
+        // No note after the click when "Allow in this thread" acts once: the scope row under the dock
         // already said so before the click.
         self.slots[self.active].notice = match sent {
             Ok(NoteDelivery::Delivered) => None,
@@ -2625,11 +2633,24 @@ impl ChatView {
                 let _ = view.update(cx, |view, cx| view.set_project_landing(mode, cx));
             }),
         };
+        let note = self
+            .attention_note
+            .filter(|note| self.attention_note_dismissed != Some(note));
+        let note = note.map(|note| {
+            let on_dismiss = self.press(cx, move |view, _, cx| {
+                view.attention_note_dismissed = Some(note);
+                cx.notify();
+            });
+            sidebar::attention_note(note, on_dismiss, cx)
+        });
         vec![
             sidebar::project_bar(bar, cx),
             sidebar::list_panel(&self.list_scroll, rows).into_any_element(),
-            self.usage.clone().into_any_element(),
         ]
+        .into_iter()
+        .chain(note)
+        .chain([self.usage.clone().into_any_element()])
+        .collect()
     }
 
     fn render_entries(
@@ -2917,8 +2938,9 @@ impl Render for ChatView {
     }
 }
 
-/// Whether a Kit menu or popover holds the keyboard (a row's "Archive thread", the "N allowed"
-/// list). Then Esc closes it, and ⌘↵ must not allow a request the user is not looking at.
+/// Whether a Kit menu or popover holds the keyboard (a row's "Archive thread", the "Allowed in
+/// this thread" list). Then Esc closes it, and ⌘↵ must not allow a request the user is not
+/// looking at.
 fn overlay_focused(window: &Window) -> bool {
     window
         .context_stack()
@@ -3144,7 +3166,7 @@ fn notice_after(sent: anyhow::Result<()>, failed: &str) -> Option<Notice> {
 }
 
 /// What to send for the user's `choice`. When the dock could not show the remembered rule in
-/// full (`rule_cut`), "Always allow" is sent as allow once: nothing is remembered that the user
+/// full (`rule_cut`), "Allow in this thread" is sent as allow once: nothing is remembered that the user
 /// could not read.
 fn sent_answer(choice: ApprovalIntent, rule_cut: bool) -> ApprovalIntent {
     match choice {

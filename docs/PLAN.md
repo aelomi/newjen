@@ -97,7 +97,7 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 - **⌘{ and ⌘} assume a US layout.** On layouts that type braces another way, previous/next thread may not fire.
 - **Reduce Motion is polled every second.** Listening for NSWorkspace's accessibility display options notification would apply it at once.
 - **One Newjen instance per data folder.** Startup takes an OS lock on the folder itself before opening the store or reaping processes. A second CLI launch forwards its project or activation request over a private, versioned Unix socket and exits quietly after the running window accepts it. Handoff has a bounded timeout. macOS file-open and reopen events use the same window. Only the lock holder owns and cleans up the socket, including after a crash. The lock releases on exit or crash; separate `NEWJEN_HOME` folders can run in parallel.
-- **Desktop notifications need an app bundle.** `cargo run` has no bundle id, so only the Dock badge works; the inbox says so. Authorization also failed on the development Mac even from a temporary bundle, so banners are unverified.
+- **Desktop notifications need an app bundle.** `cargo run` has no bundle id, so only the Dock badge works; a quiet line above the sidebar's usage row says so. Authorization also failed on the development Mac even from a temporary bundle, so banners are unverified.
 - **A Codex denial carries no note.** The typed note stays in the composer to send as a message.
 - **The terminal stops its shell with SIGKILL** on close, archive and quit; a bounded graceful stop is a follow-up. Detached daemons that ignore the PTY hangup can outlive a crash.
 

@@ -71,7 +71,7 @@ pub fn card_detail(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Style {
-    /// The inbox: `$ command`, the purpose under it, "Outside the project: <path>".
+    /// A plain list: `$ command`, the purpose under it, "Outside the project: <path>".
     Listed,
     /// The card: the command alone, "Outside the project: <path>".
     Card,

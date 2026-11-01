@@ -221,8 +221,8 @@ mod tests {
 
     #[test]
     fn an_open_popover_or_menu_keeps_its_keys() {
-        // The dock is up and the user opened the "N allowed" list (or a row's menu): Esc
-        // closes that, it never denies the request, and ⌘↵ allows nothing.
+        // The dock is up and the user opened the "Allowed in this thread" list (or a row's
+        // menu): Esc closes that, it never denies the request, and ⌘↵ allows nothing.
         for key in ["escape", "cmd-enter"] {
             assert_eq!(
                 key_route(&press(key, false), false, true, true),
