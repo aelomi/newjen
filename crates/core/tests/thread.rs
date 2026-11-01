@@ -1371,7 +1371,7 @@ fn a_repair_that_cannot_start_claude_marks_a_thread_off_screen_unread() {
     assert_eq!(thread.status(), Status::Failed);
     let errors = errors(&thread);
     assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].0, "Could not start Claude Code");
+    assert_eq!(errors[0].0, "Could not start Claude");
     assert!(
         thread.is_unread(),
         "the turn ended while the thread was not on screen"

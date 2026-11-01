@@ -3040,12 +3040,12 @@ mod tests {
     fn the_empty_state_says_where_claude_will_work() {
         assert_eq!(
             empty_caption(WorksIn::ProjectFolder, "~/Newjen", &Default::default()),
-            "Claude Code runs in ~/Newjen. You approve each tool call before it runs."
+            "Claude runs in ~/Newjen. You approve each tool call before it runs."
         );
         assert_eq!(
             empty_caption(WorksIn::RiftCopy, "~/Newjen", &Default::default()),
-            "Claude Code runs in a new Rift copy of ~/Newjen. You approve each tool call before \
-             it runs."
+            "Claude runs in a new Rift copy of ~/Newjen. You approve each tool call before it \
+             runs."
         );
     }
 
@@ -3057,7 +3057,7 @@ mod tests {
             &Default::default(),
             Some("~/.rifts/app/newjen-1a2b3c4d"),
         );
-        assert_eq!(notice.title, "Could not start Claude Code");
+        assert_eq!(notice.title, "Could not start Claude");
         assert!(
             notice
                 .detail

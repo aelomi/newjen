@@ -151,7 +151,7 @@ impl Default for crate::agent::AgentPresentation {
     fn default() -> Self {
         Self {
             label: "Claude",
-            executable_label: "Claude Code",
+            executable_label: "Claude",
             working_placeholder: "Claude is working…",
             reply_placeholder: "Reply to Claude…",
             empty_title: "What should Claude work on?",
@@ -159,7 +159,7 @@ impl Default for crate::agent::AgentPresentation {
             send_failed: "Could not reach Claude",
             answer_failed: "Could not send your answer to Claude",
             stop_failed: "Could not stop Claude",
-            start_failed: "Could not start Claude Code",
+            start_failed: "Could not start Claude",
             installation_hint: "Install Claude Code and run `claude` once in a terminal to log in, then try again. Set NEWJEN_CLAUDE to use another path.",
             unreachable_note: "Claude could not be reached.",
             send_detail_prefix: "Newjen could not send the message to the claude process",
@@ -168,5 +168,39 @@ impl Default for crate::agent::AgentPresentation {
             exit_title: "Claude exited",
             exited_tool_note: "Claude exited before this finished.",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Newjen runs Claude Code but must not wear its name: the UI labels say "Claude". Only
+    /// the install hint names the product the user has to install.
+    #[test]
+    fn ui_labels_do_not_say_claude_code() {
+        let p = crate::agent::AgentPresentation::default();
+        for label in [
+            p.label,
+            p.executable_label,
+            p.working_placeholder,
+            p.reply_placeholder,
+            p.empty_title,
+            p.grants_detail,
+            p.send_failed,
+            p.answer_failed,
+            p.stop_failed,
+            p.start_failed,
+            p.unreachable_note,
+            p.send_detail_prefix,
+            p.interrupt_title,
+            p.interrupt_detail,
+            p.exit_title,
+            p.exited_tool_note,
+        ] {
+            assert!(!label.contains("Claude Code"), "{label}");
+        }
+        assert!(
+            p.empty_caption("~/Newjen")
+                .starts_with("Claude runs in ~/Newjen")
+        );
     }
 }
