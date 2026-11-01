@@ -10,6 +10,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 publish = false
+license = "MIT"
 
 # Every dependency is pinned to an exact version (`=x.y.z`) so builds are reproducible.
 # Crates opt in with `name.workspace = true`. These versions match what GPUI Kit already
