@@ -122,16 +122,7 @@ impl NativeAttention {
                 kind,
             },
         );
-        if self
-            .authorization
-            .compare_exchange(
-                NOT_REQUESTED,
-                REQUESTING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
+        if begin_authorization(&self.authorization) {
             let authorization = self.authorization.clone();
             let completion = RcBlock::new(move |granted: Bool, error: *mut NSError| {
                 let state = if !error.is_null() {
@@ -215,6 +206,14 @@ impl Drop for NativeAttention {
             center.setDelegate(None);
         }
     }
+}
+
+fn begin_authorization(authorization: &AtomicU8) -> bool {
+    authorization
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            (state != REQUESTING).then_some(REQUESTING)
+        })
+        .is_ok()
 }
 
 fn badge_label(count: usize) -> Option<String> {
@@ -363,6 +362,26 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_authorization_rechecks_settled_results_and_coalesces_in_flight_requests() {
+        let authorization = AtomicU8::new(NOT_REQUESTED);
+        assert!(begin_authorization(&authorization));
+        assert!(!begin_authorization(&authorization));
+        for result in [DENIED, FAILED, AUTHORIZED] {
+            authorization.store(result, Ordering::Release);
+            assert!(begin_authorization(&authorization));
+            assert_eq!(authorization.load(Ordering::Acquire), REQUESTING);
+            assert!(!begin_authorization(&authorization));
+        }
+    }
+
+    #[test]
+    fn dock_badge_clears_at_zero() {
+        assert_eq!(badge_label(2).as_deref(), Some("2"));
+        assert_eq!(badge_label(1).as_deref(), Some("1"));
+        assert_eq!(badge_label(0), None);
+    }
 
     #[test]
     fn native_quit_waits_for_confirmation_and_coalesces_repeated_requests() {
