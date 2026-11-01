@@ -255,7 +255,7 @@ fn landing_instructions_reach_codex_as_developer_instructions_in_a_jj_repo() {
 }
 
 #[test]
-fn file_edits_are_once_only_even_when_always_allow_is_requested() {
+fn file_edits_are_once_only_even_when_allow_in_this_thread_is_requested() {
     let lab = Lab::new("edit-accept");
     let mut thread = lab.draft();
     thread.send("Edit once").unwrap();

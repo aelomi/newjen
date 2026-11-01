@@ -267,6 +267,9 @@ pub struct ChatView {
     /// How the thread on screen's items become rows: its turns' tool calls fold into work
     /// blocks (see `rows::Plan`).
     plan: rows::Plan,
+    /// What `plan` was built from: the thread, its transcript revision and, while a turn runs,
+    /// the whole seconds it has run.
+    plan_key: Option<(String, u64, Option<u64>)>,
     /// That approval's path outside the thread's folder, if any (`approval::outside_path`).
     /// Worked out once when the request reaches the dock, because it reads the disk and
     /// `render` runs on every streamed frame.
@@ -343,6 +346,7 @@ impl ChatView {
             changes: Default::default(),
             making_copy_shown: false,
             plan: rows::Plan::default(),
+            plan_key: None,
             dock_outside: None,
             keys_ready_at: None,
             _tasks: tasks,
@@ -2205,6 +2209,17 @@ impl ChatView {
     /// is rebuilt before each draw of the list.
     fn refresh_plan(&mut self, cx: &App) {
         let thread = self.slots[self.active].thread.read(cx);
+        let key = (
+            thread.id().to_string(),
+            thread.transcript().revision(),
+            thread
+                .turn_started_at()
+                .map(|started| started.elapsed().as_secs()),
+        );
+        if self.plan_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.plan_key = Some(key);
         self.plan.refresh(
             thread.id(),
             thread.transcript().items(),
@@ -2619,7 +2634,7 @@ impl ChatView {
         let groups = self.sidebar_groups(cx);
         let drafts: Vec<bool> = groups.iter().map(|(draft, _)| *draft).collect();
         let entries = sidebar::display_order(&groups);
-        let mut rows = self.render_entries(&entries, cx);
+        let mut rows = self.render_entries(&entries, &groups, cx);
         if sidebar::is_empty_list(&drafts) {
             rows.push(sidebar::empty_caption(cx));
         }
@@ -2656,6 +2671,7 @@ impl ChatView {
     fn render_entries(
         &self,
         entries: &[sidebar::Entry],
+        groups: &[(bool, SidebarGroup)],
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let now = Instant::now();
@@ -2665,7 +2681,10 @@ impl ChatView {
                 sidebar::Entry::Header { group, count } => {
                     Some(sidebar::section_header(group, count, cx))
                 }
-                sidebar::Entry::Thread(ix) => self.render_thread_row(ix, now, cx),
+                sidebar::Entry::Thread(ix) => {
+                    let group = groups.get(ix)?.1;
+                    self.render_thread_row(ix, group, now, cx)
+                }
             })
             .collect()
     }
@@ -2673,6 +2692,7 @@ impl ChatView {
     fn render_thread_row(
         &self,
         ix: usize,
+        group: SidebarGroup,
         now: Instant,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -2682,7 +2702,6 @@ impl ChatView {
             let thread = slot.thread.read(cx);
             let id = SharedString::from(thread.id().to_string());
             let draft = thread.is_draft();
-            let group = thread.sidebar_group(now_ms / 1000);
             let look = sidebar::row_look(&row_facts(thread, now), now_ms);
             let row = sidebar::Row {
                 id: id.clone(),
@@ -3190,7 +3209,7 @@ mod tests {
     use std::io;
 
     #[test]
-    fn always_allow_on_a_cut_rule_is_sent_as_allow_once() {
+    fn allow_in_this_thread_on_a_cut_rule_is_sent_as_allow_once() {
         let always = ApprovalIntent::AllowForSession;
         assert_eq!(sent_answer(always, true), ApprovalIntent::AllowOnce);
         // Shown in full: remembered as asked.

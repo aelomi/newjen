@@ -1,7 +1,7 @@
 //! Per-file change statistics for a thread: the exact ones from a jj diff (see
 //! [`crate::landing::changed_files`]) and a live estimate from the agent's edit tool calls.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead};
 use std::path::Path;
 
@@ -53,34 +53,100 @@ impl ChangeSummary {
 /// every line as added, `replace_all` counts one occurrence, and edits by shell commands are
 /// invisible. The jj result replaces it once the turn is snapshotted.
 pub fn estimate_from_items(items: &[Item], root: &Path) -> ChangeSummary {
-    let proposals: Vec<EditProposal> = items
+    let mut running = Estimate::default();
+    let fresh = running.unseen(items);
+    running.add(edit_stats(&fresh, root));
+    running.summary
+}
+
+/// An estimate that grows one finished edit tool call at a time, so a long thread is not
+/// counted again from the start whenever one more call finishes.
+#[derive(Debug, Clone, Default)]
+pub struct Estimate {
+    counted: HashSet<u64>,
+    merged: BTreeMap<String, FileStat>,
+    summary: ChangeSummary,
+}
+
+impl Estimate {
+    pub fn summary(&self) -> &ChangeSummary {
+        &self.summary
+    }
+
+    /// The finished edit tool calls among `items` that are not counted yet, copied so their
+    /// stats can be worked out away from the thread (see [`edit_stats`]).
+    pub fn unseen(&self, items: &[Item]) -> Vec<Item> {
+        items
+            .iter()
+            .filter(|item| is_finished_edit(item) && !self.counted.contains(&item.id()))
+            .cloned()
+            .collect()
+    }
+
+    pub fn add(&mut self, counted: Vec<(u64, Vec<FileStat>)>) {
+        for (id, stats) in counted {
+            if !self.counted.insert(id) {
+                continue;
+            }
+            for stat in stats {
+                match self.merged.get_mut(&stat.path) {
+                    Some(known) => merge(known, stat),
+                    None => {
+                        self.merged.insert(stat.path.clone(), stat);
+                    }
+                }
+            }
+        }
+        self.summary = ChangeSummary {
+            files: self.merged.values().cloned().collect(),
+        };
+    }
+}
+
+fn is_finished_edit(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Tool { name, state: ToolState::Done, .. }
+            if matches!(name.as_str(), "Write" | "Edit" | "MultiEdit" | "File change")
+    )
+}
+
+/// What each of `items` (from [`Estimate::unseen`]) changed, keyed by item id. Line counts
+/// diff the old and new text, which is slow for big edits: call this off the UI thread.
+pub fn edit_stats(items: &[Item], root: &Path) -> Vec<(u64, Vec<FileStat>)> {
+    items
         .iter()
-        .filter_map(|item| match item {
-            Item::Tool {
-                name,
-                input,
-                state: ToolState::Done,
-                ..
-            } => match name.as_str() {
-                "Write" | "Edit" | "MultiEdit" => {
-                    crate::providers::claude::edit_proposal(name, input, root)
-                }
-                "File change" => {
-                    let tool = crate::agent::ToolDescriptor {
-                        id: String::new(),
-                        name: name.clone(),
-                        display_name: String::new(),
-                        summary: String::new(),
-                        arguments: input.clone(),
-                    };
-                    Some(crate::providers::codex::edit_proposal(&tool, root))
-                }
+        .map(|item| {
+            let proposal = match item {
+                Item::Tool {
+                    name,
+                    input,
+                    state: ToolState::Done,
+                    ..
+                } => match name.as_str() {
+                    "Write" | "Edit" | "MultiEdit" => {
+                        crate::providers::claude::edit_proposal(name, input, root)
+                    }
+                    "File change" => {
+                        let tool = crate::agent::ToolDescriptor {
+                            id: String::new(),
+                            name: name.clone(),
+                            display_name: String::new(),
+                            summary: String::new(),
+                            arguments: input.clone(),
+                        };
+                        Some(crate::providers::codex::edit_proposal(&tool, root))
+                    }
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            };
+            let stats = proposal
+                .map(|proposal| proposal_stats(&proposal, root))
+                .unwrap_or_default();
+            (item.id(), stats)
         })
-        .collect();
-    estimate(&proposals, root)
+        .collect()
 }
 
 pub fn estimate<'a>(
@@ -537,6 +603,47 @@ mod tests {
             .map(|f| (f.path.as_str(), f.added, f.removed))
             .collect();
         assert_eq!(got, [("a.rs", 2, 1), ("c.txt", 2, 0), ("rel/w.txt", 3, 0)]);
+    }
+
+    #[test]
+    fn an_estimate_grows_by_the_calls_that_finished_since_and_counts_each_once() {
+        use serde_json::json;
+        let root = Path::new("/p");
+        let mut all = items(&[
+            (
+                "Edit",
+                json!({"file_path":"/p/a.rs","old_string":"a\n","new_string":"b\nc\n"}),
+                ToolState::Done,
+            ),
+            (
+                "Write",
+                json!({"file_path":"/p/w.txt","content":"1\n2\n"}),
+                ToolState::Running,
+            ),
+            (
+                "Edit",
+                json!({"file_path":"/p/a.rs","old_string":"x\n","new_string":"y\n"}),
+                ToolState::Done,
+            ),
+        ]);
+        let mut running = Estimate::default();
+        let fresh = running.unseen(&all);
+        assert_eq!(fresh.len(), 2, "the running write is not counted yet");
+        running.add(edit_stats(&fresh, root));
+        assert!(running.unseen(&all).is_empty());
+        let before = running.summary().clone();
+        running.add(edit_stats(&fresh, root));
+        assert_eq!(running.summary(), &before, "a call counts once");
+        assert_eq!((before.added(), before.removed()), (3, 2));
+
+        if let Item::Tool { state, .. } = &mut all[1] {
+            *state = ToolState::Done;
+        }
+        let fresh = running.unseen(&all);
+        assert_eq!(fresh.len(), 1);
+        running.add(edit_stats(&fresh, root));
+        assert_eq!(running.summary(), &estimate_from_items(&all, root));
+        assert_eq!(running.summary().files.len(), 2);
     }
 
     #[test]

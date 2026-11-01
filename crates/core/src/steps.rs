@@ -856,6 +856,10 @@ pub fn work_blocks(transcript: &Transcript, live_elapsed: Option<Duration>) -> V
 ///   or "Failed" when it did not finish;
 /// - `None` when nothing was ever sent.
 pub fn activity_line(transcript: &Transcript) -> Option<String> {
+    transcript.cached_line(|| compute_activity_line(transcript))
+}
+
+fn compute_activity_line(transcript: &Transcript) -> Option<String> {
     let cwd = transcript.cwd();
     match transcript.status() {
         Status::Waiting => Some(match transcript.pending_approval() {
@@ -882,14 +886,42 @@ pub fn activity_line(transcript: &Transcript) -> Option<String> {
     }
 }
 
+fn is_turn_end(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::TurnEnd { .. } | Item::Error { .. } | Item::Stopped { .. }
+    )
+}
+
+/// The last block `work_blocks` would return, built from the last turn alone: the scan goes
+/// back from the end only as far as that turn starts.
+fn last_work_block(transcript: &Transcript) -> Option<WorkBlock> {
+    let items = transcript.items();
+    let mut end = items.len();
+    while end > 0 {
+        let closed = is_turn_end(&items[end - 1]);
+        let before = if closed { end - 1 } else { end };
+        let start = items[..before]
+            .iter()
+            .rposition(is_turn_end)
+            .map_or(0, |ix| ix + 1);
+        let open_tail = end == items.len() && !closed;
+        if let Some(block) = work_block(transcript, start..end, None, open_tail) {
+            return Some(block);
+        }
+        end = start;
+    }
+    None
+}
+
 fn running_step(transcript: &Transcript) -> Option<String> {
-    let block = work_blocks(transcript, None).into_iter().next_back()?;
+    let block = last_work_block(transcript)?;
     let step = block.steps.last()?;
     (step.state == ToolState::Running).then(|| step.label.headline.clone())
 }
 
 fn outcome(transcript: &Transcript) -> Option<String> {
-    let block = work_blocks(transcript, None).into_iter().next_back()?;
+    let block = last_work_block(transcript)?;
     let items = &transcript.items()[block.turn.clone()];
     let replied = items
         .iter()
@@ -908,7 +940,7 @@ fn outcome(transcript: &Transcript) -> Option<String> {
 /// The group of the thread list a thread sits in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarGroup {
-    /// An approval to answer, a usage limit that stopped it, or a failure to look at.
+    /// An approval to answer, a usage limit that stopped it, or a failure not yet looked at.
     NeedsYou,
     /// A turn is running, a Rift copy is being made, or a background command runs.
     Working,
@@ -926,13 +958,15 @@ pub struct GroupFacts {
     /// The first message waits while a Rift copy is made or the project's base is recorded.
     pub preparing: bool,
     pub background_tasks: usize,
+    /// Something happened since the user last had the thread on screen.
+    pub unread: bool,
 }
 
 pub fn sidebar_group(facts: GroupFacts) -> SidebarGroup {
     let busy = facts.status.is_busy();
     if facts.approval_pending
         || facts.status == Status::Waiting
-        || facts.status == Status::Failed
+        || (facts.status == Status::Failed && facts.unread)
         || (facts.limit_paused && !busy)
     {
         SidebarGroup::NeedsYou
@@ -960,6 +994,7 @@ impl Thread {
             limit_paused: self.paused_until(now).is_some(),
             preparing: self.preparing().is_some(),
             background_tasks: self.background_tasks().len(),
+            unread: self.is_unread(),
         })
     }
 
@@ -1522,6 +1557,118 @@ mod tests {
         assert_eq!(work_blocks(&interrupted, None), finished);
     }
 
+    fn failed_turn(transcript: &mut Transcript) {
+        transcript.apply(&batch(vec![AgentEvent::TurnFinished {
+            outcome: TurnOutcome::Failed {
+                title: "Claude stopped".into(),
+                detail: "boom".into(),
+            },
+            duration_ms: None,
+            cost_usd: None,
+            forget_conversation: false,
+            queued: false,
+        }]));
+    }
+
+    #[test]
+    fn the_last_block_is_built_from_the_last_turn_alone() {
+        let same_as_full = |transcript: &Transcript| {
+            assert_eq!(
+                last_work_block(transcript),
+                work_blocks(transcript, None).into_iter().next_back(),
+                "{:?}",
+                transcript.items()
+            );
+        };
+        let mut transcript = Transcript::new();
+        same_as_full(&transcript);
+        transcript.push_user("one");
+        same_as_full(&transcript);
+        start(
+            &mut transcript,
+            tool("a", "Read", json!({"file_path": "a.rs"})),
+        );
+        same_as_full(&transcript);
+        finish(&mut transcript, "a", "ok");
+        end_turn(&mut transcript, 1000);
+        same_as_full(&transcript);
+        end_turn(&mut transcript, 5);
+        same_as_full(&transcript);
+        transcript.push_user("two");
+        start(&mut transcript, tool("b", "Bash", json!({"command": "ls"})));
+        same_as_full(&transcript);
+        finish(&mut transcript, "b", "x");
+        failed_turn(&mut transcript);
+        same_as_full(&transcript);
+        transcript.push_user("three");
+        same_as_full(&transcript);
+        start(
+            &mut transcript,
+            tool("c", "Bash", json!({"command": "pwd"})),
+        );
+        same_as_full(&transcript);
+        finish(&mut transcript, "c", "x");
+        end_turn(&mut transcript, 7);
+        same_as_full(&transcript);
+        transcript.normalize_after_relaunch();
+        same_as_full(&transcript);
+        assert_eq!(activity_line(&transcript).as_deref(), Some("Ran pwd"));
+    }
+
+    #[test]
+    fn the_scan_ignores_turns_before_the_last_one() {
+        let mut transcript = Transcript::new();
+        for turn in 0..50 {
+            transcript.push_user("go");
+            for call in 0..20 {
+                let id = format!("t{turn}-{call}");
+                start(&mut transcript, tool(&id, "Read", json!({"file_path": id})));
+                finish(&mut transcript, &id, "ok");
+            }
+            end_turn(&mut transcript, 10);
+        }
+        transcript.push_user("last");
+        start(&mut transcript, tool("z", "Bash", json!({"command": "ls"})));
+        let block = last_work_block(&transcript).unwrap();
+        assert_eq!(block.turn.len(), 2);
+        assert_eq!(block.step_count, 1);
+        assert_eq!(activity_line(&transcript).as_deref(), Some("Running ls"));
+    }
+
+    #[test]
+    fn the_cached_line_follows_every_change_to_the_transcript() {
+        let mut transcript = Transcript::new();
+        transcript.push_user("go");
+        let revision = transcript.revision();
+        assert_eq!(activity_line(&transcript), None);
+        assert_eq!(activity_line(&transcript), None);
+        assert_eq!(transcript.revision(), revision, "reading changes nothing");
+        start(
+            &mut transcript,
+            tool("a", "Bash", json!({"command": "make"})),
+        );
+        assert!(transcript.revision() > revision);
+        assert_eq!(activity_line(&transcript).as_deref(), Some("Running make"));
+        transcript.apply(&batch(vec![approval(
+            "a",
+            "Bash",
+            json!({"command": "make"}),
+        )]));
+        assert_eq!(transcript.status(), Status::Waiting);
+        assert_ne!(activity_line(&transcript).as_deref(), Some("Running make"));
+        let key = transcript.pending_approval().unwrap().key();
+        transcript.resolve_approval(key, crate::agent::ApprovalIntent::AllowOnce);
+        assert_eq!(transcript.status(), Status::Working);
+        assert_eq!(activity_line(&transcript).as_deref(), Some("Running make"));
+        finish(&mut transcript, "a", "ok");
+        end_turn(&mut transcript, 9);
+        assert_eq!(activity_line(&transcript).as_deref(), Some("Ran make"));
+        let clone = transcript.clone();
+        transcript.push_user("again");
+        assert_eq!(activity_line(&clone).as_deref(), Some("Ran make"));
+        assert_eq!(activity_line(&transcript), None);
+    }
+
     fn facts(status: Status) -> GroupFacts {
         GroupFacts {
             status,
@@ -1529,6 +1676,7 @@ mod tests {
             limit_paused: false,
             preparing: false,
             background_tasks: 0,
+            unread: false,
         }
     }
 
@@ -1541,7 +1689,21 @@ mod tests {
         assert_eq!(group(facts(Status::Stopped)), Done);
         assert_eq!(group(facts(Status::Working)), Working);
         assert_eq!(group(facts(Status::Waiting)), NeedsYou);
-        assert_eq!(group(facts(Status::Failed)), NeedsYou);
+        assert_eq!(
+            group(GroupFacts {
+                unread: true,
+                ..facts(Status::Failed)
+            }),
+            NeedsYou
+        );
+        assert_eq!(group(facts(Status::Failed)), Done);
+        assert_eq!(
+            group(GroupFacts {
+                unread: true,
+                ..facts(Status::Done)
+            }),
+            Done
+        );
         assert_eq!(
             group(GroupFacts {
                 approval_pending: true,
@@ -1580,9 +1742,17 @@ mod tests {
         assert_eq!(
             group(GroupFacts {
                 background_tasks: 1,
+                unread: true,
                 ..facts(Status::Failed)
             }),
             NeedsYou
+        );
+        assert_eq!(
+            group(GroupFacts {
+                background_tasks: 1,
+                ..facts(Status::Failed)
+            }),
+            Working
         );
     }
 }

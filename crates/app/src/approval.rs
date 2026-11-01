@@ -41,20 +41,13 @@ pub struct Detail {
     pub shortened: bool,
 }
 
-/// What will run: `$ <command>` for Bash (with Claude's stated purpose under it as a `#`
-/// comment), the file for edits, otherwise the arguments as compact JSON. Cut to `room`, so a
-/// huge command cannot push the buttons off screen. A long command keeps its first and last
-/// lines with the middle cut, so the end of the command (often the part that actually runs
-/// things) is always visible before you approve it. A last row warns about `outside`, the path
-/// from [`outside_path`] (passed in, so drawing a frame never touches the disk).
-#[cfg(test)]
-pub fn detail(request: &ApprovalView, outside: Option<&str>, room: Room) -> Detail {
-    detail_in(request, outside, room, Style::Listed)
-}
-
 /// The detail under the approval card's headline: the bare command (the purpose is the
-/// headline already) and, when the risk tag does not already say "Outside the project", a last
-/// row for the path outside it.
+/// headline already), the file for edits, otherwise the arguments as compact JSON. Cut to
+/// `room`, so a huge command cannot push the buttons off screen: a long command keeps its first
+/// and last lines with the middle cut, so the end of the command (often the part that actually
+/// runs things) is always visible before you approve it. When the risk tag does not already say
+/// "Outside the project", a last row warns about `outside`, the path from [`outside_path`]
+/// (passed in, so drawing a frame never touches the disk).
 pub fn card_detail(
     request: &ApprovalView,
     outside: Option<&str>,
@@ -71,8 +64,6 @@ pub fn card_detail(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Style {
-    /// A plain list: `$ command`, the purpose under it, "Outside the project: <path>".
-    Listed,
     /// The card: the command alone, "Outside the project: <path>".
     Card,
     /// The card, when its tag already says "Outside the project": just the path.
@@ -89,27 +80,13 @@ fn detail_in(request: &ApprovalView, outside: Option<&str>, room: Room, style: S
         .rows
         .saturating_sub(usize::from(outside.is_some()))
         .max(1);
-    let listed = style == Style::Listed;
     let (mut text, shortened) = if let ApprovalKind::Command {
         command: Some(command),
-        purpose,
+        ..
     } = &request.kind
     {
-        // The purpose gets one row, unless the room is so small the command needs it.
-        let purpose = purpose.as_deref().filter(|_| listed && rows >= 3);
-        let command_rows = rows - usize::from(purpose.is_some());
-        let full = if listed {
-            format!("$ {command}")
-        } else {
-            command.clone()
-        };
-        let mut text = fit_rows(&full, room.cols, command_rows);
-        // Only the command counts as shortened: the purpose is Claude's comment, not what runs.
-        let shortened = text != full;
-        if let Some(purpose) = purpose {
-            text.push('\n');
-            text.push_str(&fit_rows(&format!("# {purpose}"), room.cols, 1));
-        }
+        let text = fit_rows(command, room.cols, rows);
+        let shortened = text != *command;
         (text, shortened)
     } else {
         let specific = match &request.kind {
@@ -330,18 +307,19 @@ mod tests {
         }
     }
 
+    fn detail(request: &ApprovalView, outside: Option<&str>, room: Room) -> Detail {
+        card_detail(request, outside, room, None)
+    }
+
     #[test]
     fn bash_shows_the_command() {
         let ask = request("Bash", json!({"command": "ls -la", "description": "List"}));
         assert_eq!(title(&ask), "Allow Bash to run this command?");
-        assert_eq!(detail(&ask, None, ROOMY).text, "$ ls -la\n# List");
+        assert_eq!(detail(&ask, None, ROOMY).text, "ls -la");
 
         let mut described = request("Bash", json!({"command": "touch a.txt"}));
         purpose(&mut described, "Create an empty file".to_string());
-        assert_eq!(
-            detail(&described, None, ROOMY).text,
-            "$ touch a.txt\n# Create an empty file"
-        );
+        assert_eq!(detail(&described, None, ROOMY).text, "touch a.txt");
     }
 
     #[test]
@@ -439,7 +417,7 @@ mod tests {
         let ask = request("Bash", json!({ "command": command }));
         assert_eq!(
             detail(&ask, None, ROOMY).text,
-            "$ echo 1\necho 2\necho 3\n… 13 more lines …\necho 17\necho 18\necho 19\necho 20"
+            "echo 1\necho 2\necho 3\n… 13 more lines …\necho 17\necho 18\necho 19\necho 20"
         );
     }
 
@@ -459,13 +437,13 @@ mod tests {
         let room = Room { cols: 75, rows: 6 };
         let shown = detail(&ask, None, room).text;
         assert!(text_rows(&shown, room.cols) <= room.rows, "{shown}");
-        assert!(shown.starts_with("$ echo line 1 "), "{shown}");
-        // The line that does the damage and the purpose stay visible.
-        assert!(shown.contains("\nrm -rf build\n# Rebuild"), "{shown}");
+        assert!(shown.starts_with("echo line 1 "), "{shown}");
+        // The line that does the damage stays visible.
+        assert!(shown.ends_with("\nrm -rf build"), "{shown}");
     }
 
     #[test]
-    fn a_shortened_command_is_flagged_so_always_allow_acts_once() {
+    fn a_shortened_command_is_flagged_so_allow_in_this_thread_acts_once() {
         let ask = request("Bash", json!({"command": "touch notes.md"}));
         assert!(!detail(&ask, None, ROOMY).shortened);
         let long = (1..=40)
@@ -522,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn the_scope_row_says_what_always_allow_remembers() {
+    fn the_scope_row_says_what_allow_in_this_thread_remembers() {
         let text = |row: ScopeRow| {
             let code = row.code.map(|code| format!("`{code}`")).unwrap_or_default();
             format!("{}{code}{}", row.before, row.after)
@@ -597,12 +575,12 @@ mod tests {
         ask.affected_path = Some("/elsewhere/notes/new.txt".to_string());
         let outside = outside_path(&ask, &project);
         assert_eq!(outside.as_deref(), Some("/elsewhere/notes/new.txt"));
-        // `detail` itself only formats the path it is given: no disk access while drawing.
+        // `card_detail` itself only formats the path it is given: no disk access while drawing.
         assert_eq!(
             detail(&ask, outside.as_deref(), ROOMY).text,
-            "$ touch new.txt\nOutside the project: /elsewhere/notes/new.txt"
+            "touch new.txt\nOutside the project: /elsewhere/notes/new.txt"
         );
-        assert_eq!(detail(&ask, None, ROOMY).text, "$ touch new.txt");
+        assert_eq!(detail(&ask, None, ROOMY).text, "touch new.txt");
         let _ = std::fs::remove_dir_all(&raw);
     }
 }

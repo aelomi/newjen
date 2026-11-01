@@ -2,8 +2,9 @@
 //! touched, and the file rows the review pane reuses.
 //!
 //! While a turn runs the numbers are an estimate from the agent's edit tool calls (it never
-//! touches the folder). Once the turn is done and snapshotted they come from one read-only jj
-//! call, run off the UI thread. A failed call keeps the estimate.
+//! touches the folder), grown one finished call at a time and counted off the UI thread. Once
+//! the turn is done and snapshotted they come from one read-only jj call, also off the UI
+//! thread. A failed call keeps the estimate, marked as one, and is asked again a few times.
 
 use super::*;
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use gpui::{HighlightStyle, StyledText};
 use gpui_kit::base::motion::{Presence, Transition};
 use gpui_kit::component::diff::{DiffFile, DiffFileStatus};
 use gpui_kit::component::tooltip::Tooltip;
-use newjen_core::changes::{ChangeKind, ChangeSummary, FileStat, estimate_from_items};
+use newjen_core::changes::{ChangeKind, ChangeSummary, Estimate, FileStat, edit_stats};
 use newjen_core::landing;
 
 use crate::title_bar::ChangesToggle;
@@ -35,14 +36,21 @@ pub(super) struct ChangesCard {
     pub(super) on_screen: bool,
 }
 
+/// jj is asked again this many times for a transcript length it failed on.
+const ASKS: u8 = 3;
+const RETRY: Duration = Duration::from_secs(2);
+
 #[derive(Default)]
 struct Tracked {
-    estimate: ChangeSummary,
-    /// The count of finished tool calls the estimate was made from.
+    estimate: Estimate,
+    /// The count of finished tool calls the estimate was last brought up to.
     tools_done: Option<usize>,
+    estimating: bool,
     /// jj's answer and the transcript length it was asked at.
     exact: Option<(usize, ChangeSummary)>,
     asked: Option<usize>,
+    /// The transcript length jj last failed at, and how many times in a row.
+    failed: Option<(usize, u8)>,
     loading: bool,
 }
 
@@ -201,6 +209,29 @@ pub(super) fn counts(added: usize, removed: usize, binary: bool, cx: &App) -> An
         .into_any_element()
 }
 
+/// The card's totals; an estimate gets a muted "≈" before them and says why on hover.
+fn totals_label(added: usize, removed: usize, exact: bool, cx: &App) -> AnyElement {
+    let counted = counts(added, removed, false, cx);
+    if exact {
+        return counted;
+    }
+    h_flex()
+        .id("changes-estimate")
+        .flex_none()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().colors.muted_foreground)
+                .child("\u{2248}"),
+        )
+        .child(counted)
+        .tooltip(|window, cx| {
+            Tooltip::new("Estimated from the agent's edits; exact after the turn").build(window, cx)
+        })
+        .into_any_element()
+}
+
 /// A file's row: icon, name, the quiet folder, and the counts at the right edge.
 pub(super) fn file_row(
     id: impl Into<ElementId>,
@@ -251,17 +282,18 @@ pub(super) fn file_row(
 impl ChangesCard {
     /// What the card lists for `thread`: jj's answer while it is current, the estimate
     /// otherwise. Nothing once the work has landed.
-    fn summary(&self, thread: &Thread) -> Option<&ChangeSummary> {
+    /// The second value is false for an estimate.
+    fn summary(&self, thread: &Thread) -> Option<(&ChangeSummary, bool)> {
         if thread.landing_finished() {
             return None;
         }
         let tracked = self.threads.get(thread.id())?;
         let length = thread.transcript().items().len();
-        let summary = match &tracked.exact {
-            Some((asked, exact)) if *asked == length => exact,
-            _ => &tracked.estimate,
+        let (summary, exact) = match &tracked.exact {
+            Some((asked, exact)) if *asked == length => (exact, true),
+            _ => (tracked.estimate.summary(), false),
         };
-        (!summary.is_empty()).then_some(summary)
+        (!summary.is_empty()).then_some((summary, exact))
     }
 }
 
@@ -287,9 +319,25 @@ impl ChatView {
             })
             .count();
         let tracked = self.changes.threads.entry(id.clone()).or_default();
-        if tracked.tools_done != Some(done) {
-            tracked.estimate = estimate_from_items(items, thread.cwd());
+        if tracked.tools_done != Some(done) && !tracked.estimating {
             tracked.tools_done = Some(done);
+            let fresh = tracked.estimate.unseen(items);
+            if !fresh.is_empty() {
+                tracked.estimating = true;
+                let root = thread.cwd().to_path_buf();
+                let counted = cx.background_spawn(async move { edit_stats(&fresh, &root) });
+                let id = id.clone();
+                cx.spawn_in(window, async move |view, cx| {
+                    let counted = counted.await;
+                    let _ = view.update_in(cx, |view, _, cx| {
+                        let tracked = view.changes.threads.entry(id).or_default();
+                        tracked.estimate.add(counted);
+                        tracked.estimating = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
         }
         let quiet = !is_busy(thread.status())
             && thread.preparing().is_none()
@@ -309,14 +357,36 @@ impl ChatView {
         let task = cx.background_spawn(async move { landing::changed_files(&tools, &cwd, &base) });
         cx.spawn_in(window, async move |view, cx| {
             let result = task.await;
+            let mut retry = false;
             let _ = view.update_in(cx, |view, _, cx| {
-                let tracked = view.changes.threads.entry(id).or_default();
+                let tracked = view.changes.threads.entry(id.clone()).or_default();
                 tracked.loading = false;
-                if let Ok(summary) = result {
-                    tracked.exact = Some((length, summary));
+                match result {
+                    Ok(summary) => {
+                        tracked.exact = Some((length, summary));
+                        tracked.failed = None;
+                    }
+                    Err(_) => {
+                        let tries = match tracked.failed {
+                            Some((at, tries)) if at == length => tries + 1,
+                            _ => 1,
+                        };
+                        tracked.failed = Some((length, tries));
+                        retry = tries < ASKS;
+                    }
                 }
                 cx.notify();
             });
+            if retry {
+                cx.background_executor().timer(RETRY).await;
+                let _ = view.update_in(cx, |view, _, cx| {
+                    let tracked = view.changes.threads.entry(id).or_default();
+                    if tracked.asked == Some(length) {
+                        tracked.asked = None;
+                    }
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }
@@ -389,7 +459,8 @@ impl ChatView {
             return None;
         }
         let thread = self.thread().read(cx);
-        let summary = self.changes.summary(thread)?.clone();
+        let (summary, exact) = self.changes.summary(thread)?;
+        let summary = summary.clone();
         let working = is_busy(thread.status()) || thread.preparing().is_some();
         let fade = self
             .changes
@@ -403,7 +474,7 @@ impl ChatView {
         }
         self.changes.on_screen = true;
         let card = self
-            .changes_card(&summary, working, cx)
+            .changes_card(&summary, exact, working, cx)
             .opacity(sample.progress);
         Some((card.into_any_element(), CARD_WIDTH + f32::from(CARD_INSET)))
     }
@@ -411,6 +482,7 @@ impl ChatView {
     fn changes_card(
         &self,
         summary: &ChangeSummary,
+        exact: bool,
         working: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -475,7 +547,7 @@ impl ChatView {
                             .text_color(colors.muted_foreground)
                             .child(files_label(rows.len())),
                     )
-                    .child(counts(added, removed, false, cx)),
+                    .child(totals_label(added, removed, exact, cx)),
             )
             .child(list)
             .child(div().flex_none().p_2().child(review))

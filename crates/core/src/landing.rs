@@ -149,7 +149,7 @@ pub fn changed_files(tools: &Tools, cwd: &Path, base: &str) -> Result<ChangeSumm
         "Landing currently requires a jj repository colocated with git"
     );
     validate_commit(base)?;
-    let from = format!("{base} & ::@");
+    ensure_ancestor(tools, cwd, base, "@")?;
     let mut command = jj_command(tools, cwd);
     command.args([
         "diff",
@@ -158,7 +158,7 @@ pub fn changed_files(tools: &Tools, cwd: &Path, base: &str) -> Result<ChangeSumm
         "--context",
         "0",
         "--from",
-        &from,
+        base,
         "--to",
         "@",
     ]);

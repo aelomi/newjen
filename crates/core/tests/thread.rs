@@ -581,6 +581,26 @@ fn already_in_use_twice_shows_one_error_with_the_reason() {
     assert!(!thread.has_session());
 }
 
+#[test]
+fn a_failed_thread_needs_you_only_until_it_has_been_opened() {
+    use newjen_core::steps::SidebarGroup;
+    let fixture = Fixture::new();
+    fixture.switch("new_in_use", true);
+    fixture.switch("resume_in_use", true);
+    let mut thread = fixture.draft();
+    thread.send("hello").unwrap();
+    finish_turn(&mut thread);
+    assert_eq!(thread.status(), Status::Failed);
+    assert!(thread.is_unread());
+    assert_eq!(thread.sidebar_group(0), SidebarGroup::NeedsYou);
+    assert_eq!(thread.activity_line(0).as_deref(), Some("Failed"));
+
+    thread.set_active(true);
+    assert_eq!(thread.status(), Status::Failed);
+    assert_eq!(thread.sidebar_group(0), SidebarGroup::Done);
+    assert_eq!(thread.activity_line(0).as_deref(), Some("Failed"));
+}
+
 /// A thread from an earlier run whose conversation claude has already started.
 fn started_thread(fixture: &Fixture) -> Thread {
     let mut thread = fixture.draft();
@@ -870,7 +890,7 @@ fn a_denial_note_goes_to_claude_as_the_message_and_an_allow_ignores_it() {
 }
 
 #[test]
-fn always_allow_is_saved_and_given_to_every_later_claude_until_revoked() {
+fn allow_in_this_thread_is_saved_and_given_to_every_later_claude_until_revoked() {
     let fixture = Fixture::new();
     fixture.switch("ask", true);
     let mut thread = fixture.draft();
@@ -1924,7 +1944,7 @@ fn assert_background_stopped(fixture: &Fixture, thread: &Thread, status: Status)
     assert!(!kinds(&relaunched).contains(&"stopped"));
 }
 
-/// A thread with an "Always allow" grant whose last turn left `npm run dev` running.
+/// A thread with an "Allow in this thread" grant whose last turn left `npm run dev` running.
 fn thread_with_a_grant_and_a_background_task(fixture: &Fixture) -> Thread {
     fixture.switch("ask", true);
     fixture.switch("background", true);
@@ -2125,7 +2145,7 @@ fn archiving_mid_turn_saves_the_thread_as_stopped() {
 }
 
 #[test]
-fn always_allow_that_never_reaches_claude_saves_no_grant() {
+fn allow_in_this_thread_that_never_reaches_claude_saves_no_grant() {
     let fixture = Fixture::new();
     fixture.switch("ask", true);
     fixture.switch("exit_on_ask", true);

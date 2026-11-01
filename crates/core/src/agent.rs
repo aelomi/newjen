@@ -273,9 +273,6 @@ pub struct AgentPresentation {
     pub exited_tool_note: &'static str,
 }
 impl AgentPresentation {
-    pub fn new_thread_placeholder(&self, project: &str) -> String {
-        format!("Ask {} to work on {project}…", self.label)
-    }
     pub fn empty_caption(&self, project: &str) -> String {
         format!(
             "{} runs in {project}. You approve each tool call before it runs.",

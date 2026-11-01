@@ -1,4 +1,4 @@
-//! GPUI Kit components and Newjen’s approval card, tool card and pulse.
+//! GPUI Kit components and Newjen’s approval card and tool card.
 
 mod button;
 mod chrome;

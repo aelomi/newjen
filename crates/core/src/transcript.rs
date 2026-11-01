@@ -284,6 +284,9 @@ pub struct Transcript {
     /// The lowest index of `items` that changed since the last save (see
     /// [`Transcript::dirty_from`]). `None` when everything is saved.
     dirty_from: Option<usize>,
+    /// Goes up with every change, so what is derived from the transcript can be cached.
+    revision: u64,
+    line: std::cell::RefCell<Option<(u64, Option<String>)>>,
 }
 
 impl Default for Transcript {
@@ -310,7 +313,27 @@ impl Transcript {
             tool_started: HashMap::new(),
             stderr_tail: VecDeque::new(),
             dirty_from: None,
+            revision: 0,
+            line: std::cell::RefCell::new(None),
         }
+    }
+
+    /// A number that changes whenever the transcript does (items, status, approvals, background
+    /// tasks or working directory). Equal values mean nothing that is shown has changed.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// `compute()`'s result for the current [`Transcript::revision`], computed once per revision.
+    pub(crate) fn cached_line(&self, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+        if let Some((revision, line)) = &*self.line.borrow()
+            && *revision == self.revision
+        {
+            return line.clone();
+        }
+        let line = compute();
+        *self.line.borrow_mut() = Some((self.revision, line.clone()));
+        line
     }
 
     /// A transcript rebuilt from saved items and status (see `Thread::load`). Item ids are
@@ -345,10 +368,12 @@ impl Transcript {
 
     /// Shows file paths relative to `cwd` from now on (a thread that moved into its Rift copy).
     pub fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
+        self.revision += 1;
         self.cwd = Some(cwd.into());
     }
 
     pub(crate) fn set_presentation(&mut self, presentation: crate::agent::AgentPresentation) {
+        self.revision += 1;
         self.presentation = presentation;
     }
     pub fn presentation(&self) -> &crate::agent::AgentPresentation {
@@ -399,6 +424,7 @@ impl Transcript {
     /// Newjen stopped the claude running the background tasks, so they stopped with it: each
     /// one's tool card says so ([`BACKGROUND_STOPPED_NOTE`]) and the list is emptied.
     pub fn stop_background_tasks(&mut self) {
+        self.revision += 1;
         for ix in 0..self.items.len() {
             if let Item::Tool {
                 state,
@@ -436,12 +462,14 @@ impl Transcript {
     /// Records that the items from `position` on must be saved again, for example because the
     /// write that saved them failed (see `Thread::load` and `Store::write_errors`).
     pub fn mark_changed_from(&mut self, position: usize) {
+        self.revision += 1;
         // Never past the end: saving from the end still clears any stale rows after it.
         self.touch(position.min(self.items.len()));
     }
 
     /// Adds the user's prompt and marks the conversation as working.
     pub fn push_user(&mut self, text: &str) {
+        self.revision += 1;
         let id = self.new_id();
         self.push(Item::User {
             id,
@@ -501,6 +529,7 @@ impl Transcript {
     /// Adds the quiet row saying the conversation starts over here (see [`Item::FreshStart`]).
     /// A failure before it was the old conversation's, so the thread is Stopped, not Failed.
     pub fn push_fresh_start(&mut self) {
+        self.revision += 1;
         let id = self.new_id();
         self.push(Item::FreshStart { id });
         if self.status == Status::Failed {
@@ -511,6 +540,7 @@ impl Transcript {
     /// Adds the fresh-start row just before the user's last message, the one that starts the
     /// new conversation. Its id is a new one, so ids are unique but no longer in row order.
     pub fn insert_fresh_start_before_last_message(&mut self) {
+        self.revision += 1;
         let Some(position) = self
             .items
             .iter()
@@ -529,6 +559,7 @@ impl Transcript {
     /// Ends the turn with an error the app found itself (for example claude could not be
     /// started again), the same way a failed turn ends.
     pub fn fail(&mut self, title: &str, detail: String) {
+        self.revision += 1;
         self.finish_turn();
         self.close_unfinished_tools("The turn ended before this finished.");
         self.push_error(title, detail);
@@ -548,6 +579,7 @@ impl Transcript {
     ///
     /// Running it twice changes nothing the second time.
     pub fn normalize_after_relaunch(&mut self) {
+        self.revision += 1;
         let mut background_stopped = !self.background_tasks.is_empty();
         for ix in 0..self.items.len() {
             let changed = match &mut self.items[ix] {
@@ -605,6 +637,7 @@ impl Transcript {
         key: crate::agent::ApprovalKey,
         answer: crate::agent::ApprovalIntent,
     ) {
+        self.revision += 1;
         let Some(position) = self.pending.iter().position(|request| request.key() == key) else {
             return; // Already answered or dropped; nothing to do.
         };
@@ -634,6 +667,7 @@ impl Transcript {
 
     /// Applies one atomic batch from the agent adapter.
     pub fn apply(&mut self, batch: &AgentBatch) {
+        self.revision += 1;
         for event in &batch.events {
             self.apply_event(event);
         }
@@ -1037,6 +1071,7 @@ impl Transcript {
 
     /// Remembers that item `position` changed since the last save.
     fn touch(&mut self, position: usize) {
+        self.revision += 1;
         self.dirty_from = Some(self.dirty_from.map_or(position, |from| from.min(position)));
     }
 

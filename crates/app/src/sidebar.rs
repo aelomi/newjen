@@ -306,7 +306,7 @@ pub fn mark(group: SidebarGroup, look: &RowLook, draft: bool) -> Mark {
         return Mark::Draft;
     }
     match group {
-        SidebarGroup::NeedsYou if look.dot == Dot::Failed => Mark::Failed,
+        SidebarGroup::NeedsYou | SidebarGroup::Done if look.dot == Dot::Failed => Mark::Failed,
         SidebarGroup::NeedsYou => Mark::Attention,
         SidebarGroup::Working => Mark::Working,
         SidebarGroup::Done => Mark::Done,
@@ -1127,6 +1127,7 @@ mod tests {
         );
         let done = row_look(&facts(Status::Done), NOW);
         assert_eq!(mark(NeedsYou, &failed, false), Mark::Failed);
+        assert_eq!(mark(Done, &failed, false), Mark::Failed);
         assert_eq!(mark(NeedsYou, &done, false), Mark::Attention);
         assert_eq!(mark(Working, &done, false), Mark::Working);
         assert_eq!(mark(Done, &done, false), Mark::Done);
