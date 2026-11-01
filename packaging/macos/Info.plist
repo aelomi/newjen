@@ -15,6 +15,15 @@
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>Folder</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>None</string>
+            <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+        </dict>
+    </array>
     <key>NSDesktopFolderUsageDescription</key><string>Newjen opens projects and runs your chosen tools in your Desktop folder.</string>
     <key>NSDocumentsFolderUsageDescription</key><string>Newjen opens projects and runs your chosen tools in your Documents folder.</string>
     <key>NSDownloadsFolderUsageDescription</key><string>Newjen opens projects and runs your chosen tools in your Downloads folder.</string>
