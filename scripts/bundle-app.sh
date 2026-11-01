@@ -36,7 +36,15 @@ cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :NewjenReleaseVersion $version" "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 mkdir "$stage/Newjen.iconset"
-xcrun swift packaging/macos/icon.swift "$stage/Newjen.iconset"
+for points in 16 32 128 256 512; do
+    for scale in 1 2; do
+        pixels=$((points * scale))
+        suffix=''
+        [[ $scale == 1 ]] || suffix='@2x'
+        sips -z "$pixels" "$pixels" packaging/macos/icon.png \
+            --out "$stage/Newjen.iconset/icon_${points}x${points}${suffix}.png" >/dev/null
+    done
+done
 iconutil -c icns "$stage/Newjen.iconset" -o "$app/Contents/Resources/Newjen.icns"
 cp crates/app/THIRD-PARTY-NOTICES.md "$app/Contents/Resources/"
 printf 'APPL????' > "$app/Contents/PkgInfo"
