@@ -1272,9 +1272,12 @@ fn provider_menu_fits_the_smallest_window_and_keeps_refresh_visible(cx: &mut Tes
 async fn hidden_project_events_keep_the_other_projects_focus_and_unread(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "hidden-project", true);
     cx.simulate_input("approval after hiding the project");
-    cx.simulate_keystrokes("enter");
     let other_focus = cx.update(|window, cx| {
-        chat.update(cx, |view, cx| view.set_visible(false, window, cx));
+        chat.update(cx, |view, cx| {
+            view.send(window, cx);
+            assert_eq!(view.composer_text(0, cx), "");
+            view.set_visible(false, window, cx);
+        });
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         focus
@@ -1998,8 +2001,16 @@ fn setup_codex<'a>(
 async fn a_kept_denial_note_follows_the_composer_draft(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup_codex(cx, "codex-kept-note", "runtime-command-decline.jsonl");
     cx.simulate_input("Do the command");
-    cx.simulate_keystrokes("enter");
-    cx.simulate_input("my half-written follow-up");
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.send(window, cx);
+            assert_eq!(view.composer_text(0, cx), "");
+            let field = view.ensure_field(window, cx);
+            field.update(cx, |field, cx| {
+                field.set_value("my half-written follow-up", window, cx)
+            });
+        })
+    });
     pending(&chat, cx).await;
     assert_eq!(
         cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
