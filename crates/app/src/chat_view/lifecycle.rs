@@ -53,19 +53,38 @@ impl QuitBlockers {
         self.terminals += other.terminals;
     }
 
-    pub fn detail(&self) -> String {
-        format!(
-            "Working threads: {}\nThreads waiting for approval: {}\nAgent background tasks: \
-             {}\nRift copies and projects being prepared: {}\njj snapshots being saved: \
-             {}\nOpen terminals: {}\n\nQuitting stops every agent and terminal. Unanswered \
-             approvals expire. You can continue threads manually next time.",
-            self.working,
-            self.waiting,
-            self.background,
-            self.preparing,
-            self.snapshots,
-            self.terminals
-        )
+    /// What quitting stops besides the threads' turns, one plain sentence each.
+    pub fn notes(&self) -> Vec<String> {
+        let count = |count: usize, one: &str, many: &str| match count {
+            0 => None,
+            1 => Some(one.to_string()),
+            _ => Some(many.replace("{}", &count.to_string())),
+        };
+        [
+            count(
+                self.preparing,
+                "A Rift copy is still being made.",
+                "{} Rift copies are still being made.",
+            ),
+            count(
+                self.snapshots,
+                "A jj snapshot is still being saved.",
+                "{} jj snapshots are still being saved.",
+            ),
+            count(
+                self.background,
+                "1 background task will stop.",
+                "{} background tasks will stop.",
+            ),
+            count(
+                self.terminals,
+                "1 open terminal will close.",
+                "{} open terminals will close.",
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 }
 
@@ -138,6 +157,25 @@ impl ChatView {
             );
         }
         blockers
+    }
+
+    /// The title and the line of what each thread that quitting would stop mid-task is doing.
+    pub fn busy_threads(&self, cx: &App) -> Vec<(String, String)> {
+        let now = now_ms() / 1000;
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                let thread = slot.thread.read(cx);
+                matches!(thread.status(), Status::Working | Status::Waiting).then(|| {
+                    (
+                        thread.title().to_string(),
+                        thread
+                            .activity_line(now)
+                            .unwrap_or_else(|| "Working".to_string()),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Row `ix`'s thread changed: keeps its inbox row's facts in step and reports the
@@ -238,10 +276,14 @@ mod attention_tests {
             snapshots: 1,
             ..Default::default()
         });
-        let detail = total.detail();
-        assert!(detail.contains("Working threads: 1\n"), "{detail}");
-        assert!(detail.contains("jj snapshots being saved: 1\n"), "{detail}");
-        assert!(detail.contains("Open terminals: 2\n"), "{detail}");
+        assert_eq!(
+            total.notes(),
+            [
+                "A jj snapshot is still being saved.",
+                "2 open terminals will close."
+            ]
+        );
+        assert!(QuitBlockers::default().notes().is_empty());
         assert!(!QuitBlockers::default().any());
     }
 }

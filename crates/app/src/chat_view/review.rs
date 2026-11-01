@@ -3,6 +3,7 @@ use super::*;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::DropdownButton;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
+use gpui_kit::component::menu::PopupMenuItem;
 use newjen_core::edits::{EditPreview, ReadEdit};
 use newjen_core::landing::{self, Integration, LandingMode, Review};
 

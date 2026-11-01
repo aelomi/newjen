@@ -33,10 +33,9 @@ use gpui::{
 };
 use gpui_kit::base::input::{InputAccessibility, TextareaState};
 use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{Side, WindowExt as _};
 use newjen_core::agent::NoteDelivery;
 use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
@@ -1193,17 +1192,8 @@ impl ChatView {
                 .presentation()
                 .reply_placeholder
                 .to_string(),
-            Status::Working | Status::Waiting => self
-                .thread()
-                .read(cx)
-                .presentation()
-                .working_placeholder
-                .to_string(),
-            _ if empty => self
-                .thread()
-                .read(cx)
-                .presentation()
-                .new_thread_placeholder(&self.project_label),
+            Status::Working | Status::Waiting => "Queue a follow-up…".to_string(),
+            _ if empty => "Ask for a change…".to_string(),
             _ => self
                 .thread()
                 .read(cx)
@@ -2114,8 +2104,9 @@ impl ChatView {
         title_bar::render(bar, grants, window, cx)
     }
 
-    fn render_empty_state(&self, cx: &App) -> impl IntoElement {
-        let works_in = self.thread().read(cx).works_in();
+    /// The new-thread screen: the heading and the composer, centred together. `composer` is
+    /// `None` when a dock sits where the composer would.
+    fn render_empty_state(&self, composer: Option<AnyElement>, cx: &App) -> impl IntoElement {
         let no_agent = self.picker.checked.is_some()
             && !self
                 .picker
@@ -2127,26 +2118,28 @@ impl ChatView {
             .min_h_0()
             .items_center()
             .justify_center()
-            .gap_2()
-            .px_4()
+            .gap_4()
+            .px(px(DOCK_METRICS.page_padding))
             .child(ui::title(
-                if no_agent { "Install an agent to start" } else { self.thread().read(cx).presentation().empty_title },
+                if no_agent {
+                    "Install an agent to start"
+                } else {
+                    self.thread().read(cx).presentation().empty_title
+                },
                 cx,
             ))
-            .child(
-                // Centered and kept to the column, so a long path wraps under the title.
-                div().max_w(COLUMN_WIDTH).text_center().child(
-                    ui::caption(
-                        if no_agent { "Newjen drives the Claude or Codex CLI installed and signed in on this Mac with your own account. Install one, then Refresh.".into() } else { empty_caption(
-                            works_in,
-                            &self.project_label,
-                            self.thread().read(cx).presentation(),
-                        ) },
-                        cx,
-                    )
-                    .text_base(),
-                ),
-            )
+            .when(no_agent, |column| {
+                column.child(
+                    div().max_w(COLUMN_WIDTH).text_center().child(
+                        ui::caption(
+                            "Newjen drives the Claude or Codex CLI installed and signed in on this Mac with your own account. Install one, then Refresh.",
+                            cx,
+                        )
+                        .text_base(),
+                    ),
+                )
+            })
+            .children(composer)
     }
 
     fn render_messages(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2403,20 +2396,11 @@ impl ChatView {
         } else {
             ui::Footer::Send(self.press(cx, |view, window, cx| view.send(window, cx)))
         };
-        let focus = field.read(cx).focus_handle(cx);
-        let picker = if let Some(works_in) = choosing {
-            Some(
-                h_flex()
-                    .gap_1()
-                    .min_w_0()
-                    .child(self.render_works_in(
-                        works_in,
-                        focus,
-                        window.viewport_size().width < px(760.),
-                        cx,
-                    ))
-                    .child(self.render_agent_chips(window, cx))
-                    .into_any_element(),
+        let compact = window.viewport_size().width < px(760.);
+        let (chips, works_in) = if let Some(works_in) = choosing {
+            (
+                self.render_agent_chips(window, cx),
+                Some(self.render_works_in(works_in, compact, cx)),
             )
         } else {
             let thread = self.thread().read(cx);
@@ -2427,72 +2411,53 @@ impl ChatView {
                     .iter()
                     .find(|s| s.provider == a.provider)
             });
-            Some(
-                h_flex()
-                    .min_w_0()
-                    .gap_1()
-                    .when(newjen_core::picker::is_fast(config), |r| {
-                        r.child(ui::icon(
-                            ui::IconName::Zap,
-                            gpui_kit::component::Size::Small,
-                            cx.theme().warning,
-                        ))
-                    })
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(newjen_core::picker::frozen_label(config, status)),
-                    )
-                    .into_any_element(),
-            )
+            (self.render_frozen_chips(config, status, cx), None)
         };
         ui::Composer::new(field, footer)
-            .picker(picker)
+            .chips(Some(chips))
+            .works_in(works_in)
             .into_any_element()
     }
 
-    /// Bottom-left: Kit's corner anchors clamp rather than flip, so a menu hung below the
-    /// composer would cover its own button.
+    /// Local | Rift copy. The help is in each segment's tooltip, not on screen.
     fn render_works_in(
         &self,
         works_in: WorksIn,
-        composer: FocusHandle,
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (icon, label) = works_in_label(works_in);
-        let view = cx.weak_entity();
-        ui::button_with_icon(
-            "works-in",
-            if compact { "" } else { label },
-            icon,
-            ui::Look::Ghost,
-            ui::Size::Sm,
-            cx,
-        )
-        .tooltip(label)
-        .dropdown_caret(true)
-        .debug_selector(|| "works-in".to_string())
-        .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
-            let item = |choice: WorksIn| {
-                let (icon, label) = works_in_label(choice);
-                let view = view.clone();
-                PopupMenuItem::new(label)
-                    .icon(icon)
-                    .checked(choice == works_in)
-                    .on_click(move |_, window, cx| {
-                        let _ =
-                            view.update(cx, |view, cx| view.choose_works_in(choice, window, cx));
-                    })
-            };
-            menu.action_context(composer.clone())
-                .check_side(Side::Right)
-                .item(item(WorksIn::ProjectFolder))
-                .item(item(WorksIn::RiftCopy))
-        })
-        .into_any_element()
+        let segment = |choice: WorksIn, id: &'static str, cx: &mut Context<Self>| {
+            let (icon, label, help) = works_in_label(choice);
+            let view = cx.weak_entity();
+            ui::button_with_icon(
+                id,
+                if compact { "" } else { label },
+                icon,
+                if choice == works_in {
+                    ui::Look::Secondary
+                } else {
+                    ui::Look::Ghost
+                },
+                ui::Size::Sm,
+                cx,
+            )
+            .tooltip(help)
+            .debug_selector(move || id.to_string())
+            .on_click(move |_, window, cx| {
+                let _ = view.update(cx, |view, cx| view.choose_works_in(choice, window, cx));
+            })
+        };
+        h_flex()
+            .id("works-in")
+            .debug_selector(|| "works-in".to_string())
+            .flex_none()
+            .gap_0p5()
+            .p_0p5()
+            .rounded_lg()
+            .bg(crate::theme::material(cx).glass_hover)
+            .child(segment(WorksIn::ProjectFolder, "works-in-local", cx))
+            .child(segment(WorksIn::RiftCopy, "works-in-rift", cx))
+            .into_any_element()
     }
 
     /// "Couldn't save threads: …", once, quietly, above the composer, until dismissed.
@@ -2651,20 +2616,63 @@ impl Render for ChatView {
                 .map(IntoElement::into_any_element)
                 .unwrap_or_else(|| div().into_any_element()),
             Panel::Thread if self.review_panel.is_some() => self.render_review(cx),
-            Panel::Thread if empty => self.render_empty_state(cx).into_any_element(),
+            Panel::Thread if empty => self.render_empty_state(None, cx).into_any_element(),
             Panel::Thread => self.render_messages(cx).into_any_element(),
         };
+        let mut centred = false;
         let bottom = if self.panel != Panel::Thread {
             div().into_any_element()
         } else {
             match self.render_dock(main_width, window, cx) {
                 Some(dock) => dock,
                 None if self.review_panel.is_some() => div().into_any_element(),
-                None => self.render_composer(window, cx),
+                None => {
+                    centred = empty;
+                    self.render_composer(window, cx)
+                }
             }
         };
         let problem = self.render_save_problem(cx);
         let limit_notice = self.render_limit_notice(cx);
+        let column = v_flex()
+            .relative()
+            .w_full()
+            .max_w(COLUMN_WIDTH)
+            .gap(px(DOCK_METRICS.scope_gap))
+            .children(problem)
+            .children(limit_notice)
+            .child(bottom)
+            .children(self.dock_ghost.as_ref().map(|ghost| {
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .pb(px(DOCK_METRICS.scope_gap + 18.))
+                    .child(ghost.card.exit_ghost())
+            }));
+        let (body, tail) = if centred {
+            (
+                self.render_empty_state(Some(column.into_any_element()), cx)
+                    .into_any_element(),
+                None,
+            )
+        } else {
+            (
+                body,
+                Some(
+                    div()
+                        .flex_none()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .px(px(DOCK_METRICS.page_padding))
+                        .pt(px(DOCK_METRICS.top_padding))
+                        .pb(px(DOCK_METRICS.bottom_padding))
+                        .child(column),
+                ),
+            )
+        };
 
         let docked = (placement == Placement::Docked).then(|| {
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
@@ -2733,35 +2741,7 @@ impl Render for ChatView {
                     .then(|| self.render_review_toolbar(cx)),
             )
             .child(body)
-            .child(
-                div()
-                    .flex_none()
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .px(px(DOCK_METRICS.page_padding))
-                    .pt(px(DOCK_METRICS.top_padding))
-                    .pb(px(DOCK_METRICS.bottom_padding))
-                    .child(
-                        v_flex()
-                            .relative()
-                            .w_full()
-                            .max_w(COLUMN_WIDTH)
-                            .gap(px(DOCK_METRICS.scope_gap))
-                            .children(problem)
-                            .children(limit_notice)
-                            .child(bottom)
-                            .children(self.dock_ghost.as_ref().map(|ghost| {
-                                div()
-                                    .absolute()
-                                    .bottom_0()
-                                    .left_0()
-                                    .right_0()
-                                    .pb(px(DOCK_METRICS.scope_gap + 18.))
-                                    .child(ghost.card.exit_ghost())
-                            })),
-                    ),
-            );
+            .children(tail);
 
         // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
         // falls out of the window comes back through `reclaim_focus`.
@@ -3016,22 +2996,18 @@ fn same_repository(a: &Path, b: &Path) -> bool {
     inbox::overlaps(a, b) && (is_repo(a) || is_repo(b))
 }
 
-fn empty_caption(
-    works_in: WorksIn,
-    project: &str,
-    presentation: &newjen_core::AgentPresentation,
-) -> String {
-    let place = match works_in {
-        WorksIn::ProjectFolder => project.to_string(),
-        WorksIn::RiftCopy => format!("a new Rift copy of {project}"),
-    };
-    presentation.empty_caption(&place)
-}
-
-fn works_in_label(works_in: WorksIn) -> (ui::IconName, &'static str) {
+fn works_in_label(works_in: WorksIn) -> (ui::IconName, &'static str, &'static str) {
     match works_in {
-        WorksIn::ProjectFolder => (ui::IconName::Folder, "Project folder"),
-        WorksIn::RiftCopy => (ui::IconName::Copy, "Rift copy"),
+        WorksIn::ProjectFolder => (
+            ui::IconName::Folder,
+            "Local",
+            "Works in your project folder. Changes appear there as the agent makes them.",
+        ),
+        WorksIn::RiftCopy => (
+            ui::IconName::Layers,
+            "Rift copy",
+            "Works in a private copy of the project. Your folder stays untouched until you land the work.",
+        ),
     }
 }
 
@@ -3275,19 +3251,6 @@ mod tests {
                  made there that aren't in your project are lost."
                     .to_string()
             )
-        );
-    }
-
-    #[test]
-    fn the_empty_state_says_where_claude_will_work() {
-        assert_eq!(
-            empty_caption(WorksIn::ProjectFolder, "~/Newjen", &Default::default()),
-            "Claude runs in ~/Newjen. You approve each tool call before it runs."
-        );
-        assert_eq!(
-            empty_caption(WorksIn::RiftCopy, "~/Newjen", &Default::default()),
-            "Claude runs in a new Rift copy of ~/Newjen. You approve each tool call before it \
-             runs."
         );
     }
 

@@ -534,29 +534,63 @@ fn composer_focused(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> bool
     cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window))
 }
 
-/// Opens the composer's "Project folder" menu and picks its `nth` item with the keys.
+/// Clicks the composer's Local (0) or Rift copy (1) segment.
 fn choose(nth: usize, cx: &mut VisualTestContext) {
-    click(cx, "works-in");
-    assert!(cx.update(|window, _| overlay_focused(window)));
-    for _ in 0..=nth {
-        cx.simulate_keystrokes("down");
-    }
-    cx.simulate_keystrokes("enter");
+    click(cx, ["works-in-local", "works-in-rift"][nth]);
 }
 
 #[gpui::test]
-fn the_picker_chooses_a_rift_copy_and_hands_the_keys_back(cx: &mut TestAppContext) {
+async fn the_new_thread_screen_centres_the_composer_and_a_working_thread_offers_stop(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "new-thread-screen", true);
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.picker.statuses = vec![picker_status(
+                newjen_core::providers::Provider::Claude,
+                view.base_config.program.clone(),
+            )];
+            view.picker.checked = Some(Instant::now());
+            cx.notify();
+        })
+    });
+    cx.simulate_resize(size(px(1100.), px(700.)));
+    cx.run_until_parked();
+    let placeholder = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            chat.read(cx).slots[chat.read(cx).active]
+                .placeholder
+                .to_string()
+        })
+    };
+    assert_eq!(placeholder(cx), "Ask for a change…");
+    let composer = cx.debug_bounds("composer").unwrap();
+    assert!(
+        composer.bottom() < px(560.) && composer.top() > px(200.),
+        "{composer:?}"
+    );
+    assert!(cx.debug_bounds("works-in-local").is_some());
+    assert!(cx.debug_bounds("works-in-rift").is_some());
+    assert!(cx.debug_bounds("agent-picker").is_some());
+    assert!(cx.debug_bounds("effort-picker").is_some());
+    cx.simulate_input("do a thing");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("stop").is_some());
+    assert!(cx.debug_bounds("works-in").is_none());
+    assert!(cx.debug_bounds("agent-picker").is_none());
+    assert_eq!(placeholder(cx), "Queue a follow-up…");
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+fn the_works_in_control_chooses_a_rift_copy_and_hands_the_keys_back(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup_in(cx, "picker", false, Some(CREATE_COPY));
     cx.simulate_input("half typed");
-    click(cx, "works-in");
-    assert!(cx.update(|window, _| overlay_focused(window)));
-    cx.simulate_keystrokes("escape");
-    assert!(!cx.update(|window, _| overlay_focused(window)));
-    assert!(composer_focused(&chat, cx));
+    assert!(cx.debug_bounds("works-in").is_some());
     assert_eq!(works_in(&chat, cx), WorksIn::ProjectFolder);
 
     choose(1, cx);
-    assert!(!cx.update(|window, _| overlay_focused(window)));
     assert_eq!(works_in(&chat, cx), WorksIn::RiftCopy);
     assert!(composer_focused(&chat, cx));
     cx.simulate_input(", still typing");
@@ -1199,7 +1233,9 @@ fn picker_status(
 }
 
 #[gpui::test]
-fn agent_picker_keys_switch_tabs_choose_effort_and_return_focus(cx: &mut TestAppContext) {
+fn agent_picker_lists_every_provider_and_its_keys_choose_model_effort_and_fast(
+    cx: &mut TestAppContext,
+) {
     use newjen_core::providers::Provider;
     let (chat, path, cx) = setup(cx, "agent-picker", true);
     cx.update(|_, cx| {
@@ -1214,8 +1250,27 @@ fn agent_picker_keys_switch_tabs_choose_effort_and_return_focus(cx: &mut TestApp
     });
     click(cx, "agent-picker");
     assert!(cx.debug_bounds("provider-menu").is_some());
-    cx.simulate_keystrokes("right");
-    click(cx, "agent-row-1");
+    assert!(
+        cx.debug_bounds("agent-row-3").is_some(),
+        "both providers' models are in one list"
+    );
+    let fast = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            chat.read(cx)
+                .thread()
+                .read(cx)
+                .agent_config()
+                .unwrap()
+                .speed
+        })
+    };
+    assert!(
+        !cx.update(|_, cx| chat
+            .read(cx)
+            .fast_supported(chat.read(cx).thread().read(cx).agent_config())),
+        "the Claude default model has no Fast"
+    );
+    click(cx, "agent-row-3");
     cx.update(|_, cx| {
         let view = chat.read(cx);
         let thread = view.thread().read(cx);
@@ -1240,18 +1295,10 @@ fn agent_picker_keys_switch_tabs_choose_effort_and_return_focus(cx: &mut TestApp
             .clone()),
         newjen_core::EffortSelection::Chosen("high".into())
     );
-    click(cx, "effort-picker");
-    cx.simulate_keystrokes("down down down down enter");
-    assert_eq!(
-        cx.update(|_, cx| chat
-            .read(cx)
-            .thread()
-            .read(cx)
-            .agent_config()
-            .unwrap()
-            .speed),
-        newjen_core::Speed::Fast
-    );
+    assert_eq!(fast(cx), newjen_core::Speed::Normal);
+    click(cx, "agent-picker");
+    cx.simulate_keystrokes("down enter");
+    assert_eq!(fast(cx), newjen_core::Speed::Fast);
     click(cx, "agent-picker");
     cx.simulate_keystrokes("escape");
     assert!(cx.debug_bounds("provider-menu").is_none());

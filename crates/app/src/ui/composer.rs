@@ -1,6 +1,7 @@
 #[cfg(test)]
 use std::rc::Rc;
 
+use gpui::Focusable as _;
 use gpui::{
     AnyElement, App, Context, Entity, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
     prelude::*,
@@ -9,8 +10,9 @@ use gpui_kit::base::input::{Enter, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, input::Textarea};
 
 use super::button::icon_button_with_look;
-use super::{IconName, Look, key_caps};
+use super::{IconName, Look, ellipsis};
 use crate::sidebar::OnPress;
+use crate::theme;
 
 pub fn composer_field(window: &mut Window, cx: &mut Context<TextareaState>) -> TextareaState {
     TextareaState::new(window, cx).auto_grow(1, 8)
@@ -30,7 +32,8 @@ pub enum Footer {
 pub struct Composer {
     field: Entity<TextareaState>,
     footer: Footer,
-    picker: Option<AnyElement>,
+    chips: Option<AnyElement>,
+    works_in: Option<AnyElement>,
 }
 
 impl Composer {
@@ -38,12 +41,20 @@ impl Composer {
         Self {
             field,
             footer,
-            picker: None,
+            chips: None,
+            works_in: None,
         }
     }
 
-    pub fn picker(mut self, picker: Option<AnyElement>) -> Self {
-        self.picker = picker;
+    /// The agent and effort chips, at the left of the bottom row.
+    pub fn chips(mut self, chips: Option<AnyElement>) -> Self {
+        self.chips = chips;
+        self
+    }
+
+    /// The Local | Rift copy control, left of the send button.
+    pub fn works_in(mut self, works_in: Option<AnyElement>) -> Self {
+        self.works_in = works_in;
         self
     }
 }
@@ -57,103 +68,111 @@ impl RenderOnce for Composer {
             Footer::Stop(_) | Footer::Cancel(_) | Footer::Wait(_) | Footer::Disabled(_) => None,
         };
         let waiting = matches!(self.footer, Footer::Wait(_) | Footer::Disabled(_));
-        let hint = div()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap_1()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground);
-        let (hint, button) = match self.footer {
+        let focused = self
+            .field
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let (status, button) = match self.footer {
             Footer::Cancel(cancel) => (
-                hint.child(key_caps("cmd-.", cx))
-                    .child("to cancel the copy"),
+                None,
                 Some((
                     "cancel-copy",
                     icon_button_with_look(
                         "cancel-copy",
                         IconName::X,
-                        "Cancel the copy",
+                        "Cancel the copy (⌘.)",
                         Look::Secondary,
                         false,
                         cx,
                     )
+                    .rounded_full()
                     .on_click(move |_, window, cx| cancel(window, cx)),
                 )),
             ),
             Footer::Stop(stop) => (
-                hint.child(key_caps("cmd-.", cx)).child("to stop"),
+                None,
                 Some((
                     "stop",
                     icon_button_with_look(
                         "stop",
                         IconName::Square,
-                        "Stop",
+                        "Stop (⌘.)",
                         Look::Secondary,
                         false,
                         cx,
                     )
+                    .rounded_full()
                     .on_click(move |_, window, cx| stop(window, cx)),
                 )),
             ),
             Footer::Send(send) => (
-                hint.child(key_caps("enter", cx))
-                    .child("to send ·")
-                    .child(key_caps("shift-enter", cx))
-                    .child("for a new line"),
+                None,
                 Some((
                     "send",
                     icon_button_with_look(
                         "send",
                         IconName::ArrowUp,
-                        "Send",
+                        "Send (Enter)",
                         Look::Primary,
                         !ready,
                         cx,
                     )
+                    .rounded_full()
                     .on_click(move |_, window, cx| send(window, cx)),
                 )),
             ),
-            Footer::Wait(why) => (hint.child(why), None),
+            Footer::Wait(why) => (Some(why), None),
             Footer::Disabled(why) => (
-                hint.child(why),
+                Some(why),
                 Some((
                     "send",
                     icon_button_with_look(
                         "send",
                         IconName::ArrowUp,
-                        "Send",
+                        "Send (Enter)",
                         Look::Primary,
                         true,
                         cx,
-                    ),
+                    )
+                    .rounded_full(),
                 )),
             ),
         };
-        let footer = match self.picker {
-            Some(picker) => div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(picker)
-                .child(div().flex_1())
-                .when(
-                    waiting || window.viewport_size().width >= gpui::px(1040.),
-                    |r| r.child(hint),
-                ),
-            None => div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(hint)
-                .child(div().flex_1()),
-        };
+        let material = theme::material(cx);
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .children(self.chips)
+            .child(div().flex_1())
+            .children(status.map(|why| {
+                div()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(ellipsis(why))
+            }))
+            .children(self.works_in)
+            .children(button.map(|(name, button)| {
+                div().debug_selector(move || name.to_string()).child(button)
+            }));
         div()
             .id("composer")
             .debug_selector(|| "composer".to_string())
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded_xl()
+            .border_1()
+            .border_color(if focused {
+                cx.theme().ring
+            } else {
+                material.card_stroke
+            })
+            .bg(material.glass_hover)
             .child(
                 div()
                     .capture_action(move |action: &Enter, window, cx| {
@@ -167,13 +186,12 @@ impl RenderOnce for Composer {
                     })
                     .child(
                         Textarea::new(&self.field)
+                            .appearance(false)
                             .aria_label(name)
                             .disabled(waiting),
                     ),
             )
-            .child(footer.children(button.map(|(name, button)| {
-                div().debug_selector(move || name.to_string()).child(button)
-            })))
+            .child(footer)
     }
 }
 
@@ -181,9 +199,7 @@ impl RenderOnce for Composer {
 mod tests {
     use super::*;
     use crate::keys;
-    use gpui::{
-        AppContext, FocusHandle, Focusable as _, Render, TestAppContext, VisualTestContext,
-    };
+    use gpui::{AppContext, FocusHandle, Render, TestAppContext, VisualTestContext};
     use gpui_kit::base::Root;
 
     struct Example {

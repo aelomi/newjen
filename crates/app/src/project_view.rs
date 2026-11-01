@@ -4,16 +4,18 @@ use std::time::Duration;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, IntoElement, ParentElement, PathPromptOptions,
-    Render, Styled, Subscription, Task, Window, div, prelude::*, px,
+    Render, ScrollHandle, Styled, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_kit::base::v_flex;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _};
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use newjen_core::rift::Tools;
 use newjen_core::{Project, SessionConfig, Store, Thread, thread};
 
 use crate::attention::{NativeAttention, NativeQuitGuard};
 use crate::chat_view::{Attention, ChatView, QuitBlockers, Startup};
-use crate::format::tilde;
+use crate::format::{relative_time, tilde};
 use crate::keys::{OpenProject, OpenRecentProject, ShowProjects};
 use crate::ui;
 
@@ -71,6 +73,10 @@ pub struct ProjectView {
     quit_control: Option<async_channel::Receiver<Result<(), String>>>,
     quit_failure: Option<String>,
     quit_dialog: bool,
+    confirm_dialog: bool,
+    chooser_search: Entity<InputState>,
+    chooser_row: usize,
+    chooser_scroll: ScrollHandle,
     keep_open_focus: FocusHandle,
     focus_quit_choice: bool,
     /// The badge count last shown, so AppKit is only asked when it changes.
@@ -81,6 +87,7 @@ pub struct ProjectView {
     stand_in: Option<PathBuf>,
     _errors: Task<()>,
     _focus: [Subscription; 2],
+    _search: Subscription,
     _attention_tasks: Vec<Task<()>>,
 }
 
@@ -118,6 +125,22 @@ impl ProjectView {
             }
         });
         let focus = cx.focus_handle();
+        let chooser_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        let search = cx.subscribe_in(
+            &chooser_search,
+            window,
+            |view, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    view.chooser_row = 0;
+                    view.chooser_scroll.scroll_to_item(0);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } if view.active.is_none() => {
+                    view.open_chosen(window, cx)
+                }
+                _ => {}
+            },
+        );
         let mut view = Self {
             store,
             home,
@@ -147,6 +170,10 @@ impl ProjectView {
             quit_control: None,
             quit_failure: None,
             quit_dialog: false,
+            confirm_dialog: false,
+            chooser_search,
+            chooser_row: 0,
+            chooser_scroll: ScrollHandle::new(),
             keep_open_focus: cx.focus_handle(),
             focus_quit_choice: false,
             badge: 0,
@@ -155,12 +182,13 @@ impl ProjectView {
             stand_in: None,
             _errors: listener,
             _attention_tasks: Vec::new(),
+            _search: search,
             _focus: [
                 cx.on_focus_lost(window, |view, window, cx| {
                     if view.active.is_none() {
                         cx.defer_in(window, |view, window, cx| {
                             if view.active.is_none() {
-                                window.focus(&view.focus, cx);
+                                view.focus_chooser(window, cx);
                             }
                         });
                     }
@@ -176,6 +204,8 @@ impl ProjectView {
         view.remove_pending_copies(cx);
         if let Some(initial) = initial {
             view.open_project(initial, window, cx);
+        } else {
+            view.focus_chooser(window, cx);
         }
         view
     }
@@ -368,7 +398,7 @@ impl ProjectView {
                 .chat
                 .update(cx, |chat, cx| chat.set_visible(false, window, cx));
         }
-        window.focus(&self.focus, cx);
+        self.focus_chooser(window, cx);
         window.set_window_title("Newjen");
         cx.notify();
     }
@@ -603,6 +633,10 @@ impl ProjectView {
     /// ⌘Q, ⌘W, the window's close button and macOS asking the app to quit all come here:
     /// one confirmation when work would be lost, otherwise the app quits.
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase == QuitPhase::Confirming {
+            self.confirm_quit(window, cx);
+            return;
+        }
         if self.quit_phase != QuitPhase::Running {
             if self.quit_dialog {
                 window.activate_window();
@@ -620,37 +654,176 @@ impl ProjectView {
             return;
         }
         self.quit_phase = QuitPhase::Confirming;
-        let detail = format!(
-            "{}{}",
-            blockers.detail(),
-            if unsent {
-                "\nUnsent composer text will be discarded if you quit. Keep working to preserve it."
-            } else {
-                ""
-            }
-        );
-        let answer = window.prompt(
-            gpui::PromptLevel::Warning,
-            "Quit Newjen and stop its work?",
-            Some(&detail),
-            &["Keep working", "Quit and stop"],
-            cx,
-        );
-        cx.spawn_in(window, async move |view, cx| {
-            let confirmed = answer.await == Ok(1);
-            let _ = view.update_in(cx, |view, window, cx| {
-                if view.quit_phase != QuitPhase::Confirming {
-                    return;
-                }
-                if confirmed {
-                    view.start_saving(window, cx);
-                } else {
-                    view.quit_phase = QuitPhase::Running;
-                }
-                cx.notify();
+        self.confirm_dialog = true;
+        let mut threads = Vec::new();
+        for project in &self.projects {
+            threads.extend(project.chat.read(cx).busy_threads(cx));
+        }
+        let mut notes = blockers.notes();
+        if unsent {
+            notes.push("Unsent composer text will be discarded.".to_string());
+        }
+        let message = if threads.is_empty() {
+            "Quitting stops what is still running."
+        } else {
+            "These stop mid-task. Their work so far is kept."
+        };
+        let view = cx.entity().downgrade();
+        window.activate_window();
+        cx.activate(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let (keep, quit, cancel) = (view.clone(), view.clone(), view.clone());
+            let material = crate::theme::material(cx);
+            let muted = cx.theme().muted_foreground;
+            let keep_focus = view
+                .upgrade()
+                .map(|view| view.read(cx).keep_open_focus.clone());
+            let keep_button = ui::button("quit-keep", "", ui::Look::Secondary, ui::Size::Md, cx)
+                .child(
+                    gpui_kit::base::h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child("Keep working")
+                        .child(ui::key_caps("escape", cx)),
+                )
+                .on_click(move |_, window, cx| {
+                    let _ = keep.update(cx, |view, cx| view.keep_working(window, cx));
+                });
+            let keep_button = match &keep_focus {
+                Some(focus) => keep_button.track_focus(focus),
+                None => keep_button,
+            };
+            let quit_button = ui::button("quit-confirm", "", ui::Look::Secondary, ui::Size::Md, cx)
+                .danger()
+                .child(
+                    gpui_kit::base::h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child("Quit")
+                        .child(ui::key_caps("cmd-q", cx)),
+                )
+                .on_click(move |_, window, cx| {
+                    let _ = quit.update(cx, |view, cx| view.confirm_quit(window, cx));
+                });
+            let list = (!threads.is_empty()).then(|| {
+                v_flex()
+                    .id("quit-threads")
+                    .max_h(px(220.))
+                    .overflow_y_scroll()
+                    .p_1()
+                    .rounded_lg()
+                    .bg(material.glass_selected)
+                    .children(threads.iter().enumerate().map(|(ix, (title, activity))| {
+                        gpui_kit::base::h_flex()
+                            .id(("quit-thread", ix))
+                            .gap_2()
+                            .px_2()
+                            .py_1p5()
+                            .items_center()
+                            .child(
+                                div().flex_none().child(
+                                    gpui_kit::component::spinner::Spinner::new()
+                                        .small()
+                                        .color(cx.theme().info),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(220.))
+                                    .child(ui::ellipsis(title.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(ui::ellipsis(activity.clone())),
+                            )
+                    }))
             });
-        })
-        .detach();
+            let _ = window;
+            dialog
+                .centered()
+                .width(px(440.))
+                .bg(material.card)
+                .entrance(DialogEntrance::None)
+                .close_button(false)
+                .on_ok(|_, _, _| false)
+                .on_cancel(move |_, window, cx| {
+                    let _ = cancel.update(cx, |view, cx| view.keep_working(window, cx));
+                    false
+                })
+                .title(
+                    div()
+                        .debug_selector(|| "quit-confirm-title".into())
+                        .child("Quit Newjen?"),
+                )
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_color(muted).child(message))
+                        .children(list)
+                        .children(
+                            notes
+                                .iter()
+                                .map(|note| div().text_sm().text_color(muted).child(note.clone())),
+                        ),
+                )
+                .footer(
+                    gpui_kit::base::h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            div()
+                                .debug_selector(|| "quit-keep-working".into())
+                                .child(keep_button),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "quit-confirm-button".into())
+                                .child(quit_button),
+                        ),
+                )
+        });
+        cx.defer_in(window, |view, window, cx| {
+            if view.quit_phase == QuitPhase::Confirming {
+                window.focus(&view.keep_open_focus, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn close_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm_dialog {
+            self.confirm_dialog = false;
+            window.close_dialog(cx);
+        }
+    }
+
+    fn keep_working(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase != QuitPhase::Confirming {
+            return;
+        }
+        self.close_confirm(window, cx);
+        self.quit_phase = QuitPhase::Running;
+        if let Some(active) = self.active {
+            self.projects[active]
+                .chat
+                .update(cx, |chat, cx| chat.take_focus(window, cx));
+        } else {
+            self.focus_chooser(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_phase != QuitPhase::Confirming {
+            return;
+        }
+        self.close_confirm(window, cx);
+        self.start_saving(window, cx);
     }
 
     fn start_saving(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -819,7 +992,7 @@ impl ProjectView {
                 .chat
                 .update(cx, |chat, cx| chat.take_focus(window, cx));
         } else {
-            window.focus(&self.focus, cx);
+            self.focus_chooser(window, cx);
         }
         cx.notify();
     }
@@ -840,11 +1013,49 @@ impl ProjectView {
         }
     }
 
+    fn chooser_matches(&self, cx: &App) -> Vec<usize> {
+        filter_recents(
+            &self.recent,
+            &self.chooser_search.read(cx).value(),
+            self.home.as_deref(),
+        )
+    }
+
+    fn focus_chooser(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.recent.is_empty() {
+            window.focus(&self.focus, cx);
+        } else {
+            let handle = gpui::Focusable::focus_handle(self.chooser_search.read(cx), cx);
+            window.focus(&handle, cx);
+        }
+    }
+
+    fn open_chosen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let matches = self.chooser_matches(cx);
+        if let Some(&ix) = matches.get(self.chooser_row.min(matches.len().saturating_sub(1))) {
+            let path = self.recent[ix].path.clone();
+            self.open_project(path, window, cx);
+        }
+    }
+
+    fn move_chooser_row(&mut self, down: bool, cx: &mut Context<Self>) {
+        let count = self.chooser_matches(cx).len();
+        let row = self.chooser_row.min(count.saturating_sub(1));
+        self.chooser_row = if down {
+            (row + 1).min(count.saturating_sub(1))
+        } else {
+            row.saturating_sub(1)
+        };
+        self.chooser_scroll.scroll_to_item(self.chooser_row);
+        cx.notify();
+    }
+
     fn welcome(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let material = crate::theme::material(cx);
         let open = ui::button_with_icon(
             "open-project",
-            "Open Project…",
-            ui::IconName::Folder,
+            "Open Folder…",
+            ui::IconName::FolderOpen,
             ui::Look::Primary,
             ui::Size::Md,
             cx,
@@ -853,13 +1064,33 @@ impl ProjectView {
         .on_click(cx.listener(|view, _, window, cx| view.pick_project(&OpenProject, window, cx)));
         let mut content = ui::card(v_flex(), cx)
             .p_4()
-            .gap_4()
+            .gap_3()
             .min_h_0()
             .max_h_full()
             .w_full()
-            .max_w(px(560.))
-            .child(div().text_lg().child("Open a project to get started"))
-            .child(div().child(open));
+            .max_w(px(520.))
+            .capture_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, _, cx| {
+                if view.active.is_some() || event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let key = event.keystroke.key.as_str();
+                if matches!(key, "up" | "down") {
+                    view.move_chooser_row(key == "down", cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                gpui_kit::base::h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Projects"),
+                    )
+                    .child(open),
+            );
         if self.recent.is_empty() {
             content = content.child(
                 div()
@@ -867,41 +1098,85 @@ impl ProjectView {
                     .child("Choose the folder where your agents will work."),
             );
         } else {
-            content = content.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Recent projects"),
-            );
-            let rows = self.recent.iter().map(|project| {
-                let path = project.path.clone();
-                let label = tilde(&path, self.home.as_deref());
-                let id = project.id;
-                ui::button(
-                    ("recent-project", id as u64),
-                    label,
-                    ui::Look::Ghost,
-                    ui::Size::Md,
-                    cx,
+            let matches = self.chooser_matches(cx);
+            let selected = self.chooser_row.min(matches.len().saturating_sub(1));
+            let now = newjen_core::store::now_ms();
+            let rows: Vec<_> = matches
+                .iter()
+                .enumerate()
+                .map(|(position, &ix)| {
+                    let project = &self.recent[ix];
+                    let path = project.path.clone();
+                    let name = project_name(&project.path);
+                    let shown = tilde(&project.path, self.home.as_deref());
+                    let id = project.id;
+                    let ago = relative_time(project.last_opened_at, now);
+                    let hint = shown.clone();
+                    gpui_kit::base::h_flex()
+                        .id(("recent-project", id as u64))
+                        .debug_selector(move || format!("recent-project-{id}"))
+                        .flex_none()
+                        .w_full()
+                        .gap_3()
+                        .px_2()
+                        .py_2()
+                        .items_center()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .when(position == selected, |row| row.bg(material.glass_selected))
+                        .hover(|row| row.bg(material.glass_hover))
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(hint.clone())
+                                .build(window, cx)
+                        })
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.open_project(path.clone(), window, cx)
+                        }))
+                        .child(ui::monogram(&name, cx))
+                        .child(
+                            v_flex().flex_1().min_w_0().child(ui::ellipsis(name)).child(
+                                ui::middle_ellipsis(shown)
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(ago),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            content = content
+                .child(
+                    gpui_kit::component::input::Input::new(&self.chooser_search)
+                        .prefix(ui::icon(
+                            ui::IconName::Search,
+                            gpui_kit::component::Size::Small,
+                            cx.theme().muted_foreground,
+                        ))
+                        .cleanable(true),
                 )
-                .w_full()
-                .flex_none()
-                .debug_selector(move || format!("recent-project-{id}"))
-                .justify_start()
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    view.open_project(path.clone(), window, cx)
-                }))
-                .into_any_element()
-            });
-            content = content.child(
-                v_flex()
-                    .id("recent-projects")
-                    .debug_selector(|| "recent-projects".to_string())
-                    .min_h_0()
-                    .max_h(px(320.))
-                    .overflow_y_scroll()
-                    .children(rows),
-            );
+                .child(if rows.is_empty() {
+                    div()
+                        .py_4()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No projects match your search.")
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .id("recent-projects")
+                        .debug_selector(|| "recent-projects".to_string())
+                        .track_scroll(&self.chooser_scroll)
+                        .min_h_0()
+                        .max_h(px(340.))
+                        .overflow_y_scroll()
+                        .children(rows)
+                        .into_any_element()
+                });
         }
         v_flex()
             .size_full()
@@ -918,6 +1193,29 @@ impl ProjectView {
             )
             .into_any_element()
     }
+}
+
+/// The recent projects whose folder name or `~` path contains `query`, ignoring case, as
+/// indexes into `projects` in their original order.
+fn filter_recents(projects: &[Project], query: &str, home: Option<&Path>) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    projects
+        .iter()
+        .enumerate()
+        .filter(|(_, project)| {
+            query.is_empty()
+                || project_name(&project.path).to_lowercase().contains(&query)
+                || tilde(&project.path, home).to_lowercase().contains(&query)
+        })
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+fn project_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 impl Render for ProjectView {
@@ -1205,6 +1503,89 @@ mod tests {
         finish(&shell, path, cx);
     }
 
+    fn project(path: &str) -> Project {
+        Project {
+            id: 1,
+            path: PathBuf::from(path),
+            created_at: 0,
+            last_opened_at: 0,
+            landing_mode: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_search_matches_names_and_paths_without_regard_to_case() {
+        let projects = [
+            project("/Users/ana/Newjen"),
+            project("/Users/ana/code/pstack"),
+            project("/Users/ana/code/Rift"),
+            project("/opt/dotfiles"),
+        ];
+        let home = Some(Path::new("/Users/ana"));
+        let found = |query: &str| filter_recents(&projects, query, home);
+        assert_eq!(found(""), [0, 1, 2, 3]);
+        assert_eq!(found("   "), [0, 1, 2, 3]);
+        assert_eq!(found("RIFT"), [2]);
+        assert_eq!(found("code"), [1, 2]);
+        assert_eq!(found("~/code"), [1, 2]);
+        assert_eq!(found("/opt"), [3]);
+        assert_eq!(found("nothing here"), Vec::<usize>::new());
+        assert_eq!(project_name(Path::new("/Users/ana/Newjen")), "Newjen");
+        assert_eq!(project_name(Path::new("/")), "/");
+    }
+
+    #[gpui::test]
+    async fn the_chooser_filters_and_opens_with_the_keys(cx: &mut TestAppContext) {
+        let (shell, path, cx) = setup(cx, "chooser-keys");
+        cx.update(|window, _| window.activate_window());
+        let folder = |name: &str| {
+            let folder = path.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            folder.canonicalize().unwrap()
+        };
+        let (alpha, beta, gamma) = (folder("alpha"), folder("beta"), folder("gamma"));
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| {
+                for folder in [&alpha, &beta, &gamma] {
+                    view.store.open_project(folder).unwrap();
+                }
+                view.recent = view.store.projects().unwrap();
+                view.focus_chooser(window, cx);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        let opened = |shell: &Entity<ProjectView>, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let view = shell.read(cx);
+                view.projects[view.active.unwrap()].project.path.clone()
+            })
+        };
+        // Newest first: gamma, beta, alpha. Down moves to beta, Enter opens it.
+        cx.simulate_keystrokes("down enter");
+        cx.condition(&shell, |view, _| {
+            view.opening.is_none() && view.active.is_some()
+        })
+        .await;
+        assert_eq!(opened(&shell, cx), beta);
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| view.show_projects(&ShowProjects, window, cx))
+        });
+        cx.run_until_parked();
+        // Typing filters the list and Enter opens the first match.
+        cx.simulate_input("ALP");
+        assert!(cx.debug_bounds("recent-project-1").is_some());
+        assert!(cx.debug_bounds("recent-project-2").is_none());
+        assert!(cx.debug_bounds("recent-project-3").is_none());
+        cx.simulate_keystrokes("enter");
+        cx.condition(&shell, |view, _| {
+            view.opening.is_none() && view.active.is_some()
+        })
+        .await;
+        assert_eq!(opened(&shell, cx), alpha);
+        finish(&shell, path, cx);
+    }
+
     #[gpui::test]
     async fn clicking_any_recent_project_row_opens_that_project(cx: &mut TestAppContext) {
         let (shell, path, cx) = setup(cx, "recent-rows");
@@ -1309,15 +1690,17 @@ mod tests {
             1
         );
         cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
-        assert!(cx.has_pending_prompt());
-        // A second request while the question is up does not ask again.
-        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.debug_bounds("quit-confirm-title").is_some());
         assert_eq!(
             cx.update(|_, cx| shell.read(cx).quit_phase),
             QuitPhase::Confirming
         );
-        cx.simulate_prompt_answer("Keep working");
+        // Esc keeps working.
+        cx.simulate_keystrokes("escape");
         cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert_eq!(
             cx.update(|_, cx| shell.read(cx).quit_phase),
             QuitPhase::Running
@@ -1326,9 +1709,21 @@ mod tests {
             cx.update(|_, cx| shell.read(cx).quit_blockers(cx).terminals),
             1
         );
+        // So does the button.
         cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
-        cx.simulate_prompt_answer("Quit and stop");
         cx.run_until_parked();
+        click(cx, "quit-keep-working");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        // Quit answers yes.
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        cx.run_until_parked();
+        click(cx, "quit-confirm-button");
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert_eq!(
             cx.update(|_, cx| shell.read(cx).quit_phase),
             QuitPhase::Saving
@@ -1439,6 +1834,13 @@ mod tests {
         });
         cx.run_until_parked();
         send
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
     }
 
     fn press_enter(cx: &mut VisualTestContext) {
@@ -1555,16 +1957,20 @@ mod tests {
                 view.request_quit(window, cx);
             })
         });
-        assert!(cx.has_pending_prompt());
-        cx.simulate_prompt_answer("Keep working");
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        click(cx, "quit-keep-working");
         cx.run_until_parked();
         assert_eq!(
             cx.update(|_, cx| shell.read(cx).quit_phase),
             QuitPhase::Running
         );
         cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
-        cx.simulate_prompt_answer("Quit and stop");
         cx.run_until_parked();
+        // ⌘Q again, with the question up, is the answer yes.
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_quit(window, cx)));
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         let draft = cx.update(|_, cx| shell.read(cx).projects[0].chat.read(cx).draft_for_test(cx));
         cx.simulate_input("must not be inserted");
         cx.simulate_keystrokes("cmd-enter cmd-n cmd-`");

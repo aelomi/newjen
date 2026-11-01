@@ -18,7 +18,10 @@ gpui_kit::assets::icon_assets!(
         GitBranch,
         FilePlus,
         FileMinus,
-        FileCode
+        FileCode,
+        Layers,
+        Sparkles,
+        Sparkle
     ]
 );
 gpui_kit::assets::icon_assets!(ApprovalIcons, [Trash, FilePen, Terminal, Plug]);
@@ -71,7 +74,14 @@ mod tests {
             IconName::Close,
             IconName::Copy,
             IconName::Folder,
+            IconName::FolderOpen,
+            IconName::Gauge,
             IconName::Info,
+            IconName::Layers,
+            IconName::Search,
+            IconName::Sparkle,
+            IconName::Sparkles,
+            IconName::Zap,
             IconName::PanelLeft,
             IconName::Plus,
             IconName::RefreshCw,
