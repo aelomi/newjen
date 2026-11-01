@@ -9,7 +9,7 @@ jobs:
   test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Rust toolchain
         run: |
@@ -18,6 +18,11 @@ jobs:
 
       - name: Metal shader compiler
         run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+
+      - name: jj and Rift
+        run: |
+          brew install jj
+          npm install --global rift-snapshot@0.0.13
 
       - uses: Swatinem/rust-cache@v2
 
