@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug)]
 #[must_use = "keep the guard alive while using the data folder"]
 pub struct InstanceLock {
-    _file: File,
+    file: File,
     directory: PathBuf,
 }
 
@@ -32,10 +32,7 @@ impl InstanceLock {
         let file = File::open(&directory)
             .with_context(|| format!("could not open {}", directory.display()))?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self {
-                _file: file,
-                directory,
-            })),
+            Ok(()) => Ok(Some(Self { file, directory })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => {
                 Err(error).with_context(|| format!("could not lock {}", directory.display()))
@@ -46,6 +43,13 @@ impl InstanceLock {
     /// The absolute, symlink-free data folder protected by this guard.
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // A child between fork and exec can still hold the same open file description.
+        let _ = self.file.unlock();
     }
 }
 
@@ -477,6 +481,49 @@ fn wait_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_owner_releases_lock_before_a_forked_child_execs() {
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let owner = InstanceLock::try_acquire(temp.path()).unwrap().unwrap();
+        let (mut ready, child_ready) = UnixStream::pair().unwrap();
+        let (mut release, child_release) = UnixStream::pair().unwrap();
+        ready
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let spawning = std::thread::spawn(move || {
+            let ready_fd = child_ready.as_raw_fd();
+            let release_fd = child_release.as_raw_fd();
+            let mut command = std::process::Command::new("/usr/bin/true");
+            unsafe {
+                command.pre_exec(move || {
+                    let mut byte = 0_u8;
+                    if libc::write(ready_fd, (&byte as *const u8).cast(), 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::read(release_fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn()?.wait()
+        });
+        let started = ready.read_exact(&mut [0]);
+        let held = InstanceLock::try_acquire(temp.path());
+        drop(owner);
+        let reacquired = InstanceLock::try_acquire(temp.path());
+        let released = release.write_all(&[1]);
+        let status = spawning.join().unwrap();
+
+        started.unwrap();
+        released.unwrap();
+        assert!(status.unwrap().success());
+        assert!(held.unwrap().is_none());
+        assert!(reacquired.unwrap().is_some());
+    }
 
     #[test]
     fn long_address_alias_is_private_and_removed_before_ownership_ends() {
