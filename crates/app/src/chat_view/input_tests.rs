@@ -2209,3 +2209,32 @@ async fn review_completion_during_saving_does_not_disable_keep_open(cx: &mut Tes
     });
     finish(&chat, path, cx);
 }
+
+/// The review lists every file of the patch and shows one at a time.
+#[gpui::test]
+fn the_review_shows_the_selected_file_only(cx: &mut TestAppContext) {
+    use newjen_core::landing::{LandingMode, Review};
+    let patch = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,2 @@\n keep\n+added\n\
+                 diff --git a/b.toml b/b.toml\n--- a/b.toml\n+++ b/b.toml\n@@ -1 +1 @@\n-old\n+new\n";
+    let (chat, path, cx) = setup(cx, "review-files", false);
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let id = view.thread().read(cx).id().to_string();
+            let receipt = Review {
+                base: "base".into(),
+                head: "head".into(),
+                patch: patch.into(),
+                truncated: false,
+            };
+            view.show_review(id, receipt, LandingMode::HarnessManaged, window, cx);
+        })
+    });
+    cx.run_until_parked();
+    let shown = cx.update(|_, cx| chat.read(cx).review_shown(cx));
+    assert_eq!(shown, Some((0, 2, vec!["src/a.rs".to_string()])));
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.select_review_file(1, cx)));
+    cx.run_until_parked();
+    let shown = cx.update(|_, cx| chat.read(cx).review_shown(cx));
+    assert_eq!(shown, Some((1, 2, vec!["b.toml".to_string()])));
+    finish(&chat, path, cx);
+}

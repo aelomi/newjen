@@ -1,5 +1,7 @@
+use super::changes::{FileRow, counts, file_row, files_label, totals};
 use super::*;
 use gpui_kit::component::Disableable as _;
+use gpui_kit::component::button::DropdownButton;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
 use newjen_core::edits::{EditPreview, ReadEdit};
 use newjen_core::landing::{self, Integration, LandingMode, Review};
@@ -63,6 +65,11 @@ impl ApprovalPreview {
 pub(super) struct ReviewPanel {
     thread: String,
     receipt: Review,
+    /// The patch split by file, in patch order, and the row each file has in the list.
+    files: Vec<DiffFile>,
+    rows: Vec<FileRow>,
+    selected: usize,
+    /// Shows the selected file only.
     diff: Entity<DiffState>,
     pub(super) busy: bool,
     message: String,
@@ -429,17 +436,25 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let target = self.take_pending_file();
         match if receipt.truncated {
             Ok(Vec::new())
         } else {
             DiffFile::parse(&receipt.patch)
         } {
             Ok(files) => {
-                let message = if receipt.truncated { "The diff is too large to show. Landing is blocked." } else if mode == LandingMode::AgentManaged { "Only work recorded with jj is shown. Git commits are not imported; use jj and bookmark your work. The copy stays after landing." } else if receipt.patch.is_empty() { "No changes." } else { "Review the changes, then land or discard the work." }.into();
+                let message = if receipt.truncated { "The diff is too large to show. Landing is blocked." } else if mode == LandingMode::AgentManaged { "Only work recorded with jj is shown. Git commits are not imported; use jj and bookmark your work. The copy stays after landing." } else if receipt.patch.is_empty() { "No changes." } else { "" }.into();
+                let selected = target
+                    .and_then(|path| files.iter().position(|file| file.path().as_ref() == path))
+                    .unwrap_or(0);
+                let shown: Vec<DiffFile> = files.get(selected).cloned().into_iter().collect();
                 self.review_panel = Some(ReviewPanel {
                     thread: id,
                     receipt,
-                    diff: cx.new(|cx| DiffState::new(files, cx)),
+                    rows: files.iter().map(FileRow::from_diff).collect(),
+                    files,
+                    selected,
+                    diff: cx.new(|cx| DiffState::new(shown, cx)),
                     busy: false,
                     message,
                 });
@@ -449,6 +464,44 @@ impl ChatView {
                 self.slots[self.active].notice =
                     Some(Notice::held("Couldn't display the diff", error.to_string()))
             }
+        }
+    }
+
+    /// The selected row, how many rows there are, and the paths the diff shows.
+    #[cfg(test)]
+    pub(super) fn review_shown(&self, cx: &App) -> Option<(usize, usize, Vec<String>)> {
+        let panel = self.review_panel.as_ref()?;
+        let shown = panel
+            .diff
+            .read(cx)
+            .files()
+            .iter()
+            .map(|file| file.path().to_string())
+            .collect();
+        Some((panel.selected, panel.rows.len(), shown))
+    }
+
+    pub(super) fn select_review_file(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(panel) = self.review_panel.as_mut() else {
+            return;
+        };
+        if ix >= panel.files.len() || ix == panel.selected {
+            return;
+        }
+        panel.selected = ix;
+        let file = panel.files[ix].clone();
+        panel.diff.update(cx, |diff, cx| diff.set_files([file], cx));
+        cx.notify();
+    }
+
+    /// ⌘↵ in the review: land the way the Land button does.
+    pub(super) fn land_with_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ready = self
+            .review_panel
+            .as_ref()
+            .is_some_and(|panel| !panel.busy && !panel.receipt.truncated);
+        if ready {
+            self.resolve_review(false, Integration::Rebase, window, cx);
         }
     }
 
@@ -675,64 +728,26 @@ impl ChatView {
     pub(super) fn render_review_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let thread = self.thread().read(cx);
         if thread.is_draft() {
-            let mode = thread.landing_mode();
-            let next = if mode == LandingMode::HarnessManaged {
-                LandingMode::AgentManaged
-            } else {
-                LandingMode::HarnessManaged
-            };
-            let label = if mode == LandingMode::HarnessManaged {
-                "Harness manages jj"
-            } else {
-                "Agent manages jj"
-            };
-            return h_flex()
-                .px_4()
-                .gap_2()
-                .child(
-                    ui::button("landing-mode", label, ui::Look::Ghost, ui::Size::Sm, cx).on_click(
-                        cx.listener(move |view, _, _, cx| {
-                            let result = view
-                                .thread()
-                                .update(cx, |thread, _| thread.follow_project_landing_mode(next));
-                            view.slots[view.active].notice =
-                                notice_after(result, "Couldn't change landing mode");
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(
-                    ui::button(
-                        "landing-default",
-                        "Use as project default",
-                        ui::Look::Ghost,
-                        ui::Size::Sm,
-                        cx,
-                    )
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.store.set_project_landing_mode(view.project.id, mode);
-                        view.project.landing_mode = mode;
-                        cx.notify();
-                    })),
-                )
-                .into_any_element();
+            return div().into_any_element();
         }
         h_flex()
             .px_4()
             .gap_2()
-            .child(
-                ui::button(
-                    "review-work",
-                    if self.review_loading {
-                        "Loading diff…"
-                    } else {
-                        "Review work"
-                    },
-                    ui::Look::Ghost,
-                    ui::Size::Sm,
-                    cx,
-                )
-                .on_click(cx.listener(|view, _, window, cx| view.open_review(window, cx))),
+            .children(
+                (!self.changes.on_screen && self.review_panel.is_none()).then(|| {
+                    ui::button(
+                        "review-work",
+                        if self.review_loading {
+                            "Loading diff…"
+                        } else {
+                            "Review work"
+                        },
+                        ui::Look::Ghost,
+                        ui::Size::Sm,
+                        cx,
+                    )
+                    .on_click(cx.listener(|view, _, window, cx| view.open_review(window, cx)))
+                }),
             )
             .children(thread.can_release_project_tracking().then(|| {
                 ui::button(
@@ -778,74 +793,196 @@ impl ChatView {
 
     pub(super) fn render_review(&self, cx: &mut Context<Self>) -> AnyElement {
         let panel = self.review_panel.as_ref().unwrap();
+        let colors = cx.theme().colors;
+        let stroke = crate::theme::material(cx).card_stroke;
         let can_land = !panel.busy && !panel.receipt.truncated;
-        let button = |id, label, integration| {
-            ui::button(id, label, ui::Look::Secondary, ui::Size::Sm, cx)
+        let has_copy = self
+            .index_of(&panel.thread, cx)
+            .is_some_and(|ix| self.slots[ix].thread.read(cx).copy().is_some());
+        let (added, removed) = totals(&panel.rows);
+
+        let back = ui::icon_button(
+            "close-review",
+            ui::IconName::ArrowLeft,
+            "Back to thread",
+            cx,
+        )
+        .debug_selector(|| "close-review".to_string())
+        .on_click(cx.listener(|view, _, window, cx| {
+            if !view.review_panel.as_ref().is_some_and(|panel| panel.busy) {
+                view.review_panel = None;
+                view.focus_panel(window, cx);
+                cx.notify();
+            }
+        }));
+        let discard = ui::button("discard-work", "Discard", ui::Look::Ghost, ui::Size::Sm, cx)
+            .text_color(colors.danger)
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.resolve_review(true, Integration::Rebase, window, cx)
+            }));
+        let land = ui::button_with_icon(
+            "land-rebase",
+            "Land",
+            ui::IconName::GitBranch,
+            ui::Look::Primary,
+            ui::Size::Sm,
+            cx,
+        )
+        .child(ui::key_caps("cmd-enter", cx))
+        .disabled(!can_land)
+        .on_click(cx.listener(|view, _, window, cx| {
+            view.land_with_key(window, cx);
+        }));
+        // Only a Rift copy has two ways to land; project-folder work is already in place.
+        let land = if has_copy {
+            let view = cx.weak_entity();
+            DropdownButton::new("land")
+                .button(land)
                 .disabled(!can_land)
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    if can_land {
-                        view.resolve_review(false, integration, window, cx);
-                    }
-                }))
+                .menu_accessibility_label("Choose how to land")
+                .dropdown_menu(move |menu, _, _| {
+                    let item = |label: &'static str, integration| {
+                        let view = view.clone();
+                        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            let _ =
+                                view.update(cx, |view, cx| {
+                                    if view.review_panel.as_ref().is_some_and(|panel| {
+                                        !panel.busy && !panel.receipt.truncated
+                                    }) {
+                                        view.resolve_review(false, integration, window, cx)
+                                    }
+                                });
+                        })
+                    };
+                    menu.item(item("Rebase and land", Integration::Rebase))
+                        .item(item("Merge and land", Integration::Merge))
+                })
+                .into_any_element()
+        } else {
+            land.into_any_element()
         };
-        let rebase = button("land-rebase", "Rebase and land", Integration::Rebase);
-        let merge = button("land-merge", "Merge and land", Integration::Merge);
+
+        let top = h_flex()
+            .flex_none()
+            .h(px(46.))
+            .px_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(stroke)
+            .child(back)
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Review"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(colors.muted_foreground)
+                    .child(files_label(panel.rows.len())),
+            )
+            .child(counts(added, removed, false, cx))
+            .child(div().flex_1())
+            .child(discard)
+            .child(land);
+
+        let list = v_flex()
+            .id("review-files")
+            .flex_none()
+            .w(px(250.))
+            .h_full()
+            .p_2()
+            .gap_0p5()
+            .border_r_1()
+            .border_color(stroke)
+            .overflow_y_scroll()
+            .children(panel.rows.iter().enumerate().map(|(ix, row)| {
+                file_row(("review-file", ix), row, ix == panel.selected, cx)
+                    .on_click(cx.listener(move |view, _, _, cx| view.select_review_file(ix, cx)))
+            }));
+        let diff = if panel.files.is_empty() {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(ui::caption(
+                    if panel.message.is_empty() {
+                        "No changes.".to_string()
+                    } else {
+                        panel.message.clone()
+                    },
+                    cx,
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(Diff::new(&panel.diff).soft_wrap(true))
+                .into_any_element()
+        };
         v_flex()
             .flex_1()
             .min_h_0()
-            .p_4()
-            .gap_2()
-            .child(ui::caption(panel.message.clone(), cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(Diff::new(&panel.diff).soft_wrap(true)),
+            .child(top)
+            .children(
+                (!panel.message.is_empty() && !panel.files.is_empty()).then(|| {
+                    div()
+                        .id("review-message")
+                        .flex_none()
+                        .max_h(px(120.))
+                        .overflow_y_scroll()
+                        .px_4()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(stroke)
+                        .child(ui::caption(panel.message.clone(), cx))
+                }),
             )
             .child(
                 h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(rebase)
-                    .child(merge)
-                    .child(
-                        ui::button(
-                            "discard-work",
-                            "Discard work",
-                            ui::Look::Ghost,
-                            ui::Size::Sm,
-                            cx,
-                        )
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.resolve_review(true, Integration::Rebase, window, cx)
-                        })),
-                    )
-                    .child(
-                        ui::button(
-                            "close-review",
-                            "Close review",
-                            ui::Look::Ghost,
-                            ui::Size::Sm,
-                            cx,
-                        )
-                        .debug_selector(|| "close-review".to_string())
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            if !view.review_panel.as_ref().is_some_and(|panel| panel.busy) {
-                                view.review_panel = None;
-                                view.focus_panel(window, cx);
-                                cx.notify();
-                            }
-                        })),
-                    ),
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .child(v_flex().flex_1().min_w_0().min_h_0().child(diff)),
             )
             .into_any_element()
     }
 }
 
+/// ⌘↵, pressed fresh: macOS repeats a held key, and a repeat must not land twice.
+pub(super) fn is_land_key(event: &KeyDownEvent) -> bool {
+    let keystroke = &event.keystroke;
+    let modifiers = keystroke.modifiers;
+    keystroke.key == "enter"
+        && modifiers.platform
+        && !(modifiers.control || modifiers.alt || modifiers.shift)
+        && !event.is_held
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Keystroke;
     use newjen_core::edits::{EditProposal, FileChange};
+
+    fn press(keys: &'static str, is_held: bool) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke::parse(keys).unwrap(),
+            is_held,
+            prefer_character_input: false,
+        }
+    }
+
+    #[test]
+    fn only_a_fresh_command_return_lands() {
+        assert!(is_land_key(&press("cmd-enter", false)));
+        assert!(!is_land_key(&press("cmd-enter", true)));
+        assert!(!is_land_key(&press("enter", false)));
+        assert!(!is_land_key(&press("cmd-shift-enter", false)));
+        assert!(!is_land_key(&press("cmd-alt-enter", false)));
+    }
 
     #[test]
     fn the_kit_parser_accepts_real_file_edit_previews() {

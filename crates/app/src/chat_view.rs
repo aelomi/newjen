@@ -13,6 +13,7 @@
 //! calls on the thread on screen and draws what the threads say. Every change ends with
 //! `cx.notify()`, which asks GPUI to call `render` again.
 
+mod changes;
 mod inbox;
 mod lifecycle;
 mod limits;
@@ -272,6 +273,7 @@ pub struct ChatView {
     edit_preview: Option<review::ApprovalPreview>,
     review_panel: Option<review::ReviewPanel>,
     review_loading: bool,
+    changes: changes::ChangesCard,
     /// The root has the keyboard while the thread on screen waits for its Rift copy: the
     /// composer is disabled until then.
     making_copy_shown: bool,
@@ -348,6 +350,7 @@ impl ChatView {
             edit_preview: None,
             review_panel: None,
             review_loading: false,
+            changes: Default::default(),
             making_copy_shown: false,
             dock_outside: None,
             keys_ready_at: None,
@@ -1787,6 +1790,15 @@ impl ChatView {
             // Held down: macOS is repeating the key. Only a fresh press answers.
             KeyRoute::Ignore => cx.stop_propagation(),
             // The drawer's Esc was taken in the capture phase.
+            KeyRoute::Pass
+                if self.panel == Panel::Thread
+                    && self.review_panel.is_some()
+                    && review::is_land_key(event)
+                    && !overlay_focused(window) =>
+            {
+                cx.stop_propagation();
+                self.land_with_key(window, cx);
+            }
             KeyRoute::CloseDrawer | KeyRoute::Pass => {}
         }
     }
@@ -2023,6 +2035,7 @@ impl ChatView {
     fn render_title_bar(
         &self,
         placement: Placement,
+        window_width: f32,
         main_width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2065,7 +2078,12 @@ impl ChatView {
                     title_bar::pill(thread.status(), thread.background_tasks().len())
                 },
                 background_tasks: thread.background_tasks().len(),
+                changes: None,
             }
+        };
+        let bar = Bar {
+            changes: self.changes_toggle(placement, window_width, window, cx),
+            ..bar
         };
         // claude cannot forget a rule, so core stops it (now, or when the turn ends) and the
         // next message starts one without the rule.
@@ -2610,6 +2628,9 @@ impl Render for ChatView {
             Placement::Docked => width - sidebar_px,
             Placement::Drawer | Placement::Hidden => width,
         };
+        self.sync_changes(window, cx);
+        let changes = self.render_changes_card(placement, width, window, cx);
+        let main_width = main_width - changes.as_ref().map_or(0.0, |(_, taken)| *taken);
 
         let (thread_id, empty) = {
             let slot = &self.slots[self.active];
@@ -2621,7 +2642,7 @@ impl Render for ChatView {
                     && thread.preparing().is_none(),
             )
         };
-        let title_bar = self.render_title_bar(placement, main_width, window, cx);
+        let title_bar = self.render_title_bar(placement, width, main_width, window, cx);
         let body = match self.panel {
             Panel::Inbox => self.render_inbox(window, cx),
             Panel::Terminal => self.slots[self.active]
@@ -2793,7 +2814,9 @@ impl Render for ChatView {
                                 }),
                         )
                     })
-                    .child(main),
+                    .when(floating, |wrapper| wrapper.gap(CARD_INSET))
+                    .child(main)
+                    .children(changes.map(|(card, _)| card)),
             )
     }
 }

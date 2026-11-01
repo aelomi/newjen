@@ -13,7 +13,12 @@ gpui_kit::assets::icon_assets!(
         SquareCheck,
         Circle,
         CircleX,
-        ChevronDown
+        ChevronDown,
+        GitCompareArrows,
+        GitBranch,
+        FilePlus,
+        FileMinus,
+        FileCode
     ]
 );
 gpui_kit::assets::icon_assets!(ApprovalIcons, [Trash, FilePen, Terminal, Plug]);
@@ -57,6 +62,11 @@ mod tests {
             IconName::CircleX,
             IconName::CircleAlert,
             IconName::CirclePause,
+            IconName::FileCode,
+            IconName::FileMinus,
+            IconName::FilePlus,
+            IconName::GitBranch,
+            IconName::GitCompareArrows,
             IconName::Clock,
             IconName::Close,
             IconName::Copy,

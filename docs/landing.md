@@ -1,6 +1,6 @@
 # Review and land thread work
 
-New threads choose **Harness manages jj** or **Agent manages jj** above the conversation. **Use as project default** saves that choice for future threads. Existing threads keep their saved mode.
+The landing mode (**Harness manages jj** or **Agent manages jj**) is a project setting in the project menu. New threads follow it. Existing threads keep the mode they started with.
 
 Landing requires a jj repository colocated with git. Git-only projects can still run agents and use Rift copies. Their landing action is unavailable until a git implementation is added.
 
@@ -10,11 +10,14 @@ Newjen asks the agent not to commit. At each turn's end, it describes the workin
 
 For a project-folder thread, Newjen first snapshots existing work and starts the thread on its own change. The review excludes the earlier work. Resolve that thread before starting another project-folder thread. A copy can keep working independently. Resolve the project-folder thread before landing copy work.
 
-Open **Review work** after the turn finishes. Kit's diff viewer shows the changes since the thread's base. Choose one of these actions.
+The **Changes** card beside the conversation lists every file the thread touched, with its added and removed lines. While a turn runs the numbers are an estimate from the agent's edit tool calls. After the turn ends and its snapshot finishes, jj's own count replaces them. The header button next to the terminal button shows or hides the card; in windows too narrow for it, the button opens the review instead.
 
+Press **Review** in the card after the turn finishes, or click a file to open the review on it. The review lists the files on the left and shows the selected file's diff on the right (Kit's diff viewer, changes since the thread's base). Choose one of these actions.
+
+- **Land** (⌘↵) lands a copy's work the first way below. For a copy, its menu offers both ways. Project-folder work has one way, so it has no menu.
 - **Rebase and land** fetches a copy's changes under the project's current change.
 - **Merge and land** creates a merge with the project's current change.
-- **Discard work** asks for confirmation. For a copy, it archives the thread and removes the copy. For project-folder work, it returns the working folder to the thread's base and archives the conversation. Recorded jj history remains recoverable.
+- **Discard** asks for confirmation. For a copy, it archives the thread and removes the copy. For project-folder work, it returns the working folder to the thread's base and archives the conversation. Recorded jj history remains recoverable.
 
 Project-folder changes are already present in the project. Landing runs the checks, records the thread bookmark, and starts a fresh change. It does not copy files over themselves.
 

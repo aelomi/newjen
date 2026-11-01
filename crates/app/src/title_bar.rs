@@ -8,9 +8,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, BoxShadow, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div,
-    hsla, prelude::*, px,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, BoxShadow, ClickEvent, FocusHandle,
+    FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, Styled,
+    Window, div, hsla, prelude::*, px,
 };
 use gpui_kit::base::{FocusTrapElement as _, Selectable, h_flex, v_flex};
 use gpui_kit::component::ThemeStyled as _;
@@ -79,6 +79,18 @@ pub struct Bar {
     pub pill: Option<Pill>,
     /// How many commands Claude keeps running in the background.
     pub background_tasks: usize,
+    /// The button that shows and hides the Changes card; none while there is nothing to show.
+    pub changes: Option<ChangesToggle>,
+}
+
+/// Called with the click, so a key press and a mouse click can tell themselves apart.
+pub type OnClick = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+pub struct ChangesToggle {
+    /// The card is on screen.
+    pub shown: bool,
+    pub tooltip: &'static str,
+    pub on_press: OnClick,
 }
 
 /// The most height the grants popover's rows may take in a window `viewport_height` pixels
@@ -174,7 +186,8 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
                     grants,
                 ))
             })
-            .children(bar.pill.map(status_pill)),
+            .children(bar.pill.map(status_pill))
+            .children(bar.changes.map(|toggle| changes_button(toggle, cx))),
     );
     ui::card_title_bar(cx)
         .when(!lights_over_bar, |bar| bar.pl_4())
@@ -182,6 +195,21 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
         .child(middle)
         .child(right)
         .into_any_element()
+}
+
+/// The git-compare button at the right end of the bar, lit while the Changes card is out.
+fn changes_button(toggle: ChangesToggle, cx: &App) -> AnyElement {
+    let on_press = toggle.on_press;
+    ui::icon_button(
+        "changes-toggle",
+        IconName::GitCompareArrows,
+        toggle.tooltip,
+        cx,
+    )
+    .selected(toggle.shown)
+    .debug_selector(|| "changes-toggle".to_string())
+    .on_click(move |event, window, cx| on_press(event, window, cx))
+    .into_any_element()
 }
 
 /// The panel-left button, with an amber dot while a hidden thread needs an approval.
@@ -480,6 +508,7 @@ mod tests {
                 grants_detail: "Claude runs these without asking, until you revoke them.",
                 pill: pill(Status::Waiting, 0),
                 background_tasks: 0,
+                changes: None,
             };
             let grants = Grants {
                 open: false,
