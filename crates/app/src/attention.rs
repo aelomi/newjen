@@ -87,15 +87,15 @@ impl NativeAttention {
     pub fn capability_note(&self) -> Option<&'static str> {
         if self.center.is_none() {
             return Some(
-                "Desktop notifications need an app bundle. The Dock still shows approvals.",
+                "Desktop notifications need an app bundle. Use the approvals inbox to review requests.",
             );
         }
         match self.authorization.load(Ordering::Acquire) {
             DENIED => Some(
-                "Desktop notifications are off in macOS settings. The Dock still shows approvals.",
+                "Desktop notifications are off in macOS settings. Use the approvals inbox to review requests.",
             ),
             FAILED => Some(
-                "macOS could not enable desktop notifications. The Dock still shows approvals.",
+                "macOS could not enable desktop notifications. Use the approvals inbox to review requests.",
             ),
             _ => None,
         }
@@ -150,7 +150,7 @@ impl NativeAttention {
                 }
             });
             center.requestAuthorizationWithOptions_completionHandler(
-                UNAuthorizationOptions::Alert,
+                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Badge,
                 &completion,
             );
         }

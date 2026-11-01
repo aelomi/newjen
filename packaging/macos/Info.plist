@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Newjen</string>
+    <key>CFBundleDisplayName</key><string>Newjen</string>
+    <key>CFBundleIdentifier</key><string>com.aelomi.newjen</string>
+    <key>CFBundleExecutable</key><string>newjen</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>Newjen.icns</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>0.1.0</string>
+    <key>NewjenReleaseVersion</key><string>0.1.0</string>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSDesktopFolderUsageDescription</key><string>Newjen opens projects and runs your chosen tools in your Desktop folder.</string>
+    <key>NSDocumentsFolderUsageDescription</key><string>Newjen opens projects and runs your chosen tools in your Documents folder.</string>
+    <key>NSDownloadsFolderUsageDescription</key><string>Newjen opens projects and runs your chosen tools in your Downloads folder.</string>
+    <key>NSRemovableVolumesUsageDescription</key><string>Newjen opens projects and runs your chosen tools on removable volumes.</string>
+    <key>NSNetworkVolumesUsageDescription</key><string>Newjen opens projects and runs your chosen tools on network volumes.</string>
+</dict>
+</plist>

@@ -147,6 +147,14 @@ cargo build --release                 # optimized build
 
 The first build takes about 1–2 minutes and creates a `target/` folder of several GB. Later builds are incremental.
 
+## Build the app
+
+```sh
+scripts/bundle-app.sh
+scripts/bundle-app.sh 0.1.0-alpha.1
+open dist/Newjen.app
+```
+
 ## Version control
 
 Use **jj**, not raw git, for commits in this repo:

@@ -125,7 +125,7 @@ fn locate(cli: Cli, override_path: Option<&OsStr>, path: &OsStr) -> PathBuf {
 
 /// Finds the executable `name`.
 ///
-/// Order: `$<override_var>`, then every directory on `$PATH`, then `home_dirs` (relative to
+/// Order: `$<override_var>`, then the login shell's PATH, then `home_dirs` (relative to
 /// `$HOME`), `/opt/homebrew/bin` and `/usr/local/bin`. The fallbacks matter because apps
 /// started from Finder get a minimal `PATH` that usually does not include where the program
 /// was installed. If nothing is found, returns plain `name` so the spawn error names it.
@@ -133,15 +133,12 @@ pub(crate) fn find_program(override_var: &str, name: &str, home_dirs: &[&str]) -
     if let Some(path) = std::env::var_os(override_var).filter(|path| !path.is_empty()) {
         return PathBuf::from(path);
     }
-    let on_path = std::env::var_os("PATH")
-        .map(|path_var| std::env::split_paths(&path_var).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let on_path = std::env::split_paths(resolved_path());
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let in_home = home_dirs
         .iter()
         .filter_map(|dir| Some(home.as_ref()?.join(dir)));
     on_path
-        .into_iter()
         .chain(in_home)
         .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
         .map(|dir| dir.join(name))
