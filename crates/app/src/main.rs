@@ -20,6 +20,7 @@ mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     App, AppContext, Bounds, Context, IntoElement, Menu, MenuItem, OsAction, PromptLevel, QuitMode,
@@ -94,6 +95,8 @@ fn main() {
         gpui_kit::init(cx);
         // Match the system's light/dark mode from the first frame (no flash).
         gpui_kit::component::Theme::change(cx.window_appearance(), None, cx);
+        // The window's glass materials sit on Kit's theme; Reduce Transparency is read here too.
+        theme::install(cx);
         // And its Reduce Motion setting; the chat view's clock keeps it in step.
         gpui_kit::base::apply_system_reduce_motion(cx);
 
@@ -345,6 +348,7 @@ fn open_window(
             ..gpui_kit::component::TitleBar::title_bar_options()
         }),
         app_owns_titlebar_drag: true,
+        window_background: theme::window_background(cx),
         window_min_size: Some(size(px(640.0), px(480.0))),
         ..Default::default()
     };
@@ -353,6 +357,7 @@ fn open_window(
         window
             .observe_window_appearance(|window, cx| {
                 gpui_kit::component::Theme::change(window.appearance(), Some(window), cx);
+                theme::apply(cx);
             })
             .detach();
         let view = cx.new(|cx| ProjectView::new(store, home, project, window, cx));
@@ -365,6 +370,19 @@ fn open_window(
         });
         view
     })?;
+    // Reduce Transparency has no change notice, so it is re-read like Reduce Motion.
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let followed = window_handle.update(cx, |_, window, cx| {
+                theme::follow_reduce_transparency(window, cx)
+            });
+            if followed.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
     let target = view.downgrade();
     cx.spawn(async move |cx| {
         loop {

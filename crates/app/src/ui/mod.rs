@@ -6,7 +6,7 @@ mod status;
 mod text;
 
 pub use button::{Look, Size, button, button_with_icon, icon_button};
-pub use chrome::{ListRow, list_row};
+pub use chrome::{ListRow, card, card_title_bar, glass_title_bar, list_row};
 pub use gpui_kit::assets::IconName;
 pub use status::{AgentState, Pulse, Tone, agent_pill, status_badge};
 pub use text::{caption, ellipsis, key_caps, middle_ellipsis, title};

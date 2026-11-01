@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, div, font, prelude::*, px, uniform_list,
+    MouseButton, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, Subscription,
+    Task, UniformListScrollHandle, Window, WindowControlArea, div, font, prelude::*, px,
+    uniform_list,
 };
 use gpui_kit::base::input::{InputAccessibility, TextareaState};
 use gpui_kit::base::{h_flex, v_flex};
@@ -51,7 +52,7 @@ use crate::reply;
 use crate::rows::{self, OnRestart};
 use crate::sidebar::{self, OnPress, Placement, RowFacts};
 use crate::terminal::TerminalPanel;
-use crate::theme::SIDEBAR;
+use crate::theme::{CARD_INSET, CARD_RADIUS, SIDEBAR};
 use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
 use crate::ui;
 use crate::ui::DOCK_METRICS;
@@ -2568,6 +2569,7 @@ impl Render for ChatView {
         });
         use gpui_kit::component::{Placement as SheetPlacement, WindowExt as _};
         if placement == Placement::Drawer && !window.has_active_sheet(cx) {
+            let drawer_fill = crate::theme::material(cx).card;
             let view = cx.entity().downgrade();
             let closed = view.clone();
             window.open_sheet_at(SheetPlacement::Left, cx, move |sheet, window, cx| {
@@ -2576,6 +2578,7 @@ impl Render for ChatView {
                     .ok();
                 let closed = closed.clone();
                 sheet
+                    .bg(drawer_fill)
                     .size(SIDEBAR)
                     .resizable(false)
                     .children(content)
@@ -2598,11 +2601,9 @@ impl Render for ChatView {
         }
 
         let theme = cx.theme();
-        let (bg, fg, font) = (
-            theme.background,
-            theme.foreground,
-            theme.font_family.clone(),
-        );
+        let (fg, font) = (theme.foreground, theme.font_family.clone());
+        let material = crate::theme::material(cx);
+        let floating = placement == Placement::Docked;
         // Everything that belongs to one thread sits under an id made from the thread's id,
         // so per-element state (a tool card left open, the scroll position, a streaming reply)
         // can never carry over to another thread whose rows have the same numbers.
@@ -2611,6 +2612,14 @@ impl Render for ChatView {
             .flex_1()
             .min_w_0()
             .h_full()
+            .bg(material.card)
+            .when(floating, |main| {
+                main.border_1()
+                    .border_color(material.card_stroke)
+                    .rounded(CARD_RADIUS)
+                    .shadow(material.card_shadow())
+                    .overflow_hidden()
+            })
             .child(title_bar)
             .child(self.render_panel_tabs(cx))
             .children(
@@ -2664,11 +2673,33 @@ impl Render for ChatView {
             .on_action(cx.listener(Self::on_show_approvals))
             .on_action(cx.listener(Self::on_toggle_terminal))
             .flex()
-            .bg(bg)
             .text_color(fg)
             .font_family(font)
             .children(docked)
-            .child(main)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .relative()
+                    .when(floating, |wrapper| {
+                        wrapper.pt(CARD_INSET).pr(CARD_INSET).pb(CARD_INSET).child(
+                            // The strip above the card moves the window like a title bar.
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(CARD_INSET)
+                                .window_control_area(WindowControlArea::Drag)
+                                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.start_window_move()
+                                }),
+                        )
+                    })
+                    .child(main),
+            )
     }
 }
 

@@ -7,7 +7,7 @@ use gpui::{
     Render, Styled, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_kit::base::v_flex;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, TitleBar};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _};
 use newjen_core::rift::Tools;
 use newjen_core::{Project, SessionConfig, Store, Thread, thread};
 
@@ -779,7 +779,7 @@ impl ProjectView {
                 let keep_focus = state.keep_open_focus.clone();
                 let keep = view.clone();
                 let anyway = view.clone();
-                dialog.centered().entrance(DialogEntrance::None).close_button(false).overlay_closable(false).keyboard(false).on_ok(|_, _, _| false).on_cancel(|_, _, _| false)
+                dialog.centered().bg(crate::theme::material(cx).card).entrance(DialogEntrance::None).close_button(false).overlay_closable(false).keyboard(false).on_ok(|_, _, _| false).on_cancel(|_, _, _| false)
                     .title(div().debug_selector(move || selector.into()).child(title)).child(message)
                     .when(choices, |dialog| dialog.footer(gpui_kit::base::h_flex().gap_2()
                         .child(div().debug_selector(|| "quit-anyway-button".into()).child(ui::button("quit-anyway", "Quit anyway", ui::Look::Secondary, ui::Size::Md, cx)
@@ -851,7 +851,8 @@ impl ProjectView {
         )
         .disabled(self.picking || self.opening.is_some())
         .on_click(cx.listener(|view, _, window, cx| view.pick_project(&OpenProject, window, cx)));
-        let mut content = v_flex()
+        let mut content = ui::card(v_flex(), cx)
+            .p_4()
             .gap_4()
             .min_h_0()
             .max_h_full()
@@ -904,7 +905,7 @@ impl ProjectView {
         }
         v_flex()
             .size_full()
-            .child(TitleBar::new().child("Newjen"))
+            .child(ui::glass_title_bar(cx))
             .child(
                 div()
                     .flex_1()
@@ -937,7 +938,6 @@ impl Render for ProjectView {
             .on_action(cx.listener(Self::pick_project))
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::open_recent))
-            .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(div().flex_1().min_h_0().child(body))
             .when_some(

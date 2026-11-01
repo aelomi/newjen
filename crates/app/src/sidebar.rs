@@ -13,7 +13,6 @@ use gpui::{
     Styled, TextRun, Window, div, font, prelude::*, px,
 };
 use gpui_kit::base::v_flex;
-use gpui_kit::component::TitleBar;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use newjen_core::Status;
 use newjen_core::transcript::STOPPED_ON_QUIT;
@@ -317,7 +316,7 @@ pub fn dot(dot: Dot, id: ElementId, cx: &App) -> AnyElement {
                 .size(px(DOT))
                 .rounded_full()
                 .border_1()
-                .border_color(colors.muted_foreground)
+                .border_color(crate::theme::material(cx).glass_muted)
                 .into_any_element(),
         ),
         // A thin ring that widens and fades, and none under Reduce Motion.
@@ -342,7 +341,7 @@ pub fn dot(dot: Dot, id: ElementId, cx: &App) -> AnyElement {
 /// a title bar.
 pub fn header(on_toggle: OnPress, window: &mut Window, cx: &mut App) -> AnyElement {
     let _ = window;
-    TitleBar::new()
+    ui::glass_title_bar(cx)
         .child(toggle_button("sidebar-hide", "Hide sidebar", on_toggle, cx))
         .into_any_element()
 }
@@ -384,7 +383,7 @@ pub fn project_row(name: &str, path: &str, room: f32, window: &Window, cx: &App)
         .child(ui::icon(
             IconName::Folder,
             gpui_kit::component::Size::Small,
-            colors.muted_foreground,
+            crate::theme::material(cx).glass_muted,
         ))
         .child(
             // The name keeps its width; only a name wider than the whole row is cut.
@@ -403,7 +402,7 @@ pub fn project_row(name: &str, path: &str, room: f32, window: &Window, cx: &App)
                 .min_w_0()
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_xs()
-                .text_color(colors.muted_foreground)
+                .text_color(crate::theme::material(cx).glass_muted)
                 .child(ui::middle_ellipsis(path))
         }))
         .into_any_element()
@@ -415,10 +414,7 @@ pub fn column(header: AnyElement, list: Vec<AnyElement>, cx: &App) -> gpui::Div 
         .flex_none()
         .w(SIDEBAR)
         .h_full()
-        .bg(theme.sidebar)
         .text_color(theme.sidebar_foreground)
-        .border_r_1()
-        .border_color(theme.sidebar_border)
         .child(header)
         .child(v_flex().flex_1().min_h_0().px_2().children(list))
 }
@@ -430,7 +426,7 @@ pub fn new_thread_row(selected: bool, on_press: OnPress, cx: &App) -> AnyElement
     let ink = if selected {
         colors.foreground
     } else {
-        colors.muted_foreground
+        crate::theme::material(cx).glass_muted
     };
     let row = ListRow {
         title: "New thread".into(),
@@ -459,7 +455,7 @@ pub fn empty_caption(cx: &App) -> AnyElement {
         .px_2p5()
         .py_2()
         .text_sm()
-        .text_color(cx.theme().colors.muted_foreground)
+        .text_color(crate::theme::material(cx).glass_muted)
         .child(EMPTY_LIST)
         .into_any_element()
 }

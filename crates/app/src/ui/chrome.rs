@@ -1,9 +1,37 @@
 use super::{IconName, ellipsis};
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, MouseButton, SharedString, Window, div,
-    prelude::*,
+    AnyElement, App, ClickEvent, Div, ElementId, FontWeight, MouseButton, SharedString, Window,
+    div, prelude::*,
 };
-use gpui_kit::component::{ActiveTheme as _, list::ListItem};
+use gpui_kit::component::{ActiveTheme as _, TitleBar, list::ListItem};
+
+use crate::theme::{self, CARD_RADIUS};
+
+/// Kit's title bar with its gradient and border taken off, for a bar that sits on the glass.
+pub fn glass_title_bar(cx: &App) -> TitleBar {
+    TitleBar::new()
+        .bg(cx.theme().transparent)
+        .border_color(cx.theme().transparent)
+}
+
+/// Kit's title bar as the header of the card: the card shows through, with a line below.
+pub fn card_title_bar(cx: &App) -> TitleBar {
+    TitleBar::new()
+        .bg(cx.theme().transparent)
+        .border_color(theme::material(cx).card_stroke)
+}
+
+/// Makes `base` a solid floating card: the fill, a hairline border, rounded corners and a soft
+/// shadow.
+pub fn card(base: Div, cx: &App) -> Div {
+    let material = theme::material(cx);
+    base.bg(material.card)
+        .border_1()
+        .border_color(material.card_stroke)
+        .rounded(CARD_RADIUS)
+        .shadow(material.card_shadow())
+        .overflow_hidden()
+}
 
 /// What a list row shows.
 pub struct ListRow {
@@ -54,11 +82,11 @@ pub fn list_row(
                             ellipsis(row.title)
                                 .when(row.strong, |line| line.font_weight(FontWeight::SEMIBOLD))
                                 .when(row.quiet, |line| {
-                                    line.text_color(cx.theme().muted_foreground)
+                                    line.text_color(theme::material(cx).glass_muted)
                                 }),
                         )
                         .children(row.detail.map(|detail| {
-                            let color = cx.theme().muted_foreground;
+                            let color = theme::material(cx).glass_muted;
                             div()
                                 .flex()
                                 .items_center()
@@ -76,7 +104,7 @@ pub fn list_row(
                 .children(row.trailing.map(|text| {
                     div()
                         .text_sm()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(theme::material(cx).glass_muted)
                         .child(text)
                 })),
         )

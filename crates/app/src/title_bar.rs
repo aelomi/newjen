@@ -18,10 +18,7 @@ use crate::sidebar::{self, OnPress};
 use crate::ui::{self, AgentState, IconName, Look, Tone, ellipsis, middle_ellipsis};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::TITLE_BAR_HEIGHT;
-use gpui_kit::component::{
-    TitleBar,
-    button::{Button, ButtonVariants as _},
-};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 
 /// About how wide one character of the path (12 px mono) is, and the share of the chat's
 /// width the path may take beside the title.
@@ -172,7 +169,7 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
             })
             .children(bar.pill.map(status_pill)),
     );
-    TitleBar::new()
+    ui::card_title_bar(cx)
         .when(!lights_over_bar, |bar| bar.pl_4())
         .child(left)
         .child(middle)
