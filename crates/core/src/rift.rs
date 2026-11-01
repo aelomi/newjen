@@ -297,6 +297,9 @@ pub(crate) fn create_controlled(
     mut on_created: impl FnMut(&str) -> Result<(), CopyError>,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<Copy, CopyError> {
+    if control.cancelled() {
+        return Err(CopyError::Cancelled);
+    }
     let project = std::fs::canonicalize(project_dir)
         .map_err(|error| failure("rift create", format!("{}: {error}", project_dir.display())))?;
     let (root, jj) = project_root(&project);

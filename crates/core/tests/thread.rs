@@ -3024,6 +3024,7 @@ fn cancelling_before_the_copy_is_made_never_starts_an_agent() {
     assert!(thread.send("too early").is_err());
     let made = job.run(&Tools::find(), |_| {});
     assert_eq!(made, Err(CopyError::Cancelled));
+    assert!(!fixture.project.path.join(".rift").exists());
     let failed = thread.finish_copy(made).unwrap_err();
     assert_eq!(failed.message, "Do not send this");
     assert!(failed.copy_to_remove.is_none());

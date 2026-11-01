@@ -56,12 +56,14 @@ impl Lab {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
-    fn rift_tools(&self) -> newjen_core::rift::Tools {
+    fn rift_tools(&self) -> Option<newjen_core::rift::Tools> {
         let mut tools = newjen_core::rift::Tools::find();
-        assert!(
-            tools.rift.is_absolute() && tools.jj.is_absolute(),
-            "This test requires Rift and jj"
-        );
+        for (name, program) in [("rift", &tools.rift), ("jj", &tools.jj)] {
+            if !program.is_absolute() {
+                eprintln!("skipped: `{name}` is not installed");
+                return None;
+            }
+        }
         let home = self.dir.path().join("rift-home");
         std::fs::create_dir(&home).unwrap();
         tools.env = vec![
@@ -69,7 +71,7 @@ impl Lab {
             ("JJ_USER".into(), "Test".into()),
             ("JJ_EMAIL".into(), "test@example.com".into()),
         ];
-        tools
+        Some(tools)
     }
     fn flush(&self) {
         assert!(self.store.flush(Duration::from_secs(5)));
@@ -224,7 +226,9 @@ fn command_allow_deny_and_exact_session_grants_use_the_right_decision() {
 #[test]
 fn landing_instructions_reach_codex_as_developer_instructions_in_a_jj_repo() {
     let lab = Lab::new("reply");
-    let tools = lab.rift_tools();
+    let Some(tools) = lab.rift_tools() else {
+        return;
+    };
     let output = std::process::Command::new(&tools.jj)
         .args(["git", "init", "--colocate"])
         .current_dir(&lab.project.path)
@@ -369,7 +373,9 @@ fn relaunch_resumes_the_server_id_in_the_saved_workdir_without_an_automatic_turn
 #[test]
 fn a_codex_rift_copy_delivers_the_held_message_once_in_the_copy() {
     let lab = Lab::new("reply");
-    let tools = lab.rift_tools();
+    let Some(tools) = lab.rift_tools() else {
+        return;
+    };
     let mut thread = lab.draft();
     thread.set_works_in(WorksIn::RiftCopy).unwrap();
     let Sent::MakingCopy(job) = thread.send("Only in the copy").unwrap() else {
@@ -416,7 +422,9 @@ fn a_codex_rift_copy_delivers_the_held_message_once_in_the_copy() {
 #[test]
 fn a_refused_sent_checkpoint_never_delivers_the_held_message_to_codex() {
     let lab = Lab::new("reply");
-    let tools = lab.rift_tools();
+    let Some(tools) = lab.rift_tools() else {
+        return;
+    };
     let mut thread = lab.draft();
     thread.set_works_in(WorksIn::RiftCopy).unwrap();
     let Sent::MakingCopy(job) = thread

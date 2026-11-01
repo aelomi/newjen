@@ -578,7 +578,7 @@ async fn a_rift_draft_sends_its_first_message_from_its_new_copy(cx: &mut TestApp
 
 #[gpui::test]
 async fn a_failed_copy_puts_the_message_back_and_try_again_sends_it(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup_in(cx, "rift-fail", false, Some(FAIL_HOOK));
+    let (chat, path, cx) = setup_in(cx, "rift-fail", true, Some(FAIL_HOOK));
     choose(1, cx);
     cx.simulate_input("add a benchmark");
     cx.simulate_keystrokes("enter");
@@ -1847,6 +1847,7 @@ fn archiving_the_selected_terminal_returns_to_a_visible_conversation(cx: &mut Te
 #[gpui::test]
 fn a_terminal_keeps_its_draft_and_working_folder_until_closed(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "terminal-folder-retention", false);
+    cx.update(|_, cx| chat.update(cx, |view, _| view.tools.rift = PathBuf::from("/bin/rift")));
     cx.executor().allow_parking();
     cx.simulate_keystrokes("cmd-`");
     cx.update(|window, cx| {
