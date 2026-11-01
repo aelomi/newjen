@@ -17,7 +17,7 @@ The full plan, with the reasons behind each decision, is in [`docs/PLAN.md`](doc
 | Area | Decision |
 |---|---|
 | Platform | **macOS only**. Don't add Linux or Windows code paths. |
-| Language | Rust, in a Cargo workspace. Toolchain 1.98+. |
+| Language | Rust, in a Cargo workspace. Toolchain 1.99.1 pinned in `rust-toolchain.toml`. |
 | UI | GPUI via `gpui = { package = "gpui-pre", version = "=0.3.10" }` and `gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }`. |
 | Components | **GPUI Kit** (Longbridge): `gpui-kit = "=0.8.1"`, a plain crates.io dependency built on the same GPUI. Use Kit's own components with Kit's default theme, sizes and fonts. **Do not fork or vendor it.** Newjen hand-builds only the approval card, tool card and working-dot pulse, from Kit pieces; `crates/app/src/ui/` also holds thin behavior helpers. If a Kit bug blocks work, use a temporary `[patch.crates-io]` entry and report it upstream. |
 | Agents | Claude Code CLI over stream-json and Codex CLI (`codex app-server`), both in the MVP (decided 2026-10-31). Newjen detects which CLIs are installed without spending usage, and each thread picks one provider, model, effort and speed when it is created. `core` has one neutral event and approval model (`agent.rs`) with a Claude adapter and a Codex adapter under `providers/`. API-key providers and ACP agents come later. |
@@ -138,11 +138,17 @@ Mock a change in `design/newjen.pen` with [pen.dev](https://pen.dev) first, incl
 
 ## Commands
 
+Run these commands from the repository. Rustup selects and installs the Rust version pinned in `rust-toolchain.toml`, including Clippy and rustfmt.
+Bump Rust by editing `rust-toolchain.toml` in its own commit.
+
 ```sh
+rustup toolchain install
 cargo run -p app [-- <project dir>]   # launch the app; without a folder it shows the project chooser
 cargo test --workspace --locked       # all tests; no network or login needed (Rift tests skip without rift and jj)
 cargo test -p newjen-core -- --ignored   # live tests against the real claude and codex CLIs (use your logins)
 cargo build --release                 # optimized build
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 A second launch with the same data folder opens or switches to the requested project in the running window. Without a project, it brings that window to the front. Separate `NEWJEN_HOME` folders run independently. A successful handoff exits quietly with code 0. If the running instance cannot accept the request before the timeout, the launcher exits with code 1 and reports an error. In an app bundle, macOS folder-open and reopen events use the running window. The bundle must declare `public.folder` in `CFBundleDocumentTypes` to accept project folders.
@@ -189,7 +195,9 @@ After the release changes land, create and push a version tag pointing at the co
 A tag push runs `.github/workflows/release.yml` on GitHub's hosted Apple Silicon macOS runner.
 You can also run **Release** from the Actions tab and enter an existing version tag.
 Manual dispatch builds that tag, even if you select a different workflow branch.
-The tag must contain the release workflow and `scripts/bundle-app.sh`.
+The tag must contain the release workflow, `scripts/bundle-app.sh`, and `rust-toolchain.toml`.
+CI, releases, and local builds use `rust-toolchain.toml` from the checked-out revision.
+For a release, that file comes from the selected tag.
 
 The workflow runs the same build, test, format, and Clippy gates as CI.
 It calls `scripts/bundle-app.sh <version>` to build an ad-hoc-signed app without Developer ID signing or notarization.

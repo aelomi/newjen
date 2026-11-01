@@ -15,7 +15,7 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Language | Rust (Cargo workspace) | Toolchain 1.98.1 installed |
+| Language | Rust (Cargo workspace) | Toolchain 1.99.1 pinned in `rust-toolchain.toml` |
 | UI framework | GPUI: `gpui-pre =0.3.10`, `gpui-pre-platform =0.3.10` (`font-kit`) | The version GPUI Kit pins |
 | Components | GPUI Kit (Longbridge): `gpui-kit =0.8.1` | Plain pinned dependency, Apache-2.0. Kit components with Kit's default theme, sizes and fonts: title bar, list items, Sheet, Popover, messages/scroller, markdown, input, buttons, tags and menus; diff in slice 4. Newjen hand-builds only the approval card, tool card and working-dot pulse, with thin behavior helpers. |
 | Agent | Claude Code CLI (`claude`) over stream-json and Codex CLI (`codex app-server`), both in the MVP (decided 2026-10-31) | Newjen detects which CLIs are installed without spending usage; each thread picks its provider, model, effort and speed. API-key providers and ACP later |

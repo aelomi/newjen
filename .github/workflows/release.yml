@@ -56,8 +56,7 @@ jobs:
       - name: Rust toolchain
         run: |
           test "$(uname -m)" = arm64
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          rustup toolchain install
 
       - name: Metal shader compiler
         run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
