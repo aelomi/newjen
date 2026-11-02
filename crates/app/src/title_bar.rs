@@ -168,6 +168,38 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
         .into_any_element()
 }
 
+/// The bar above the Usage view: its name and what it shows, with the button that brings the
+/// thread list back while it is out of sight.
+pub fn usage_header(show_list: Option<(OnPress, bool)>, cx: &mut App) -> AnyElement {
+    let lights_over_bar = show_list.is_some();
+    let muted = cx.theme().colors.muted_foreground;
+    ui::card_title_bar(cx)
+        .when(!lights_over_bar, |bar| bar.pl_4())
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .when_some(show_list, |left, (on_press, attention)| {
+                    left.child(show_list_button(on_press, attention, cx))
+                }),
+        )
+        .child(
+            h_flex()
+                .flex_1()
+                .gap_2()
+                .items_baseline()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Usage"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("From each CLI's own reports"),
+                ),
+        )
+        .into_any_element()
+}
+
 /// Where the thread works: the project folder ("Local") or its worktree, quiet beside the
 /// title. The full folder is its tooltip.
 fn where_chip(copy: bool, path: String, cx: &App) -> AnyElement {

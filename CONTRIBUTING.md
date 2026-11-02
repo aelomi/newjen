@@ -42,7 +42,8 @@ crates/
   app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
           #   src/project_view.rs: the window, its loaded projects, the Dock badge, notifications and the quit gate.
           #   src/chat_view.rs (+ chat_view/): one project's threads, composer, approval dock, picker, review pane, terminal panel.
-          #   src/sidebar.rs, src/usage_view.rs: the thread list (grouped by what needs you) and its usage popover.
+          #   src/sidebar.rs: the thread list (grouped by what needs you) and the Usage row at its foot.
+          #   src/context_chip.rs: the composer's context chip and its "This thread" popover. src/usage_view.rs: the Usage view (plan windows with pace, threads in the current windows, a week of tokens).
           #   src/terminal.rs: the per-thread terminal panel. src/attention.rs: AppKit badge and notification adapters.
           #   src/theme.rs: the sidebar width, the card inset and radius, and the material tokens. src/ui/: approval card, tool card, thin Kit helpers and style wrappers (`card`, `glass_title_bar`, `card_title_bar`).
           #   src/assets.rs: extra Kit icons. THIRD-PARTY-NOTICES.md: embedded Lucide icon licenses.

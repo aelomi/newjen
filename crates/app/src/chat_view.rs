@@ -20,6 +20,7 @@ mod lifecycle;
 mod limits;
 mod picker;
 mod review;
+mod usage;
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -59,10 +60,16 @@ use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
 use crate::ui;
 use crate::ui::DOCK_METRICS;
 use crate::ui::MessageList;
-use crate::usage_view::UsageMenu;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::TITLE_BAR_HEIGHT;
 use gpui_kit::component::message_scroller::MessageScrollerState;
+
+/// What the main card shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pane {
+    Thread,
+    Usage,
+}
 
 /// The conversation column is capped at this width and centered, as in the mocks.
 const COLUMN_WIDTH: Pixels = px(720.0);
@@ -84,6 +91,8 @@ const TICK: Duration = Duration::from_secs(1);
 /// Every this many ticks (once a minute) idle `claude`s are stopped (see `Thread::idle_check`)
 /// and "4m ago" moves on.
 const MINUTE_TICKS: u64 = 60;
+/// While the Usage view is open its store queries run again every this many ticks.
+const USAGE_REFRESH_TICKS: u64 = 5;
 
 const LINE_REDRAW: Duration = Duration::from_millis(100);
 const COPY_CANCELLING: &str = "Cancelling…";
@@ -243,8 +252,11 @@ pub struct ChatView {
     drawer_open: bool,
     drawer_focus: FocusHandle,
     list_scroll: ScrollHandle,
-    usage: Entity<UsageMenu>,
     chip: Entity<ChipMenu>,
+    /// What the main card shows: the thread on screen, or the Usage view.
+    pane: Pane,
+    /// The store's answers for the Usage view, read when it opens and while it stays open.
+    usage_snapshot: Option<crate::usage_view::Snapshot>,
     save_problem: Option<String>,
     /// Focus target while an approval is pending (the dock replaces the composer, so the field
     /// is not on screen), so ⌘↵ and Esc reach us.
@@ -335,8 +347,9 @@ impl ChatView {
             drawer_open: false,
             drawer_focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
-            usage: cx.new(|_| UsageMenu::new()),
             chip: cx.new(|_| ChipMenu::new()),
+            pane: Pane::Thread,
+            usage_snapshot: None,
             save_problem: problem,
             root: cx.focus_handle(),
             grants_open: false,
@@ -542,7 +555,7 @@ impl ChatView {
     }
 
     fn composer_has_keys(&self) -> bool {
-        self.dock_request.is_none() && !self.making_copy_shown
+        self.pane == Pane::Thread && self.dock_request.is_none() && !self.making_copy_shown
     }
 
     /// The composer's focus handle of the thread on screen, so `main` can focus it when the
@@ -751,6 +764,7 @@ impl ChatView {
         self.review_panel = None;
         self.terminal_open = false;
         self.drawer_open = false;
+        self.pane = Pane::Thread;
         if target >= self.slots.len() {
             return;
         }
@@ -1045,7 +1059,10 @@ impl ChatView {
             thread.status().is_busy() || thread.preparing().is_some()
         });
         let limited = self.thread().read(cx).limit_event().is_some();
-        if minute || busy || limited {
+        let refreshed = self.pane == Pane::Usage
+            && ticks.is_multiple_of(USAGE_REFRESH_TICKS)
+            && self.refresh_usage();
+        if minute || busy || limited || refreshed {
             cx.notify();
         }
     }
@@ -1599,7 +1616,8 @@ impl ChatView {
     /// Where a key press goes (see `keys::key_route`).
     fn key_route(&self, event: &KeyDownEvent, window: &Window, cx: &App) -> KeyRoute {
         // Only the dock on screen takes ⌘↵ and Esc, and not while the shell has the keyboard.
-        let pending = !self.terminal_focused(window, cx)
+        let pending = self.pane == Pane::Thread
+            && !self.terminal_focused(window, cx)
             && self
                 .thread()
                 .read(cx)
@@ -1663,7 +1681,9 @@ impl ChatView {
         if self.quit_saving {
             return;
         }
-        self.stop(window, cx);
+        if self.pane == Pane::Thread {
+            self.stop(window, cx);
+        }
     }
 
     fn on_new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
@@ -1764,7 +1784,7 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.quit_saving {
+        if self.quit_saving || self.pane == Pane::Usage {
             return;
         }
         self.toggle_terminal(window, cx);
@@ -2643,7 +2663,7 @@ impl ChatView {
         ]
         .into_iter()
         .chain(note)
-        .chain([self.usage.clone().into_any_element()])
+        .chain([self.render_usage_row(cx)])
         .collect()
     }
 
@@ -2696,7 +2716,7 @@ impl ChatView {
                 time: (!draft).then(|| sidebar::compact_time(thread.updated_at(), now_ms)),
                 in_copy: look.copy,
                 strong: look.strong,
-                selected: ix == self.active,
+                selected: ix == self.active && self.pane == Pane::Thread,
                 archivable: thread.preparing().is_none(),
             };
             (id, row)
@@ -2740,6 +2760,124 @@ impl Render for ChatView {
             Placement::Docked => width - sidebar_px,
             Placement::Drawer | Placement::Hidden => width,
         };
+        let docked = (placement == Placement::Docked).then(|| {
+            let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
+            let header = sidebar::header(toggle, window, cx);
+            let list = self.render_list(cx);
+            sidebar::column(header, list, cx)
+        });
+        use gpui_kit::component::{Placement as SheetPlacement, WindowExt as _};
+        if placement == Placement::Drawer && !window.has_active_sheet(cx) {
+            let drawer_fill = crate::theme::material(cx).card;
+            let view = cx.entity().downgrade();
+            let closed = view.clone();
+            window.open_sheet_at(SheetPlacement::Left, cx, move |sheet, window, cx| {
+                let content = view
+                    .update(cx, |view, cx| view.render_drawer(window, cx))
+                    .ok();
+                let closed = closed.clone();
+                sheet
+                    .bg(drawer_fill)
+                    .size(SIDEBAR)
+                    .resizable(false)
+                    .children(content)
+                    .on_close(move |_, _, cx| {
+                        let _ = closed.update(cx, |view, cx| {
+                            view.drawer_open = false;
+                            cx.notify();
+                        });
+                    })
+            });
+            let focus = self.drawer_focus.clone();
+            cx.defer_in(window, move |view, window, cx| {
+                if view.visible && view.drawer_open {
+                    focus.focus(window, cx);
+                }
+            });
+        } else if placement != Placement::Drawer && window.has_active_sheet(cx) {
+            window.close_sheet(cx);
+            self.focus_panel(window, cx);
+        }
+
+        let (fg, font) = {
+            let theme = cx.theme();
+            (theme.foreground, theme.font_family.clone())
+        };
+        let floating = placement == Placement::Docked;
+        let (main, changes) = match self.pane {
+            Pane::Thread => self.render_thread_card(placement, width, main_width, window, cx),
+            Pane::Usage => (self.render_usage_card(placement, cx), None),
+        };
+
+        // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
+        // falls out of the window comes back through `reclaim_focus`.
+        div()
+            .key_context(keys::CONTEXT)
+            .track_focus(&self.root)
+            .size_full()
+            .capture_action(
+                cx.listener(|view, _: &gpui_kit::base::input::Escape, _, cx| {
+                    if view.drawer_open {
+                        view.drawer_open = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .capture_key_down(cx.listener(Self::on_key_capture))
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(cx.listener(Self::on_stop))
+            .on_action(cx.listener(Self::on_new_thread))
+            .on_action(cx.listener(Self::on_previous))
+            .on_action(cx.listener(Self::on_next))
+            .on_action(cx.listener(Self::on_jump))
+            .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_jump_to_needs_you))
+            .on_action(cx.listener(Self::on_toggle_terminal))
+            .flex()
+            .text_color(fg)
+            .font_family(font)
+            .children(docked)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .relative()
+                    .when(floating, |wrapper| {
+                        wrapper.pt(CARD_INSET).pr(CARD_INSET).pb(CARD_INSET).child(
+                            // The strip above the card moves the window like a title bar.
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(CARD_INSET)
+                                .window_control_area(WindowControlArea::Drag)
+                                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.start_window_move()
+                                }),
+                        )
+                    })
+                    .when(floating, |wrapper| wrapper.gap(CARD_INSET))
+                    .child(main)
+                    .children(changes),
+            )
+    }
+}
+
+impl ChatView {
+    /// The thread on screen: its title bar, messages, composer or approval dock, and the
+    /// terminal. The Changes card beside it, when there is one, comes back apart.
+    fn render_thread_card(
+        &mut self,
+        placement: Placement,
+        width: f32,
+        main_width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, Option<AnyElement>) {
         self.sync_changes(window, cx);
         let changes = self.render_changes_card(placement, width, window, cx);
         let main_width = main_width - changes.as_ref().map_or(0.0, |(_, taken)| *taken);
@@ -2813,47 +2951,6 @@ impl Render for ChatView {
             )
         };
 
-        let docked = (placement == Placement::Docked).then(|| {
-            let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
-            let header = sidebar::header(toggle, window, cx);
-            let list = self.render_list(cx);
-            sidebar::column(header, list, cx)
-        });
-        use gpui_kit::component::{Placement as SheetPlacement, WindowExt as _};
-        if placement == Placement::Drawer && !window.has_active_sheet(cx) {
-            let drawer_fill = crate::theme::material(cx).card;
-            let view = cx.entity().downgrade();
-            let closed = view.clone();
-            window.open_sheet_at(SheetPlacement::Left, cx, move |sheet, window, cx| {
-                let content = view
-                    .update(cx, |view, cx| view.render_drawer(window, cx))
-                    .ok();
-                let closed = closed.clone();
-                sheet
-                    .bg(drawer_fill)
-                    .size(SIDEBAR)
-                    .resizable(false)
-                    .children(content)
-                    .on_close(move |_, _, cx| {
-                        let _ = closed.update(cx, |view, cx| {
-                            view.drawer_open = false;
-                            cx.notify();
-                        });
-                    })
-            });
-            let focus = self.drawer_focus.clone();
-            cx.defer_in(window, move |view, window, cx| {
-                if view.visible && view.drawer_open {
-                    focus.focus(window, cx);
-                }
-            });
-        } else if placement != Placement::Drawer && window.has_active_sheet(cx) {
-            window.close_sheet(cx);
-            self.focus_panel(window, cx);
-        }
-
-        let theme = cx.theme();
-        let (fg, font) = (theme.foreground, theme.font_family.clone());
         let material = crate::theme::material(cx);
         let floating = placement == Placement::Docked;
         // Everything that belongs to one thread sits under an id made from the thread's id,
@@ -2880,63 +2977,9 @@ impl Render for ChatView {
             )
             .child(body)
             .children(tail)
-            .children(self.render_terminal_panel(cx));
-
-        // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
-        // falls out of the window comes back through `reclaim_focus`.
-        div()
-            .key_context(keys::CONTEXT)
-            .track_focus(&self.root)
-            .size_full()
-            .capture_action(
-                cx.listener(|view, _: &gpui_kit::base::input::Escape, _, cx| {
-                    if view.drawer_open {
-                        view.drawer_open = false;
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                }),
-            )
-            .capture_key_down(cx.listener(Self::on_key_capture))
-            .on_key_down(cx.listener(Self::on_key_down))
-            .on_action(cx.listener(Self::on_stop))
-            .on_action(cx.listener(Self::on_new_thread))
-            .on_action(cx.listener(Self::on_previous))
-            .on_action(cx.listener(Self::on_next))
-            .on_action(cx.listener(Self::on_jump))
-            .on_action(cx.listener(Self::on_toggle_sidebar))
-            .on_action(cx.listener(Self::on_jump_to_needs_you))
-            .on_action(cx.listener(Self::on_toggle_terminal))
-            .flex()
-            .text_color(fg)
-            .font_family(font)
-            .children(docked)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .relative()
-                    .when(floating, |wrapper| {
-                        wrapper.pt(CARD_INSET).pr(CARD_INSET).pb(CARD_INSET).child(
-                            // The strip above the card moves the window like a title bar.
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(CARD_INSET)
-                                .window_control_area(WindowControlArea::Drag)
-                                .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                    window.start_window_move()
-                                }),
-                        )
-                    })
-                    .when(floating, |wrapper| wrapper.gap(CARD_INSET))
-                    .child(main)
-                    .children(changes.map(|(card, _)| card)),
-            )
+            .children(self.render_terminal_panel(cx))
+            .into_any_element();
+        (main, changes.map(|(card, _)| card))
     }
 }
 

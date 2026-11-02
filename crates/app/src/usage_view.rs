@@ -1,66 +1,123 @@
-//! The "Usage" row at the foot of the thread list and the popover it opens: per provider, its
-//! plan and each window's meter, as the CLIs reported them (`newjen_core::usage`).
-//!
-//! A bar exists only where the CLI reported how much was used. The popover moves in
-//! (opacity and a 4 px rise, 150 ms) only when opened with the mouse.
+//! The Usage view: both providers' plan windows with their pace, the threads that used the
+//! current windows, and a week of tokens. Everything comes from what the CLIs reported and
+//! from what Newjen's own threads saved; nothing here asks a CLI or an API for anything.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, Context, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement, Render, RenderOnce, Styled,
-    WeakEntity, Window, div, hsla, point, prelude::*, px,
+    AnyElement, App, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _, px, relative,
 };
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::animation::ease_out_cubic;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::popover::Popover;
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::{ActiveTheme as _, Selectable, Sizable as _};
-use newjen_core::picker::reset_time;
-use newjen_core::providers::Provider;
-use newjen_core::store::now_ms;
-use newjen_core::usage::{self, ProviderUsage, UsageStatus, UsageWindow};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use newjen_core::Store;
+use newjen_core::picker::{self, reset_time};
+use newjen_core::providers::{Availability, Billing, Provider, ProviderStatus};
+use newjen_core::store::{DailyTokens, ThreadWindowUsage, local_utc_offset_seconds};
+use newjen_core::usage::{self, Pace, ProviderUsage, UsageCredits, UsageStatus, UsageWindow};
 
+use crate::format::{as_of, compact_tokens, dollars, model_name, span, thousands};
+use crate::sidebar::compact_time;
 use crate::theme::material;
-use crate::ui::{self, IconName, Tone};
+use crate::ui;
 
-const WIDTH: f32 = 300.0;
-const RISE: f32 = 4.0;
-const OPEN: Duration = Duration::from_millis(150);
+const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
+const WEEK_DAYS: u32 = 7;
+const THREAD_ROWS: usize = 8;
+const CHART_HEIGHT: f32 = 130.0;
 const METER_WIDTH: f32 = 56.0;
+const TABLE_BAR: f32 = 84.0;
+const LIMIT_REACHED: &str = "You choose when to continue; Newjen never resumes on its own.";
+const NOTHING_REPORTED: &str = "They show here after this account's next reply.";
 
-/// The providers that reported something, in a fixed order.
-fn reported() -> Vec<ProviderUsage> {
-    [Provider::Claude, Provider::Codex]
-        .into_iter()
-        .filter_map(usage::latest)
-        .collect()
+/// How a window reads: amber from 90% or when the pace empties it before the reset, red at
+/// the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Normal,
+    Warning,
+    Limited,
 }
 
-fn provider_name(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Claude => "Claude",
-        Provider::Codex => "Codex",
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowModel {
+    pub key: String,
+    pub label: String,
+    /// "resets 4:10 pm", or "reset" once the time has passed.
+    pub reset: Option<String>,
+    /// The big figure and the bar's fill. None past the reset, or while the CLI gave none.
+    pub used: Option<(String, f32)>,
+    /// Where even spending would be by now, 0.0 to 1.0.
+    pub mark: Option<f32>,
+    pub line: Option<String>,
+    pub tone: Tone,
+}
+
+pub fn window_model(provider: Provider, window: &UsageWindow, now: i64) -> WindowModel {
+    let label = provider.presentation().label;
+    let expired = window.expired(now);
+    let pace = window.pace(now);
+    let mut tone = Tone::Normal;
+    if !expired {
+        let used = window.used_fraction.unwrap_or(0.0);
+        let runs_out = matches!(
+            pace,
+            Some(Pace::Ahead {
+                runs_out_at: Some(_)
+            })
+        );
+        tone = match window.status {
+            UsageStatus::Limited => Tone::Limited,
+            UsageStatus::Warning => Tone::Warning,
+            UsageStatus::Ok if used >= 0.9 || runs_out => Tone::Warning,
+            UsageStatus::Ok => Tone::Normal,
+        };
     }
-}
-
-fn provider_icon(provider: Provider) -> IconName {
-    match provider {
-        Provider::Claude => IconName::Sparkles,
-        Provider::Codex => IconName::Bot,
+    let remaining = window
+        .resets_at_unix_seconds
+        .filter(|_| window.length_seconds.is_some_and(|length| length <= 86_400))
+        .map(|reset| format!(" {} left in this window.", span(reset - now)))
+        .unwrap_or_default();
+    let line = if expired {
+        Some(
+            "Reset since the last report, so no percentage. The next reply brings a new reading."
+                .to_string(),
+        )
+    } else if tone == Tone::Limited {
+        Some(format!("{label}'s limit is reached. {LIMIT_REACHED}"))
+    } else {
+        match pace {
+            Some(Pace::Under) => Some(format!("Under pace.{remaining}")),
+            Some(Pace::On) => Some(format!("On pace.{remaining}")),
+            Some(Pace::Ahead {
+                runs_out_at: Some(out),
+            }) => {
+                let reset = window.resets_at_unix_seconds.unwrap_or(out);
+                Some(format!(
+                    "At this pace it runs out around {}, {} before it resets.",
+                    reset_time(out, now),
+                    span(reset - out)
+                ))
+            }
+            Some(Pace::Ahead { runs_out_at: None }) => Some("Ahead of an even pace.".to_string()),
+            None => None,
+        }
+    };
+    WindowModel {
+        key: window.key.clone(),
+        label: window.label.clone(),
+        reset: reset_line(window, now),
+        used: window
+            .used_fraction
+            .filter(|_| !expired)
+            .map(|used| (format!("{}%", (used * 100.0).round() as i64), used)),
+        mark: pace.and(window.elapsed_fraction(now)),
+        line,
+        tone,
     }
-}
-
-/// The fullest window still counting, for the little meter on the row. A window past its
-/// reset time no longer says anything.
-pub fn worst_meter(usages: &[ProviderUsage], now: i64) -> Option<(f32, UsageStatus)> {
-    usages
-        .iter()
-        .flat_map(|usage| &usage.windows)
-        .filter(|window| !window.expired(now))
-        .filter_map(|window| window.used_fraction.map(|used| (used, window.status)))
-        .max_by(|a, b| a.0.total_cmp(&b.0))
 }
 
 /// "resets 4:10pm", or "reset" once the time has passed; nothing when none was reported.
@@ -73,300 +130,842 @@ pub fn reset_line(window: &UsageWindow, now: i64) -> Option<String> {
         .map(|reset| format!("resets {}", reset_time(reset, now)))
 }
 
-/// The credits line as a label and a value: "Credits 120" is `("Credits", Some("120"))`, "No
-/// credits" has no value.
-pub fn credits_parts(summary: &str) -> (&str, Option<&str>) {
-    match summary.strip_prefix("Credits ") {
-        Some(value) => ("Credits", Some(value)),
-        None => (summary, None),
-    }
-}
-
-/// The credits line for the popover: from 100 up a balance is rounded to whole credits with
-/// thousands separators ("66,389"), below it keeps its cents ("12.50").
-pub fn credits_line(credits: &newjen_core::usage::UsageCredits) -> (String, Option<String>) {
+/// The credits line as a label and a value: from 100 up a balance is rounded to whole credits
+/// with thousands separators ("66,389"), below it keeps its cents ("12.50").
+pub fn credits_line(credits: &UsageCredits) -> (String, Option<String>) {
     match credits.balance {
-        Some(balance) if !credits.unlimited && balance >= 100.0 => (
-            "Credits".into(),
-            Some(crate::format::thousands(balance.round() as usize)),
-        ),
+        Some(balance) if !credits.unlimited && balance >= 100.0 => {
+            ("Credits".into(), Some(thousands(balance.round() as usize)))
+        }
         _ => {
             let summary = credits.summary();
-            let (label, value) = credits_parts(&summary);
-            (label.to_string(), value.map(str::to_string))
+            match summary.strip_prefix("Credits ") {
+                Some(value) => ("Credits".to_string(), Some(value.to_string())),
+                None => (summary, None),
+            }
         }
     }
 }
 
-fn status_color(status: UsageStatus, cx: &App) -> Hsla {
-    let colors = &cx.theme().colors;
-    match status {
-        UsageStatus::Ok => colors.foreground,
-        UsageStatus::Warning => colors.warning,
-        UsageStatus::Limited => colors.danger,
+/// The fullest window still counting, for the little meter on the footer row. A window past
+/// its reset time no longer says anything.
+pub fn worst_meter(usages: &[ProviderUsage], now: i64) -> Option<(f32, UsageStatus)> {
+    usages
+        .iter()
+        .flat_map(|usage| &usage.windows)
+        .filter(|window| !window.expired(now))
+        .filter_map(|window| window.used_fraction.map(|used| (used, window.status)))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+}
+
+/// The meter for the footer row, from what the board holds.
+pub fn footer_meter(now: i64) -> Option<(f32, UsageStatus)> {
+    let usages: Vec<ProviderUsage> = PROVIDERS.into_iter().filter_map(usage::latest).collect();
+    worst_meter(&usages, now)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Charged {
+    pub week: String,
+    pub today: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CardBody {
+    Checking,
+    Unavailable(String),
+    SignedOut {
+        command: &'static str,
+    },
+    /// Signed in, with no limit reported yet.
+    Quiet,
+    ApiKey {
+        variable: &'static str,
+        charged: Option<Charged>,
+    },
+    Plan {
+        windows: Vec<WindowModel>,
+        credits: Option<(String, Option<String>)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardModel {
+    pub provider: Provider,
+    pub plan: Option<String>,
+    /// Beside the name, at the right: "Subscription · as of 2 min ago".
+    pub meta: Option<String>,
+    pub meta_warning: bool,
+    pub body: CardBody,
+}
+
+pub fn card_model(
+    provider: Provider,
+    status: Option<&ProviderStatus>,
+    usage: Option<&ProviderUsage>,
+    charged: Option<(f64, f64)>,
+    now: i64,
+) -> CardModel {
+    let label = provider.presentation().label;
+    let card = |plan, meta, body| CardModel {
+        provider,
+        plan,
+        meta,
+        meta_warning: false,
+        body,
+    };
+    match status.map(|status| &status.availability) {
+        Some(Availability::SignedOut { .. }) => {
+            return card(
+                None,
+                Some("Not signed in".into()),
+                CardBody::SignedOut {
+                    command: match provider {
+                        Provider::Claude => "claude",
+                        Provider::Codex => "codex login",
+                    },
+                },
+            );
+        }
+        Some(Availability::NotInstalled { .. } | Availability::Broken { .. }) => {
+            let detail = status
+                .and_then(|status| picker::account_view(status).unavailable)
+                .unwrap_or_else(|| format!("Couldn't check {label}"));
+            return card(None, None, CardBody::Unavailable(detail));
+        }
+        Some(Availability::Ready { .. }) | None => {}
     }
-}
-
-fn bar(id: String, used: f32, status: UsageStatus, height: f32, cx: &App) -> Progress {
-    Progress::new(id)
-        .value(used * 100.0)
-        .color(status_color(status, cx))
-        .with_size(gpui_kit::component::Size::Size(px(height)))
-}
-
-/// The state behind the footer row: whether the pointer or the keyboard last acted on its
-/// button, which decides whether the popover moves in.
-pub struct UsageMenu {
-    pointer: bool,
-}
-
-impl UsageMenu {
-    pub fn new() -> Self {
-        Self { pointer: false }
-    }
-}
-
-impl Render for UsageMenu {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let usages = reported();
-        let now = now_ms() / 1000;
-        let meter = worst_meter(&usages, now);
-        let pointer = self.pointer;
-        div().id("usage-menu").flex_none().px_0p5().pb_2().child(
-            Popover::new("usage")
-                .anchor(Anchor::BottomLeft)
-                .appearance(false)
-                .trigger_style(gpui::StyleRefinement::default().w_full())
-                .on_open_change({
-                    let owner = cx.weak_entity();
-                    move |open, _, cx| {
-                        if !*open {
-                            let _ = owner.update(cx, |menu, _| menu.pointer = false);
-                        }
-                    }
-                })
-                .trigger(Trigger {
-                    meter,
-                    owner: cx.weak_entity(),
-                })
-                .content(move |_, _, cx| panel(&usages, now, pointer, cx)),
-        )
-    }
-}
-
-/// The footer row: a gauge, "Usage" and the meter of the worst window.
-#[derive(IntoElement)]
-struct Trigger {
-    meter: Option<(f32, UsageStatus)>,
-    owner: WeakEntity<UsageMenu>,
-}
-
-impl Selectable for Trigger {
-    fn selected(self, _: bool) -> Self {
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        false
-    }
-}
-
-impl RenderOnce for Trigger {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let muted = material(cx).glass_muted;
-        let (by_mouse, by_key) = (self.owner.clone(), self.owner);
-        Button::new("usage-trigger")
-            .ghost()
-            .w_full()
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                let _ = by_mouse.update(cx, |menu, _| menu.pointer = true);
-            })
-            .on_key_down(move |_, _, cx| {
-                let _ = by_key.update(cx, |menu, _| menu.pointer = false);
-            })
-            .debug_selector(|| "usage-trigger".to_string())
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(ui::icon(
-                        IconName::Gauge,
-                        gpui_kit::component::Size::Small,
-                        muted,
-                    ))
-                    .child(div().flex_1().text_color(muted).child("Usage"))
-                    .children(self.meter.map(|(used, status)| {
-                        div().flex_none().w(px(METER_WIDTH)).child(bar(
-                            "usage-meter".into(),
-                            used,
-                            status,
-                            4.0,
-                            cx,
-                        ))
-                    })),
+    let Some(usage) = usage else {
+        return card(None, None, CardBody::Checking);
+    };
+    let age = as_of(usage.updated_at_unix_seconds, now);
+    if usage.billing == Billing::ApiKey {
+        let variable = provider.api_key_var();
+        return CardModel {
+            meta: Some(format!("API key · {variable}")),
+            meta_warning: true,
+            ..card(
+                None,
+                None,
+                CardBody::ApiKey {
+                    variable,
+                    charged: charged.map(|(week, today)| Charged {
+                        week: dollars(week),
+                        today: dollars(today),
+                    }),
+                },
             )
+        };
+    }
+    let meta = [
+        (usage.billing == Billing::Subscription).then(|| "Subscription".to_string()),
+        age,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let meta = (!meta.is_empty()).then(|| meta.join(" · "));
+    let body = if usage.windows.is_empty() && usage.credits.is_none() {
+        CardBody::Quiet
+    } else {
+        CardBody::Plan {
+            windows: usage
+                .windows
+                .iter()
+                .map(|window| window_model(provider, window, now))
+                .collect(),
+            credits: usage.credits.as_ref().map(credits_line),
+        }
+    };
+    card(usage.plan_label(), meta, body)
+}
+
+/// The window whose start bounds "the threads that used it": the shortest one still open.
+pub fn current_window(usage: &ProviderUsage, now: i64) -> Option<&UsageWindow> {
+    usage
+        .windows
+        .iter()
+        .filter(|window| !window.expired(now) && window.started_at().is_some())
+        .min_by_key(|window| window.length_seconds)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadLine {
+    pub thread_id: String,
+    pub project_id: i64,
+    pub title: String,
+    pub archived: bool,
+    pub provider: Provider,
+    /// The model that used the most tokens.
+    pub model: String,
+    pub tokens: u64,
+    pub last_active_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DayBar {
+    pub label: String,
+    pub claude: u64,
+    pub codex: u64,
+}
+
+impl DayBar {
+    fn total(&self) -> u64 {
+        self.claude + self.codex
     }
 }
 
-fn panel(usages: &[ProviderUsage], now: i64, pointer: bool, cx: &mut App) -> AnyElement {
-    let material = material(cx);
-    let theme = cx.theme();
-    let ink = hsla(0., 0., 0., if theme.is_dark() { 0.45 } else { 0.18 });
-    let ring = material.card_stroke;
-    let surface = v_flex()
-        .id("usage-panel")
-        .debug_selector(|| "usage-panel".to_string())
-        .relative()
-        .w(px(WIDTH))
-        .p_3()
-        .gap_3()
-        .rounded(px(10.))
-        .bg(material.popover_glass)
-        .text_color(theme.popover_foreground)
-        .text_sm()
-        .children(provider_sections(usages, now, cx));
-    let surface = if usages.is_empty() {
-        surface.child(
-            div()
-                .text_color(material.glass_muted)
-                .child("No usage reported yet."),
-        )
-    } else {
-        surface
-    };
-    // The shadow fades in with the surface: a translucent panel does not hide its own shadow,
-    // so a shadow at full strength would show through it mid-fade.
-    let shadow = move |strength: f32| {
-        vec![
-            gpui::BoxShadow {
-                color: ring.opacity(strength),
-                offset: point(px(0.), px(0.)),
-                blur_radius: px(0.),
-                spread_radius: px(1.),
-                inset: false,
-            },
-            gpui::BoxShadow {
-                color: ink.opacity(ink.a * strength),
-                offset: point(px(0.), px(6.)),
-                blur_radius: px(10.),
-                spread_radius: px(-2.),
-                inset: false,
-            },
-        ]
-    };
-    if !pointer {
-        return surface.shadow(shadow(1.0)).into_any_element();
+/// What the store says, read when the view opens and now and then while it stays open.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Snapshot {
+    pub threads: Vec<ThreadLine>,
+    /// Which windows the table counts, "5-hour" when all are.
+    pub window_name: Option<String>,
+    pub days: Vec<DayBar>,
+    pub busiest: Option<String>,
+    pub charged: HashMap<Provider, (f64, f64)>,
+}
+
+impl Snapshot {
+    pub fn load(store: &Store, now_ms: i64) -> Self {
+        let now = now_ms / 1000;
+        let mut snapshot = Self::default();
+        let offset = local_utc_offset_seconds(now);
+        let days = store
+            .daily_tokens(now_ms, WEEK_DAYS, offset)
+            .unwrap_or_default();
+        let week_start = days
+            .first()
+            .map_or(now - 7 * 86_400, |d| d.day_start_unix_seconds)
+            * 1000;
+        let today_start = days
+            .last()
+            .map_or(now - 86_400, |d| d.day_start_unix_seconds)
+            * 1000;
+        snapshot.days = day_bars(&days);
+        let mut week: HashMap<String, (String, u64)> = HashMap::new();
+        let mut names = Vec::new();
+        for provider in PROVIDERS {
+            for thread in store
+                .threads_with_usage_since(provider, week_start)
+                .unwrap_or_default()
+            {
+                let entry = week
+                    .entry(thread.thread_id.clone())
+                    .or_insert((thread.title.clone(), 0));
+                entry.1 += thread.tokens.total();
+            }
+            let usage = usage::latest(provider);
+            if usage.as_ref().is_some_and(|u| u.billing == Billing::ApiKey) {
+                let charged = |since| store.charged_since(provider, since).unwrap_or_default();
+                snapshot
+                    .charged
+                    .insert(provider, (charged(week_start), charged(today_start)));
+            }
+            let Some(window) = usage.as_ref().and_then(|usage| current_window(usage, now)) else {
+                continue;
+            };
+            let Some(started) = window.started_at() else {
+                continue;
+            };
+            names.push(window.label.clone());
+            snapshot.threads.extend(
+                store
+                    .threads_with_usage_since(provider, started * 1000)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|thread| thread_line(provider, thread)),
+            );
+        }
+        snapshot.threads.sort_by(|a, b| {
+            b.tokens
+                .cmp(&a.tokens)
+                .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
+        });
+        snapshot.threads.truncate(THREAD_ROWS);
+        snapshot.window_name = (!names.is_empty() && names.iter().all(|name| name == "5 hours"))
+            .then(|| "5-hour".to_string());
+        snapshot.busiest = week
+            .into_values()
+            .filter(|(_, tokens)| *tokens > 0)
+            .max_by_key(|(_, tokens)| *tokens)
+            .map(|(title, _)| title);
+        snapshot
     }
-    surface
-        .with_animation(
-            "usage-open",
-            Animation::new(OPEN).with_easing(ease_out_cubic),
-            move |surface, delta| {
-                surface
-                    .top(px(-RISE * (1.0 - delta)))
-                    .opacity(delta)
-                    .shadow(shadow(delta * delta * delta))
-            },
+
+    pub fn week_tokens(&self) -> u64 {
+        self.days.iter().map(DayBar::total).sum()
+    }
+}
+
+fn thread_line(provider: Provider, thread: ThreadWindowUsage) -> ThreadLine {
+    ThreadLine {
+        thread_id: thread.thread_id,
+        project_id: thread.project_id,
+        title: thread.title,
+        archived: thread.archived,
+        provider,
+        model: thread
+            .models
+            .first()
+            .map(|m| model_name(m))
+            .unwrap_or_default(),
+        tokens: thread.tokens.total(),
+        last_active_ms: thread.last_active_ms,
+    }
+}
+
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// The weekday ("Tue") of the local day that began at `day_start` Unix seconds.
+fn weekday(day_start: i64) -> &'static str {
+    let local = day_start + i64::from(local_utc_offset_seconds(day_start));
+    WEEKDAYS[(local.div_euclid(86_400) + 4).rem_euclid(7) as usize]
+}
+
+/// One bar per local day, oldest first, the last one "Today".
+pub fn day_bars(days: &[DailyTokens]) -> Vec<DayBar> {
+    let mut bars: Vec<(i64, DayBar)> = Vec::new();
+    for day in days {
+        let at = match bars
+            .iter()
+            .position(|(start, _)| *start == day.day_start_unix_seconds)
+        {
+            Some(at) => at,
+            None => {
+                bars.push((
+                    day.day_start_unix_seconds,
+                    DayBar {
+                        label: weekday(day.day_start_unix_seconds).to_string(),
+                        claude: 0,
+                        codex: 0,
+                    },
+                ));
+                bars.len() - 1
+            }
+        };
+        let total = day.tokens.total();
+        match day.provider {
+            Provider::Claude => bars[at].1.claude += total,
+            Provider::Codex => bars[at].1.codex += total,
+        }
+    }
+    let mut bars: Vec<DayBar> = bars.into_iter().map(|(_, bar)| bar).collect();
+    if let Some(last) = bars.last_mut() {
+        last.label = "Today".into();
+    }
+    bars
+}
+
+pub type OnOpenThread = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// What the view draws.
+pub struct Input<'a> {
+    pub snapshot: &'a Snapshot,
+    pub statuses: &'a [ProviderStatus],
+    pub now: i64,
+    pub now_ms: i64,
+    /// Rows whose thread is in the project on screen: they open it.
+    pub openable: &'a [String],
+    pub on_open: OnOpenThread,
+}
+
+pub fn render(input: &Input, cx: &App) -> AnyElement {
+    let cards = PROVIDERS.map(|provider| {
+        let model = card_model(
+            provider,
+            input.statuses.iter().find(|s| s.provider == provider),
+            usage::latest(provider).as_ref(),
+            input.snapshot.charged.get(&provider).copied(),
+            input.now,
+        );
+        card_view(&model, cx)
+    });
+    let [claude, codex] = cards;
+    v_flex()
+        .id("usage-scroll")
+        .debug_selector(|| "usage-view".to_string())
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .p_4()
+        .gap_4()
+        .child(
+            h_flex()
+                .flex_wrap()
+                .items_start()
+                .gap_4()
+                .child(claude)
+                .child(codex),
+        )
+        .child(
+            h_flex()
+                .flex_wrap()
+                .items_start()
+                .gap_4()
+                .child(threads_card(input, cx))
+                .child(week_card(input.snapshot, cx)),
         )
         .into_any_element()
 }
 
-fn provider_sections(usages: &[ProviderUsage], now: i64, cx: &App) -> Vec<AnyElement> {
+fn panel(cx: &App) -> gpui::Div {
     let material = material(cx);
-    let mut sections = Vec::new();
-    for (ix, usage) in usages.iter().enumerate() {
-        let mut section = v_flex().gap_2p5();
-        if ix > 0 {
-            section = section
-                .pt_3()
-                .border_t_1()
-                .border_color(material.card_stroke);
-        }
-        section = section.child(
-            h_flex()
-                .items_center()
-                .gap_2()
-                .child(ui::icon(
-                    provider_icon(usage.provider),
-                    gpui_kit::component::Size::Small,
-                    material.glass_muted,
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_base()
-                        .child(provider_name(usage.provider)),
-                )
-                .children(
-                    usage
-                        .plan_label()
-                        .map(|plan| ui::status_badge(plan, Tone::Neutral)),
-                ),
-        );
-        for window in &usage.windows {
-            section = section.child(window_row(usage.provider, window, now, cx));
-        }
-        if let Some(credits) = &usage.credits {
-            let (label, value) = credits_line(credits);
-            section =
-                section.child(
-                    h_flex()
-                        .justify_between()
-                        .gap_2()
-                        .text_color(material.glass_muted)
-                        .child(label)
-                        .children(value.map(|value| {
-                            div().text_color(cx.theme().popover_foreground).child(value)
-                        })),
-                );
-        }
-        sections.push(section.into_any_element());
-    }
-    sections
+    div()
+        .min_w(px(320.))
+        .flex_1()
+        .overflow_hidden()
+        .p_4()
+        .rounded_xl()
+        .border_1()
+        .border_color(material.card_stroke)
+        .bg(material.glass_hover)
 }
 
-fn window_row(provider: Provider, window: &UsageWindow, now: i64, cx: &App) -> AnyElement {
+fn tone_color(tone: Tone, cx: &App) -> Hsla {
+    let colors = cx.theme().colors;
+    match tone {
+        Tone::Normal => colors.foreground,
+        Tone::Warning => colors.warning,
+        Tone::Limited => colors.danger,
+    }
+}
+
+fn card_view(model: &CardModel, cx: &App) -> AnyElement {
     let muted = material(cx).glass_muted;
-    let expired = window.expired(now);
-    let status = if expired {
-        UsageStatus::Ok
+    let colors = cx.theme().colors;
+    let provider = model.provider;
+    let header = h_flex()
+        .items_center()
+        .gap_2()
+        .min_w_0()
+        .child(ui::provider_icon(provider, cx).size_5().flex_none())
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_lg()
+                .child(provider.presentation().label),
+        )
+        .children(
+            model
+                .plan
+                .clone()
+                .map(|plan| ui::status_badge(plan, ui::Tone::Neutral)),
+        )
+        .child(div().flex_1())
+        .children(model.meta.clone().map(|meta| {
+            div()
+                .min_w_0()
+                .text_ellipsis()
+                .text_sm()
+                .text_color(if model.meta_warning {
+                    colors.warning
+                } else {
+                    muted
+                })
+                .child(meta)
+        }));
+    let note = |text: String| div().text_sm().text_color(muted).child(text);
+    let mut card = panel(cx)
+        .id(SharedString::from(format!("usage-card-{}", provider.id())))
+        .debug_selector(move || format!("usage-card-{}", provider.id()))
+        .child(header);
+    let body = v_flex().mt_3().gap_3();
+    card = card.child(match &model.body {
+        CardBody::Checking => {
+            body.child(note(format!("Checking {}…", provider.presentation().label)))
+        }
+        CardBody::Unavailable(detail) => body.child(note(detail.clone())),
+        CardBody::SignedOut { command } => body
+            .child(note(format!(
+                "Run {command} in your own terminal to sign in. Newjen never handles your login."
+            )))
+            .child(
+                div()
+                    .self_start()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(material(cx).glass_selected)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_sm()
+                    .child(command.to_string()),
+            ),
+        CardBody::Quiet => body.child(note(format!(
+            "{} reports its limits during a turn. {NOTHING_REPORTED}",
+            provider.presentation().label
+        ))),
+        CardBody::ApiKey { charged, .. } => {
+            let line = |label: &str, value: String| {
+                h_flex()
+                    .justify_between()
+                    .child(div().text_color(muted).child(label.to_string()))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(value))
+            };
+            body.child(
+                div().text_sm().text_color(colors.warning).child(
+                    "Threads bill the API per token, not your plan. Plan limits do not apply.",
+                ),
+            )
+            .children(
+                charged
+                    .as_ref()
+                    .map(|c| line("Charged in the last 7 days", c.week.clone())),
+            )
+            .children(charged.as_ref().map(|c| line("Today", c.today.clone())))
+        }
+        CardBody::Plan { windows, credits } => body
+            .children(
+                windows
+                    .iter()
+                    .map(|window| window_view(provider, window, cx)),
+            )
+            .children(credits.as_ref().map(|(label, value)| {
+                h_flex()
+                    .justify_between()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(material(cx).card_stroke)
+                    .child(div().text_color(muted).child(label.clone()))
+                    .children(value.clone().map(|value| div().child(value)))
+            })),
+    });
+    card.into_any_element()
+}
+
+fn window_view(provider: Provider, window: &WindowModel, cx: &App) -> AnyElement {
+    let muted = material(cx).glass_muted;
+    let color = tone_color(window.tone, cx);
+    let reset_color = if window.tone == Tone::Limited {
+        color
     } else {
-        window.status
+        muted
     };
-    let reset = reset_line(window, now);
-    let attention = status != UsageStatus::Ok;
+    let bar = window.used.as_ref().map(|(_, used)| {
+        div()
+            .relative()
+            .w_full()
+            .child(
+                Progress::new(format!("usage-{}-{}", provider.id(), window.key))
+                    .value(used * 100.0)
+                    .color(color)
+                    .with_size(gpui_kit::component::Size::Size(px(6.))),
+            )
+            .children(window.mark.map(|mark| {
+                div()
+                    .absolute()
+                    .top(px(-2.))
+                    .left(relative(mark))
+                    .w(px(2.))
+                    .h(px(10.))
+                    .rounded_full()
+                    .bg(muted)
+            }))
+    });
     v_flex()
-        .gap_1()
+        .gap_1p5()
         .child(
             h_flex()
                 .justify_between()
                 .gap_2()
+                .text_sm()
                 .text_color(muted)
                 .child(div().min_w_0().child(window.label.clone()))
-                .children(reset.map(|reset| {
-                    div()
-                        .flex_none()
-                        .when(attention, |line| line.text_color(status_color(status, cx)))
-                        .child(reset)
-                })),
+                .children(
+                    window
+                        .reset
+                        .clone()
+                        .map(|reset| div().flex_none().text_color(reset_color).child(reset)),
+                ),
         )
-        .children(window.used_fraction.filter(|_| !expired).map(|used| {
-            bar(
-                format!("usage-{}-{}", provider.id(), window.key),
-                used,
-                status,
-                4.0,
-                cx,
-            )
+        .children(window.used.as_ref().map(|(percent, _)| {
+            h_flex()
+                .items_baseline()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_color(color)
+                        .text_size(px(26.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(percent.clone()),
+                )
+                .child(div().text_color(muted).child("used"))
         }))
+        .children(bar)
+        .children(window.line.clone().map(|line| {
+            div()
+                .text_sm()
+                .text_color(if window.tone == Tone::Normal {
+                    muted
+                } else {
+                    color
+                })
+                .child(line)
+        }))
+        .into_any_element()
+}
+
+fn threads_card(input: &Input, cx: &App) -> AnyElement {
+    let muted = material(cx).glass_muted;
+    let stroke = material(cx).card_stroke;
+    let snapshot = input.snapshot;
+    let title = match &snapshot.window_name {
+        Some(name) => format!("Threads in the current {name} windows"),
+        None => "Threads in the current windows".to_string(),
+    };
+    let top = snapshot
+        .threads
+        .iter()
+        .map(|t| t.tokens)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let head = |text: &'static str| div().text_xs().text_color(muted).child(text);
+    let table_row = |thread: &ThreadLine| {
+        let openable = input.openable.contains(&thread.thread_id);
+        let id = thread.thread_id.clone();
+        let on_open = input.on_open.clone();
+        let fill = (thread.tokens as f32 / top as f32).clamp(0.04, 1.0);
+        h_flex()
+            .id(SharedString::from(format!("usage-thread-{id}")))
+            .items_center()
+            .gap_3()
+            .py_2()
+            .border_t_1()
+            .border_color(stroke)
+            .text_sm()
+            .when_some(openable.then_some(()), |row, _| {
+                row.cursor_pointer()
+                    .hover(|row| row.bg(material(cx).glass_hover))
+                    .on_click(move |_, window, cx| on_open(&id, window, cx))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .text_color(if thread.archived {
+                        muted
+                    } else {
+                        cx.theme().colors.foreground
+                    })
+                    .child(if thread.archived {
+                        format!("{} (archived)", thread.title)
+                    } else {
+                        thread.title.clone()
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w(px(130.))
+                    .gap_1p5()
+                    .items_center()
+                    .text_color(muted)
+                    .child(ui::provider_icon(thread.provider, cx).size_3p5())
+                    .child(div().min_w_0().text_ellipsis().child(thread.model.clone())),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w(px(TABLE_BAR + 52.))
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div().w(px(TABLE_BAR)).h(px(4.)).rounded_full().child(
+                            div()
+                                .h_full()
+                                .w(relative(fill))
+                                .rounded_full()
+                                .bg(ui::provider_color(thread.provider, cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_right()
+                            .child(compact_tokens(thread.tokens)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(44.))
+                    .text_right()
+                    .text_color(muted)
+                    .child(compact_time(thread.last_active_ms, input.now_ms)),
+            )
+    };
+    let mut card = panel(cx)
+        .flex_grow(1.0)
+        .min_w(px(460.))
+        .child(
+            h_flex()
+                .justify_between()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(div().text_sm().text_color(muted).child("tokens used")),
+        )
+        .child(
+            h_flex()
+                .mt_3()
+                .pb_1p5()
+                .gap_3()
+                .child(head("Thread").flex_1())
+                .child(head("Agent").flex_none().w(px(130.)))
+                .child(head("Tokens").flex_none().w(px(TABLE_BAR + 52.)))
+                .child(head("Active").flex_none().w(px(44.)).text_right()),
+        );
+    if snapshot.threads.is_empty() {
+        card = card.child(
+            div()
+                .pt_3()
+                .border_t_1()
+                .border_color(stroke)
+                .text_sm()
+                .text_color(muted)
+                .child("No Newjen thread has used the current windows yet."),
+        );
+    }
+    card.children(snapshot.threads.iter().map(table_row))
+        .child(
+            div()
+                .pt_2()
+                .border_t_1()
+                .border_color(stroke)
+                .text_xs()
+                .text_color(muted)
+                .child("Counts what Newjen's threads used. Other apps on the same account also count toward the limits."),
+        )
+        .into_any_element()
+}
+
+fn week_card(snapshot: &Snapshot, cx: &App) -> AnyElement {
+    let muted = material(cx).glass_muted;
+    let top = snapshot
+        .days
+        .iter()
+        .map(DayBar::total)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let legend = |provider: Provider| {
+        h_flex()
+            .items_center()
+            .gap_1p5()
+            .text_xs()
+            .text_color(muted)
+            .child(
+                div()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(ui::provider_color(provider, cx)),
+            )
+            .child(provider.presentation().label)
+    };
+    let height = |tokens: u64| {
+        if tokens == 0 {
+            0.0
+        } else {
+            (CHART_HEIGHT * tokens as f32 / top as f32).max(2.0)
+        }
+    };
+    let bars = snapshot.days.iter().map(|day| {
+        v_flex()
+            .flex_1()
+            .items_center()
+            .gap_1p5()
+            .child(
+                v_flex()
+                    .h(px(CHART_HEIGHT))
+                    .w_full()
+                    .max_w(px(40.))
+                    .justify_end()
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(height(day.codex)))
+                            .rounded_t_sm()
+                            .bg(ui::provider_color(Provider::Codex, cx).opacity(0.85)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(height(day.claude)))
+                            .rounded_t_sm()
+                            .bg(ui::provider_color(Provider::Claude, cx)),
+                    ),
+            )
+            .child(div().text_xs().text_color(muted).child(day.label.clone()))
+    });
+    let line = |label: &str, value: String| {
+        h_flex()
+            .justify_between()
+            .text_sm()
+            .child(div().text_color(muted).child(label.to_string()))
+            .child(div().font_weight(FontWeight::MEDIUM).child(value))
+    };
+    panel(cx)
+        .min_w(px(280.))
+        .max_w(px(360.))
+        .child(
+            h_flex()
+                .justify_between()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Last 7 days"))
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .child(legend(Provider::Claude))
+                        .child(legend(Provider::Codex)),
+                ),
+        )
+        .child(h_flex().mt_4().gap_1().items_end().children(bars))
+        .child(
+            v_flex()
+                .mt_3()
+                .gap_1p5()
+                .child(line(
+                    "Tokens this week",
+                    compact_tokens(snapshot.week_tokens()),
+                ))
+                .child(line(
+                    "Busiest thread",
+                    snapshot
+                        .busiest
+                        .clone()
+                        .unwrap_or_else(|| "None yet".into()),
+                )),
+        )
+        .into_any_element()
+}
+
+/// The footer row's meter, a thin bar in the worst window's color.
+pub fn meter_view(meter: (f32, UsageStatus), cx: &App) -> AnyElement {
+    let (used, status) = meter;
+    let colors = cx.theme().colors;
+    let color = match status {
+        UsageStatus::Ok => colors.foreground,
+        UsageStatus::Warning => colors.warning,
+        UsageStatus::Limited => colors.danger,
+    };
+    div()
+        .flex_none()
+        .w(px(METER_WIDTH))
+        .child(
+            Progress::new("usage-meter")
+                .value(used * 100.0)
+                .color(color)
+                .with_size(gpui_kit::component::Size::Size(px(4.))),
+        )
         .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use newjen_core::agent::TokenCounts;
+    use newjen_core::providers::{Account, CatalogSource, ModelCatalog};
 
     const NOW: i64 = 1_000_000;
 
@@ -374,6 +973,7 @@ mod tests {
         key: &str,
         used: Option<f32>,
         resets: Option<i64>,
+        length: Option<i64>,
         status: UsageStatus,
     ) -> UsageWindow {
         UsageWindow {
@@ -381,7 +981,7 @@ mod tests {
             label: key.into(),
             used_fraction: used,
             resets_at_unix_seconds: resets,
-            length_seconds: None,
+            length_seconds: length,
             status,
         }
     }
@@ -389,20 +989,55 @@ mod tests {
     fn usage(windows: Vec<UsageWindow>) -> ProviderUsage {
         ProviderUsage {
             windows,
+            billing: Billing::Subscription,
+            plan: Some("max".into()),
+            updated_at_unix_seconds: Some(NOW - 120),
             ..ProviderUsage::empty(Provider::Claude)
         }
+    }
+
+    fn ready(provider: Provider, billing: Billing) -> ProviderStatus {
+        ProviderStatus {
+            provider,
+            availability: Availability::Ready {
+                binary: "cli".into(),
+                version: "1.0.0".into(),
+                account: Account {
+                    billing,
+                    plan: None,
+                    email: None,
+                },
+                catalog: ModelCatalog {
+                    source: CatalogSource::CliAliases,
+                    models: Vec::new(),
+                },
+                rate_limits: None,
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    fn five_hours(used: f32, left: i64, status: UsageStatus) -> UsageWindow {
+        window(
+            "five_hour",
+            Some(used),
+            Some(NOW + left),
+            Some(18_000),
+            status,
+        )
     }
 
     #[test]
     fn the_meter_shows_the_fullest_live_window() {
         let usages = [
             usage(vec![
-                window("5h", Some(0.38), Some(NOW + 100), UsageStatus::Ok),
-                window("week", Some(0.2), Some(NOW + 100), UsageStatus::Ok),
+                window("5h", Some(0.38), Some(NOW + 100), None, UsageStatus::Ok),
+                window("week", Some(0.2), Some(NOW + 100), None, UsageStatus::Ok),
             ]),
             usage(vec![window(
                 "codex",
                 Some(0.91),
+                None,
                 None,
                 UsageStatus::Warning,
             )]),
@@ -411,43 +1046,38 @@ mod tests {
             worst_meter(&usages, NOW),
             Some((0.91, UsageStatus::Warning))
         );
-        // A window past its reset says nothing any more.
         let stale = [usage(vec![window(
             "5h",
             Some(0.99),
             Some(NOW - 1),
+            None,
             UsageStatus::Warning,
         )])];
         assert_eq!(worst_meter(&stale, NOW), None);
-        // No utilisation reported: no meter.
-        let bare = [usage(vec![window("5h", None, None, UsageStatus::Limited)])];
+        let bare = [usage(vec![window(
+            "5h",
+            None,
+            None,
+            None,
+            UsageStatus::Limited,
+        )])];
         assert_eq!(worst_meter(&bare, NOW), None);
         assert_eq!(worst_meter(&[], NOW), None);
     }
 
     #[test]
     fn a_window_says_when_it_resets_or_that_it_did() {
-        let live = window("5h", Some(0.5), Some(NOW + 3600), UsageStatus::Ok);
+        let live = window("5h", Some(0.5), Some(NOW + 3600), None, UsageStatus::Ok);
         assert!(reset_line(&live, NOW).unwrap().starts_with("resets "));
-        let past = window("5h", Some(0.5), Some(NOW - 5), UsageStatus::Ok);
+        let past = window("5h", Some(0.5), Some(NOW - 5), None, UsageStatus::Ok);
         assert_eq!(reset_line(&past, NOW).as_deref(), Some("reset"));
-        let unknown = window("5h", None, None, UsageStatus::Ok);
+        let unknown = window("5h", None, None, None, UsageStatus::Ok);
         assert_eq!(reset_line(&unknown, NOW), None);
     }
 
     #[test]
-    fn credits_split_into_a_label_and_a_value() {
-        assert_eq!(credits_parts("Credits 120"), ("Credits", Some("120")));
-        assert_eq!(
-            credits_parts("Credits unlimited"),
-            ("Credits", Some("unlimited"))
-        );
-        assert_eq!(credits_parts("No credits"), ("No credits", None));
-    }
-
-    #[test]
     fn a_large_credit_balance_reads_in_whole_credits_with_separators() {
-        let credits = |balance| newjen_core::usage::UsageCredits {
+        let credits = |balance| UsageCredits {
             has_credits: true,
             unlimited: false,
             balance,
@@ -458,9 +1088,271 @@ mod tests {
             ("Credits".into(), Some("66,389".into()))
         );
         assert_eq!(line(Some(100.0)), ("Credits".into(), Some("100".into())));
-        assert_eq!(line(Some(1000.0)), ("Credits".into(), Some("1,000".into())));
         assert_eq!(line(Some(12.5)), ("Credits".into(), Some("12.50".into())));
-        assert_eq!(line(Some(99.0)), ("Credits".into(), Some("99".into())));
+        assert_eq!(line(Some(120.0)), ("Credits".into(), Some("120".into())));
         assert_eq!(line(None), ("Credits".into(), Some("available".into())));
+        let none = UsageCredits {
+            has_credits: false,
+            unlimited: false,
+            balance: None,
+        };
+        assert_eq!(credits_line(&none), ("No credits".into(), None));
+    }
+
+    #[test]
+    fn under_pace_says_how_long_is_left_in_a_short_window() {
+        let model = window_model(
+            Provider::Claude,
+            &five_hours(0.1, 110 * 60, UsageStatus::Ok),
+            NOW,
+        );
+        assert_eq!(model.tone, Tone::Normal);
+        assert_eq!(
+            model.line.as_deref(),
+            Some("Under pace. 1 h 50 min left in this window.")
+        );
+        assert_eq!(model.used, Some(("10%".into(), 0.1)));
+        assert!(model.mark.unwrap() > 0.6);
+        let week = window_model(
+            Provider::Claude,
+            &window(
+                "seven_day",
+                Some(0.12),
+                Some(NOW + 400_000),
+                Some(604_800),
+                UsageStatus::Ok,
+            ),
+            NOW,
+        );
+        assert_eq!(week.line.as_deref(), Some("Under pace."));
+    }
+
+    #[test]
+    fn running_ahead_turns_amber_and_names_when_it_runs_out() {
+        let model = window_model(
+            Provider::Codex,
+            &five_hours(0.82, 3 * 3600, UsageStatus::Ok),
+            NOW,
+        );
+        assert_eq!(model.tone, Tone::Warning);
+        let line = model.line.unwrap();
+        assert!(
+            line.starts_with("At this pace it runs out around "),
+            "{line}"
+        );
+        assert!(line.ends_with(" before it resets."), "{line}");
+    }
+
+    #[test]
+    fn a_fresh_window_ahead_of_pace_stays_plain_until_ninety_percent() {
+        let fresh = |used| {
+            window(
+                "seven_day",
+                Some(used),
+                Some(NOW + 604_800),
+                Some(604_800),
+                UsageStatus::Ok,
+            )
+        };
+        let model = window_model(Provider::Claude, &fresh(0.5), NOW);
+        assert_eq!(model.tone, Tone::Normal);
+        assert_eq!(model.line.as_deref(), Some("Ahead of an even pace."));
+        let nearly = window_model(Provider::Claude, &fresh(0.9), NOW);
+        assert_eq!(nearly.tone, Tone::Warning);
+    }
+
+    #[test]
+    fn a_limit_is_red_and_never_resumes_on_its_own() {
+        let model = window_model(
+            Provider::Codex,
+            &five_hours(1.0, 3600, UsageStatus::Limited),
+            NOW,
+        );
+        assert_eq!(model.tone, Tone::Limited);
+        assert_eq!(model.used.as_ref().unwrap().0, "100%");
+        assert_eq!(
+            model.line.as_deref(),
+            Some(
+                "Codex's limit is reached. You choose when to continue; Newjen never resumes on its own."
+            )
+        );
+    }
+
+    #[test]
+    fn a_window_past_its_reset_drops_its_percentage() {
+        let model = window_model(
+            Provider::Claude,
+            &five_hours(0.9, -10, UsageStatus::Warning),
+            NOW,
+        );
+        assert_eq!(model.used, None);
+        assert_eq!(model.mark, None);
+        assert_eq!(model.tone, Tone::Normal);
+        assert_eq!(model.reset.as_deref(), Some("reset"));
+        assert!(
+            model
+                .line
+                .unwrap()
+                .starts_with("Reset since the last report")
+        );
+    }
+
+    #[test]
+    fn a_window_with_no_utilisation_has_no_bar_or_pace() {
+        let model = window_model(
+            Provider::Claude,
+            &window("usage", None, Some(NOW + 60), None, UsageStatus::Ok),
+            NOW,
+        );
+        assert_eq!(model.used, None);
+        assert_eq!(model.mark, None);
+        assert_eq!(model.line, None);
+    }
+
+    #[test]
+    fn the_card_follows_what_the_cli_and_the_board_know() {
+        let signed_out = ProviderStatus {
+            provider: Provider::Claude,
+            availability: Availability::SignedOut {
+                binary: "cli".into(),
+                version: "1".into(),
+                hint: String::new(),
+            },
+        };
+        let card = card_model(Provider::Claude, Some(&signed_out), None, None, NOW);
+        assert_eq!(card.body, CardBody::SignedOut { command: "claude" });
+        assert_eq!(card.meta.as_deref(), Some("Not signed in"));
+        let card = card_model(Provider::Codex, Some(&signed_out), None, None, NOW);
+        assert_eq!(
+            card.body,
+            CardBody::SignedOut {
+                command: "codex login"
+            }
+        );
+
+        let card = card_model(Provider::Claude, None, None, None, NOW);
+        assert_eq!(card.body, CardBody::Checking);
+
+        let quiet = ProviderUsage {
+            windows: Vec::new(),
+            ..usage(Vec::new())
+        };
+        let card = card_model(
+            Provider::Claude,
+            Some(&ready(Provider::Claude, Billing::Subscription)),
+            Some(&quiet),
+            None,
+            NOW,
+        );
+        assert_eq!(card.body, CardBody::Quiet);
+        assert_eq!(card.plan.as_deref(), Some("Max"));
+        assert_eq!(card.meta.as_deref(), Some("Subscription · as of 2 min ago"));
+
+        let keyed = ProviderUsage {
+            billing: Billing::ApiKey,
+            plan: None,
+            ..usage(vec![five_hours(0.5, 100, UsageStatus::Ok)])
+        };
+        let card = card_model(
+            Provider::Claude,
+            Some(&ready(Provider::Claude, Billing::ApiKey)),
+            Some(&keyed),
+            Some((48.2, 6.75)),
+            NOW,
+        );
+        assert!(card.meta_warning);
+        assert_eq!(card.meta.as_deref(), Some("API key · ANTHROPIC_API_KEY"));
+        assert_eq!(
+            card.body,
+            CardBody::ApiKey {
+                variable: "ANTHROPIC_API_KEY",
+                charged: Some(Charged {
+                    week: "$48.20".into(),
+                    today: "$6.75".into()
+                })
+            }
+        );
+
+        let planned = usage(vec![five_hours(0.38, 6600, UsageStatus::Ok)]);
+        let card = card_model(Provider::Claude, None, Some(&planned), None, NOW);
+        let CardBody::Plan { windows, credits } = card.body else {
+            panic!("a plan card")
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(credits, None);
+    }
+
+    #[test]
+    fn the_table_counts_from_the_shortest_open_window() {
+        let mixed = usage(vec![
+            window(
+                "seven_day",
+                Some(0.1),
+                Some(NOW + 300_000),
+                Some(604_800),
+                UsageStatus::Ok,
+            ),
+            five_hours(0.4, 3600, UsageStatus::Ok),
+        ]);
+        let picked = current_window(&mixed, NOW).unwrap();
+        assert_eq!(picked.key, "five_hour");
+        assert_eq!(picked.started_at(), Some(NOW + 3600 - 18_000));
+
+        let expired = usage(vec![five_hours(0.4, -5, UsageStatus::Ok)]);
+        assert!(current_window(&expired, NOW).is_none());
+        let unmeasured = usage(vec![window(
+            "x",
+            Some(0.1),
+            Some(NOW + 5),
+            None,
+            UsageStatus::Ok,
+        )]);
+        assert!(current_window(&unmeasured, NOW).is_none());
+    }
+
+    #[test]
+    fn days_group_both_providers_and_the_last_is_today() {
+        let counts = |total: u64| TokenCounts {
+            input: total,
+            ..TokenCounts::default()
+        };
+        let day = |start: i64, provider, total| DailyTokens {
+            day_start_unix_seconds: start,
+            provider,
+            tokens: counts(total),
+        };
+        let bars = day_bars(&[
+            day(0, Provider::Claude, 100),
+            day(0, Provider::Codex, 40),
+            day(86_400, Provider::Claude, 0),
+            day(86_400, Provider::Codex, 7),
+        ]);
+        assert_eq!(bars.len(), 2);
+        assert_eq!((bars[0].claude, bars[0].codex), (100, 40));
+        assert_eq!((bars[1].claude, bars[1].codex), (0, 7));
+        assert_eq!(bars[1].label, "Today");
+        assert!(WEEKDAYS.contains(&bars[0].label.as_str()));
+        assert_eq!(
+            Snapshot {
+                days: bars,
+                ..Snapshot::default()
+            }
+            .week_tokens(),
+            147
+        );
+    }
+
+    #[test]
+    fn weekdays_follow_the_local_calendar() {
+        let midnight = 1_793_664_000;
+        let offset = i64::from(local_utc_offset_seconds(midnight));
+        let local_midnight = midnight - offset;
+        let names: Vec<_> = (0..7)
+            .map(|d| weekday(local_midnight + d * 86_400))
+            .collect();
+        let first = WEEKDAYS.iter().position(|d| *d == names[0]).unwrap();
+        for (ix, name) in names.iter().enumerate() {
+            assert_eq!(*name, WEEKDAYS[(first + ix) % 7]);
+        }
     }
 }

@@ -5,7 +5,7 @@ use newjen_core::providers::Provider;
 use super::IconName;
 
 /// The provider's mark color: Claude's own orange, Codex in the text color.
-fn provider_color(provider: Provider, cx: &App) -> Hsla {
+pub fn provider_color(provider: Provider, cx: &App) -> Hsla {
     match provider {
         Provider::Claude => Hsla::from(rgb(0xd97757)),
         Provider::Codex => cx.theme().foreground,

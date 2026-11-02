@@ -189,6 +189,37 @@ fn capitalized(word: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A stretch of time in the two largest whole units: "40 s", "35 min", "1 h 50 min", "2 days".
+pub fn span(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let (minutes, hours, days) = (seconds / 60, seconds / 3600, seconds / 86_400);
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else if hours < 1 {
+        format!("{minutes} min")
+    } else if days < 1 {
+        match minutes % 60 {
+            0 => format!("{hours} h"),
+            rest => format!("{hours} h {rest} min"),
+        }
+    } else if days == 1 {
+        "1 day".to_string()
+    } else {
+        format!("{days} days")
+    }
+}
+
+/// How old a report is, "as of now", "as of 2 min ago", "as of 3 days ago". `None` when the
+/// report has no time.
+pub fn as_of(updated: Option<i64>, now: i64) -> Option<String> {
+    let age = now - updated?;
+    Some(if age < 60 {
+        "as of now".to_string()
+    } else {
+        format!("as of {} ago", span(age))
+    })
+}
+
 /// The quiet line under an answer: the model and how hard it thinks, "Opus 5.5 · High".
 pub fn model_footer(model: &str, effort: Option<&str>, fast: bool) -> String {
     let mut line = model.to_string();
@@ -559,6 +590,24 @@ mod tests {
         assert_eq!(model_name("gpt-6.1-sol"), "GPT-6.1-Sol");
         assert_eq!(model_name("some-local-model"), "some-local-model");
         assert_eq!(model_name("claude-"), "claude-");
+    }
+
+    #[test]
+    fn spans_and_report_ages_read_in_two_units() {
+        assert_eq!(span(40), "40 s");
+        assert_eq!(span(35 * 60), "35 min");
+        assert_eq!(span(110 * 60), "1 h 50 min");
+        assert_eq!(span(2 * 3600), "2 h");
+        assert_eq!(span(86_400), "1 day");
+        assert_eq!(span(3 * 86_400 + 5), "3 days");
+        assert_eq!(as_of(Some(100), 130).as_deref(), Some("as of now"));
+        assert_eq!(as_of(Some(0), 120).as_deref(), Some("as of 2 min ago"));
+        assert_eq!(
+            as_of(Some(0), 3 * 86_400).as_deref(),
+            Some("as of 3 days ago")
+        );
+        assert_eq!(as_of(None, 5), None);
+        assert_eq!(as_of(Some(500), 100).as_deref(), Some("as of now"));
     }
 
     #[test]

@@ -2263,7 +2263,9 @@ fn a_dismissed_notification_note_stays_dismissed(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn the_sidebar_groups_threads_and_its_usage_row_opens_a_panel(cx: &mut TestAppContext) {
+async fn the_sidebar_groups_threads_and_its_usage_row_opens_the_usage_view(
+    cx: &mut TestAppContext,
+) {
     let (chat, path, cx) = setup(cx, "sidebar-groups", true);
     cx.run_until_parked();
     for selector in [
@@ -2294,14 +2296,14 @@ async fn the_sidebar_groups_threads_and_its_usage_row_opens_a_panel(cx: &mut Tes
     cx.simulate_keystrokes("cmd-n");
     cx.run_until_parked();
     assert!(cx.debug_bounds("thread-row").is_some());
-    // The usage row opens its panel, and a click elsewhere closes it.
-    assert!(cx.debug_bounds("usage-panel").is_none());
+    // The usage row opens the Usage view in place of the thread, and a thread row returns.
+    assert!(cx.debug_bounds("usage-view").is_none());
     click(cx, "usage-trigger");
     cx.run_until_parked();
-    assert!(cx.debug_bounds("usage-panel").is_some());
+    assert!(cx.debug_bounds("usage-view").is_some());
     click(cx, "thread-row");
     cx.run_until_parked();
-    assert!(cx.debug_bounds("usage-panel").is_none());
+    assert!(cx.debug_bounds("usage-view").is_none());
     finish(&chat, path, cx);
 }
 

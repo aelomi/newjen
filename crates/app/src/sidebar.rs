@@ -611,6 +611,46 @@ pub fn section_header(group: SidebarGroup, count: usize, cx: &App) -> AnyElement
         .into_any_element()
 }
 
+/// The row at the foot of the list that opens the Usage view: a gauge, "Usage" and the meter
+/// of the fullest window.
+pub fn usage_row(
+    selected: bool,
+    meter: Option<AnyElement>,
+    on_press: OnPress,
+    cx: &App,
+) -> AnyElement {
+    let muted = crate::theme::material(cx).glass_muted;
+    div()
+        .id("usage-menu")
+        .flex_none()
+        .pb_2()
+        .child(
+            ListItem::new("usage-row")
+                .w_full()
+                .px_2p5()
+                .py_1p5()
+                .rounded_lg()
+                .selected(selected)
+                .accessibility_label("Usage")
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                .on_click(move |_, window, cx| on_press(window, cx))
+                .debug_selector(|| "usage-trigger".to_string())
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(ui::icon(
+                            IconName::Gauge,
+                            gpui_kit::component::Size::Small,
+                            muted,
+                        ))
+                        .child(div().flex_1().text_color(muted).child("Usage"))
+                        .children(meter),
+                ),
+        )
+        .into_any_element()
+}
+
 /// What one thread row shows.
 pub struct Row {
     /// The thread's id, which keys the row's state (its menu).
