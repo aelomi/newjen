@@ -155,7 +155,7 @@ impl ChatView {
                 .h(px(TERMINAL_HEIGHT))
                 .max_h(gpui::relative(0.5))
                 .child(strip)
-                .child(v_flex().flex_1().min_h_0().child(terminal))
+                .child(v_flex().flex_1().min_h_0().px_3().pb_2().child(terminal))
                 .into_any_element(),
         )
     }

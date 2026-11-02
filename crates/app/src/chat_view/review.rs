@@ -624,7 +624,10 @@ impl ChatView {
             .px_4()
             .gap_2()
             .children(
-                (!self.changes.on_screen && self.review_panel.is_none()).then(|| {
+                (self.changes.has_changes
+                    && !self.changes.on_screen
+                    && self.review_panel.is_none())
+                .then(|| {
                     ui::button(
                         "review-work",
                         if self.review_loading {

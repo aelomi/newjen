@@ -34,6 +34,8 @@ pub(super) struct ChangesCard {
     toggled_at: Option<Instant>,
     /// The card is on screen, so the review toolbar need not offer its own button.
     pub(super) on_screen: bool,
+    /// The thread on screen has changes to review.
+    pub(super) has_changes: bool,
 }
 
 /// jj is asked again this many times for a transcript length it failed on.
@@ -455,6 +457,7 @@ impl ChatView {
     ) -> Option<(AnyElement, f32)> {
         let (has, fits) = self.changes_facts(placement, width, cx);
         self.changes.on_screen = false;
+        self.changes.has_changes = has;
         if !has || !fits {
             return None;
         }
