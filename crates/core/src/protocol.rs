@@ -43,7 +43,7 @@ pub enum Incoming {
     /// `type: "control_cancel_request"`: the CLI withdraws a control request it sent earlier
     /// (for example an approval it no longer needs). Holds that request's id.
     ControlCancelRequest { request_id: String },
-    /// `type: "rate_limit_event"`: usage-limit info. Kept raw; Newjen does not use it yet.
+    /// `type: "rate_limit_event"`: usage-limit info, kept raw.
     RateLimit(Value),
     /// `type: "result"`: the end of a turn.
     Result(ResultMessage),
@@ -194,6 +194,34 @@ pub struct ApiMessage {
     pub id: String,
     pub model: Option<String>,
     pub content: Vec<ContentBlock>,
+    /// Token counts of the model call that produced this line. Several lines of one message
+    /// repeat the same counts, and the output count can still be partial.
+    #[serde(deserialize_with = "lenient")]
+    pub usage: Option<ApiUsage>,
+}
+
+/// The `usage` object of an `assistant` line (snake_case, unlike a result's `modelUsage`).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct ApiUsage {
+    #[serde(deserialize_with = "lenient")]
+    pub input_tokens: u64,
+    #[serde(deserialize_with = "lenient")]
+    pub cache_read_input_tokens: u64,
+    #[serde(deserialize_with = "lenient")]
+    pub cache_creation_input_tokens: u64,
+    #[serde(deserialize_with = "lenient")]
+    pub output_tokens: u64,
+}
+
+impl ApiUsage {
+    /// Everything the model saw and wrote in this call: what now sits in the context.
+    pub fn context_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.output_tokens)
+    }
 }
 
 /// One content block of a message. Built from raw JSON by hand (see the `From<Value>` impl) so
@@ -511,8 +539,21 @@ pub struct ResultMessage {
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default)]
 pub struct ModelUsage {
-    #[serde(rename = "costUSD")]
+    #[serde(rename = "costUSD", deserialize_with = "lenient")]
     pub cost_usd: Option<f64>,
+    #[serde(rename = "inputTokens", deserialize_with = "lenient")]
+    pub input_tokens: u64,
+    #[serde(rename = "outputTokens", deserialize_with = "lenient")]
+    pub output_tokens: u64,
+    #[serde(rename = "cacheReadInputTokens", deserialize_with = "lenient")]
+    pub cache_read_input_tokens: u64,
+    #[serde(rename = "cacheCreationInputTokens", deserialize_with = "lenient")]
+    pub cache_creation_input_tokens: u64,
+    /// Part of `output_tokens`, not on top of it.
+    #[serde(rename = "thinkingTokens", deserialize_with = "lenient")]
+    pub thinking_tokens: u64,
+    #[serde(rename = "contextWindow", deserialize_with = "lenient")]
+    pub context_window: Option<u64>,
 }
 
 impl ResultMessage {
@@ -946,6 +987,48 @@ mod tests {
             suggestions,
             blocked_path: None,
         }
+    }
+
+    #[test]
+    fn assistant_usage_and_result_model_usage_keep_their_own_key_styles() {
+        let Incoming::Assistant(assistant) = Incoming::from_value(json!({
+            "type": "assistant",
+            "message": {"id": "m1", "model": "claude-haiku-5-5", "content": [],
+                "usage": {"input_tokens": 2, "cache_creation_input_tokens": 13999,
+                    "cache_read_input_tokens": 15381, "output_tokens": 4}}
+        })) else {
+            panic!("not an assistant line");
+        };
+        let usage = assistant.message.usage.unwrap();
+        assert_eq!(usage.context_tokens(), 2 + 13999 + 15381 + 4);
+
+        let Incoming::Result(result) = Incoming::from_value(json!({
+            "type": "result",
+            "model_usage_since_last_result": {"claude-haiku-5-5": {
+                "inputTokens": 2, "outputTokens": 6, "cacheReadInputTokens": 15859,
+                "cacheCreationInputTokens": 13608, "thinkingTokens": 3,
+                "costUSD": 0.5, "contextWindow": 1000000}}
+        })) else {
+            panic!("not a result line");
+        };
+        let model = &result.model_usage_since_last_result.unwrap()["claude-haiku-5-5"];
+        assert_eq!(model.cache_read_input_tokens, 15859);
+        assert_eq!(model.cache_creation_input_tokens, 13608);
+        assert_eq!(model.thinking_tokens, 3);
+        assert_eq!(model.context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn malformed_usage_numbers_default_instead_of_losing_the_line() {
+        let Incoming::Result(result) = Incoming::from_value(json!({
+            "type": "result",
+            "model_usage_since_last_result": {"m": {"inputTokens": "many", "contextWindow": "big"}}
+        })) else {
+            panic!("not a result line");
+        };
+        let model = &result.model_usage_since_last_result.unwrap()["m"];
+        assert_eq!(model.input_tokens, 0);
+        assert_eq!(model.context_window, None);
     }
 
     #[test]
