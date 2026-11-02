@@ -522,9 +522,11 @@ impl UsageBoard {
                         .clone()
                         .filter(|p| !p.trim().is_empty() && p != "unknown"),
                 };
-                stored.updated_at_unix_seconds = Some(now);
                 if let Some(report) = rate_limits {
                     stored.absorb(&ProviderUsage::from_codex_report(report));
+                }
+                if rate_limits.is_some() || stored.windows.is_empty() {
+                    stored.updated_at_unix_seconds = Some(now);
                 }
             }
             Availability::NotInstalled { .. } | Availability::SignedOut { .. } => {

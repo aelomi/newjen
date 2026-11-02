@@ -264,7 +264,7 @@ fn board_keeps_the_latest_window_and_never_erases_plan_or_credits() {
     let stored = board.get(Provider::Claude).unwrap();
     assert_eq!(stored.plan_label().as_deref(), Some("Max"));
     assert_eq!(stored.windows.len(), 2);
-    assert_eq!(stored.updated_at_unix_seconds, Some(101));
+    assert_eq!(stored.updated_at_unix_seconds, Some(100));
 
     let rejected =
         ProviderUsage::from_claude_rate_limit(&claude_infos("claude/limit-rejected.jsonl")[0])
@@ -526,6 +526,29 @@ fn a_restored_report_is_dropped_when_the_cli_is_signed_in_to_another_account() {
     assert!(stored.windows.is_empty());
     assert_eq!(stored.plan.as_deref(), Some("pro"));
     assert_eq!(board.account(Provider::Claude), Some("b@example.com"));
+}
+
+#[test]
+fn a_status_check_does_not_make_older_windows_look_fresh() {
+    let mut saved =
+        ProviderUsage::from_claude_rate_limit(&claude_infos("text_reply.jsonl")[0]).unwrap();
+    saved.updated_at_unix_seconds = Some(50);
+    let mut board = UsageBoard::new();
+    board.restore(vec![SavedUsage {
+        usage: saved,
+        account: Some("a@example.com".into()),
+    }]);
+    board.record_status(&status(Provider::Claude, "max", "a@example.com", None), 900);
+    let stored = board.get(Provider::Claude).unwrap();
+    assert_eq!(stored.updated_at_unix_seconds, Some(50));
+    assert_eq!(stored.plan.as_deref(), Some("max"));
+
+    let mut bare = UsageBoard::new();
+    bare.record_status(&status(Provider::Claude, "max", "a@example.com", None), 900);
+    assert_eq!(
+        bare.get(Provider::Claude).unwrap().updated_at_unix_seconds,
+        Some(900)
+    );
 }
 
 #[test]
