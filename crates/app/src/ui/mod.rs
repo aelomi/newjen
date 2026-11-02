@@ -26,12 +26,18 @@ mod code;
 mod copy;
 mod message;
 mod motion;
+mod popover;
+mod provider;
+mod ring;
 mod step;
 mod tool_card;
 pub use code::CodeBlock;
 pub use copy::CopyButton;
 pub use message::{ErrorNotice, Pending, assistant, user, user_pending};
 pub use motion::Chevron;
+pub use popover::popover_surface;
+pub use provider::provider_icon;
+pub use ring::ring;
 pub use step::{
     Detail, Mark, Narration, Part, QuietMark, StepState, StepView, WorkBlockView, mark, step_mark,
 };

@@ -5,16 +5,11 @@
 //!
 use std::rc::Rc;
 
-use std::time::Duration;
-
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, BoxShadow, ClickEvent, FocusHandle,
-    FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, Styled,
-    Window, div, hsla, prelude::*, px,
+    Anchor, AnyElement, App, ClickEvent, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, RenderOnce, SharedString, Styled, Window, div, prelude::*, px,
 };
 use gpui_kit::base::{FocusTrapElement as _, Selectable, h_flex, v_flex};
-use gpui_kit::component::ThemeStyled as _;
-use gpui_kit::component::animation::ease_out_cubic;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
 use newjen_core::{GrantId, GrantView};
@@ -298,47 +293,9 @@ fn grants_popover(
                 .child(panel)
                 .on_mouse_down_out(dismiss)
                 .focus_trap("grants-trap", &focus);
-            let surface = div().relative().popover_style(cx).p_3().child(inner);
-            if pointer {
-                // The shadow is raised with the cube of the fade, as Kit's own dropdowns do,
-                // so it never shows through the glass while it is still see-through.
-                let ink = cx.theme().foreground.alpha(0.1);
-                surface
-                    .with_animation(
-                        "grants-enter",
-                        Animation::new(POPOVER_ENTER).with_easing(ease_out_cubic),
-                        move |surface, t| {
-                            surface
-                                .top(px(POPOVER_RISE * (t - 1.)))
-                                .opacity(t)
-                                .shadow(surface_shadow(ink, t * t * t))
-                        },
-                    )
-                    .into_any_element()
-            } else {
-                surface.into_any_element()
-            }
+            ui::popover_surface("grants-enter", div().p_3().child(inner), pointer, cx)
         })
         .into_any_element()
-}
-
-const POPOVER_ENTER: Duration = Duration::from_millis(150);
-const POPOVER_RISE: f32 = 4.;
-
-/// The hairline ring and soft shadow of a Kit popover, at `strength` of their ink.
-fn surface_shadow(ring: gpui::Hsla, strength: f32) -> Vec<BoxShadow> {
-    let ink = hsla(0., 0., 0., 0.1 * strength);
-    vec![
-        BoxShadow::new(px(0.), px(0.), ring.alpha(ring.a * strength))
-            .blur_radius(px(0.))
-            .spread_radius(px(1.)),
-        BoxShadow::new(px(0.), px(4.), ink)
-            .blur_radius(px(3.))
-            .spread_radius(px(-1.)),
-        BoxShadow::new(px(0.), px(2.), ink)
-            .blur_radius(px(2.))
-            .spread_radius(px(-2.)),
-    ]
 }
 
 /// The shield button that opens the popover.

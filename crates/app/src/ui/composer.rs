@@ -34,6 +34,7 @@ pub struct Composer {
     footer: Footer,
     chips: Option<AnyElement>,
     works_in: Option<AnyElement>,
+    meter: Option<AnyElement>,
 }
 
 impl Composer {
@@ -43,6 +44,7 @@ impl Composer {
             footer,
             chips: None,
             works_in: None,
+            meter: None,
         }
     }
 
@@ -55,6 +57,12 @@ impl Composer {
     /// The Local | worktree control, left of the send button.
     pub fn works_in(mut self, works_in: Option<AnyElement>) -> Self {
         self.works_in = works_in;
+        self
+    }
+
+    /// The context chip, between the Local | worktree control and the send button.
+    pub fn meter(mut self, meter: Option<AnyElement>) -> Self {
+        self.meter = meter;
         self
     }
 }
@@ -154,6 +162,7 @@ impl RenderOnce for Composer {
                     .child(ellipsis(why))
             }))
             .children(self.works_in)
+            .children(self.meter)
             .children(button.map(|(name, button)| {
                 div().debug_selector(move || name.to_string()).child(button)
             }));

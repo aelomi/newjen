@@ -83,6 +83,112 @@ pub fn thousands(count: usize) -> String {
     grouped
 }
 
+/// A token count in three significant figures: "742", "9.84k", "68k", "186k", "1.24M". A
+/// count that rounds up to the next unit moves to it ("999,600" is "1M").
+pub fn compact_tokens(count: u64) -> String {
+    const UNITS: [(f64, &str); 3] = [(1e3, "k"), (1e6, "M"), (1e9, "B")];
+    if count < 1_000 {
+        return count.to_string();
+    }
+    let mut ix = UNITS
+        .iter()
+        .rposition(|(size, _)| count as f64 >= *size)
+        .unwrap_or(0);
+    loop {
+        let value = count as f64 / UNITS[ix].0;
+        let decimals = if value >= 100.0 {
+            0
+        } else if value >= 10.0 {
+            1
+        } else {
+            2
+        };
+        let text = format!("{value:.decimals$}");
+        if text == "1000" && ix + 1 < UNITS.len() {
+            ix += 1;
+            continue;
+        }
+        let text = if text.contains('.') {
+            text.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            text
+        };
+        return format!("{text}{}", UNITS[ix].1);
+    }
+}
+
+/// A price in dollars and cents with thousands separators: "$4.12", "$1,234.56". Less than a
+/// cent reads "<$0.01", so a real charge is never shown as nothing.
+pub fn dollars(amount: f64) -> String {
+    if amount <= 0.0 {
+        return "$0.00".to_string();
+    }
+    let cents = (amount * 100.0).round() as u64;
+    if cents == 0 {
+        return "<$0.01".to_string();
+    }
+    format!("${}.{:02}", thousands((cents / 100) as usize), cents % 100)
+}
+
+/// A model as people name it, from the id the CLI reports: "claude-opus-5-5" is "Opus 5.5",
+/// "claude-haiku-4-5-20251001" is "Haiku 4.5", "gpt-6.1-sol" is "GPT-6.1-Sol". A context
+/// suffix such as "[1m]" stays. An id it does not recognise is returned as it is.
+pub fn model_name(id: &str) -> String {
+    let (base, suffix) = match id.find('[') {
+        Some(at) => (&id[..at], &id[at..]),
+        None => (id, ""),
+    };
+    let named = if let Some(rest) = base.strip_prefix("claude-") {
+        let (mut family, mut version) = (Vec::new(), Vec::new());
+        for part in rest.split('-') {
+            if part.len() == 8 && part.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                version.push(part);
+            } else if !part.is_empty() {
+                family.push(capitalized(part));
+            }
+        }
+        if family.is_empty() {
+            None
+        } else {
+            let mut name = family.join(" ");
+            if !version.is_empty() {
+                name = format!("{name} {}", version.join("."));
+            }
+            Some(name)
+        }
+    } else if base.to_ascii_lowercase().starts_with("gpt") {
+        Some(
+            base.split('-')
+                .map(|part| {
+                    if part.eq_ignore_ascii_case("gpt") {
+                        "GPT".to_string()
+                    } else {
+                        capitalized(part)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("-"),
+        )
+    } else {
+        None
+    };
+    match named {
+        Some(name) => format!("{name}{}", if suffix.is_empty() { "" } else { " " }) + suffix,
+        None => id.to_string(),
+    }
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// The quiet line under an answer: the model and how hard it thinks, "Opus 5.5 · High".
 pub fn model_footer(model: &str, effort: Option<&str>, fast: bool) -> String {
     let mut line = model.to_string();
@@ -409,6 +515,50 @@ mod tests {
         assert_eq!(turn_caption(Some(4_523_417), None, false), "Done in 1h 15m");
         assert_eq!(turn_caption(None, None, false), "Done");
         assert_eq!(turn_caption(Some(1_000), Some(0.5), true), "Stopped");
+    }
+
+    #[test]
+    fn token_counts_keep_three_significant_figures() {
+        let cases: [(u64, &str); 15] = [
+            (0, "0"),
+            (742, "742"),
+            (1_000, "1k"),
+            (9_840, "9.84k"),
+            (9_800, "9.8k"),
+            (18_400, "18.4k"),
+            (68_000, "68k"),
+            (186_000, "186k"),
+            (999_400, "999k"),
+            (999_600, "1M"),
+            (1_240_000, "1.24M"),
+            (12_400_000, "12.4M"),
+            (124_000_000, "124M"),
+            (999_700_000, "1B"),
+            (1_500_000_000, "1.5B"),
+        ];
+        for (count, text) in cases {
+            assert_eq!(compact_tokens(count), text, "{count}");
+        }
+    }
+
+    #[test]
+    fn prices_show_cents_and_never_hide_a_real_charge() {
+        assert_eq!(dollars(4.12), "$4.12");
+        assert_eq!(dollars(0.42), "$0.42");
+        assert_eq!(dollars(1234.56), "$1,234.56");
+        assert_eq!(dollars(0.004), "<$0.01");
+        assert_eq!(dollars(0.0), "$0.00");
+    }
+
+    #[test]
+    fn models_are_named_the_way_people_say_them() {
+        assert_eq!(model_name("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(model_name("claude-haiku-4-5-20251001"), "Haiku 4.5");
+        assert_eq!(model_name("claude-3-5-haiku-20241022"), "Haiku 3.5");
+        assert_eq!(model_name("claude-opus-5-5[1m]"), "Opus 5.5 [1m]");
+        assert_eq!(model_name("gpt-6.1-sol"), "GPT-6.1-Sol");
+        assert_eq!(model_name("some-local-model"), "some-local-model");
+        assert_eq!(model_name("claude-"), "claude-");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::*;
-use gpui::{Animation, AnimationExt, ClickEvent, Hsla, rgb};
+use gpui::{Animation, AnimationExt, ClickEvent};
 use gpui_kit::component::{Disableable as _, Icon, Sizable, popover::Popover, switch::Switch};
 use newjen_core::providers::{self, Billing, ModelSelection, Provider, ProviderStatus, Warning};
 use newjen_core::{AgentConfig, EffortSelection, Speed, picker};
@@ -731,12 +731,8 @@ fn model_label(config: &AgentConfig, status: Option<&ProviderStatus>) -> String 
     }
 }
 
-/// The agent's mark: Claude's in its own orange, Codex's in the text color.
 fn provider_icon(provider: Provider, cx: &App) -> Icon {
-    match provider {
-        Provider::Claude => Icon::new(ui::IconName::Sparkles).text_color(Hsla::from(rgb(0xd97757))),
-        Provider::Codex => Icon::new(ui::IconName::Sparkle).text_color(cx.theme().foreground),
-    }
+    ui::provider_icon(provider, cx)
 }
 
 /// The plan, short, at the right of the provider's header; warm when the API is billed instead

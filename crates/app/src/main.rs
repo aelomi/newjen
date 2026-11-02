@@ -7,6 +7,7 @@ mod approval;
 mod assets;
 mod attention;
 mod chat_view;
+mod context_chip;
 mod format;
 mod keys;
 mod project_view;

@@ -44,6 +44,7 @@ use newjen_core::{ApprovalIntent, Item, Project, SessionConfig, Status, Store, T
 
 use crate::approval::{self, Room};
 pub use crate::chat_view::lifecycle::{Attention, QuitBlockers};
+use crate::context_chip::{self, ChipMenu, ChipState};
 use crate::format::{elapsed, fit_rows, text_rows, tilde};
 use crate::keys::{
     self, JumpToNeedsYou, JumpToThread, KeyRoute, NewThread, NextThread, PreviousThread, Stop,
@@ -243,6 +244,7 @@ pub struct ChatView {
     drawer_focus: FocusHandle,
     list_scroll: ScrollHandle,
     usage: Entity<UsageMenu>,
+    chip: Entity<ChipMenu>,
     save_problem: Option<String>,
     /// Focus target while an approval is pending (the dock replaces the composer, so the field
     /// is not on screen), so ⌘↵ and Esc reach us.
@@ -334,6 +336,7 @@ impl ChatView {
             drawer_focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             usage: cx.new(|_| UsageMenu::new()),
+            chip: cx.new(|_| ChipMenu::new()),
             save_problem: problem,
             root: cx.focus_handle(),
             grants_open: false,
@@ -2474,7 +2477,36 @@ impl ChatView {
         ui::Composer::new(field, footer)
             .chips(Some(chips))
             .works_in(works_in)
+            .meter(self.render_context_chip(cx))
             .into_any_element()
+    }
+
+    fn render_context_chip(&self, cx: &App) -> Option<AnyElement> {
+        let thread = self.thread().read(cx);
+        let now = now_ms() / 1000;
+        let usage = thread.transcript().usage();
+        let state = ChipState::of(usage, thread.paused_until(now));
+        if state == ChipState::Hidden {
+            return None;
+        }
+        let config = thread.agent_config()?;
+        let plan = newjen_core::usage::latest(config.provider);
+        let facts = context_chip::Facts {
+            provider: config.provider,
+            usage,
+            billing: plan
+                .as_ref()
+                .map_or_else(Default::default, |plan| plan.billing),
+            plan: plan.as_ref().and_then(|plan| plan.plan_label()),
+            effort: match &config.effort {
+                newjen_core::EffortSelection::CliDefault => None,
+                effort => Some(newjen_core::picker::effort_label(effort)),
+            },
+        };
+        let model = context_chip::PopoverModel::build(&facts);
+        Some(context_chip::context_chip(
+            &self.chip, state, model, now, cx,
+        ))
     }
 
     fn render_works_in(
