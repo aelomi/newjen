@@ -172,7 +172,10 @@ impl ProviderUsage {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.plan.is_none() && self.windows.is_empty() && self.credits.is_none()
+        self.plan.is_none()
+            && self.windows.is_empty()
+            && self.credits.is_none()
+            && self.billing == Billing::Unknown
     }
 
     pub fn plan_label(&self) -> Option<String> {

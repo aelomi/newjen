@@ -399,7 +399,11 @@ fn billing_comes_from_the_account_and_a_turn_report_never_erases_it() {
         account.billing = Billing::ApiKey;
     }
     board.record_status(&api, 1);
-    assert_eq!(board.get(Provider::Claude), None, "nothing to show yet");
+    let stored = board
+        .get(Provider::Claude)
+        .expect("an API-key account is reported");
+    assert_eq!(stored.billing, Billing::ApiKey);
+    assert!(stored.windows.is_empty() && stored.plan.is_none());
     let turn = ProviderUsage::from_claude_rate_limit(&claude_infos("text_reply.jsonl")[0]).unwrap();
     assert_eq!(turn.billing, Billing::Unknown);
     board.record(&turn, 2);
