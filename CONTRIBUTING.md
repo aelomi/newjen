@@ -37,6 +37,7 @@ crates/
           #   providers/: detection (`detect.rs`), the Claude adapter (stream-json) and the Codex adapter (app-server JSON-RPC).
           #   session.rs, thread.rs, transcript.rs: one process per thread, its lifecycle and the rendered transcript.
           #   worktree.rs: git worktrees. vcs.rs: checkpoints, diffs and git actions. commit_message.rs: AI commit messages through the user's CLI. changes.rs, edits.rs: per-file change counts and edit previews.
+          #   thread_usage.rs: context fill and tokens per model for one thread. usage.rs: each CLI's plan windows, pace and billing.
           #   store.rs: SQLite. instance.rs: the single-instance lock and local launch handoff. env.rs: the login shell's PATH.
   app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
           #   src/project_view.rs: the window, its loaded projects, the Dock badge, notifications and the quit gate.

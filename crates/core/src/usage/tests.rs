@@ -466,3 +466,46 @@ fn pace_needs_a_known_use_and_length_and_a_window_still_open() {
     assert_eq!(paced(Some(0.5), 20_000, Some(10_000)).pace(20_000), None);
     assert_eq!(paced(Some(0.5), 20_000, Some(10_000)).pace(25_000), None);
 }
+
+#[test]
+fn a_restored_report_fills_only_a_provider_the_board_knows_nothing_about() {
+    let mut saved =
+        ProviderUsage::from_claude_rate_limit(&claude_infos("text_reply.jsonl")[0]).unwrap();
+    saved.plan = Some("max".into());
+    saved.billing = Billing::Subscription;
+    saved.updated_at_unix_seconds = Some(50);
+    let mut board = UsageBoard::new();
+    board.restore(vec![saved.clone()]);
+    assert_eq!(board.get(Provider::Claude), Some(&saved));
+    assert!(board.get(Provider::Codex).is_none());
+
+    let live =
+        ProviderUsage::from_claude_rate_limit(&claude_infos("claude/limit-rejected.jsonl")[0])
+            .unwrap();
+    let mut board = UsageBoard::new();
+    board.record(&live, 900);
+    board.restore(vec![saved]);
+    assert_eq!(
+        board.get(Provider::Claude).unwrap().updated_at_unix_seconds,
+        Some(900)
+    );
+}
+
+#[test]
+fn a_report_survives_serialization_and_reads_old_reports_without_the_new_fields() {
+    let mut usage =
+        ProviderUsage::from_claude_rate_limit(&claude_infos("text_reply.jsonl")[0]).unwrap();
+    usage.billing = Billing::ApiKey;
+    let again: ProviderUsage =
+        serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+    assert_eq!(again, usage);
+
+    let mut old = serde_json::to_value(&usage).unwrap();
+    old.as_object_mut().unwrap().remove("billing");
+    for window in old["windows"].as_array_mut().unwrap() {
+        window.as_object_mut().unwrap().remove("length_seconds");
+    }
+    let old: ProviderUsage = serde_json::from_value(old).unwrap();
+    assert_eq!(old.billing, Billing::Unknown);
+    assert!(old.windows.iter().all(|w| w.length_seconds.is_none()));
+}

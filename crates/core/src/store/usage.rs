@@ -9,6 +9,7 @@ use super::Store;
 use crate::agent::TokenCounts;
 use crate::providers::{Billing, Provider};
 use crate::thread_usage::TurnUsageRow;
+use crate::usage::ProviderUsage;
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -49,6 +50,27 @@ impl Store {
         )?;
         let rows = statement.query_map([thread_id], turn_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The plan reports saved for each provider, as the last run left them.
+    pub fn provider_usages(&self) -> Result<Vec<ProviderUsage>> {
+        let connection = self.reader();
+        let mut statement = connection.prepare("SELECT report FROM provider_usage")?;
+        let reports = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(reports
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .filter_map(|report| serde_json::from_str(report).ok())
+            .collect())
+    }
+
+    /// Keeps the provider's latest plan report, or forgets it when there is none.
+    pub(crate) fn save_provider_usage(&self, provider: Provider, usage: Option<&ProviderUsage>) {
+        self.queue(super::Write::ProviderUsage {
+            provider: provider.id().into(),
+            report: usage.map(|usage| serde_json::to_string(usage).expect("usage serialization")),
+            updated_at: super::now_ms(),
+        });
     }
 
     /// Saves usage rows for a thread, replacing any saved for the same turn and model.
@@ -452,6 +474,27 @@ mod tests {
         );
         assert!(store.write_errors().try_recv().is_ok());
         assert!(store.turn_usage("no-such-thread").unwrap().is_empty());
+    }
+
+    #[test]
+    fn plan_reports_are_kept_per_provider_replaced_and_forgotten() {
+        let (_dir, store, _) = open();
+        let mut claude = ProviderUsage::empty(Provider::Claude);
+        claude.plan = Some("max".into());
+        claude.billing = Billing::Subscription;
+        let codex = ProviderUsage::empty(Provider::Codex);
+        store.save_provider_usage(Provider::Claude, Some(&claude));
+        store.save_provider_usage(Provider::Codex, Some(&codex));
+        assert!(store.flush(Duration::from_secs(5)));
+        let mut saved = store.provider_usages().unwrap();
+        saved.sort_by_key(|usage| usage.provider.id());
+        assert_eq!(saved, [claude.clone(), codex]);
+
+        claude.plan = Some("pro".into());
+        store.save_provider_usage(Provider::Claude, Some(&claude));
+        store.save_provider_usage(Provider::Codex, None);
+        assert!(store.flush(Duration::from_secs(5)));
+        assert_eq!(store.provider_usages().unwrap(), [claude]);
     }
 
     #[test]

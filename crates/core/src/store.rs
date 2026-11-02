@@ -425,6 +425,12 @@ enum Write {
         thread_id: String,
         rows: Vec<TurnUsageRow>,
     },
+    /// Keeps `report` as the provider's plan report, or forgets the provider's when `None`.
+    ProviderUsage {
+        provider: String,
+        report: Option<String>,
+        updated_at: i64,
+    },
     /// Replaces all of a thread's grants (to redo grant writes that failed).
     ReplaceGrants {
         thread_id: String,
@@ -1155,6 +1161,7 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         // and records it then.
         Write::RememberAgent { .. }
         | Write::Limit { .. }
+        | Write::ProviderUsage { .. }
         | Write::UpsertProject { .. }
         | Write::Archive { .. }
         | Write::CopyRemoved { .. }
@@ -1276,6 +1283,25 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
             let transaction = connection.transaction()?;
             usage::write_turn_rows(&transaction, &thread_id, &rows)?;
             transaction.commit()?;
+        }
+        Write::ProviderUsage {
+            provider,
+            report: Some(report),
+            updated_at,
+        } => {
+            connection.execute(
+                "INSERT INTO provider_usage (provider, report, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (provider) DO UPDATE
+                 SET report = excluded.report, updated_at = excluded.updated_at",
+                params![provider, report, updated_at],
+            )?;
+        }
+        Write::ProviderUsage {
+            provider,
+            report: None,
+            ..
+        } => {
+            connection.execute("DELETE FROM provider_usage WHERE provider = ?1", [provider])?;
         }
         Write::AddGrant { thread_id, grant } => {
             connection.execute(

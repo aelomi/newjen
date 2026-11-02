@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::providers::{
     Availability, Billing, Provider, ProviderStatus, RateLimitSnapshot, RateLimits,
 };
+use crate::store::Store;
 
 const WARNING_FRACTION: f32 = 0.9;
 
@@ -453,6 +454,16 @@ impl UsageBoard {
         .filter(|usage| !usage.is_empty())
     }
 
+    /// Fills providers the board knows nothing about with reports an earlier run saved.
+    pub fn restore(&mut self, saved: Vec<ProviderUsage>) {
+        for usage in saved {
+            let entry = self.entry(usage.provider);
+            if entry.usage.as_ref().is_none_or(ProviderUsage::is_empty) {
+                entry.usage = Some(usage);
+            }
+        }
+    }
+
     pub fn record(&mut self, usage: &ProviderUsage, now: i64) {
         let entry = self.entry(usage.provider);
         let stored = entry
@@ -509,6 +520,30 @@ fn now() -> i64 {
     crate::store::now_ms() / 1000
 }
 
+fn sink() -> &'static Mutex<Option<Store>> {
+    static SINK: OnceLock<Mutex<Option<Store>>> = OnceLock::new();
+    SINK.get_or_init(Mutex::default)
+}
+
+/// Brings back the reports an earlier run saved, and from now on saves every change to the
+/// board in `store`. Call it once at startup, before the first detection.
+pub fn attach_store(store: &Store) {
+    if let Ok(saved) = store.provider_usages() {
+        board()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .restore(saved);
+    }
+    *sink().lock().unwrap_or_else(PoisonError::into_inner) = Some(store.clone());
+}
+
+fn persist(provider: Provider) {
+    let sink = sink().lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(store) = &*sink {
+        store.save_provider_usage(provider, latest(provider).as_ref());
+    }
+}
+
 /// The latest report for `provider` seen by this process.
 pub fn latest(provider: Provider) -> Option<ProviderUsage> {
     board()
@@ -523,6 +558,7 @@ pub(crate) fn record(usage: &ProviderUsage) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .record(usage, now());
+    persist(usage.provider);
 }
 
 pub(crate) fn record_status(status: &ProviderStatus) {
@@ -530,6 +566,7 @@ pub(crate) fn record_status(status: &ProviderStatus) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .record_status(status, now());
+    persist(status.provider);
 }
 
 #[cfg(test)]
