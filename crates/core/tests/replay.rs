@@ -6,6 +6,7 @@
 mod common;
 
 use newjen_core::ApprovalIntent;
+use newjen_core::agent::{AgentEvent, ContextFill, TokenCounts};
 use newjen_core::protocol::Incoming;
 use newjen_core::providers::claude::events::ClaudeEvents;
 use newjen_core::session::SessionEvent;
@@ -327,6 +328,121 @@ fn multi_turn_costs_are_per_turn() {
     assert_close(ends[1].0, 0.00288339);
     assert_eq!(assistant_texts(&transcript), ["ok", "pineapple"]);
     assert_eq!(transcript.status(), Status::Done);
+}
+
+fn haiku(input: u64, cached: u64, written: u64, output: u64) -> TokenCounts {
+    TokenCounts {
+        input,
+        cached_input: cached,
+        cache_write_input: written,
+        output,
+        reasoning_output: 0,
+    }
+}
+
+#[test]
+fn multi_turn_usage_is_per_model_per_turn_and_context_is_the_latest_call() {
+    let replay = replay("multi_turn");
+    let first = replay.after_each_result[0].usage();
+    assert_eq!(first.main_model(), Some("claude-haiku-5-5"));
+    assert_eq!(first.turns(), 1);
+    assert_eq!(first.last_turn(), Some(haiku(2, 15381, 13999, 4)));
+    assert_eq!(first.models().len(), 1);
+    assert_eq!(first.models()[0].tokens, haiku(2, 15381, 13999, 4));
+    assert_close(first.cost_usd(), 0.00295581);
+    assert_eq!(
+        first.context(),
+        Some(ContextFill {
+            used: 2 + 13999 + 15381 + 4,
+            window: Some(1_000_000)
+        })
+    );
+
+    let whole = replay.end.usage();
+    assert_eq!(whole.turns(), 2);
+    assert_eq!(whole.models()[0].tokens, haiku(4, 31240, 27607, 10));
+    assert_eq!(whole.total(), haiku(4, 31240, 27607, 10));
+    assert_eq!(whole.last_turn(), Some(haiku(2, 15859, 13608, 6)));
+    assert_close(whole.cost_usd(), 0.0058392);
+    assert_eq!(
+        whole.context(),
+        Some(ContextFill {
+            used: 2 + 13608 + 15859 + 6,
+            window: Some(1_000_000)
+        })
+    );
+    assert!((whole.cache_share().unwrap() - 31240.0 / (4.0 + 31240.0 + 27607.0)).abs() < 1e-6);
+}
+
+#[test]
+fn several_assistant_lines_in_one_turn_overwrite_the_context_and_never_add_to_the_turn() {
+    let usage = replay("tool_allow").end;
+    let usage = usage.usage();
+    assert_eq!(usage.turns(), 1);
+    assert_eq!(usage.models()[0].tokens, haiku(4, 44782, 14191, 126));
+    assert_eq!(usage.context().unwrap().used, 2 + 171 + 29401 + 5);
+}
+
+#[test]
+fn the_window_is_unknown_until_the_first_result_reports_it_and_usage_precedes_the_turn_end() {
+    let mut codec = ClaudeEvents::default();
+    let mut events = Vec::new();
+    for line in common::load("multi_turn").into_iter().filter(|l| l.out) {
+        let batch = codec.translate(&SessionEvent::Line(Incoming::from_value(line.msg)), None);
+        events.extend(batch.events);
+        if events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFinished { .. }))
+        {
+            break;
+        }
+    }
+    let usage_events: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::ContextUsed { .. }
+                    | AgentEvent::TurnUsage(_)
+                    | AgentEvent::TurnFinished { .. }
+            )
+        })
+        .collect();
+    let AgentEvent::ContextUsed { fill: before, .. } = usage_events[0] else {
+        panic!("{usage_events:?}");
+    };
+    assert_eq!((before.used, before.window), (29386, None));
+    let AgentEvent::ContextUsed { fill: after, .. } = usage_events[1] else {
+        panic!("{usage_events:?}");
+    };
+    assert_eq!((after.used, after.window), (29386, Some(1_000_000)));
+    let (AgentEvent::TurnUsage(turns), AgentEvent::TurnFinished { cost_usd, .. }) =
+        (usage_events[2], usage_events[3])
+    else {
+        panic!("{usage_events:?}");
+    };
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].context_window, Some(1_000_000));
+    assert_eq!(*cost_usd, turns[0].cost_usd);
+}
+
+#[test]
+fn the_window_a_model_reported_is_known_from_the_next_turns_first_call() {
+    let mut codec = ClaudeEvents::default();
+    let mut first_fills = Vec::new();
+    for line in common::load("multi_turn").into_iter().filter(|l| l.out) {
+        let batch = codec.translate(&SessionEvent::Line(Incoming::from_value(line.msg)), None);
+        for event in batch.events {
+            if let AgentEvent::ContextUsed { fill, .. } = event {
+                first_fills.push(fill);
+            }
+        }
+    }
+    assert_eq!(
+        first_fills.iter().map(|f| f.window).collect::<Vec<_>>(),
+        [None, Some(1_000_000), Some(1_000_000)],
+        "turn 2's first call already carries the window turn 1 reported"
+    );
 }
 
 #[test]

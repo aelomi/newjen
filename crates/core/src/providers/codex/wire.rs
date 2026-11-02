@@ -163,7 +163,7 @@ pub(super) struct Usage {
     #[serde(rename = "modelContextWindow")]
     pub context_window: Option<u64>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 pub(super) struct Counts {
     #[serde(rename = "inputTokens")]
     pub input: u64,
@@ -177,6 +177,21 @@ pub(super) struct Counts {
     pub reasoning_output: u64,
     #[serde(rename = "totalTokens")]
     pub total: u64,
+}
+
+impl Counts {
+    pub(super) fn minus(self, other: Counts) -> Counts {
+        Counts {
+            input: self.input.saturating_sub(other.input),
+            cached_input: self.cached_input.saturating_sub(other.cached_input),
+            cache_write_input: self
+                .cache_write_input
+                .saturating_sub(other.cache_write_input),
+            output: self.output.saturating_sub(other.output),
+            reasoning_output: self.reasoning_output.saturating_sub(other.reasoning_output),
+            total: self.total.saturating_sub(other.total),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

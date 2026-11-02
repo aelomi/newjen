@@ -3,6 +3,7 @@ mod approvals;
 mod codec;
 mod items;
 mod limits;
+mod usage;
 mod wire;
 
 pub(crate) use approvals::edit_proposal;

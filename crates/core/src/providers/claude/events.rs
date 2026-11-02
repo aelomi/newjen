@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::agent::{
-    AgentBatch, AgentEvent, BackgroundTaskView, Checkpoint, ContentKey, TextUpdate, ToolDescriptor,
-    ToolOutcome, TurnOutcome,
+    AgentBatch, AgentEvent, BackgroundTaskView, Checkpoint, ContentKey, ContextFill, ModelTurn,
+    TextUpdate, TokenCounts, ToolDescriptor, ToolOutcome, TurnOutcome,
 };
 use crate::protocol::{BackgroundTask, ContentBlock, Delta, Incoming, StreamEvent};
 use crate::session::SessionEvent;
@@ -21,6 +21,15 @@ pub struct ClaudeEvents {
     api_error_text: Option<String>,
     tasks: Vec<BackgroundTask>,
     task_tools: HashMap<String, String>,
+    context_windows: HashMap<String, u64>,
+    context: Option<ContextSeen>,
+}
+
+/// The latest model call of the main conversation in the running turn.
+#[derive(Debug)]
+struct ContextSeen {
+    model: String,
+    fill: ContextFill,
 }
 
 impl ClaudeEvents {
@@ -121,6 +130,7 @@ impl ClaudeEvents {
     fn finish(&mut self) {
         self.approvals.clear();
         self.open_text.clear();
+        self.context = None;
     }
 
     fn background(&self) -> AgentEvent {
@@ -213,6 +223,22 @@ impl ClaudeEvents {
                     );
                     return;
                 }
+                if let (Some(usage), Some(model)) = (&message.message.usage, &message.message.model)
+                    && usage.context_tokens() > 0
+                {
+                    let fill = ContextFill {
+                        used: usage.context_tokens(),
+                        window: self.context_windows.get(model).copied(),
+                    };
+                    self.context = Some(ContextSeen {
+                        model: model.clone(),
+                        fill,
+                    });
+                    events.push(AgentEvent::ContextUsed {
+                        model: model.clone(),
+                        fill,
+                    });
+                }
                 for block in &message.message.content {
                     match block {
                         ContentBlock::Text { text } => {
@@ -288,6 +314,27 @@ impl ClaudeEvents {
                 }
             }
             Incoming::Result(result) => {
+                let turns = model_turns(result);
+                for turn in &turns {
+                    if let Some(window) = turn.context_window {
+                        self.context_windows.insert(turn.model.clone(), window);
+                    }
+                }
+                if let Some(seen) = &self.context {
+                    let window = self.context_windows.get(&seen.model).copied();
+                    if window != seen.fill.window {
+                        events.push(AgentEvent::ContextUsed {
+                            model: seen.model.clone(),
+                            fill: ContextFill {
+                                used: seen.fill.used,
+                                window,
+                            },
+                        });
+                    }
+                }
+                if !turns.is_empty() {
+                    events.push(AgentEvent::TurnUsage(turns));
+                }
                 let cost_usd = result.turn_cost_usd().or_else(|| {
                     Some(result.total_cost_usd? - self.previous_total_cost.unwrap_or(0.0))
                 });
@@ -391,6 +438,29 @@ impl ClaudeEvents {
     }
 }
 
+/// One entry per model the turn used, sorted by name so the order never depends on the map.
+fn model_turns(result: &crate::protocol::ResultMessage) -> Vec<ModelTurn> {
+    let mut turns: Vec<ModelTurn> = result
+        .model_usage_since_last_result
+        .iter()
+        .flatten()
+        .map(|(model, usage)| ModelTurn {
+            model: model.clone(),
+            tokens: TokenCounts {
+                input: usage.input_tokens,
+                cached_input: usage.cache_read_input_tokens,
+                cache_write_input: usage.cache_creation_input_tokens,
+                output: usage.output_tokens,
+                reasoning_output: usage.thinking_tokens,
+            },
+            cost_usd: usage.cost_usd,
+            context_window: usage.context_window,
+        })
+        .collect();
+    turns.sort_by(|a, b| a.model.cmp(&b.model));
+    turns
+}
+
 pub fn describe_tool(id: &str, name: &str, input: &Value, cwd: Option<&Path>) -> ToolDescriptor {
     ToolDescriptor {
         id: id.to_string(),
@@ -459,5 +529,70 @@ mod tests {
             None,
         );
         assert!(batch.events.iter().any(|event| matches!(event, AgentEvent::TurnFinished { cost_usd: Some(cost), .. } if *cost == 0.25)));
+    }
+
+    #[test]
+    fn subagent_lines_and_empty_usage_leave_the_main_context_alone_and_models_come_out_sorted() {
+        let mut codec = ClaudeEvents::default();
+        let line = |value| SessionEvent::Line(Incoming::from_value(value));
+        let usage = |input| json!({"input_tokens":input,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1});
+        let contexts = |batch: &AgentBatch| {
+            batch
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ContextUsed { model, fill } => Some((model.clone(), fill.used)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let main = codec.translate(
+            &line(json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","content":[],"usage":usage(100)}})),
+            None,
+        );
+        assert_eq!(contexts(&main), [("claude-opus-5-5".to_string(), 101)]);
+        let sub = codec.translate(
+            &line(json!({"type":"assistant","parent_tool_use_id":"t1","message":{"id":"m2","model":"claude-haiku-5-5","content":[],"usage":usage(7)}})),
+            None,
+        );
+        assert!(contexts(&sub).is_empty());
+        let synthetic = codec.translate(
+            &line(json!({"type":"assistant","message":{"id":"m3","model":"<synthetic>","content":[],"usage":{"input_tokens":0,"output_tokens":0}}})),
+            None,
+        );
+        assert!(contexts(&synthetic).is_empty());
+        let done = codec.translate(
+            &line(json!({"type":"result","is_error":false,"model_usage_since_last_result":{
+                "claude-opus-5-5":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":3,"cacheCreationInputTokens":4,"thinkingTokens":1,"costUSD":0.5,"contextWindow":200000},
+                "claude-haiku-5-5":{"inputTokens":5,"outputTokens":6,"costUSD":0.25,"contextWindow":1000000}}})),
+            None,
+        );
+        assert_eq!(contexts(&done), [("claude-opus-5-5".to_string(), 101)]);
+        let turns = done
+            .events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::TurnUsage(turns) => Some(turns),
+                _ => None,
+            })
+            .unwrap();
+        let names: Vec<_> = turns.iter().map(|turn| turn.model.as_str()).collect();
+        assert_eq!(names, ["claude-haiku-5-5", "claude-opus-5-5"]);
+        assert_eq!(turns[1].tokens.reasoning_output, 1);
+        assert!(done.events.iter().any(|event| matches!(event, AgentEvent::TurnFinished { cost_usd: Some(cost), .. } if *cost == 0.75)));
+        let next_turn = codec.translate(
+            &line(json!({"type":"assistant","message":{"id":"m4","model":"claude-opus-5-5","content":[],"usage":usage(300)}})),
+            None,
+        );
+        assert_eq!(contexts(&next_turn), [("claude-opus-5-5".to_string(), 301)]);
+        let window = next_turn.events.iter().find_map(|event| match event {
+            AgentEvent::ContextUsed { fill, .. } => Some(fill.window),
+            _ => None,
+        });
+        assert_eq!(
+            window,
+            Some(Some(200000)),
+            "windows outlive the turn that reported them"
+        );
     }
 }

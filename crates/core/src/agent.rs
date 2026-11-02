@@ -50,7 +50,15 @@ pub enum AgentEvent {
         key: ApprovalKey,
         intent: ApprovalIntent,
     },
-    UsageUpdated(Usage),
+    /// How full the main conversation's context is after its latest model call. Each one
+    /// replaces the last. `model` is the model that call ran on.
+    ContextUsed {
+        model: String,
+        fill: ContextFill,
+    },
+    /// Tokens and cost per model for the turn that just ended. Sent right before `TurnFinished`,
+    /// only when the CLI reported usage.
+    TurnUsage(Vec<ModelTurn>),
     RateLimit(RateLimitEvent),
     ProviderUsage(crate::usage::ProviderUsage),
     UserConfirmed,
@@ -335,19 +343,71 @@ pub struct AgentConfig {
     pub effort: EffortSelection,
     pub speed: Speed,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Token counts in one shape for both providers: the four input and output buckets do not
+/// overlap, so `total` is their sum. Codex reports cached tokens inside `inputTokens`; the Codex
+/// adapter moves them out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenCounts {
+    /// Fresh input, neither read from nor written to the prompt cache.
     pub input: u64,
+    /// Input read from the prompt cache.
     pub cached_input: u64,
+    /// Input written to the prompt cache (Claude only).
     pub cache_write_input: u64,
     pub output: u64,
+    /// Thinking tokens. Part of `output`, not on top of it.
     pub reasoning_output: u64,
-    pub total: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Usage {
-    pub last: TokenCounts,
-    pub total: TokenCounts,
+impl TokenCounts {
+    pub fn total(&self) -> u64 {
+        self.input
+            .saturating_add(self.cached_input)
+            .saturating_add(self.cache_write_input)
+            .saturating_add(self.output)
+    }
+    /// The part of the input side served from the prompt cache, 0.0 to 1.0.
+    pub fn cache_share(&self) -> Option<f32> {
+        let input_side = self
+            .input
+            .saturating_add(self.cached_input)
+            .saturating_add(self.cache_write_input);
+        (input_side > 0).then(|| self.cached_input as f32 / input_side as f32)
+    }
+    pub fn saturating_add(self, other: TokenCounts) -> TokenCounts {
+        TokenCounts {
+            input: self.input.saturating_add(other.input),
+            cached_input: self.cached_input.saturating_add(other.cached_input),
+            cache_write_input: self
+                .cache_write_input
+                .saturating_add(other.cache_write_input),
+            output: self.output.saturating_add(other.output),
+            reasoning_output: self.reasoning_output.saturating_add(other.reasoning_output),
+        }
+    }
+}
+/// How much of the context window the main conversation fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextFill {
+    pub used: u64,
+    /// `None` until the CLI has reported the model's window. Show tokens only then.
+    pub window: Option<u64>,
+}
+impl ContextFill {
+    /// 0.0 to 1.0, when the window is known.
+    pub fn fraction(&self) -> Option<f32> {
+        self.window
+            .filter(|window| *window > 0)
+            .map(|window| (self.used as f32 / window as f32).min(1.0))
+    }
+}
+/// One model's share of a finished turn. A turn that ran subagents has several.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelTurn {
+    /// As the CLI names the model.
+    pub model: String,
+    pub tokens: TokenCounts,
+    /// Claude's list-price value for the turn (`costUSD`). Codex reports none.
+    pub cost_usd: Option<f64>,
     pub context_window: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

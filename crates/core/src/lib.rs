@@ -6,6 +6,7 @@
 //! - [`session`]: starts and talks to one `claude` process.
 //! - [`transcript`]: turns session events into a conversation a UI can render.
 //! - [`thread`]: one conversation with its process, transcript, grants and saving.
+//! - [`thread_usage`]: what one thread has used: context fill and tokens per model.
 //! - [`store`]: the SQLite database that keeps threads across relaunches.
 //! - [`orphans`]: cleans up `claude` processes left behind by a crash.
 //! - [`worktree`]: makes and removes the git worktrees threads can work in.
@@ -29,6 +30,7 @@ pub mod session;
 pub mod steps;
 pub mod store;
 pub mod thread;
+pub mod thread_usage;
 pub mod transcript;
 pub mod usage;
 pub mod vcs;

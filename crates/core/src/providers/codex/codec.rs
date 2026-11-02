@@ -96,6 +96,9 @@ pub struct CodexCodec {
     pub(super) limits: HashMap<String, Value>,
     pub(super) ordinary_usage_allowed: Option<bool>,
     tier: String,
+    /// The model Codex reported running the thread on.
+    model: String,
+    tokens: super::usage::TurnTokens,
 }
 impl CodexCodec {
     /// Constructing a codec authorizes initialization only, never a model turn.
@@ -142,6 +145,8 @@ impl CodexCodec {
             limits: HashMap::new(),
             ordinary_usage_allowed: None,
             tier: "default".into(),
+            model: String::new(),
+            tokens: Default::default(),
         };
         let mut out = CodecOutput::default();
         let id = codec.reserve(PendingRpc::Initialize);
@@ -309,6 +314,7 @@ impl CodexCodec {
                     "Codex changed the thread's working directory"
                 );
                 self.validate_effective_model(&opened.model)?;
+                self.model = opened.model.clone();
                 ensure!(
                     opened.service_tier.as_deref() == Some(self.tier.as_str()),
                     "Codex did not honor the requested speed tier"
@@ -483,7 +489,7 @@ impl CodexCodec {
                     }
                 };
                 self.settle_pending(out);
-                out.event(finished(outcome, n.turn.duration_ms));
+                self.finish_turn(outcome, n.turn.duration_ms, out);
                 out.effects.push(ControlEffect::TurnEnded);
                 self.state = CodexRuntime::Ready {
                     thread_id: n.thread_id,
@@ -539,11 +545,14 @@ impl CodexCodec {
             "thread/tokenUsage/updated" => {
                 let n: UsageNotification = serde_json::from_value(value)?;
                 if self.active(&n.thread_id, &n.turn_id) {
-                    out.event(AgentEvent::UsageUpdated(crate::agent::Usage {
-                        last: n.usage.last.into(),
-                        total: n.usage.total.into(),
-                        context_window: n.usage.context_window,
-                    }));
+                    self.tokens.observe(&n.usage);
+                    out.event(AgentEvent::ContextUsed {
+                        model: self.model.clone(),
+                        fill: ContextFill {
+                            used: n.usage.last.total,
+                            window: n.usage.context_window,
+                        },
+                    });
                 }
             }
             "account/rateLimits/updated" => self.rate_limits(&value, out)?,
@@ -611,7 +620,7 @@ impl CodexCodec {
         );
         self.close(&mut out);
         if active {
-            out.event(finished(TurnOutcome::Stopped, None));
+            self.finish_turn(TurnOutcome::Stopped, None, &mut out);
         }
         out
     }
@@ -643,7 +652,7 @@ impl CodexCodec {
             | CodexRuntime::StartingTurn { .. }
             | CodexRuntime::Ready { .. } => {
                 self.close(&mut out);
-                out.event(finished(TurnOutcome::Stopped, None));
+                self.finish_turn(TurnOutcome::Stopped, None, &mut out);
             }
         }
         out
@@ -658,6 +667,17 @@ impl CodexCodec {
         self.pending.clear();
         self.grants.clear();
         out
+    }
+    fn finish_turn(
+        &mut self,
+        outcome: TurnOutcome,
+        duration_ms: Option<u64>,
+        out: &mut CodecOutput,
+    ) {
+        if let Some(turn) = self.tokens.finish(&self.model) {
+            out.event(AgentEvent::TurnUsage(vec![turn]));
+        }
+        out.event(finished(outcome, duration_ms));
     }
     pub(super) fn settle_pending(&mut self, out: &mut CodecOutput) {
         for (key, _) in self.pending.drain() {
@@ -679,13 +699,14 @@ impl CodexCodec {
         self.rpc.clear();
         self.grants.clear();
         self.state = CodexRuntime::Blocked;
-        out.event(finished(
+        self.finish_turn(
             TurnOutcome::Failed {
                 title: title.into(),
                 detail: detail.into(),
             },
             None,
-        ));
+            out,
+        );
         out.effects.push(ControlEffect::Shutdown);
         out.effects.push(ControlEffect::TurnEnded);
     }
@@ -712,17 +733,5 @@ pub(super) fn finished(outcome: TurnOutcome, duration_ms: Option<u64>) -> AgentE
         cost_usd: None,
         forget_conversation: false,
         queued: false,
-    }
-}
-impl From<Counts> for TokenCounts {
-    fn from(c: Counts) -> Self {
-        Self {
-            input: c.input,
-            cached_input: c.cached_input,
-            cache_write_input: c.cache_write_input,
-            output: c.output,
-            reasoning_output: c.reasoning_output,
-            total: c.total,
-        }
     }
 }

@@ -263,7 +263,7 @@ fn is_false(flag: &bool) -> bool {
 pub struct Transcript {
     items: Vec<Item>,
     presentation: crate::agent::AgentPresentation,
-    usage: Option<crate::agent::Usage>,
+    usage: crate::thread_usage::ThreadUsage,
     rate_limit: Option<crate::agent::RateLimitEvent>,
     status: Status,
     /// The agent's currently reported background tasks.
@@ -300,7 +300,7 @@ impl Transcript {
         Transcript {
             items: Vec::new(),
             presentation: Default::default(),
-            usage: None,
+            usage: Default::default(),
             rate_limit: None,
             status: Status::Idle,
             background_tasks: Vec::new(),
@@ -380,8 +380,8 @@ impl Transcript {
         &self.presentation
     }
 
-    pub fn usage(&self) -> Option<&crate::agent::Usage> {
-        self.usage.as_ref()
+    pub fn usage(&self) -> &crate::thread_usage::ThreadUsage {
+        &self.usage
     }
     pub fn rate_limit(&self) -> Option<&crate::agent::RateLimitEvent> {
         self.rate_limit.as_ref()
@@ -706,7 +706,7 @@ impl Transcript {
 
     fn apply_event(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::UsageUpdated(usage) => self.usage = Some(usage.clone()),
+            AgentEvent::ContextUsed { .. } | AgentEvent::TurnUsage(_) => self.usage.apply(event),
             AgentEvent::RateLimit(limit) => self.rate_limit = Some(limit.clone()),
             AgentEvent::ProviderUsage(_) => {}
             AgentEvent::ToolOutput { id, update } => {

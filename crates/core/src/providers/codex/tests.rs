@@ -675,8 +675,14 @@ fn token_usage_has_no_invented_price_and_signed_counts_are_rejected() {
         "thread/tokenUsage/updated",
         json!({"threadId":"thread","turnId":"turn","tokenUsage":{"last":counts,"total":counts,"modelContextWindow":128000}}),
     );
-    assert_eq!(t.usage().unwrap().last.input, 10);
-    assert_eq!(t.usage().unwrap().total.cache_write_input, 0);
+    assert_eq!(
+        t.usage().context(),
+        Some(ContextFill {
+            used: 13,
+            window: Some(128000)
+        })
+    );
+    assert_eq!(t.usage().main_model(), Some("test-model"));
     let mut invalid = counts;
     invalid["inputTokens"] = json!(-1);
     let out = notification(
@@ -1676,4 +1682,165 @@ fn recorded_codex_turns_read_as_plain_english_steps() {
         activity_line(&transcript).as_deref(),
         Some("Answered")
     ));
+}
+
+fn token_counts(input: u64, cached: u64, output: u64) -> Value {
+    json!({"inputTokens":input,"cachedInputTokens":cached,"outputTokens":output,"reasoningOutputTokens":0,"totalTokens":input + output})
+}
+fn token_usage(c: &mut CodexCodec, t: &mut Transcript, total: Value, last: Value) -> CodecOutput {
+    notification(
+        c,
+        t,
+        "thread/tokenUsage/updated",
+        json!({"threadId":"thread","turnId":"turn","tokenUsage":{"last":last,"total":total,"modelContextWindow":1000}}),
+    )
+}
+fn complete(c: &mut CodexCodec, t: &mut Transcript) -> CodecOutput {
+    notification(
+        c,
+        t,
+        "turn/completed",
+        json!({"threadId":"thread","turn":{"id":"turn","status":"completed"}}),
+    )
+}
+fn turn_usage(out: &CodecOutput) -> Option<&Vec<ModelTurn>> {
+    out.batch.events.iter().find_map(|event| match event {
+        AgentEvent::TurnUsage(turns) => Some(turns),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_turns_tokens_are_the_growth_of_the_thread_total_with_cache_moved_out_of_input() {
+    let mut c = ready();
+    let mut t = Transcript::new();
+    start(&mut c, &mut t);
+    token_usage(
+        &mut c,
+        &mut t,
+        token_counts(100, 0, 10),
+        token_counts(100, 0, 10),
+    );
+    token_usage(
+        &mut c,
+        &mut t,
+        token_counts(260, 100, 25),
+        token_counts(160, 100, 15),
+    );
+    let out = complete(&mut c, &mut t);
+    let turns = turn_usage(&out).expect("usage at the turn's end");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].model, "test-model");
+    assert_eq!(
+        turns[0].tokens,
+        TokenCounts {
+            input: 160,
+            cached_input: 100,
+            cache_write_input: 0,
+            output: 25,
+            reasoning_output: 0,
+        }
+    );
+    assert_eq!(turns[0].tokens.total(), 285);
+    assert_eq!(turns[0].cost_usd, None);
+    assert_eq!(turns[0].context_window, Some(1000));
+    let position =
+        |wanted: fn(&AgentEvent) -> bool| out.batch.events.iter().position(wanted).unwrap();
+    assert!(
+        position(|e| matches!(e, AgentEvent::TurnUsage(_)))
+            < position(|e| matches!(e, AgentEvent::TurnFinished { .. }))
+    );
+
+    start(&mut c, &mut t);
+    token_usage(
+        &mut c,
+        &mut t,
+        token_counts(400, 150, 40),
+        token_counts(140, 50, 15),
+    );
+    let out = complete(&mut c, &mut t);
+    assert_eq!(turn_usage(&out).unwrap()[0].tokens.total(), 155);
+    assert_eq!(t.usage().turns(), 2);
+    assert_eq!(t.usage().total().total(), 440);
+    assert_eq!(t.usage().last_turn().unwrap().total(), 155);
+    assert_eq!(
+        t.usage().context(),
+        Some(ContextFill {
+            used: 155,
+            window: Some(1000)
+        })
+    );
+}
+
+#[test]
+fn a_resumed_threads_first_notification_recovers_where_the_total_stood() {
+    let mut c = ready();
+    let mut t = Transcript::new();
+    start(&mut c, &mut t);
+    token_usage(
+        &mut c,
+        &mut t,
+        token_counts(5000, 4000, 100),
+        token_counts(200, 150, 20),
+    );
+    let out = complete(&mut c, &mut t);
+    assert_eq!(turn_usage(&out).unwrap()[0].tokens.total(), 220);
+}
+
+#[test]
+fn a_failed_or_stopped_turn_still_reports_what_it_used_and_an_unused_one_reports_nothing() {
+    let mut c = ready();
+    let mut t = Transcript::new();
+    start(&mut c, &mut t);
+    token_usage(
+        &mut c,
+        &mut t,
+        token_counts(100, 0, 10),
+        token_counts(100, 0, 10),
+    );
+    let out = c.interrupt();
+    t.apply(&out.batch);
+    assert_eq!(turn_usage(&out), None, "interrupt is only requested here");
+    let out = notification(
+        &mut c,
+        &mut t,
+        "turn/completed",
+        json!({"threadId":"thread","turn":{"id":"turn","status":"interrupted"}}),
+    );
+    assert_eq!(turn_usage(&out).unwrap()[0].tokens.total(), 110);
+
+    start(&mut c, &mut t);
+    let out = complete(&mut c, &mut t);
+    assert_eq!(turn_usage(&out), None);
+    assert_eq!(t.usage().turns(), 1);
+}
+
+#[test]
+fn recorded_codex_threads_report_the_growth_of_total_and_the_fill_of_the_last_call() {
+    let write = replay("workspace-write", 2, 6, 0);
+    let usage = write.usage();
+    assert_eq!(usage.main_model(), Some("gpt-6-luna"));
+    assert_eq!(usage.turns(), 2);
+    assert_eq!(usage.total().total(), 84047);
+    assert_eq!(usage.last_turn().unwrap().total(), 84047 - 36048);
+    assert_eq!(usage.total().cached_input, 59136);
+    assert_eq!(usage.total().output, 378);
+    assert_eq!(
+        usage.context(),
+        Some(ContextFill {
+            used: 24030,
+            window: Some(258400)
+        })
+    );
+    assert_eq!(usage.cost_usd(), None);
+
+    let read = replay("read-only", 9, 10, 2);
+    let usage = read.usage();
+    assert_eq!(usage.total().total(), 284817);
+    assert_eq!(
+        usage.turns(),
+        8,
+        "the repeated report after the last stop adds nothing"
+    );
+    assert_eq!(usage.last_turn().unwrap().total(), 284817 - 241788);
 }
