@@ -1,5 +1,5 @@
 //! Newjen's own database (SQLite): projects, their threads, each thread's transcript rows, its
-//! "Always allow" grants and its Rift copy. Claude keeps the full conversation in its own files; this is the
+//! "Always allow" grants and its worktree. Claude keeps the full conversation in its own files; this is the
 //! small copy Newjen needs to show threads again after a relaunch.
 //!
 //! - **Where:** `$NEWJEN_HOME/newjen.db` if `NEWJEN_HOME` is set, else
@@ -29,9 +29,8 @@ use anyhow::{Context, Result, anyhow};
 use async_channel::{Receiver, Sender};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
-use crate::landing::LandingMode;
-use crate::rift::Copy;
 use crate::transcript::Status;
+use crate::worktree::Worktree;
 
 /// The database file's name inside the Newjen folder.
 pub const DB_FILE: &str = "newjen.db";
@@ -136,6 +135,17 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE threads ADD COLUMN review_base TEXT;
      ALTER TABLE threads ADD COLUMN landing_resolved INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE threads ADD COLUMN snapshot_needed INTEGER NOT NULL DEFAULT 0;",
+    // Version 6: git worktrees replace Rift copies, and git replaces jj. A worktree's row keeps
+    // its branch in `branch`; a Rift copy's row has none. Work recorded with jj can no longer be
+    // reviewed here, so those threads count as resolved. There is one landing mode now.
+    "ALTER TABLE copies ADD COLUMN branch TEXT;
+     UPDATE threads SET landing_resolved = 1
+         WHERE review_base IS NOT NULL OR id IN (SELECT thread_id FROM copies);
+     UPDATE threads SET snapshot_needed = 0;
+     UPDATE projects SET landing_mode = 'harness_managed';
+     UPDATE threads SET landing_mode = 'harness_managed';
+     DELETE FROM copy_cleanup;
+     DELETE FROM pending_copies WHERE state = 'making_copy';",
 ];
 
 /// The `user_version` of a database at the current schema.
@@ -172,7 +182,6 @@ pub struct Project {
     pub path: PathBuf,
     pub created_at: i64,
     pub last_opened_at: i64,
-    pub landing_mode: LandingMode,
 }
 
 /// One saved thread (the `threads` table).
@@ -182,7 +191,7 @@ pub struct ThreadRow {
     pub id: String,
     pub project_id: i64,
     /// The folder the thread's agent works in, and always restarts from: the project folder,
-    /// or the [`Copy::workdir`] of its Rift copy. It never changes, because Claude ties
+    /// or the [`Worktree::workdir`] of its worktree. It never changes, because Claude ties
     /// `--resume` to the folder a conversation started in.
     pub workdir: PathBuf,
     pub title: String,
@@ -199,10 +208,9 @@ pub struct ThreadRow {
     pub updated_at: i64,
     /// When the thread was archived (hidden). `None` for a visible thread.
     pub archived_at: Option<i64>,
-    /// The thread's Rift copy, if it works in one (the `copies` table). Saved with the
+    /// The thread's worktree, if it works in one (the `copies` table). Saved with the
     /// thread's first row and never changed after.
-    pub copy: Option<Copy>,
-    pub landing_mode: LandingMode,
+    pub copy: Option<Worktree>,
     pub review_base: Option<String>,
     pub landing_resolved: bool,
     pub snapshot_needed: bool,
@@ -228,7 +236,7 @@ pub struct PendingCopy {
     pub path: PathBuf,
     pub intent: PendingIntent,
     pub state: PendingState,
-    pub rift_id: Option<String>,
+    pub branch: Option<String>,
     pub created_at: i64,
 }
 
@@ -237,7 +245,7 @@ pub struct CopyCleanup {
     pub path: PathBuf,
     pub project_id: i64,
     pub thread_id: String,
-    pub rift_id: Option<String>,
+    pub branch: Option<String>,
 }
 
 /// One saved transcript row (the `thread_items` table). Read it with `Item::from_saved`.
@@ -346,7 +354,7 @@ enum Write {
     },
     PendingId {
         thread_id: String,
-        rift_id: String,
+        branch: String,
         done: mpsc::Sender<Result<(), String>>,
     },
     DraftMessage {
@@ -359,10 +367,6 @@ enum Write {
     UpsertProject {
         path: String,
         now: i64,
-    },
-    SetLandingMode {
-        project_id: i64,
-        mode: LandingMode,
     },
     SaveThread(ThreadRow),
     ReplaceItems {
@@ -610,7 +614,7 @@ impl Store {
         self.flush(OPEN_PROJECT_TIMEOUT);
         self.reader()
             .query_row(
-                "SELECT id, path, created_at, last_opened_at, landing_mode FROM projects WHERE path = ?1",
+                "SELECT id, path, created_at, last_opened_at FROM projects WHERE path = ?1",
                 params![path_text],
                 |row| {
                     Ok(Project {
@@ -618,7 +622,6 @@ impl Store {
                         path: PathBuf::from(row.get::<_, String>(1)?),
                         created_at: row.get(2)?,
                         last_opened_at: row.get(3)?,
-                        landing_mode: saved_landing_mode(row, 4)?,
                     })
                 },
             )
@@ -629,7 +632,7 @@ impl Store {
     pub fn projects(&self) -> Result<Vec<Project>> {
         let read = self.reader();
         let mut statement = read.prepare(
-            "SELECT id, path, created_at, last_opened_at, landing_mode FROM projects
+            "SELECT id, path, created_at, last_opened_at FROM projects
              ORDER BY last_opened_at DESC, id DESC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -638,27 +641,9 @@ impl Store {
                 path: PathBuf::from(row.get::<_, String>(1)?),
                 created_at: row.get(2)?,
                 last_opened_at: row.get(3)?,
-                landing_mode: saved_landing_mode(row, 4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// The mode new threads in the project start with.
-    pub fn landing_mode(&self, project_id: i64) -> Result<LandingMode> {
-        self.reader()
-            .query_row(
-                "SELECT landing_mode FROM projects WHERE id = ?1",
-                params![project_id],
-                |row| saved_landing_mode(row, 0),
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("unknown project {project_id}"))
-    }
-
-    /// Sets the mode new threads in the project start with. Existing threads keep theirs.
-    pub fn set_project_landing_mode(&self, project_id: i64, mode: LandingMode) {
-        self.queue(Write::SetLandingMode { project_id, mode });
     }
 
     /// The project's threads that are not archived, newest first. Activity never reorders
@@ -704,12 +689,12 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The Rift copies of archived threads that are not removed yet, with their threads' ids.
+    /// The worktrees of archived threads that are not removed yet, with their threads' ids.
     /// Removing them at startup finishes what an earlier run could not (see `Removal`).
-    pub fn copies_to_remove(&self) -> Result<Vec<(String, Copy)>> {
+    pub fn copies_to_remove(&self) -> Result<Vec<(String, Worktree)>> {
         let read = self.reader();
         let mut statement = read.prepare(
-            "SELECT copies.thread_id, path, copies.workdir, source, rift_id, base
+            "SELECT copies.thread_id, path, copies.workdir, source, branch, base
              FROM copies JOIN threads ON threads.id = copies.thread_id
              WHERE threads.archived_at IS NOT NULL AND copies.removed_at IS NULL
              ORDER BY copies.created_at",
@@ -720,7 +705,7 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The id of the thread whose Rift copy is at `path` and not removed yet, archived or not.
+    /// The id of the thread whose worktree is at `path` and not removed yet, archived or not.
     pub fn copy_owner(&self, path: &Path) -> Result<Option<String>> {
         Ok(self
             .reader()
@@ -746,7 +731,7 @@ impl Store {
                 intent: row
                     .get::<_, Option<String>>(3)?
                     .map_or(PendingIntent::Discard, PendingIntent::Restore),
-                rift_id: row.get(6)?,
+                branch: row.get(6)?,
                 created_at: row.get(4)?,
                 state: match row.get::<_, String>(5)?.as_str() {
                     "making_copy" => PendingState::MakingCopy,
@@ -768,7 +753,7 @@ impl Store {
                 path: PathBuf::from(row.get::<_, String>(0)?),
                 project_id: row.get(1)?,
                 thread_id: row.get(2)?,
-                rift_id: row.get(3)?,
+                branch: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -782,19 +767,19 @@ impl Store {
         let (done, wait) = mpsc::channel();
         self.queue(Write::SavePending { pending, done });
         wait.recv_timeout(OPEN_PROJECT_TIMEOUT)
-            .context("could not save the message before making a Rift copy")?
+            .context("could not save the message before making a worktree")?
             .map_err(anyhow::Error::msg)
     }
 
-    pub(crate) fn save_pending_id(&self, thread_id: &str, rift_id: &str) -> Result<()> {
+    pub(crate) fn save_pending_id(&self, thread_id: &str, branch: &str) -> Result<()> {
         let (done, wait) = mpsc::channel();
         self.queue(Write::PendingId {
             thread_id: thread_id.to_string(),
-            rift_id: rift_id.to_string(),
+            branch: branch.to_string(),
             done,
         });
         wait.recv_timeout(OPEN_PROJECT_TIMEOUT)
-            .context("could not save the Rift id")?
+            .context("could not save the worktree's branch")?
             .map_err(anyhow::Error::msg)
     }
 
@@ -896,7 +881,7 @@ impl Store {
         });
     }
 
-    /// Records that the thread's Rift copy was removed.
+    /// Records that the thread's worktree was removed.
     pub fn mark_copy_removed(&self, thread_id: &str, at: i64) {
         self.queue(Write::CopyRemoved {
             thread_id: thread_id.to_string(),
@@ -963,8 +948,8 @@ fn path_text(path: &Path) -> String {
 /// The `SELECT … FROM` for [`thread_row`]: a thread's columns, then its copy's.
 const THREAD_COLUMNS: &str = "SELECT id, project_id, title, provider, conversation_id, conversation_state,
         status, unread, threads.created_at, updated_at, archived_at, threads.workdir,
-        copies.path, copies.workdir, source, rift_id, base, threads.model, threads.effort, threads.speed,
-        landing_mode, review_base, landing_resolved, snapshot_needed
+        copies.path, copies.workdir, source, branch, base, threads.model, threads.effort, threads.speed,
+        review_base, landing_resolved, snapshot_needed
      FROM threads LEFT JOIN copies ON copies.thread_id = threads.id";
 
 fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
@@ -1001,30 +986,29 @@ fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         archived_at: row.get(10)?,
         workdir: PathBuf::from(row.get::<_, String>(11)?),
         copy: saved_copy(row, 12)?,
-        landing_mode: saved_landing_mode(row, 20)?,
-        review_base: row.get(21)?,
-        landing_resolved: row.get(22)?,
-        snapshot_needed: row.get(23)?,
+        review_base: row.get(20)?,
+        landing_resolved: row.get(21)?,
+        snapshot_needed: row.get(22)?,
     })
 }
 
-fn saved_landing_mode(row: &Row<'_>, at: usize) -> rusqlite::Result<LandingMode> {
-    row.get::<_, String>(at)?
-        .parse()
-        .map_err(|_| rusqlite::Error::InvalidQuery)
-}
-
-/// The copy in the five columns from `at` (path, workdir, source, Rift id, base), if any.
-fn saved_copy(row: &Row<'_>, at: usize) -> rusqlite::Result<Option<Copy>> {
+/// The worktree in the five columns from `at` (path, workdir, source, branch, base), if any. A
+/// Rift copy from an older Newjen has no branch, and its base is cleared.
+fn saved_copy(row: &Row<'_>, at: usize) -> rusqlite::Result<Option<Worktree>> {
     let Some(path) = row.get::<_, Option<String>>(at)? else {
         return Ok(None);
     };
-    Ok(Some(Copy {
+    let branch: Option<String> = row.get(at + 3)?;
+    let base = match &branch {
+        Some(_) => row.get::<_, Option<String>>(at + 4)?.unwrap_or_default(),
+        None => String::new(),
+    };
+    Ok(Some(Worktree {
         path: PathBuf::from(path),
         workdir: PathBuf::from(row.get::<_, String>(at + 1)?),
         source: PathBuf::from(row.get::<_, String>(at + 2)?),
-        rift_id: row.get(at + 3)?,
-        base: row.get(at + 4)?,
+        branch: branch.unwrap_or_default(),
+        base,
     }))
 }
 
@@ -1133,7 +1117,6 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         // and records it then.
         Write::RememberAgent { .. }
         | Write::Limit { .. }
-        | Write::SetLandingMode { .. }
         | Write::UpsertProject { .. }
         | Write::Archive { .. }
         | Write::CopyRemoved { .. }
@@ -1151,12 +1134,6 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
 
 fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> {
     match write {
-        Write::SetLandingMode { project_id, mode } => {
-            connection.execute(
-                "UPDATE projects SET landing_mode = ?2 WHERE id = ?1",
-                params![project_id, mode.as_str()],
-            )?;
-        }
         Write::RememberAgent { project_id, config } => {
             connection.execute("INSERT INTO project_agent_choices (project_id, config) VALUES (?1, ?2) ON CONFLICT(project_id) DO UPDATE SET config=excluded.config", params![project_id, config])?;
         }
@@ -1187,7 +1164,7 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
                             PendingState::Draft => "draft",
                             PendingState::Sent => "sent",
                         },
-                        pending.rift_id,
+                        pending.branch,
                     ],
                 )?;
                 transaction.commit()
@@ -1197,12 +1174,12 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
         }
         Write::PendingId {
             thread_id,
-            rift_id,
+            branch,
             done,
         } => {
             let result = connection.execute(
                 "UPDATE pending_copies SET rift_id = ?2 WHERE thread_id = ?1",
-                params![thread_id, rift_id],
+                params![thread_id, branch],
             );
             let _ = done.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
             result?;
@@ -1348,8 +1325,8 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
     connection.execute(
         "INSERT INTO threads (id, project_id, title, provider, session_id, session_started,
                               status, unread, created_at, updated_at, archived_at, workdir, conversation_id, conversation_state, model, effort, speed,
-                              landing_mode, review_base, landing_resolved, snapshot_needed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                              review_base, landing_resolved, snapshot_needed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT (id) DO UPDATE SET
              title = excluded.title,
              provider = excluded.provider,
@@ -1363,7 +1340,6 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
              status = excluded.status,
              unread = excluded.unread,
              updated_at = excluded.updated_at,
-             landing_mode = excluded.landing_mode,
              review_base = excluded.review_base,
              landing_resolved = excluded.landing_resolved,
              snapshot_needed = excluded.snapshot_needed",
@@ -1385,7 +1361,6 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
             match &row.model { crate::providers::ModelSelection::CliDefault => None, crate::providers::ModelSelection::Model { id } => Some(id) },
             match &row.effort { crate::agent::EffortSelection::CliDefault => None, crate::agent::EffortSelection::Chosen(effort) => Some(effort) },
             match row.speed { crate::agent::Speed::Normal => "normal", crate::agent::Speed::Fast => "fast" },
-            row.landing_mode.as_str(),
             row.review_base,
             row.landing_resolved,
             row.snapshot_needed,
@@ -1393,15 +1368,15 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
     )?;
     if let Some(copy) = &row.copy {
         connection.execute(
-            "INSERT INTO copies (thread_id, path, workdir, source, rift_id, base, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO copies (thread_id, path, workdir, source, rift_id, branch, base, created_at)
+             VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7)
              ON CONFLICT (thread_id) DO NOTHING",
             params![
                 row.id,
                 path_text(&copy.path),
                 path_text(&copy.workdir),
                 path_text(&copy.source),
-                copy.rift_id,
+                copy.branch,
                 copy.base,
                 now_ms(),
             ],
@@ -1515,7 +1490,11 @@ mod tests {
             rows[1].conversation,
             crate::agent::ConversationState::Established("old-e".into())
         );
-        assert_eq!(rows[1].copy.as_ref().unwrap().rift_id, "rift-id");
+        let legacy = rows[1].copy.as_ref().unwrap();
+        assert!(legacy.is_legacy());
+        assert_eq!(legacy.base, "");
+        assert!(rows[1].landing_resolved);
+        assert!(!rows[0].landing_resolved);
         assert!(rows.iter().all(
             |row| row.model == crate::providers::ModelSelection::CliDefault
                 && row.effort == crate::agent::EffortSelection::CliDefault
@@ -1545,7 +1524,6 @@ mod tests {
             updated_at: 1,
             archived_at: None,
             copy: None,
-            landing_mode: crate::landing::LandingMode::HarnessManaged,
             review_base: None,
             landing_resolved: false,
             snapshot_needed: false,
@@ -1658,12 +1636,12 @@ mod tests {
         assert_eq!(old.title, "Old");
         assert_eq!(old.copy, None);
 
-        let copy = Copy {
-            path: PathBuf::from("/tmp/.rifts/project/c"),
-            workdir: PathBuf::from("/tmp/.rifts/project/c"),
+        let copy = Worktree {
+            path: PathBuf::from("/tmp/.newjen-worktrees/project/c"),
+            workdir: PathBuf::from("/tmp/.newjen-worktrees/project/c"),
             source: PathBuf::from("/tmp/project"),
-            rift_id: "01RIFT".to_string(),
-            base: None,
+            branch: "newjen/c".to_string(),
+            base: "0123456789abcdef0123456789abcdef01234567".to_string(),
         };
         let mut new = row("t2", 1);
         new.copy = Some(copy.clone());
@@ -1711,7 +1689,7 @@ mod tests {
                 path: dir.path().join("unfinished-copy"),
                 intent: PendingIntent::Restore("held message".into()),
                 state: PendingState::MakingCopy,
-                rift_id: Some("owned-copy".into()),
+                branch: Some("newjen/owned-copy".into()),
                 created_at: 1,
             })
             .unwrap();
@@ -1728,7 +1706,7 @@ mod tests {
             pending.intent,
             PendingIntent::Restore("restored composer".into())
         );
-        assert_eq!(pending.rift_id.as_deref(), Some("owned-copy"));
+        assert_eq!(pending.branch.as_deref(), Some("newjen/owned-copy"));
     }
     #[test]
     fn save_receipt_covers_late_loader_failure_after_an_earlier_success() {

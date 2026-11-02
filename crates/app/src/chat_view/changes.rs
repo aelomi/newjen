@@ -3,7 +3,7 @@
 //!
 //! While a turn runs the numbers are an estimate from the agent's edit tool calls (it never
 //! touches the folder), grown one finished call at a time and counted off the UI thread. Once
-//! the turn is done and snapshotted they come from one read-only jj call, also off the UI
+//! the turn is done and snapshotted they come from one read-only git call, also off the UI
 //! thread. A failed call keeps the estimate, marked as one, and is asked again a few times.
 
 use super::*;
@@ -38,7 +38,7 @@ pub(super) struct ChangesCard {
     pub(super) has_changes: bool,
 }
 
-/// jj is asked again this many times for a transcript length it failed on.
+/// git is asked again this many times for a transcript length it failed on.
 const ASKS: u8 = 3;
 const RETRY: Duration = Duration::from_secs(2);
 
@@ -48,10 +48,10 @@ struct Tracked {
     /// The count of finished tool calls the estimate was last brought up to.
     tools_done: Option<usize>,
     estimating: bool,
-    /// jj's answer and the transcript length it was asked at.
+    /// git's answer and the transcript length it was asked at.
     exact: Option<(usize, ChangeSummary)>,
     asked: Option<usize>,
-    /// The transcript length jj last failed at, and how many times in a row.
+    /// The transcript length git last failed at, and how many times in a row.
     failed: Option<(usize, u8)>,
     loading: bool,
 }
@@ -282,7 +282,7 @@ pub(super) fn file_row(
 }
 
 impl ChangesCard {
-    /// What the card lists for `thread`: jj's answer while it is current, the estimate
+    /// What the card lists for `thread`: git's answer while it is current, the estimate
     /// otherwise. Nothing once the work has landed.
     /// The second value is false for an estimate.
     fn summary(&self, thread: &Thread) -> Option<(&ChangeSummary, bool)> {
@@ -301,7 +301,7 @@ impl ChangesCard {
 
 impl ChatView {
     /// Keeps the active thread's numbers current: the estimate when a tool call finishes, and
-    /// jj's answer once the turn has ended and been snapshotted.
+    /// git's answer once the turn has ended and been snapshotted.
     pub(super) fn sync_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = self.thread().clone();
         let thread = entity.read(cx);
@@ -356,7 +356,11 @@ impl ChatView {
         tracked.loading = true;
         let cwd = thread.cwd().to_path_buf();
         let tools = self.tools.clone();
-        let task = cx.background_spawn(async move { landing::changed_files(&tools, &cwd, &base) });
+        let thread_id = id.clone();
+        let task =
+            cx.background_spawn(
+                async move { landing::changed_files(&tools, &cwd, &thread_id, &base) },
+            );
         cx.spawn_in(window, async move |view, cx| {
             let result = task.await;
             let mut retry = false;

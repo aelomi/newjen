@@ -1,5 +1,5 @@
-//! The bar across the top of the chat: the thread's title and where it works (Local or a Rift
-//! copy) in the middle; the shield with its list of rules allowed in the thread, the terminal
+//! The bar across the top of the chat: the thread's title and where it works (Local or a
+//! worktree) in the middle; the shield with its list of rules allowed in the thread, the terminal
 //! button and the Changes button on the right; and, while the thread list is out of sight, the
 //! button that brings it back on the left.
 //!
@@ -61,9 +61,9 @@ pub struct Bar {
     /// The thread's title, e.g. "Fix the flaky orphan test" or "New thread".
     pub title: SharedString,
     /// The folder the thread's claude works in, as `~/…`: the where chip's tooltip. Empty while
-    /// the Rift copy is made and its folder is not known yet.
+    /// the worktree is made and its folder is not known yet.
     pub path: String,
-    /// The thread works in a Rift copy (the chip says "Rift copy"), not the project folder.
+    /// The thread works in a worktree (the chip says "Worktree"), not the project folder.
     pub copy: bool,
     /// Set while the thread list is out of sight: the button that shows it, and whether
     /// another thread waits for an approval (an amber dot on the button).
@@ -173,12 +173,12 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
         .into_any_element()
 }
 
-/// Where the thread works: the project folder ("Local") or its Rift copy, quiet beside the
+/// Where the thread works: the project folder ("Local") or its worktree, quiet beside the
 /// title. The full folder is its tooltip.
 fn where_chip(copy: bool, path: String, cx: &App) -> AnyElement {
     let colors = &cx.theme().colors;
     let (glyph, label) = if copy {
-        (IconName::Layers, "Rift copy")
+        (IconName::GitBranch, "Worktree")
     } else {
         (IconName::Folder, "Local")
     };
@@ -198,7 +198,7 @@ fn where_chip(copy: bool, path: String, cx: &App) -> AnyElement {
         .child(
             div()
                 .when(copy, |label| {
-                    label.debug_selector(|| "rift-copy-tag".to_string())
+                    label.debug_selector(|| "worktree-tag".to_string())
                 })
                 .child(label),
         )
@@ -527,7 +527,7 @@ mod tests {
             "the chip keeps its width: {chip:?}"
         );
         assert!(chip.right() <= right.left(), "{chip:?} {right:?}");
-        assert!(cx.debug_bounds("rift-copy-tag").is_some());
+        assert!(cx.debug_bounds("worktree-tag").is_some());
         assert!(cx.debug_bounds("terminal-toggle").is_some());
     }
 

@@ -63,13 +63,13 @@ impl QuitBlockers {
         [
             count(
                 self.preparing,
-                "A Rift copy is still being made.",
-                "{} Rift copies are still being made.",
+                "A worktree is still being made.",
+                "{} worktrees are still being made.",
             ),
             count(
                 self.snapshots,
-                "A jj snapshot is still being saved.",
-                "{} jj snapshots are still being saved.",
+                "A snapshot is still being saved.",
+                "{} snapshots are still being saved.",
             ),
             count(
                 self.background,
@@ -266,7 +266,7 @@ mod attention_tests {
         assert_eq!(
             total.notes(),
             [
-                "A jj snapshot is still being saved.",
+                "A snapshot is still being saved.",
                 "2 open terminals will close."
             ]
         );

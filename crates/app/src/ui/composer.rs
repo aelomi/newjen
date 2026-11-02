@@ -21,7 +21,7 @@ pub fn composer_field(window: &mut Window, cx: &mut Context<TextareaState>) -> T
 pub enum Footer {
     Send(OnPress),
     Stop(OnPress),
-    /// While a Rift copy is made.
+    /// While a worktree is made.
     Cancel(OnPress),
     /// Disabled, with this hint.
     Wait(&'static str),
@@ -52,7 +52,7 @@ impl Composer {
         self
     }
 
-    /// The Local | Rift copy control, left of the send button.
+    /// The Local | worktree control, left of the send button.
     pub fn works_in(mut self, works_in: Option<AnyElement>) -> Self {
         self.works_in = works_in;
         self

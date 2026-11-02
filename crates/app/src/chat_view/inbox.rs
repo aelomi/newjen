@@ -3,43 +3,6 @@
 
 use super::*;
 impl ChatView {
-    /// Whether a thread of this project or a peer sharing the repository has a terminal in
-    /// the project folder (not in a Rift copy), where a shell could change files while Rift
-    /// snapshots the project.
-    pub(super) fn project_terminal_open(&self, source: &Path, cx: &App) -> bool {
-        let open_in = |view: &ChatView| {
-            view.slots.iter().any(|slot| {
-                let thread = slot.thread.read(cx);
-                slot.terminal.is_some()
-                    && thread.copy().is_none()
-                    && overlaps(source, &rift::project_root(thread.cwd()).0)
-            })
-        };
-        open_in(self)
-            || self
-                .copy_peers
-                .iter()
-                .filter_map(|peer| peer.upgrade())
-                .any(|peer| open_in(peer.read(cx)))
-    }
-
-    /// The thread (here or in a peer) whose Rift copy of `source` is being made, if any.
-    fn copy_in_progress(&self, source: &Path, cx: &App) -> bool {
-        let making_in = |view: &ChatView| {
-            view.slots.iter().any(|slot| {
-                let thread = slot.thread.read(cx);
-                thread.preparing().is_some()
-                    && overlaps(source, &rift::project_root(thread.cwd()).0)
-            })
-        };
-        making_in(self)
-            || self
-                .copy_peers
-                .iter()
-                .filter_map(|peer| peer.upgrade())
-                .any(|peer| making_in(peer.read(cx)))
-    }
-
     /// Whether the terminal panel is out and the keyboard is in it.
     pub(super) fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
         self.terminal_open
@@ -62,20 +25,12 @@ impl ChatView {
         let refused = {
             let thread = self.thread().read(cx);
             if thread.preparing().is_some()
-                || (thread.works_in() == WorksIn::RiftCopy && thread.copy().is_none())
+                || (thread.works_in() == WorksIn::Worktree && thread.copy().is_none())
             {
                 Some(Notice::held(
                     "The working folder is not ready",
-                    "Send the first message and wait for the Rift copy before opening its \
+                    "Send the first message and wait for the worktree before opening its \
                      terminal."
-                        .to_string(),
-                ))
-            } else if thread.copy().is_none()
-                && self.copy_in_progress(&rift::project_root(thread.cwd()).0, cx)
-            {
-                Some(Notice::held(
-                    "A Rift copy is being made",
-                    "Wait for the copy before opening a terminal in the project folder."
                         .to_string(),
                 ))
             } else {

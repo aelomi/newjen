@@ -417,8 +417,8 @@ pub fn footer_for(model: Option<String>, items: &[Item], ix: usize) -> TurnFoote
     }
 }
 
-/// The card shown while a Rift copy is made: the project, a track to the copy, the steps it
-/// goes through, and the latest line the hooks printed.
+/// The card shown while a worktree is made: the project, a track to the worktree, the steps
+/// it goes through, and the latest line git printed.
 pub struct CopyCard<'a> {
     pub project: &'a str,
     pub took: &'a str,
@@ -542,9 +542,9 @@ pub fn copy_card(card: CopyCard, cx: &App) -> AnyElement {
     };
     let joint = || div().w_6().h(px(1.)).bg(theme.border);
     let line = match (card.cancelling, card.last_line) {
-        (true, _) => "Cancelling\u{2026} Rift is being stopped".to_string(),
+        (true, _) => "Cancelling\u{2026}".to_string(),
         (false, Some(line)) => line.to_string(),
-        (false, None) => format!("Creating a Rift copy \u{b7} {}", card.took),
+        (false, None) => format!("Creating a worktree \u{b7} {}", card.took),
     };
     let cancel = card.on_cancel;
     v_flex()
@@ -569,11 +569,11 @@ pub fn copy_card(card: CopyCard, cx: &App) -> AnyElement {
                 .justify_center()
                 .items_center()
                 .gap_2()
-                .child(step("Snapshot", state(0)))
+                .child(step("Base", state(0)))
                 .child(joint())
-                .child(step("Copy", state(1)))
+                .child(step("Branch", state(1)))
                 .child(joint())
-                .child(step("Setup", state(2))),
+                .child(step("Checkout", state(2))),
         )
         .child(
             h_flex()
@@ -615,8 +615,8 @@ pub fn copy_card(card: CopyCard, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// Which of Snapshot (0), Copy (1) and Setup (2) is under way. Rift reports no step names, so
-/// Setup is inferred from the first line its hooks print.
+/// Which of Base (0), Branch (1) and Checkout (2) is under way. git reports no step names, so
+/// Checkout is inferred from the first line it prints.
 fn copy_stage(snapshotting: bool, printed: bool) -> usize {
     if snapshotting {
         0
@@ -1328,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn the_copy_steps_follow_what_rift_has_reported() {
+    fn the_worktree_steps_follow_what_git_has_reported() {
         assert_eq!(copy_stage(true, false), 0);
         assert_eq!(copy_stage(false, false), 1);
         assert_eq!(copy_stage(false, true), 2);

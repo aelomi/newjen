@@ -23,7 +23,7 @@
 //! a message only while its turn runs; a Stop pressed in that window ends the turn at once
 //! instead (see [`Thread::stop`]).
 //!
-//! **Where it works.** In the project folder, or in a Rift copy of its own. A draft chooses
+//! **Where it works.** In the project folder, or in a worktree of its own. A draft chooses
 //! ([`Thread::set_works_in`]). A draft that wants a copy holds its first message while the copy
 //! is made: [`Thread::send`] hands back a [`CopyJob`] for the app to run off the UI thread, and
 //! [`Thread::finish_copy`] then moves the thread into the copy and sends the message, once.
@@ -44,7 +44,7 @@
 //! while one runs.
 //!
 //! **Subscription safety.** Nothing here starts a turn on its own. A turn starts only from
-//! [`Thread::send`] (or, for a first message held for a Rift copy, [`Thread::finish_copy`]);
+//! [`Thread::send`] (or, for a first message held for a worktree, [`Thread::finish_copy`]);
 //! the two repairs above resend the user's own message once. A copy that could not be made is
 //! never tried again by itself. (claude itself starts a turn when a background task it ran
 //! finishes; [`Thread::apply`] follows that turn like any other.)
@@ -58,18 +58,18 @@ use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
 use crate::agent::NoteDelivery;
-use crate::landing::{self, LandingMode};
+use crate::landing;
 #[cfg(test)]
 use crate::protocol::{Incoming, ResultMessage};
 #[cfg(test)]
 use crate::providers::claude::controller::{is_missing_conversation, is_session_in_use};
-use crate::rift::{self, CopyError, Tools};
 use crate::session::{Session, SessionConfig, SessionEvent};
 use crate::store::{
     Grant, PendingCopy, PendingIntent, PendingState, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow,
     now_ms,
 };
 use crate::transcript::{Item, Status, Transcript};
+use crate::worktree::{self, CopyError, Tools};
 
 /// A thread's title before its first message.
 pub const NEW_THREAD_TITLE: &str = "New thread";
@@ -109,7 +109,6 @@ pub struct Thread {
     /// The folder claude works in.
     cwd: PathBuf,
     place: Place,
-    landing_mode: LandingMode,
     review_base: Option<String>,
     landing_resolved: bool,
     snapshot: SnapshotState,
@@ -140,7 +139,7 @@ pub struct Thread {
     /// Whether this is the thread on screen (see [`Thread::set_active`]).
     active: bool,
     stage: Stage,
-    copy_job: Option<rift::CopyControl>,
+    copy_job: Option<worktree::CopyControl>,
     created_at: i64,
     updated_at: i64,
     /// The last time anything happened (an event, a message, an answer), for idle shutdown.
@@ -160,7 +159,7 @@ pub struct Thread {
 enum Stage {
     /// Nothing sent yet.
     Draft,
-    /// The first message waits while the thread's Rift copy is made.
+    /// The first message waits while the thread's worktree is made.
     Preparing(Preparing),
     /// A message waits while the project folder's base is recorded.
     PreparingProject(PreparingProject),
@@ -181,19 +180,19 @@ enum SnapshotState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Place {
     ProjectFolder,
-    /// A Rift copy of its own, made when the first message is sent. Drafts only.
+    /// A worktree of its own, made when the first message is sent. Drafts only.
     NewCopy,
-    Copy(rift::Copy),
+    Copy(worktree::Worktree),
 }
 
 /// Where a draft works, as the user chose (see [`Thread::set_works_in`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorksIn {
     ProjectFolder,
-    RiftCopy,
+    Worktree,
 }
 
-/// A first message held while the thread's Rift copy is made (see [`Thread::send`]).
+/// A first message held while the thread's worktree is made (see [`Thread::send`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preparing {
     message: String,
@@ -216,12 +215,12 @@ impl Preparing {
         &self.message
     }
 
-    /// When the user sent it, for "Making a Rift copy · 3s".
+    /// When the user sent it, for "Making a worktree · 3s".
     pub fn started_at(&self) -> Instant {
         self.started_at
     }
 
-    /// The last line Rift or its hooks printed (see [`Thread::note_copy_progress`]).
+    /// The last line git printed (see [`Thread::note_copy_progress`]).
     pub fn last_line(&self) -> Option<&str> {
         self.last_line.as_deref()
     }
@@ -231,7 +230,7 @@ impl Preparing {
         &self.path
     }
 
-    /// The user cancelled ([`Thread::stop`]); the message comes back once Rift has stopped.
+    /// The user cancelled ([`Thread::stop`]); the message comes back once git has stopped.
     pub fn cancelled(&self) -> bool {
         self.cancelled
     }
@@ -250,7 +249,7 @@ pub struct PreparingProject {
 /// What the app shows while a thread's first message waits (see [`Thread::preparing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waiting<'a> {
-    /// The thread's Rift copy is being made.
+    /// The thread's worktree is being made.
     Copy(&'a Preparing),
     /// The project folder's base is being recorded.
     Project(&'a PreparingProject),
@@ -265,7 +264,7 @@ impl Waiting<'_> {
         }
     }
 
-    /// When the user sent it, for "Making a Rift copy · 3s".
+    /// When the user sent it, for "Making a worktree · 3s".
     pub fn started_at(&self) -> Instant {
         match self {
             Waiting::Copy(preparing) => preparing.started_at,
@@ -273,7 +272,7 @@ impl Waiting<'_> {
         }
     }
 
-    /// The last line Rift or its hooks printed; nothing for project preparation.
+    /// The last line git printed; nothing for project preparation.
     pub fn last_line(&self) -> Option<&str> {
         match self {
             Waiting::Copy(preparing) => preparing.last_line(),
@@ -304,7 +303,7 @@ impl Waiting<'_> {
 pub enum Sent {
     /// It went to claude.
     Started,
-    /// It is held until the thread's Rift copy is made: run the job off the UI thread and pass
+    /// It is held until the thread's worktree is made: run the job off the UI thread and pass
     /// what it returns to [`Thread::finish_copy`].
     MakingCopy(CopyJob),
     PreparingProject(ProjectJob),
@@ -337,7 +336,6 @@ pub struct SnapshotJob {
     cwd: PathBuf,
     title: String,
     thread_id: String,
-    mode: LandingMode,
     stopping: Vec<JoinHandle<()>>,
 }
 
@@ -346,19 +344,19 @@ impl SnapshotJob {
         for stopping in self.stopping {
             let _ = stopping.join();
         }
-        let result = landing::snapshot(tools, &self.cwd, self.mode, &self.title, &self.thread_id);
+        let result = landing::snapshot(tools, &self.cwd, &self.title, &self.thread_id);
         let _ = self.completion.send(());
         result
     }
 }
 
-/// Makes a thread's Rift copy ([`rift::create`]). It can take seconds, so the app runs it on a
+/// Makes a thread's worktree ([`worktree::create`]). It can take seconds, so the app runs it on a
 /// background thread.
 #[must_use = "run it, then pass the result to `Thread::finish_copy`"]
 pub struct CopyJob {
     project_dir: PathBuf,
     name: String,
-    control: rift::CopyControl,
+    control: worktree::CopyControl,
     thread_id: String,
     store: Store,
 }
@@ -378,9 +376,9 @@ impl CopyJob {
     pub fn run(
         self,
         tools: &Tools,
-        on_progress: impl FnMut(rift::Progress),
-    ) -> Result<rift::Copy, CopyError> {
-        rift::create_controlled(
+        on_progress: impl FnMut(worktree::Progress),
+    ) -> Result<worktree::Worktree, CopyError> {
+        worktree::create_controlled(
             tools,
             &self.project_dir,
             &self.name,
@@ -389,7 +387,7 @@ impl CopyJob {
                 self.store
                     .save_pending_id(&self.thread_id, id)
                     .map_err(|error| CopyError::Failed {
-                        command: "save Rift id".to_string(),
+                        command: "save the worktree's branch".to_string(),
                         detail: error.to_string(),
                         output: Vec::new(),
                     })
@@ -412,15 +410,15 @@ pub struct NotSent {
     /// Empty when nothing was held.
     pub message: String,
     pub error: anyhow::Error,
-    pub copy_to_remove: Option<Box<rift::Copy>>,
+    pub copy_to_remove: Option<Box<worktree::Worktree>>,
 }
 
-/// Removes an archived thread's Rift copy, once its `claude` has stopped, and records that it
+/// Removes an archived thread's worktree, once its `claude` has stopped, and records that it
 /// is gone. It can take seconds, so the app runs it on a background thread.
 #[must_use = "run it off the UI thread, or the copy stays until the next launch"]
 pub struct Removal {
     thread_id: String,
-    copy: rift::Copy,
+    copy: worktree::Worktree,
     stopping: Vec<JoinHandle<()>>,
     store: Store,
 }
@@ -441,7 +439,7 @@ impl Removal {
             .collect())
     }
 
-    pub fn copy(&self) -> &rift::Copy {
+    pub fn copy(&self) -> &worktree::Worktree {
         &self.copy
     }
 
@@ -449,15 +447,7 @@ impl Removal {
         for stopping in self.stopping {
             let _ = stopping.join();
         }
-        rift::remove(
-            tools,
-            &self.copy.source,
-            &self.copy.path,
-            &self.copy.rift_id,
-        )?;
-        if self.copy.base.is_some() {
-            landing::cleanup_remote(tools, &self.copy.source, &self.thread_id)?;
-        }
+        worktree::remove(tools, &self.copy.source, &self.copy.path, &self.copy.branch)?;
         self.store.mark_copy_removed(&self.thread_id, now_ms());
         Ok(())
     }
@@ -491,7 +481,6 @@ impl Thread {
             project_dir: project.path.clone(),
             cwd: project.path.clone(),
             place: Place::ProjectFolder,
-            landing_mode: project.landing_mode,
             review_base: None,
             landing_resolved: false,
             snapshot: SnapshotState::Clean,
@@ -623,20 +612,19 @@ impl Thread {
         thread.id = row.id;
         thread.cwd = row.workdir;
         thread.place = row.copy.map_or(Place::ProjectFolder, Place::Copy);
-        thread.landing_mode = row.landing_mode;
-        thread.review_base = row
-            .review_base
-            .or_else(|| thread.copy().and_then(|copy| copy.base.clone()));
+        thread.review_base = row.review_base.or_else(|| {
+            thread
+                .copy()
+                .filter(|copy| !copy.is_legacy())
+                .map(|copy| copy.base.clone())
+        });
         thread.landing_resolved = row.landing_resolved;
-        thread.snapshot = if row.snapshot_needed
-            || (row.status.is_busy()
-                && thread.review_base.is_some()
-                && thread.landing_mode == LandingMode::HarnessManaged)
-        {
-            SnapshotState::Pending
-        } else {
-            SnapshotState::Clean
-        };
+        thread.snapshot =
+            if row.snapshot_needed || (row.status.is_busy() && thread.review_base.is_some()) {
+                SnapshotState::Pending
+            } else {
+                SnapshotState::Clean
+            };
         thread.title = row.title;
         thread.provider = row.provider;
         thread.session_id = row.conversation.id().unwrap_or("").to_owned();
@@ -703,13 +691,8 @@ impl Thread {
                 &cleanup.path,
             )
             .and_then(|()| {
-                rift::remove_pending(
-                    tools,
-                    &project.path,
-                    &cleanup.path,
-                    cleanup.rift_id.as_deref(),
-                )
-                .map_err(anyhow::Error::from)
+                worktree::remove_pending(tools, &project.path, &cleanup.path)
+                    .map_err(anyhow::Error::from)
             });
             match result {
                 Ok(()) => store.delete_copy_cleanup(&cleanup.path),
@@ -743,12 +726,7 @@ impl Thread {
             return Ok(CopyRecovery::Saved);
         }
         if pending.state == PendingState::MakingCopy {
-            rift::remove_pending(
-                tools,
-                &project.path,
-                &pending.path,
-                pending.rift_id.as_deref(),
-            )?;
+            worktree::remove_pending(tools, &project.path, &pending.path)?;
             let mut recovered = pending.clone();
             recovered.state = PendingState::Draft;
             store.save_pending_copy(recovered)?;
@@ -833,29 +811,29 @@ impl Thread {
         self.unread
     }
 
-    /// Nothing sent yet. A thread whose first message waits for its Rift copy is not a draft
+    /// Nothing sent yet. A thread whose first message waits for its worktree is not a draft
     /// any more (see [`Thread::preparing`]). See [`keeps_draft`] for switching away from one.
     pub fn is_draft(&self) -> bool {
         matches!(self.stage, Stage::Draft)
     }
 
-    /// The project folder, or a Rift copy of its own.
+    /// The project folder, or a worktree of its own.
     pub fn works_in(&self) -> WorksIn {
         match self.place {
             Place::ProjectFolder => WorksIn::ProjectFolder,
-            Place::NewCopy | Place::Copy(_) => WorksIn::RiftCopy,
+            Place::NewCopy | Place::Copy(_) => WorksIn::Worktree,
         }
     }
 
-    /// The thread's Rift copy, once it is made.
-    pub fn copy(&self) -> Option<&rift::Copy> {
+    /// The thread's worktree, once it is made.
+    pub fn copy(&self) -> Option<&worktree::Worktree> {
         match &self.place {
             Place::Copy(copy) => Some(copy),
             Place::ProjectFolder | Place::NewCopy => None,
         }
     }
 
-    /// The message that waits while the thread's Rift copy is made or the project folder's
+    /// The message that waits while the thread's worktree is made or the project folder's
     /// base is recorded. The thread is busy then: nothing else can be sent, and no claude
     /// runs for it.
     pub fn preparing(&self) -> Option<Waiting<'_>> {
@@ -866,20 +844,10 @@ impl Thread {
         }
     }
 
-    /// True if a new Rift copy must not be made now, because making one snapshots the main
-    /// repo and may run `jj new` there: this thread works in the project folder and its agent
-    /// is busy (a turn, an approval, a background task, any of which can be mid-edit), or this
-    /// thread's own copy is being made. The app refuses with "wait for <thread> to finish".
+    /// True while this thread's own worktree or project base is being recorded. Making a
+    /// worktree reads only committed history, so a busy project-folder thread never blocks one.
     pub fn blocks_copy_creation(&self) -> bool {
-        match (&self.stage, &self.place) {
-            (Stage::Preparing(_) | Stage::PreparingProject(_), _) => true,
-            (_, Place::ProjectFolder) => {
-                self.status().is_busy()
-                    || self.work_pending()
-                    || !self.background_tasks().is_empty()
-            }
-            (_, Place::NewCopy | Place::Copy(_)) => false,
-        }
+        matches!(self.stage, Stage::Preparing(_) | Stage::PreparingProject(_))
     }
 
     pub fn blocks_project_send(&self) -> bool {
@@ -948,10 +916,11 @@ impl Thread {
         let mut config = self.base_config.clone();
         config.bind(&self.session_id, self.session_started, &rules);
         config.cwd = self.cwd.clone();
-        // Only where Newjen (or the agent) can record work with jj: a git-only or plain
-        // folder is never snapshotted, so the agent must not be told it is.
-        if landing::available(&self.cwd) {
-            config.instructions = Some(self.landing_mode.instructions().to_string());
+        // Only where Newjen snapshots the work: a plain folder or an old Rift copy never is, so
+        // the agent must not be told it is.
+        if landing::available(&self.cwd) && !self.copy().is_some_and(worktree::Worktree::is_legacy)
+        {
+            config.instructions = Some(landing::instructions().to_string());
         }
         if let Place::Copy(copy) = &self.place {
             config.env.extend(copy.env());
@@ -983,20 +952,6 @@ impl Thread {
     pub fn pending_edit(&self) -> Option<crate::edits::EditProposal> {
         let request = self.transcript.pending_approval()?;
         self.controller.edit_proposal(request.view(), &self.cwd)
-    }
-
-    pub fn landing_mode(&self) -> LandingMode {
-        self.landing_mode
-    }
-
-    /// Updates a draft to the project's current landing mode after the project setting
-    /// changes. A thread that has been sent keeps the mode it started with.
-    pub fn follow_project_landing_mode(&mut self, mode: LandingMode) -> Result<()> {
-        if !self.is_draft() {
-            bail!("only a new thread follows the project's landing mode");
-        }
-        self.landing_mode = mode;
-        Ok(())
     }
 
     pub fn review_base(&self) -> Option<&str> {
@@ -1043,7 +998,6 @@ impl Thread {
             cwd: self.cwd.clone(),
             title: self.title.clone(),
             thread_id: self.id.clone(),
-            mode: self.landing_mode,
             stopping,
         })
     }
@@ -1107,14 +1061,14 @@ impl Thread {
         self.save();
     }
 
-    /// Chooses where a draft works. Only a draft whose Rift copy is not made yet can change.
+    /// Chooses where a draft works. Only a draft whose worktree is not made yet can change.
     pub fn set_works_in(&mut self, works_in: WorksIn) -> Result<()> {
         if !self.is_draft() || self.copy().is_some() {
             bail!("only a new thread can choose where it works");
         }
         self.place = match works_in {
             WorksIn::ProjectFolder => Place::ProjectFolder,
-            WorksIn::RiftCopy => Place::NewCopy,
+            WorksIn::Worktree => Place::NewCopy,
         };
         Ok(())
     }
@@ -1122,7 +1076,7 @@ impl Thread {
     /// Sends a user message, starting `claude` first if none runs. The first message of a
     /// draft also names the thread (see [`title_from_message`]) and saves it.
     ///
-    /// The first message of a draft that wants a Rift copy is held instead, and nothing else
+    /// The first message of a draft that wants a worktree is held instead, and nothing else
     /// happens until the app runs the [`CopyJob`] it gets back and passes the result to
     /// [`Thread::finish_copy`].
     ///
@@ -1142,7 +1096,7 @@ impl Thread {
             bail!("there is nothing to send");
         }
         if self.preparing().is_some() {
-            bail!("Newjen is still making this thread's Rift copy");
+            bail!("Newjen is still making this thread's worktree");
         }
         if self.landing_resolved {
             bail!("this thread’s work was already landed or discarded");
@@ -1158,18 +1112,18 @@ impl Thread {
         }
         if self.place == Place::NewCopy {
             let name = copy_name(&self.id);
-            let path = rift::destination(&self.project_dir, &name)?;
-            rift::check_destination(&path)?;
+            let path = worktree::destination(&self.project_dir, &name)?;
+            worktree::check_destination(&path)?;
             self.store.save_pending_copy(PendingCopy {
                 thread_id: self.id.clone(),
                 project_id: self.project_id,
                 path: path.clone(),
                 intent: PendingIntent::Restore(text.to_string()),
                 state: PendingState::MakingCopy,
-                rift_id: None,
+                branch: None,
                 created_at: self.created_at,
             })?;
-            let control = rift::CopyControl::default();
+            let control = worktree::CopyControl::default();
             self.copy_job = Some(control.clone());
             self.title = title_from_message(text);
             self.stage = Stage::Preparing(Preparing {
@@ -1252,7 +1206,7 @@ impl Thread {
         })
     }
 
-    /// [`Thread::stop`] while the copy is made: Rift and its hooks are stopped as quitting
+    /// [`Thread::stop`] while the copy is made: git is stopped as quitting
     /// stops them, and the half-made copy is removed. The held message is never sent; it comes
     /// back through [`Thread::finish_copy`] with [`CopyError::Cancelled`].
     fn cancel_copy(&mut self) {
@@ -1270,14 +1224,14 @@ impl Thread {
         }
     }
 
-    pub fn note_copy_progress(&mut self, progress: rift::Progress) {
+    pub fn note_copy_progress(&mut self, progress: worktree::Progress) {
         if let Stage::Preparing(preparing) = &mut self.stage {
             match progress {
-                rift::Progress::MainRepoReady => preparing.main_repo = MainRepoStep::Ready,
-                rift::Progress::Line(line) if !line.trim().is_empty() => {
+                worktree::Progress::MainRepoReady => preparing.main_repo = MainRepoStep::Ready,
+                worktree::Progress::Line(line) if !line.trim().is_empty() => {
                     preparing.last_line = Some(line)
                 }
-                rift::Progress::Line(_) => {}
+                worktree::Progress::Line(_) => {}
             }
         }
     }
@@ -1287,14 +1241,17 @@ impl Thread {
     /// sent, as [`Thread::send`] sends it. Otherwise, or if that send fails, the thread is a
     /// draft again and the message comes back for the composer. Only the first call after a
     /// send does anything: later ones fail and send nothing.
-    pub fn finish_copy(&mut self, made: Result<rift::Copy, CopyError>) -> Result<(), NotSent> {
+    pub fn finish_copy(
+        &mut self,
+        made: Result<worktree::Worktree, CopyError>,
+    ) -> Result<(), NotSent> {
         let preparing = match std::mem::replace(&mut self.stage, Stage::Draft) {
             Stage::Preparing(preparing) => preparing,
             stage => {
                 self.stage = stage;
                 return Err(NotSent {
                     message: String::new(),
-                    error: anyhow!("this thread was not waiting for a Rift copy"),
+                    error: anyhow!("this thread was not waiting for a worktree"),
                     copy_to_remove: made
                         .ok()
                         .filter(|copy| self.copy() != Some(copy))
@@ -1304,7 +1261,7 @@ impl Thread {
         };
         let message = preparing.message;
         let (made, copy_to_remove) = match made {
-            // Rift finished just as the user cancelled; the copy goes the way a half-made one
+            // git finished just as the user cancelled; the copy goes the way a half-made one
             // does, without being used.
             Ok(copy) if preparing.cancelled => (Err(CopyError::Cancelled), Some(Box::new(copy))),
             made => (made, None),
@@ -1312,7 +1269,8 @@ impl Thread {
         if made.is_err() {
             let path = preparing.path;
             if copy_to_remove.is_none()
-                && (matches!(&made, Err(CopyError::Exists { .. })) || rift::pending_is_gone(&path))
+                && (matches!(&made, Err(CopyError::Exists { .. }))
+                    || worktree::pending_is_gone(&path))
             {
                 self.store.delete_pending_copy(&self.id);
             }
@@ -1320,7 +1278,7 @@ impl Thread {
         self.copy_job = None;
         let sent = made.map_err(anyhow::Error::from).and_then(|copy| {
             self.end_session();
-            self.review_base = copy.base.clone();
+            self.review_base = Some(copy.base.clone());
             self.cwd = copy.workdir.clone();
             self.transcript.set_cwd(copy.workdir.clone());
             self.place = Place::Copy(copy);
@@ -1349,7 +1307,7 @@ impl Thread {
                 thread_id: self.id.clone(),
                 project_id: self.project_id,
                 path: copy.path.clone(),
-                rift_id: Some(copy.rift_id.clone()),
+                branch: Some(copy.branch.clone()),
                 intent: PendingIntent::Restore(text.to_string()),
                 state: PendingState::Sent,
                 created_at: self.created_at,
@@ -1468,7 +1426,7 @@ impl Thread {
         // A copy, project preparation or snapshot job holds the old process's stop handles,
         // so `spawn` could not wait for it: a second agent would start before it is gone.
         match self.preparing() {
-            Some(Waiting::Copy(_)) => bail!("Newjen is still making this thread's Rift copy"),
+            Some(Waiting::Copy(_)) => bail!("Newjen is still making this thread's worktree"),
             Some(Waiting::Project(_)) => {
                 bail!("Newjen is still recording this thread's starting point")
             }
@@ -1560,9 +1518,9 @@ impl Thread {
     }
 
     /// Hides the thread from the list and stops its `claude`. Its rows stay in the store. A
-    /// thread with a Rift copy hands back the [`Removal`] that deletes it.
+    /// thread with a worktree hands back the [`Removal`] that deletes it.
     ///
-    /// A first message held for a Rift copy is dropped, so a later [`Thread::finish_copy`]
+    /// A first message held for a worktree is dropped, so a later [`Thread::finish_copy`]
     /// sends nothing and returns its copy for removal.
     pub fn archive(&mut self) -> Option<Removal> {
         if self.session.is_some() {
@@ -1669,7 +1627,7 @@ impl Thread {
             self.snapshot = SnapshotState::Pending;
         }
         if self.status().is_busy() || !self.background_tasks().is_empty() {
-            if self.landing_mode == LandingMode::HarnessManaged && self.review_base.is_some() {
+            if self.review_base.is_some() {
                 self.snapshot = SnapshotState::Pending;
             }
             self.transcript.normalize_after_relaunch();
@@ -1885,7 +1843,7 @@ impl Thread {
         }
         self.turn_started = None;
         self.controller.end_turn();
-        if self.landing_mode == LandingMode::HarnessManaged && self.review_base.is_some() {
+        if self.review_base.is_some() {
             self.snapshot = SnapshotState::Pending;
         }
         if self.stop_after_turn {
@@ -1992,7 +1950,6 @@ impl Thread {
             updated_at: self.updated_at,
             archived_at: None,
             copy: self.copy().cloned(),
-            landing_mode: self.landing_mode,
             review_base: self.review_base.clone(),
             landing_resolved: self.landing_resolved,
             snapshot_needed: self.work_pending(),
@@ -2141,7 +2098,7 @@ impl std::error::Error for QuitError {}
 /// [`QUIT_FLUSH_TIMEOUT`] for `store` to write what is queued, then always joins the process
 /// and copy cleanup threads. The timeout does not bound those joins.
 ///
-/// Only thread writes are checked for failure, not project or Rift copy writes.
+/// Only thread writes are checked for failure, not project or worktree writes.
 pub fn finish_quit(
     store: &Store,
     quitting: impl IntoIterator<Item = Quitting>,
@@ -2237,13 +2194,13 @@ fn check_pending_destination(
     let prefix = format!("{}-", copy_prefix(thread_id));
     let suffix = name.strip_prefix(&prefix).unwrap_or("");
     if project_id != project.id
-        || path != rift::destination(&project.path, name)?
+        || path != worktree::destination(&project.path, name)?
         || suffix.len() != 6
         || !suffix
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
-        bail!("the pending Rift copy is outside its destination");
+        bail!("the pending worktree is outside its destination");
     }
     Ok(())
 }
@@ -2567,7 +2524,7 @@ mod tests {
             path: home.path().join("copy"),
             intent: PendingIntent::Restore("my work".into()),
             state: PendingState::Draft,
-            rift_id: None,
+            branch: None,
             created_at: 0,
         };
         store.save_pending_copy(pending.clone()).unwrap();
@@ -2733,7 +2690,7 @@ mod tests {
         let project = store.open_project(home.path()).unwrap();
         let mut thread =
             Thread::new_draft(store.clone(), &project, SessionConfig::new(home.path()));
-        thread.set_works_in(WorksIn::RiftCopy).unwrap();
+        thread.set_works_in(WorksIn::Worktree).unwrap();
         let Sent::MakingCopy(job) = thread.send("held user message").unwrap() else {
             panic!("copy preparation");
         };

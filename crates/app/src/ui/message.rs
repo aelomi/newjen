@@ -27,7 +27,7 @@ pub fn user(text: String, _: &App) -> Message {
 
 /// What sits beside a message of the user's that has not gone through yet.
 pub enum Pending {
-    /// Held while the Rift copy is made: an hourglass.
+    /// Held while the worktree is made: an hourglass.
     Held,
     /// Never reached the agent: says so, with Retry when there is a way to send it again.
     NotSent(Option<OnRestart>),

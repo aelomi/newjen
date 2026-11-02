@@ -19,7 +19,6 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, list::ListItem};
 use newjen_core::Status;
-use newjen_core::landing::LandingMode;
 use newjen_core::steps::SidebarGroup;
 use newjen_core::transcript::STOPPED_ON_QUIT;
 
@@ -41,7 +40,7 @@ pub const DRAFT_LINE: &str = "Draft";
 /// bar's pill on the same screen.
 pub const NEEDS_APPROVAL: &str = "Needs approval";
 
-pub const MAKING_COPY_DETAIL: &str = "Creating a Rift copy…";
+pub const MAKING_COPY_DETAIL: &str = "Creating a worktree…";
 
 /// What the list says when it has no thread yet (screen 12, "Empty").
 pub const EMPTY_LIST: &str = "No threads yet. Your first message starts one.";
@@ -85,8 +84,8 @@ pub struct RowLook {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Folder {
     Project,
-    RiftCopy,
-    MakingRiftCopy,
+    Worktree,
+    MakingWorktree,
 }
 
 /// What a row needs to know about its thread. The chat view reads it from the thread.
@@ -138,7 +137,7 @@ pub fn row_look(facts: &RowFacts, now_ms: i64) -> RowLook {
             copy,
         };
     }
-    if facts.folder == Folder::MakingRiftCopy {
+    if facts.folder == Folder::MakingWorktree {
         return RowLook {
             dot: Dot::Working,
             detail: MAKING_COPY_DETAIL.to_string(),
@@ -457,63 +456,35 @@ pub fn toggle_button(
         .into_any_element()
 }
 
-/// A change of the project's landing mode, from the project row's menu.
-pub type OnLanding = Rc<dyn Fn(LandingMode, &mut Window, &mut App)>;
-
 /// The project row's callbacks and state.
 pub struct ProjectBar {
     pub name: SharedString,
-    pub landing: LandingMode,
     /// Opens the project chooser; `None` when no chooser is wired.
     pub on_switch: Option<OnPress>,
     pub on_new_thread: OnPress,
-    pub on_landing: OnLanding,
 }
 
-/// The project menu: the chooser, then the project's landing setting.
-fn project_menu(
-    menu: PopupMenu,
-    landing: LandingMode,
-    on_landing: &OnLanding,
-    chooser: &Option<OnPress>,
-) -> PopupMenu {
-    let harness = on_landing.clone();
-    let agent = on_landing.clone();
+/// The project menu: the chooser.
+fn project_menu(menu: PopupMenu, chooser: &Option<OnPress>) -> PopupMenu {
     menu.min_w(MENU_WIDTH)
         .when_some(chooser.clone(), |menu, chooser| {
             menu.item(
                 PopupMenuItem::new("Switch project…")
                     .on_click(move |_, window, cx| chooser(window, cx)),
             )
-            .item(PopupMenuItem::separator())
         })
-        .item(PopupMenuItem::label("Landing"))
-        .item(
-            PopupMenuItem::new(HARNESS_LANDING)
-                .checked(landing == LandingMode::HarnessManaged)
-                .on_click(move |_, window, cx| harness(LandingMode::HarnessManaged, window, cx)),
-        )
-        .item(
-            PopupMenuItem::new(AGENT_LANDING)
-                .checked(landing == LandingMode::AgentManaged)
-                .on_click(move |_, window, cx| agent(LandingMode::AgentManaged, window, cx)),
-        )
 }
 
 /// The project switcher and the new-thread button. A click on the project's name opens the
-/// chooser; the chevron beside it, and a right click on the name, open the project menu with
-/// the chooser and the project's landing setting.
+/// chooser; the chevron beside it, and a right click on the name, open the project menu.
 pub fn project_bar(bar: ProjectBar, cx: &App) -> AnyElement {
     let material = crate::theme::material(cx);
     let ProjectBar {
         name,
-        landing,
         on_switch,
         on_new_thread,
-        on_landing,
     } = bar;
     let chooser = on_switch.clone();
-    let menu_landing = on_landing.clone();
     let menu_chooser = on_switch.clone();
     let switcher = div()
         .id("switch-project")
@@ -538,10 +509,10 @@ pub fn project_bar(bar: ProjectBar, cx: &App) -> AnyElement {
         .when_some(on_switch, |row, chooser| {
             row.on_click(move |_, window, cx| chooser(window, cx))
         })
-        .context_menu(move |menu, _, _| project_menu(menu, landing, &on_landing, &chooser));
+        .context_menu(move |menu, _, _| project_menu(menu, &chooser));
     let chevron = ui::icon_button("project-menu", IconName::ChevronsUpDown, "Project menu", cx)
         .debug_selector(|| "project-menu".to_string())
-        .dropdown_menu(move |menu, _, _| project_menu(menu, landing, &menu_landing, &menu_chooser));
+        .dropdown_menu(move |menu, _, _| project_menu(menu, &menu_chooser));
     h_flex()
         .flex_none()
         .items_center()
@@ -581,9 +552,6 @@ pub fn attention_note(note: &'static str, on_dismiss: OnPress, cx: &App) -> AnyE
         )
         .into_any_element()
 }
-
-pub const HARNESS_LANDING: &str = "Harness manages jj";
-pub const AGENT_LANDING: &str = "Agent manages jj";
 
 /// The panel of rows under the project bar: scrolls, and `scroll` brings a row into view. The
 /// rows are its first children (the scrollbar comes last), so a row's place is its index.
@@ -654,7 +622,7 @@ pub struct Row {
     pub attention: bool,
     /// How long ago, on the right; none for a draft.
     pub time: Option<String>,
-    /// The thread works in a Rift copy.
+    /// The thread works in a worktree.
     pub in_copy: bool,
     /// The title in the semibold weight: a finished turn you have not seen.
     pub strong: bool,
@@ -906,26 +874,26 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_in_a_rift_copy_shows_a_copy_icon_and_says_while_it_is_made() {
+    fn a_thread_in_a_worktree_shows_a_copy_icon_and_says_while_it_is_made() {
         let mut making = facts(Status::Idle);
-        making.folder = Folder::MakingRiftCopy;
+        making.folder = Folder::MakingWorktree;
         assert_eq!(
             row_look(&making, NOW),
             RowLook {
                 dot: Dot::Working,
-                detail: "Creating a Rift copy…".to_string(),
+                detail: "Creating a worktree…".to_string(),
                 strong: false,
                 copy: true,
             }
         );
         let mut working = facts(Status::Working);
-        working.folder = Folder::RiftCopy;
+        working.folder = Folder::Worktree;
         working.working_for = Some(Duration::from_secs(48));
         let look = row_look(&working, NOW);
         assert_eq!((look.detail.as_str(), look.copy), ("Working · 48s", true));
         let mut draft = facts(Status::Idle);
         draft.draft = true;
-        draft.folder = Folder::RiftCopy;
+        draft.folder = Folder::Worktree;
         assert!(row_look(&draft, NOW).copy);
         assert!(!row_look(&facts(Status::Done), NOW).copy);
     }

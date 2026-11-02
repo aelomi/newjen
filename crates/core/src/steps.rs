@@ -942,7 +942,7 @@ fn outcome(transcript: &Transcript) -> Option<String> {
 pub enum SidebarGroup {
     /// An approval to answer, a usage limit that stopped it, or a failure not yet looked at.
     NeedsYou,
-    /// A turn is running, a Rift copy is being made, or a background command runs.
+    /// A turn is running, a worktree is being made, or a background command runs.
     Working,
     /// Idle: nothing for the user to do.
     Done,
@@ -955,7 +955,7 @@ pub struct GroupFacts {
     pub approval_pending: bool,
     /// A usage limit refused the thread's provider and has not reset yet.
     pub limit_paused: bool,
-    /// The first message waits while a Rift copy is made or the project's base is recorded.
+    /// The first message waits while a worktree is made or the project's base is recorded.
     pub preparing: bool,
     pub background_tasks: usize,
     /// Something happened since the user last had the thread on screen.
@@ -1010,7 +1010,7 @@ impl Thread {
                 _ => activity_line(self.transcript()),
             },
             SidebarGroup::Working => match self.preparing() {
-                Some(Waiting::Copy(_)) => Some("Creating a Rift copy".to_string()),
+                Some(Waiting::Copy(_)) => Some("Creating a worktree".to_string()),
                 Some(Waiting::Project(_)) => Some("Preparing the project".to_string()),
                 None if self.status().is_busy() => activity_line(self.transcript()),
                 None => Some(match self.background_tasks() {

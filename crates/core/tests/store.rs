@@ -4,9 +4,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use newjen_core::rift::Copy;
 use newjen_core::store::{Grant, Store, ThreadRow};
 use newjen_core::transcript::Status;
+use newjen_core::worktree::Worktree;
 
 const FLUSH: Duration = Duration::from_secs(5);
 
@@ -27,20 +27,19 @@ fn thread_row(id: &str, project_id: i64, created_at: i64) -> ThreadRow {
         updated_at: created_at,
         archived_at: None,
         copy: None,
-        landing_mode: newjen_core::landing::LandingMode::HarnessManaged,
         review_base: None,
         landing_resolved: false,
         snapshot_needed: false,
     }
 }
 
-fn copy(name: &str) -> Copy {
-    Copy {
-        path: PathBuf::from(format!("/tmp/.rifts/project/{name}")),
-        workdir: PathBuf::from(format!("/tmp/.rifts/project/{name}/app")),
+fn copy(name: &str) -> Worktree {
+    Worktree {
+        path: PathBuf::from(format!("/tmp/.newjen-worktrees/project/{name}")),
+        workdir: PathBuf::from(format!("/tmp/.newjen-worktrees/project/{name}/app")),
         source: PathBuf::from("/tmp/project"),
-        rift_id: format!("01RIFT{}", name.to_uppercase()),
-        base: Some("4f0b21f3aa".to_string()),
+        branch: format!("newjen/{name}"),
+        base: "4f0b21f3aa0123456789abcdef0123456789abcd".to_string(),
     }
 }
 
@@ -304,7 +303,7 @@ fn a_threads_copy_is_saved_with_its_row_and_never_changes_after() {
         store.thread("t1").unwrap().unwrap().copy,
         Some(copy("first"))
     );
-    let listed: Vec<Option<Copy>> = store
+    let listed: Vec<Option<Worktree>> = store
         .threads(project.id)
         .unwrap()
         .into_iter()
@@ -398,20 +397,13 @@ fn recent_projects_survive_reopening_without_duplicate_rows() {
 }
 
 #[test]
-fn landing_settings_and_review_state_survive_reopen() {
-    use newjen_core::landing::LandingMode;
+fn review_state_survives_reopen() {
     let home = tempfile::tempdir().unwrap();
     let store = Store::open_in(home.path()).unwrap();
     let project = store
         .open_project(std::path::Path::new("/tmp/landing-project"))
         .unwrap();
-    assert_eq!(
-        store.landing_mode(project.id).unwrap(),
-        LandingMode::HarnessManaged
-    );
-    store.set_project_landing_mode(project.id, LandingMode::AgentManaged);
     let mut row = thread_row("landing", project.id, 1);
-    row.landing_mode = LandingMode::AgentManaged;
     row.review_base = Some("abc123".to_string());
     row.snapshot_needed = true;
     row.landing_resolved = true;
@@ -420,13 +412,4 @@ fn landing_settings_and_review_state_survive_reopen() {
     drop(store);
     let store = Store::open_in(home.path()).unwrap();
     assert_eq!(store.thread("landing").unwrap(), Some(row));
-    assert_eq!(
-        store.open_project(&project.path).unwrap().landing_mode,
-        LandingMode::AgentManaged
-    );
-    assert_eq!(
-        store.landing_mode(project.id).unwrap(),
-        LandingMode::AgentManaged
-    );
-    assert!(store.landing_mode(project.id + 1000).is_err());
 }

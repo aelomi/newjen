@@ -366,7 +366,7 @@ impl Transcript {
         transcript
     }
 
-    /// Shows file paths relative to `cwd` from now on (a thread that moved into its Rift copy).
+    /// Shows file paths relative to `cwd` from now on (a thread that moved into its worktree).
     pub fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
         self.revision += 1;
         self.cwd = Some(cwd.into());

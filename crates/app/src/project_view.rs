@@ -10,7 +10,7 @@ use gpui_kit::base::v_flex;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
-use newjen_core::rift::Tools;
+use newjen_core::worktree::Tools;
 use newjen_core::{Project, SessionConfig, Store, Thread, thread};
 
 use crate::attention::{NativeAttention, NativeQuitGuard};
@@ -468,7 +468,7 @@ impl ProjectView {
             if let Err(error) = removed.await {
                 let _ = view.update(cx, |view, cx| {
                     view.background_problem =
-                        Some(format!("Couldn't remove an archived Rift copy: {error:#}"));
+                        Some(format!("Couldn't remove an archived worktree: {error:#}"));
                     cx.notify();
                 });
             }
@@ -1297,7 +1297,7 @@ fn load_project(
 ) -> anyhow::Result<Startup> {
     let base_config = SessionConfig::new(project.path.clone());
     let threads = Thread::load_all(&store, &project, &base_config)?;
-    // Rift hooks run with the login shell's PATH, not the minimal one an app started from
+    // Landing checks run with the login shell's PATH, not the minimal one an app started from
     // Finder has. Resolving it can take a moment, which is why this runs off the UI thread.
     let tools = tools.with_env([(
         "PATH".to_string(),
@@ -1515,7 +1515,6 @@ mod tests {
             path: PathBuf::from(path),
             created_at: 0,
             last_opened_at: 0,
-            landing_mode: Default::default(),
         }
     }
 

@@ -56,26 +56,48 @@ impl Lab {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
-    fn rift_tools(&self) -> Option<newjen_core::rift::Tools> {
-        let mut tools = newjen_core::rift::Tools::find();
-        for (name, program) in [("rift", &tools.rift), ("jj", &tools.jj)] {
-            if !program.is_absolute() {
-                eprintln!("skipped: `{name}` is not installed");
-                return None;
-            }
-        }
-        let home = self.dir.path().join("rift-home");
+    /// The installed `git` with a `HOME` and an identity of its own, and the project folder made
+    /// a repository with one commit, "base", holding `base.txt`.
+    fn git_project(&self) -> newjen_core::worktree::Tools {
+        let mut tools = newjen_core::worktree::Tools::find();
+        let home = self.dir.path().join("git-home");
         std::fs::create_dir(&home).unwrap();
         tools.env = vec![
             ("HOME".into(), home.display().to_string()),
-            ("JJ_USER".into(), "Test".into()),
-            ("JJ_EMAIL".into(), "test@example.com".into()),
+            ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            ("GIT_AUTHOR_NAME".into(), "Test".into()),
+            ("GIT_AUTHOR_EMAIL".into(), "test@example.invalid".into()),
+            ("GIT_COMMITTER_NAME".into(), "Test".into()),
+            ("GIT_COMMITTER_EMAIL".into(), "test@example.invalid".into()),
         ];
-        Some(tools)
+        std::fs::write(self.project.path.join("base.txt"), "base\n").unwrap();
+        for args in [
+            &["init", "--quiet", "--initial-branch=main"][..],
+            &["add", "--all"],
+            &["commit", "--quiet", "-m", "base"],
+        ] {
+            git(&tools, &self.project.path, args);
+        }
+        tools
     }
     fn flush(&self) {
         assert!(self.store.flush(Duration::from_secs(5)));
     }
+}
+fn git(tools: &newjen_core::worktree::Tools, cwd: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new(&tools.git)
+        .args(args)
+        .current_dir(cwd)
+        .envs(tools.env.iter().map(|(name, value)| (name, value)))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 fn until(thread: &mut Thread, condition: impl Fn(&Thread) -> bool) {
     let events = thread.events();
@@ -224,18 +246,9 @@ fn command_allow_deny_and_exact_session_grants_use_the_right_decision() {
 }
 
 #[test]
-fn landing_instructions_reach_codex_as_developer_instructions_in_a_jj_repo() {
+fn landing_instructions_reach_codex_as_developer_instructions_in_a_git_repo() {
     let lab = Lab::new("reply");
-    let Some(tools) = lab.rift_tools() else {
-        return;
-    };
-    let output = std::process::Command::new(&tools.jj)
-        .args(["git", "init", "--colocate"])
-        .current_dir(&lab.project.path)
-        .envs(tools.env.iter().map(|(key, value)| (key, value)))
-        .output()
-        .unwrap();
-    assert!(output.status.success());
+    let tools = lab.git_project();
     let mut thread = lab.draft();
     let Sent::PreparingProject(job) = thread.send("Say hello").unwrap() else {
         panic!("project preparation expected");
@@ -249,7 +262,7 @@ fn landing_instructions_reach_codex_as_developer_instructions_in_a_jj_repo() {
         .unwrap();
     assert_eq!(
         opened["params"]["developerInstructions"],
-        thread.landing_mode().instructions(),
+        newjen_core::landing::instructions(),
         "Newjen's instructions reach Codex as developer instructions: {opened}"
     );
 }
@@ -371,15 +384,13 @@ fn relaunch_resumes_the_server_id_in_the_saved_workdir_without_an_automatic_turn
 }
 
 #[test]
-fn a_codex_rift_copy_delivers_the_held_message_once_in_the_copy() {
+fn a_codex_worktree_delivers_the_held_message_once_in_the_worktree() {
     let lab = Lab::new("reply");
-    let Some(tools) = lab.rift_tools() else {
-        return;
-    };
+    let tools = lab.git_project();
     let mut thread = lab.draft();
-    thread.set_works_in(WorksIn::RiftCopy).unwrap();
-    let Sent::MakingCopy(job) = thread.send("Only in the copy").unwrap() else {
-        panic!("copy job expected");
+    thread.set_works_in(WorksIn::Worktree).unwrap();
+    let Sent::MakingCopy(job) = thread.send("Only in the worktree").unwrap() else {
+        panic!("worktree job expected");
     };
     assert!(lab.input().is_empty());
     let copy = job.run(&tools, |_| {}).unwrap();
@@ -395,9 +406,9 @@ fn a_codex_rift_copy_delivers_the_held_message_once_in_the_copy() {
     assert_eq!(thread.cwd(), cwd);
     assert!(
         thread
-            .finish_copy(Err(newjen_core::rift::CopyError::Failed {
+            .finish_copy(Err(newjen_core::worktree::CopyError::Failed {
                 detail: "late".into(),
-                command: "rift".into(),
+                command: "git worktree add".into(),
                 output: Vec::new()
             }))
             .is_err()
@@ -422,16 +433,14 @@ fn a_codex_rift_copy_delivers_the_held_message_once_in_the_copy() {
 #[test]
 fn a_refused_sent_checkpoint_never_delivers_the_held_message_to_codex() {
     let lab = Lab::new("reply");
-    let Some(tools) = lab.rift_tools() else {
-        return;
-    };
+    let tools = lab.git_project();
     let mut thread = lab.draft();
-    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    thread.set_works_in(WorksIn::Worktree).unwrap();
     let Sent::MakingCopy(job) = thread
         .send("Do not deliver without the checkpoint")
         .unwrap()
     else {
-        panic!("copy job expected");
+        panic!("worktree job expected");
     };
     let copy = job.run(&tools, |_| {}).unwrap();
     let database = rusqlite::Connection::open(lab.store.path()).unwrap();
@@ -623,25 +632,10 @@ fn live_codex_thread_reply() {
 
 #[test]
 #[ignore = "spends Codex credits using the installed, unmodified CLI"]
-fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
+fn live_codex_worktree_creates_resumes_and_removes_in_the_worktree() {
     use newjen_core::agent::ApprovalKind;
-    use newjen_core::rift::{Progress, Tools};
+    use newjen_core::worktree::{Progress, Tools};
     use std::process::Command;
-
-    fn jj(tools: &Tools, cwd: &Path, args: &[&str]) -> String {
-        let output = Command::new(&tools.jj)
-            .args(args)
-            .current_dir(cwd)
-            .envs(tools.env.iter().map(|(name, value)| (name, value)))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "jj {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_string()
-    }
 
     fn agent_cwd() -> PathBuf {
         let output = Command::new("/bin/ps")
@@ -737,32 +731,37 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
     }
 
     let mut tools = Tools::find();
-    for (name, program) in [("rift", &tools.rift), ("jj", &tools.jj)] {
-        if !program.is_absolute() || !program.is_file() {
-            eprintln!("skipped: `{name}` is not installed");
-            return;
-        }
+    if !tools.git.is_absolute() || !tools.git.is_file() {
+        eprintln!("skipped: `git` is not installed");
+        return;
     }
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let root = dir.path().canonicalize().unwrap();
-    let home = root.join("rift-home");
+    let home = root.join("git-home");
     let project_dir = root.join("project");
     std::fs::create_dir(&home).unwrap();
     std::fs::create_dir(&project_dir).unwrap();
     tools.env = vec![
         ("HOME".into(), home.display().to_string()),
-        ("JJ_USER".into(), "Test".into()),
-        ("JJ_EMAIL".into(), "test@example.com".into()),
+        ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+        ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+        ("GIT_AUTHOR_NAME".into(), "Test".into()),
+        ("GIT_AUTHOR_EMAIL".into(), "test@example.invalid".into()),
+        ("GIT_COMMITTER_NAME".into(), "Test".into()),
+        ("GIT_COMMITTER_EMAIL".into(), "test@example.invalid".into()),
     ];
-    jj(&tools, &project_dir, &["git", "init", "--colocate"]);
+    git(
+        &tools,
+        &project_dir,
+        &["init", "--quiet", "--initial-branch=main"],
+    );
     std::fs::write(project_dir.join("base.txt"), "base\n").unwrap();
-    jj(&tools, &project_dir, &["commit", "-m", "base"]);
+    git(&tools, &project_dir, &["add", "--all"]);
+    git(&tools, &project_dir, &["commit", "--quiet", "-m", "base"]);
     std::fs::write(project_dir.join("base.txt"), "uncommitted edit\n").unwrap();
-    std::fs::write(
-        project_dir.join(".rift.toml"),
-        "version = 1\n[[hooks.postcreate]]\nrun = \"echo live-codex-copy-ready\"\n",
-    )
-    .unwrap();
+    let hook = project_dir.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\necho live-codex-copy-ready >&2\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
     let status = providers::detect(Provider::Codex);
     let Availability::Ready {
@@ -787,10 +786,10 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
     };
     config.effort = EffortSelection::Chosen("low".into());
     let mut thread = Thread::draft_with_agent(store.clone(), &project, config, &status).unwrap();
-    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    thread.set_works_in(WorksIn::Worktree).unwrap();
     let prompt = "Create a file named hello.txt containing exactly hi, using a shell command. Do not delegate.";
     let Sent::MakingCopy(job) = thread.send(prompt).unwrap() else {
-        panic!("copy job expected");
+        panic!("worktree job expected");
     };
     assert!(!thread.has_session());
     assert!(thread.transcript().items().is_empty());
@@ -819,12 +818,12 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
     assert_eq!(pending[0].state, newjen_core::store::PendingState::Sent);
     assert_eq!(pending[0].path, thread.copy().unwrap().path);
     assert_eq!(
-        pending[0].rift_id.as_deref(),
-        Some(thread.copy().unwrap().rift_id.as_str())
+        pending[0].branch.as_deref(),
+        Some(thread.copy().unwrap().branch.as_str())
     );
     assert!(store.thread(thread.id()).unwrap().is_none());
     println!(
-        "delivery: pending_copies=1, state=Sent, Rift id/path matched, thread checkpoint held by test trigger"
+        "delivery: pending_copies=1, state=Sent, branch/path matched, thread checkpoint held by test trigger"
     );
     database
         .execute_batch("DROP TRIGGER hold_first_checkpoint;")
@@ -834,13 +833,14 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
     assert_eq!(thread.cwd(), copy.workdir);
     assert_eq!(
         std::fs::read_to_string(copy.path.join("base.txt")).unwrap(),
-        "uncommitted edit\n"
+        "base\n",
+        "a worktree starts from the committed files only"
     );
     assert!(
         complete(&mut thread, true, &copy.workdir) > 0,
         "expected a shell approval"
     );
-    // A harness-managed thread snapshots its copy after each turn; the app runs this job.
+    // Newjen commits a worktree's changes after each turn; the app runs this job.
     let snapshot = thread
         .take_snapshot_job()
         .expect("a snapshot is due after the turn");
@@ -871,58 +871,27 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
     let row = store.thread(&id).unwrap().unwrap();
     assert_eq!(row.workdir, copy.workdir);
     assert_eq!(row.copy.as_ref(), Some(&copy));
-    let base = copy.base.as_deref().expect("jj base");
+    let base = copy.base.as_str();
+    assert_eq!(git(&tools, &project.path, &["rev-parse", "HEAD"]), base);
     assert_eq!(
-        jj(
+        git(
             &tools,
             &project.path,
-            &[
-                "log",
-                "--ignore-working-copy",
-                "--no-graph",
-                "-r",
-                base,
-                "-T",
-                "commit_id"
-            ]
+            &["rev-parse", &format!("{}~1", copy.branch)]
         ),
         base
     );
     assert_eq!(
-        jj(
+        git(
             &tools,
             &project.path,
-            &[
-                "log",
-                "--ignore-working-copy",
-                "--no-graph",
-                "-r",
-                "@-",
-                "-T",
-                "commit_id"
-            ]
+            &["show", &format!("{}:hello.txt", copy.branch)]
         ),
-        base
-    );
-    assert!(
-        jj(
-            &tools,
-            &project.path,
-            &[
-                "log",
-                "--ignore-working-copy",
-                "--no-graph",
-                "-r",
-                "divergent()",
-                "-T",
-                "commit_id"
-            ]
-        )
-        .is_empty()
+        "hi"
     );
     assert!(store.pending_copies(project.id).unwrap().is_empty());
     println!(
-        "checks: user_items=1, hello.txt=hi only in copy, process_cwd={}, saved_workdir/copy=matched, main_base={base}, divergent=0, pending_copies=0",
+        "checks: user_items=1, hello.txt=hi only in copy, process_cwd={}, saved_workdir/copy=matched, main_base={base}, snapshot_on_branch=hello.txt, pending_copies=0",
         copy.workdir.display()
     );
 
@@ -977,17 +946,11 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
         loaded.cwd().display()
     );
     let removal = loaded.archive().expect("copy removal");
-    let trash = copy.path.parent().unwrap().join(".trash").join(format!(
-        "{}-{}",
-        copy.rift_id,
-        copy.path.file_name().unwrap().to_str().unwrap()
-    ));
     std::thread::spawn(move || removal.run(&tools))
         .join()
         .unwrap()
         .unwrap();
     assert!(!copy.path.exists());
-    assert!(!trash.exists());
     assert!(store.flush(Duration::from_secs(5)));
     let db = rusqlite::Connection::open(store.path()).unwrap();
     let removed_at: Option<i64> = db
@@ -1000,7 +963,7 @@ fn live_codex_rift_copy_creates_resumes_and_removes_in_the_copy() {
     assert!(removed_at.is_some());
     assert!(store.thread(&id).unwrap().unwrap().archived_at.is_some());
     assert!(store.pending_copies(project.id).unwrap().is_empty());
-    println!("archive: copy gone, trash entry gone, removed_at={removed_at:?}");
+    println!("archive: worktree gone, removed_at={removed_at:?}");
 }
 
 #[test]

@@ -1,70 +1,33 @@
-use std::fmt;
+//! Reviewing and landing a thread's work with git. No UI.
+//!
+//! **In a worktree** the thread has its own branch. After each turn Newjen commits everything
+//! the agent changed there ([`snapshot`]). Review shows the branch since the worktree's base,
+//! and [`land_worktree`] merges it into the project's current branch.
+//!
+//! **In the project folder** Newjen never commits to the project's branch until you land. The
+//! thread's base and its snapshots are commits built from a separate index file and kept under
+//! `refs/newjen/<thread id>`, so the project's own index, staged changes and branch are left
+//! alone. Uncommitted work that was there before the thread started is in the base, so review
+//! shows only the thread's changes. [`land_project`] commits the thread's files on the current
+//! branch; [`discard_project`] puts them back as they were.
+
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::str::FromStr;
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::{Deserialize, Serialize};
 
 use crate::changes::{self, ChangeSummary};
-use crate::rift::{Copy, Tools};
+use crate::worktree::{Tools, Worktree};
 
 pub const MAX_PATCH_BYTES: usize = 100_000;
 const MAX_OUTPUT_BYTES: usize = 1_000_000;
 const CHECKS_FILE: &str = ".newjen/checks.json";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LandingMode {
-    #[default]
-    HarnessManaged,
-    AgentManaged,
-}
-
-impl LandingMode {
-    pub fn instructions(self) -> &'static str {
-        match self {
-            Self::HarnessManaged => {
-                "Newjen manages version control for this thread. Do not commit, describe, rebase, merge, create bookmarks or branches, or otherwise write version-control metadata. Make file changes only. Newjen snapshots the folder after each turn."
-            }
-            Self::AgentManaged => {
-                "Use jj, not git, to manage version control in this thread. Snapshot your changes with jj and create or update a jj bookmark covering all your work before finishing each turn. Newjen reads recorded jj state only; it does not import git commits or snapshot this thread for you. Do not push unless the user explicitly asks."
-            }
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HarnessManaged => "harness_managed",
-            Self::AgentManaged => "agent_managed",
-        }
-    }
-}
-
-impl fmt::Display for LandingMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for LandingMode {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "harness_managed" => Ok(Self::HarnessManaged),
-            "agent_managed" => Ok(Self::AgentManaged),
-            _ => bail!("Unknown landing mode {value:?}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Integration {
-    Rebase,
-    Merge,
+/// What the agent is told about version control in a thread Newjen can review.
+pub fn instructions() -> &'static str {
+    "Newjen manages version control for this thread. Do not commit, stage, stash, rebase, merge, create branches or tags, or otherwise write git metadata. Make file changes only. Newjen snapshots the folder after each turn."
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,62 +38,82 @@ pub struct Review {
     pub truncated: bool,
 }
 
+/// Whether work in `cwd` can be reviewed and landed: it is inside a git repository.
 pub fn available(cwd: &Path) -> bool {
-    cwd.ancestors()
-        .find(|path| path.join(".jj").exists())
-        .is_some_and(|root| root.join(".git").exists())
+    cwd.ancestors().any(|path| path.join(".git").exists())
 }
 
-pub fn head(tools: &Tools, cwd: &Path) -> Result<String> {
-    revision(tools, cwd, "@")
+/// The commit the thread's work is reviewed up to: the last snapshot.
+pub fn head(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<String> {
+    match project_ref(tools, cwd, thread_id)? {
+        Some(snapshot) => Ok(snapshot),
+        None => revision(tools, cwd, "HEAD"),
+    }
 }
 
+/// Records the project folder's files as a project-folder thread's base, before the agent
+/// changes anything. Returns the base commit.
 pub fn prepare_project(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<String> {
-    ensure!(
-        available(cwd),
-        "Landing currently requires a jj repository colocated with git"
-    );
-    marker(thread_id)?;
-    jj(tools, cwd, &["status"])?;
-    let base = head(tools, cwd)?;
-    jj(tools, cwd, &["new", "-m", &marker(thread_id)?])?;
+    ensure!(available(cwd), "Review and landing need a git repository");
+    let name = reference(thread_id)?;
+    let parent = revision(tools, cwd, "HEAD").ok();
+    let index = index_path(tools, cwd, thread_id)?;
+    let _ = std::fs::remove_file(&index);
+    let tree = match &parent {
+        Some(parent) => snapshot_tree(tools, cwd, &index, parent)?,
+        None => snapshot_tree(tools, cwd, &index, &empty_tree(tools, cwd)?)?,
+    };
+    let base = commit_tree(tools, cwd, &tree, parent.as_deref(), &marker(thread_id)?)?;
+    git(tools, cwd, &["update-ref", &name, &base])?;
     Ok(base)
 }
 
-pub fn snapshot(
-    tools: &Tools,
-    cwd: &Path,
-    mode: LandingMode,
-    title: &str,
-    thread_id: &str,
-) -> Result<()> {
-    if mode == LandingMode::AgentManaged {
+/// Records what the agent changed this turn: a commit on a worktree's branch, or a snapshot
+/// under `refs/newjen/<thread id>` for the project folder. Nothing when nothing changed.
+pub fn snapshot(tools: &Tools, cwd: &Path, title: &str, thread_id: &str) -> Result<()> {
+    let message = format!("{}\n\n{title}", marker(thread_id)?);
+    if let Some(previous) = project_ref(tools, cwd, thread_id)? {
+        let index = index_path(tools, cwd, thread_id)?;
+        let tree = snapshot_tree(tools, cwd, &index, &previous)?;
+        if tree == git(tools, cwd, &["rev-parse", &format!("{previous}^{{tree}}")])? {
+            return Ok(());
+        }
+        let next = commit_tree(tools, cwd, &tree, Some(&previous), &message)?;
+        git(
+            tools,
+            cwd,
+            &["update-ref", &reference(thread_id)?, &next, &previous],
+        )?;
         return Ok(());
     }
-    let description = format!("{}\n\n{title}", marker(thread_id)?);
-    jj(tools, cwd, &["describe", "-m", &description])?;
-    jj(tools, cwd, &["new", "-m", &marker(thread_id)?])?;
+    ensure!(
+        git(tools, cwd, &["rev-parse", "--absolute-git-dir"])?
+            != git(
+                tools,
+                cwd,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+            )?,
+        "This thread's recorded base is missing, so Newjen won't snapshot the project folder"
+    );
+    git(tools, cwd, &["add", "--all"])?;
+    if succeeds(tools, cwd, &["diff", "--cached", "--quiet"])? {
+        return Ok(());
+    }
+    commit(
+        tools,
+        cwd,
+        &["commit", "--quiet", "--no-verify", "-m", &message],
+    )?;
     Ok(())
 }
 
-pub fn review(tools: &Tools, cwd: &Path, base: &str) -> Result<Review> {
-    ensure!(
-        available(cwd),
-        "Landing currently requires a jj repository colocated with git"
-    );
+pub fn review(tools: &Tools, cwd: &Path, thread_id: &str, base: &str) -> Result<Review> {
+    ensure!(available(cwd), "Review and landing need a git repository");
     validate_commit(base)?;
-    let head = head(tools, cwd)?;
+    let head = head(tools, cwd, thread_id)?;
     ensure_ancestor(tools, cwd, base, &head)?;
-    let mut command = jj_command(tools, cwd);
-    command.args([
-        "diff",
-        "--ignore-working-copy",
-        "--git",
-        "--from",
-        base,
-        "--to",
-        &head,
-    ]);
+    let mut command = git_command(tools, cwd);
+    command.args(["diff", "--no-ext-diff", "--no-renames", base, &head]);
     let output = execute(command, MAX_PATCH_BYTES)?;
     let patch = String::from_utf8_lossy(&output.stdout).into_owned();
     Ok(Review {
@@ -141,32 +124,32 @@ pub fn review(tools: &Tools, cwd: &Path, base: &str) -> Result<Review> {
     })
 }
 
-/// Per-file counts of everything the thread changed since `base`, up to the last snapshot. One
-/// read-only jj call whose output is counted as it streams, so a large diff costs no memory.
-pub fn changed_files(tools: &Tools, cwd: &Path, base: &str) -> Result<ChangeSummary> {
-    ensure!(
-        available(cwd),
-        "Landing currently requires a jj repository colocated with git"
-    );
+/// Per-file counts of everything the thread changed since `base`, up to the last snapshot.
+/// The diff is counted as it streams, so a large one costs no memory.
+pub fn changed_files(
+    tools: &Tools,
+    cwd: &Path,
+    thread_id: &str,
+    base: &str,
+) -> Result<ChangeSummary> {
+    ensure!(available(cwd), "Review and landing need a git repository");
     validate_commit(base)?;
-    ensure_ancestor(tools, cwd, base, "@")?;
-    let mut command = jj_command(tools, cwd);
+    let head = head(tools, cwd, thread_id)?;
+    ensure_ancestor(tools, cwd, base, &head)?;
+    let mut command = git_command(tools, cwd);
     command.args([
         "diff",
-        "--ignore-working-copy",
-        "--git",
-        "--context",
-        "0",
-        "--from",
+        "--no-ext-diff",
+        "--no-renames",
+        "--unified=0",
         base,
-        "--to",
-        "@",
+        &head,
     ]);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().context("Cannot start jj")?;
+    let mut child = command.spawn().context("Cannot start git")?;
     let out = child.stdout.take().expect("piped stdout");
     let err = child.stderr.take().expect("piped stderr");
     let stderr = thread::spawn(move || read_bounded(err, 16_000));
@@ -180,238 +163,225 @@ pub fn changed_files(tools: &Tools, cwd: &Path, base: &str) -> Result<ChangeSumm
         .map_err(|_| anyhow!("Command error reader failed"))??;
     ensure!(
         status.success(),
-        "jj failed: {}",
+        "git failed: {}",
         String::from_utf8_lossy(&stderr).trim()
     );
     Ok(counted?)
 }
 
-pub fn land_copy(
+/// Merges a worktree thread's reviewed work into the project's current branch.
+pub fn land_worktree(
     tools: &Tools,
-    copy: &Copy,
-    mode: LandingMode,
+    worktree: &Worktree,
     thread_id: &str,
-    integration: Integration,
+    title: &str,
     reviewed: &Review,
 ) -> Result<()> {
-    let bookmark = bookmark(thread_id)?;
-    let remote = remote(thread_id)?;
-    let base = copy
-        .base
-        .as_deref()
-        .context("Landing needs a colocated jj repository")?;
-    ensure!(base == reviewed.base, "The review belongs to another copy");
-    ensure_review(tools, &copy.path, mode, reviewed)?;
-    let target = match mode {
-        LandingMode::HarnessManaged => {
-            jj(
-                tools,
-                &copy.path,
-                &["bookmark", "set", &bookmark, "-r", &reviewed.head],
-            )?;
-            reviewed.head.clone()
-        }
-        LandingMode::AgentManaged => agent_bookmarked_head(tools, &copy.path, reviewed)?,
-    };
-    run_checks(tools, &copy.source, &copy.workdir)?;
-    ensure_review(tools, &copy.path, mode, reviewed)?;
-    jj(tools, &copy.source, &["status"])?;
     ensure!(
-        log(tools, &copy.source, "@ & conflicts()", "commit_id")?.is_empty(),
-        "Resolve the project's existing conflicts before landing"
+        !worktree.is_legacy(),
+        "This thread works in a Rift copy from an older Newjen. Land it by hand"
     );
-    if already_landed(tools, &copy.source, &copy.path, &remote, &bookmark, &target)? {
+    ensure!(
+        worktree.base == reviewed.base,
+        "The review belongs to another worktree"
+    );
+    ensure_review(tools, &worktree.path, thread_id, reviewed)?;
+    run_checks(tools, &worktree.source, &worktree.workdir)?;
+    ensure_review(tools, &worktree.path, thread_id, reviewed)?;
+    let source = &worktree.source;
+    if succeeds(
+        tools,
+        source,
+        &["merge-base", "--is-ancestor", &reviewed.head, "HEAD"],
+    )? {
         return Ok(());
     }
-    ensure_remote(tools, &copy.source, &remote, &copy.path)?;
-    // Only the thread's own bookmarks: a full fetch brings the copy's inherited bookmarks,
-    // and with them old versions of changes the project has since rewritten.
-    let mut fetch = vec![
-        "git".to_string(),
-        "fetch".to_string(),
-        "--remote".to_string(),
-        remote.clone(),
-        "--config".to_string(),
-        "git.auto-local-bookmark=false".to_string(),
-    ];
-    for name in work_bookmarks(tools, &copy.path, base, &target)? {
-        fetch.push("--branch".to_string());
-        fetch.push(name);
-    }
-    let fetch: Vec<&str> = fetch.iter().map(String::as_str).collect();
-    jj(tools, &copy.source, &fetch)?;
     ensure!(
-        revision(tools, &copy.source, &target)? == target,
-        "The agent's reviewed commit was not exported by a bookmark"
+        !succeeds(
+            tools,
+            source,
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+        )?,
+        "The project is in the middle of a merge. Finish or abort it first"
     );
-    track_work_refs(tools, &copy.source, &remote, &bookmark, base, &target)?;
-    jj(
-        tools,
-        &copy.source,
-        &["bookmark", "set", &bookmark, "-r", &target],
-    )?;
-    let (base, target) = reconcile_rewritten_base(tools, &copy.source, base, &bookmark)?;
-    let base = base.as_str();
-    let main = head(tools, &copy.source)?;
-    if !log(
-        tools,
-        &copy.source,
-        &format!("{target} & ::{main}"),
-        "commit_id",
-    )?
-    .is_empty()
-    {
-        return Ok(());
-    }
-    let operation_before = operation(tools, &copy.source)?;
-    let staged_operation = match integration {
-        Integration::Rebase => stage(
+    ensure!(
+        succeeds(
             tools,
-            &copy.source,
-            &["rebase", "-r", &format!("{base}..{target}"), "-B", "@"],
+            source,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "HEAD",
+                &reviewed.head
+            ]
         )?,
-        Integration::Merge => stage(
-            tools,
-            &copy.source,
-            &["new", "@", &target, "-m", &format!("Land {bookmark}")],
-        )?,
-    };
-    let conflicts = jj(
+        "Landing would conflict with the project. Resolve the changes in the worktree and review again"
+    );
+    let message = format!("Land {}: {title}", worktree.branch);
+    let merged = commit(
         tools,
-        &copy.source,
+        source,
         &[
-            "log",
-            "--at-operation",
-            &staged_operation,
-            "--no-graph",
-            "-r",
-            "@ & conflicts()",
-            "-T",
-            "commit_id",
+            "merge",
+            "--no-ff",
+            "--no-verify",
+            "--no-edit",
+            "-m",
+            &message,
+            &reviewed.head,
         ],
-    )?;
-    ensure!(
-        conflicts.is_empty(),
-        "Landing would conflict with the project. Resolve the changes in the copy and review again"
     );
-    ensure!(
-        operation_before == operation(tools, &copy.source)?,
-        "The project changed while landing. Review and try again"
-    );
-    ensure_review(tools, &copy.path, mode, reviewed)?;
-    match integration {
-        Integration::Rebase => {
-            jj(
-                tools,
-                &copy.source,
-                &["rebase", "-r", &format!("{base}..{target}"), "-B", "@"],
-            )?;
+    if let Err(error) = merged {
+        if succeeds(
+            tools,
+            source,
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        )? {
+            let _ = git(tools, source, &["merge", "--abort"]);
         }
-        Integration::Merge => {
-            jj(
-                tools,
-                &copy.source,
-                &["new", "@", &target, "-m", &format!("Land {bookmark}")],
-            )?;
-        }
+        return Err(error.context(
+            "Landing could not merge into the project. Its files are unchanged; commit or stash the project's own changes to these files and try again",
+        ));
     }
-    ensure!(
-        log(tools, &copy.source, "@ & conflicts()", "commit_id")?.is_empty(),
-        "Concurrent project edits caused conflicts. Both versions are preserved in jj; resolve them in the project before continuing"
-    );
     Ok(())
 }
 
+/// Commits a project-folder thread's reviewed files on the project's current branch. Refuses
+/// when any of them also had uncommitted changes from before the thread, which git cannot
+/// separate.
 pub fn land_project(
     tools: &Tools,
     cwd: &Path,
-    mode: LandingMode,
     thread_id: &str,
+    title: &str,
     reviewed: &Review,
 ) -> Result<()> {
-    let bookmark = bookmark(thread_id)?;
-    jj(tools, cwd, &["status"])?;
-    ensure_review(tools, cwd, mode, reviewed)?;
-    ensure!(
-        log(tools, cwd, "@ & conflicts()", "commit_id")?.is_empty(),
-        "Resolve the project’s conflicts before landing"
-    );
-    if mode == LandingMode::HarnessManaged {
-        ensure_owned(tools, cwd, thread_id, reviewed)?;
-    }
+    ensure_review(tools, cwd, thread_id, reviewed)?;
     run_checks(tools, cwd, cwd)?;
-    jj(tools, cwd, &["status"])?;
-    ensure_review(tools, cwd, mode, reviewed)?;
-    ensure!(
-        log(tools, cwd, "@ & conflicts()", "commit_id")?.is_empty(),
-        "Resolve the project’s conflicts before landing"
-    );
-    jj(
-        tools,
-        cwd,
-        &["bookmark", "set", &bookmark, "-r", &reviewed.head],
-    )?;
-    jj(tools, cwd, &["new"])?;
-    Ok(())
+    ensure_review(tools, cwd, thread_id, reviewed)?;
+    let root = root(tools, cwd)?;
+    let changed = changed_paths(tools, &root, &reviewed.base, &reviewed.head)?;
+    if !changed.is_empty() {
+        let paths: Vec<&str> = changed.iter().map(|(_, path)| path.as_str()).collect();
+        let head = revision(tools, &root, "HEAD").or_else(|_| empty_tree(tools, &root))?;
+        let mut compare = vec![
+            "diff",
+            "--quiet",
+            "--no-renames",
+            &head,
+            &reviewed.base,
+            "--",
+        ];
+        compare.extend(&paths);
+        ensure!(
+            succeeds(tools, &root, &compare)?,
+            "Some of these files had other uncommitted changes. Commit them in your terminal, or choose Keep files and close"
+        );
+        let mut add = vec!["add", "--all", "--"];
+        add.extend(&paths);
+        git(tools, &root, &add)?;
+        let message = if title.trim().is_empty() {
+            "Newjen thread"
+        } else {
+            title
+        };
+        let mut commit_args = vec![
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "-m",
+            message,
+            "--only",
+            "--",
+        ];
+        commit_args.extend(&paths);
+        commit(tools, &root, &commit_args)?;
+    }
+    release(tools, cwd, thread_id)
 }
 
+/// Returns a project-folder thread's files to how they were at its base.
 pub fn discard_project(
     tools: &Tools,
     cwd: &Path,
-    mode: LandingMode,
     thread_id: &str,
     reviewed: &Review,
 ) -> Result<()> {
-    marker(thread_id)?;
-    jj(tools, cwd, &["status"])?;
-    ensure_review(tools, cwd, mode, reviewed)?;
-    if mode == LandingMode::HarnessManaged {
-        ensure_owned(tools, cwd, thread_id, reviewed)?;
+    ensure_review(tools, cwd, thread_id, reviewed)?;
+    let root = root(tools, cwd)?;
+    let changed = changed_paths(tools, &root, &reviewed.base, &reviewed.head)?;
+    let restore: Vec<&str> = changed
+        .iter()
+        .filter(|(status, _)| status != "A")
+        .map(|(_, path)| path.as_str())
+        .collect();
+    if !restore.is_empty() {
+        let index = index_path(tools, cwd, thread_id)?;
+        let mut read = git_command(tools, &root);
+        read.env("GIT_INDEX_FILE", &index)
+            .args(["read-tree", &reviewed.base]);
+        execute(read, MAX_OUTPUT_BYTES)?;
+        let mut checkout = git_command(tools, &root);
+        checkout
+            .env("GIT_INDEX_FILE", &index)
+            .args(["checkout-index", "--force", "--"])
+            .args(&restore);
+        execute(checkout, MAX_OUTPUT_BYTES)?;
     }
-    let descendants = log(
-        tools,
-        cwd,
-        &format!(
-            "({}..{}):: ~ ::{}",
-            reviewed.base, reviewed.head, reviewed.head
-        ),
-        "commit_id",
-    )?;
-    ensure!(
-        descendants.is_empty(),
-        "Other changes depend on this thread. Discard them in your terminal"
-    );
-    jj(tools, cwd, &["new", &reviewed.base])?;
+    for (status, path) in &changed {
+        if status == "A" {
+            let file = root.join(path);
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("Cannot delete {}", file.display()));
+                }
+            }
+        }
+    }
+    release(tools, cwd, thread_id)
+}
+
+/// Forgets a project-folder thread's base and snapshots. Its files stay as they are.
+pub fn release(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<()> {
+    if project_ref(tools, cwd, thread_id)?.is_some() {
+        git(tools, cwd, &["update-ref", "-d", &reference(thread_id)?])?;
+    }
+    let _ = std::fs::remove_file(index_path(tools, cwd, thread_id)?);
     Ok(())
 }
 
-pub fn cleanup_remote(tools: &Tools, source: &Path, thread_id: &str) -> Result<()> {
-    let remote = remote(thread_id)?;
-    if remote_url(tools, source, &remote)?.is_some() {
-        jj(
-            tools,
-            source,
-            &["git", "remote", "remove", &remote, "--ignore-working-copy"],
-        )?;
-    }
-    Ok(())
-}
-
-fn ensure_review(tools: &Tools, cwd: &Path, mode: LandingMode, reviewed: &Review) -> Result<()> {
+fn ensure_review(tools: &Tools, cwd: &Path, thread_id: &str, reviewed: &Review) -> Result<()> {
     validate_commit(&reviewed.base)?;
     validate_commit(&reviewed.head)?;
     ensure!(
         !reviewed.truncated,
-        "This diff is too large to review here. Review and land it with jj in your terminal"
+        "This diff is too large to review here. Review and land it with git in your terminal"
     );
-    if mode == LandingMode::HarnessManaged {
-        jj(tools, cwd, &["status"])?;
-    }
+    let changed = match project_ref(tools, cwd, thread_id)? {
+        Some(snapshot) => {
+            let index = index_path(tools, cwd, thread_id)?;
+            let tree = snapshot_tree(tools, cwd, &index, &snapshot)?;
+            snapshot != reviewed.head
+                || tree != git(tools, cwd, &["rev-parse", &format!("{snapshot}^{{tree}}")])?
+        }
+        None => {
+            revision(tools, cwd, "HEAD")? != reviewed.head
+                || !git(
+                    tools,
+                    cwd,
+                    &["status", "--porcelain", "--untracked-files=all"],
+                )?
+                .is_empty()
+        }
+    };
     ensure!(
-        head(tools, cwd)? == reviewed.head,
+        !changed,
         "The files changed since this review. Refresh the diff before continuing"
     );
-    let current = review(tools, cwd, &reviewed.base)?;
+    let current = review(tools, cwd, thread_id, &reviewed.base)?;
     ensure!(
         current == *reviewed,
         "The diff changed. Refresh it before continuing"
@@ -419,244 +389,155 @@ fn ensure_review(tools: &Tools, cwd: &Path, mode: LandingMode, reviewed: &Review
     Ok(())
 }
 
-fn ensure_owned(tools: &Tools, cwd: &Path, thread_id: &str, reviewed: &Review) -> Result<()> {
-    let marker = serde_json::to_string(&marker(thread_id)?)?;
-    let unowned = log(
-        tools,
-        cwd,
-        &format!("{}..{}", reviewed.base, reviewed.head),
-        &format!("if(!description.starts_with({marker}), commit_id ++ \"\\n\")"),
-    )?;
-    ensure!(
-        unowned.is_empty(),
-        "This project contains changes outside this thread. Manage them with jj in your terminal"
-    );
-    Ok(())
-}
-
-fn agent_bookmarked_head(tools: &Tools, cwd: &Path, reviewed: &Review) -> Result<String> {
-    let candidates = log(
-        tools,
-        cwd,
-        &format!(
-            "heads(({}..{}) & bookmarks())",
-            reviewed.base, reviewed.head
-        ),
-        "commit_id ++ \"\\n\"",
-    )?;
-    let candidates: Vec<_> = candidates.lines().collect();
-    ensure!(
-        candidates.len() == 1,
-        "Agent-managed landing needs one bookmarked head. Ask the agent to bookmark its work"
-    );
-    let target = candidates[0];
-    let remaining = jj(
-        tools,
-        cwd,
-        &[
-            "diff",
-            "--ignore-working-copy",
-            "--from",
-            target,
-            "--to",
-            &reviewed.head,
-            "--summary",
-        ],
-    )?;
-    ensure!(
-        remaining.is_empty(),
-        "Some recorded work is not bookmarked. Ask the agent to bookmark all its work"
-    );
-    Ok(target.to_string())
-}
-
-fn already_landed(
+/// The files changed between two commits, with git's status letter (`A`, `M`, `D`, `T`).
+fn changed_paths(
     tools: &Tools,
-    source: &Path,
-    copy: &Path,
-    remote: &str,
-    bookmark: &str,
-    target: &str,
-) -> Result<bool> {
-    if remote_url(tools, source, remote)?.is_none() {
-        return Ok(false);
-    }
-    let remote_pattern = serde_json::to_string(remote)?;
-    let imported = log(
-        tools,
-        source,
-        &format!("remote_bookmarks(remote=exact:{remote_pattern})"),
-        "commit_id ++ \"\\n\"",
-    )?;
-    if !imported.lines().any(|id| id == target) {
-        return Ok(false);
-    }
-    let bookmark_pattern = serde_json::to_string(bookmark)?;
-    let landed_change = log(
-        tools,
-        source,
-        &format!("bookmarks(exact:{bookmark_pattern}) & ::@"),
-        "change_id",
-    )?;
-    let source_change = log(tools, copy, target, "change_id")?;
-    Ok(landed_change == source_change)
-}
-
-fn track_work_refs(
-    tools: &Tools,
-    source: &Path,
-    remote: &str,
-    owned_bookmark: &str,
+    root: &Path,
     base: &str,
-    target: &str,
-) -> Result<()> {
-    let refs = jj(
-        tools,
-        source,
-        &[
-            "bookmark",
-            "list",
-            "--ignore-working-copy",
-            "--remote",
-            remote,
-            "-T",
-            "if(remote, name ++ \"\\t\" ++ normal_target.commit_id() ++ \"\\n\")",
-        ],
-    )?;
-    let mut work_refs = Vec::new();
-    for line in refs.lines() {
-        let Some((name, commit)) = line.split_once('\t') else {
-            continue;
-        };
-        validate_commit(commit)?;
-        if log(
-            tools,
-            source,
-            &format!("{commit} & ({base}..{target})"),
-            "commit_id",
-        )?
-        .is_empty()
-        {
-            continue;
-        }
-        let pattern = serde_json::to_string(name)?;
-        let local = log(
-            tools,
-            source,
-            &format!("bookmarks(exact:{pattern})"),
-            "commit_id",
-        )?;
-        ensure!(
-            name == owned_bookmark || local.is_empty() || local == commit,
-            "The agent bookmark {name:?} conflicts with an existing project bookmark. Rename it in the copy before landing"
-        );
-        work_refs.push(format!("{name}@{remote}"));
+    head: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut command = git_command(tools, root);
+    command.args(["diff", "--name-status", "--no-renames", "-z", base, head]);
+    let output = execute(command, MAX_OUTPUT_BYTES)?;
+    ensure!(!output.truncated, "Too many files changed to land here");
+    let text = String::from_utf8(output.stdout).context("A changed file name is not UTF-8")?;
+    let mut fields = text.split('\0').filter(|field| !field.is_empty());
+    let mut changed = Vec::new();
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        changed.push((status.to_string(), path.to_string()));
     }
-    for name in work_refs {
-        jj(tools, source, &["bookmark", "track", &name])?;
-    }
-    Ok(())
+    Ok(changed)
 }
 
-/// The copy's bookmarks on the thread's work (`base..target`), the ones landing fetches.
-fn work_bookmarks(tools: &Tools, copy: &Path, base: &str, target: &str) -> Result<Vec<String>> {
-    let listed = jj(
-        tools,
-        copy,
-        &[
-            "bookmark",
-            "list",
-            "--ignore-working-copy",
-            "-T",
-            "if(!remote, name ++ \"\\t\" ++ normal_target.commit_id() ++ \"\\n\")",
-        ],
-    )?;
-    let mut names = Vec::new();
-    for line in listed.lines() {
-        let Some((name, commit)) = line.split_once('\t') else {
-            continue;
-        };
-        validate_commit(commit)?;
-        if !log(
-            tools,
-            copy,
-            &format!("{commit} & ({base}..{target})"),
-            "commit_id",
-        )?
-        .is_empty()
-        {
-            names.push(name.to_string());
-        }
+/// The tree of every file in the folder that git does not ignore, staged into `index` on top of
+/// `parent`. The project's own index is not touched.
+fn snapshot_tree(tools: &Tools, cwd: &Path, index: &Path, parent: &str) -> Result<String> {
+    let root = root(tools, cwd)?;
+    if !index.exists() {
+        let mut read = git_command(tools, &root);
+        read.env("GIT_INDEX_FILE", index)
+            .args(["read-tree", parent]);
+        execute(read, MAX_OUTPUT_BYTES)?;
     }
-    ensure!(
-        !names.is_empty(),
-        "The reviewed work has no bookmark in the copy to fetch"
-    );
-    Ok(names)
+    let mut add = git_command(tools, &root);
+    add.env("GIT_INDEX_FILE", index).args(["add", "--all"]);
+    execute(add, MAX_OUTPUT_BYTES)?;
+    let mut write = git_command(tools, &root);
+    write.env("GIT_INDEX_FILE", index).arg("write-tree");
+    let output = execute(write, MAX_OUTPUT_BYTES)?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-/// If the project rewrote the thread's base change while the copy worked on the old version,
-/// the fetch brought that old version back. Move the work onto the current version and hide
-/// the old one, so `divergent()` stays empty. Returns the base and the bookmark's commit to
-/// land from, after the move.
-fn reconcile_rewritten_base(
+fn commit_tree(
     tools: &Tools,
-    source: &Path,
-    base: &str,
-    bookmark: &str,
-) -> Result<(String, String)> {
-    let change = log(tools, source, base, "change_id")?;
-    let current = log(
-        tools,
-        source,
-        &format!("change_id({change}) ~ {base}"),
-        "commit_id ++ \"\\n\"",
-    )?;
-    let current: Vec<&str> = current.lines().filter(|line| !line.is_empty()).collect();
-    if current.is_empty() {
-        return Ok((base.to_string(), revision(tools, source, bookmark)?));
+    cwd: &Path,
+    tree: &str,
+    parent: Option<&str>,
+    message: &str,
+) -> Result<String> {
+    let mut args = vec!["commit-tree", tree, "-m", message];
+    if let Some(parent) = parent {
+        args.extend(["-p", parent]);
     }
-    ensure!(
-        current.len() == 1,
-        "The thread's base change has several versions in the project. Resolve that before landing"
-    );
-    validate_commit(current[0])?;
-    jj(
+    let id = commit(tools, cwd, &args)?;
+    validate_commit(&id)?;
+    Ok(id)
+}
+
+/// Runs a git command that makes a commit, with a stand-in identity when git has none, and
+/// without signing: a passphrase prompt would wait forever.
+fn commit(tools: &Tools, cwd: &Path, args: &[&str]) -> Result<String> {
+    let mut command = git_command(tools, cwd);
+    command.args(["-c", "commit.gpgsign=false"]).args(args);
+    if git(tools, cwd, &["config", "user.email"]).is_err() {
+        command.envs([
+            ("GIT_AUTHOR_NAME", "Newjen"),
+            ("GIT_AUTHOR_EMAIL", "newjen@localhost"),
+            ("GIT_COMMITTER_NAME", "Newjen"),
+            ("GIT_COMMITTER_EMAIL", "newjen@localhost"),
+        ]);
+    }
+    let output = execute(command, MAX_OUTPUT_BYTES)?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+/// The empty tree, the base of a repository with no commits yet.
+fn empty_tree(tools: &Tools, cwd: &Path) -> Result<String> {
+    git(tools, cwd, &["hash-object", "-t", "tree", "--stdin"])
+}
+
+/// The snapshot a project-folder thread recorded, if it has one.
+fn project_ref(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<Option<String>> {
+    let name = reference(thread_id)?;
+    let mut command = git_command(tools, cwd);
+    command.args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{name}^{{commit}}"),
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = command.output().context("Cannot start git")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let id = String::from_utf8(output.stdout)?.trim().to_string();
+    validate_commit(&id)?;
+    Ok(Some(id))
+}
+
+fn index_path(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<PathBuf> {
+    reference(thread_id)?;
+    let path = git(
         tools,
-        source,
+        cwd,
         &[
-            "rebase",
-            "-s",
-            &format!("roots({base}..{bookmark})"),
-            "-d",
-            current[0],
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            &format!("newjen/{thread_id}.index"),
         ],
     )?;
-    jj(tools, source, &["abandon", base])?;
-    Ok((current[0].to_string(), revision(tools, source, bookmark)?))
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(path)
+}
+
+fn root(tools: &Tools, cwd: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(git(
+        tools,
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+    )?))
 }
 
 fn ensure_ancestor(tools: &Tools, cwd: &Path, base: &str, head: &str) -> Result<()> {
     ensure!(
-        !log(tools, cwd, &format!("{base} & ::{head}"), "commit_id")?.is_empty(),
+        succeeds(tools, cwd, &["merge-base", "--is-ancestor", base, head])?,
         "The thread's base is no longer an ancestor of its work"
     );
     Ok(())
 }
 
+/// Runs the checks the project committed, so an agent cannot change them in its own files.
 fn run_checks(tools: &Tools, trusted_project: &Path, workdir: &Path) -> Result<()> {
-    let root = Path::new(&jj(
+    let committed = format!("HEAD:{CHECKS_FILE}");
+    if !succeeds(
         tools,
         trusted_project,
-        &["root", "--ignore-working-copy"],
-    )?)
-    .to_path_buf();
-    let path = root.join(CHECKS_FILE);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("Cannot read the project's landing checks"),
-    };
+        &["rev-parse", "--verify", "--quiet", &committed],
+    )? {
+        return Ok(());
+    }
+    let mut show = git_command(tools, trusted_project);
+    show.args(["cat-file", "blob", &committed]);
+    let output = execute(show, 64_001).context("Cannot read the project's landing checks")?;
+    let bytes = output.stdout;
     ensure!(
         bytes.len() <= 64_000,
         "Landing checks configuration is too large"
@@ -679,133 +560,76 @@ fn run_checks(tools: &Tools, trusted_project: &Path, workdir: &Path) -> Result<(
     Ok(())
 }
 
-fn ensure_remote(tools: &Tools, source: &Path, remote: &str, path: &Path) -> Result<()> {
-    match remote_url(tools, source, remote)? {
-        Some(url) => ensure!(
-            Path::new(&url) == path,
-            "The thread's jj remote points to another folder"
-        ),
-        None => {
-            jj(
-                tools,
-                source,
-                &[
-                    "git",
-                    "remote",
-                    "add",
-                    remote,
-                    path.to_str().context("The copy path is not UTF-8")?,
-                ],
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn remote_url(tools: &Tools, source: &Path, remote: &str) -> Result<Option<String>> {
-    let remotes = jj(
-        tools,
-        source,
-        &["git", "remote", "list", "--ignore-working-copy"],
-    )?;
-    Ok(remotes.lines().find_map(|line| {
-        let (name, url) = line.split_once(char::is_whitespace)?;
-        (name == remote).then(|| url.trim().to_string())
-    }))
-}
-
 fn marker(thread_id: &str) -> Result<String> {
-    Ok(format!("Newjen {}", bookmark(thread_id)?))
-}
-
-fn bookmark(thread_id: &str) -> Result<String> {
     uuid::Uuid::parse_str(thread_id).context("Invalid thread id")?;
-    Ok(format!("thread/{thread_id}"))
+    Ok(format!("Newjen thread/{thread_id}"))
 }
 
-fn remote(thread_id: &str) -> Result<String> {
-    bookmark(thread_id)?;
-    Ok(format!("thread-{thread_id}"))
+fn reference(thread_id: &str) -> Result<String> {
+    uuid::Uuid::parse_str(thread_id).context("Invalid thread id")?;
+    Ok(format!("refs/newjen/{thread_id}"))
 }
 
 fn validate_commit(value: &str) -> Result<()> {
     ensure!(
         (40..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit()),
-        "Invalid jj commit id"
+        "Invalid git commit id"
     );
     Ok(())
 }
 
-fn revision(tools: &Tools, cwd: &Path, revset: &str) -> Result<String> {
-    let value = log(tools, cwd, revset, "commit_id")?;
+fn revision(tools: &Tools, cwd: &Path, name: &str) -> Result<String> {
+    let value = git(
+        tools,
+        cwd,
+        &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
+    )?;
     validate_commit(&value)?;
     Ok(value)
 }
 
-fn log(tools: &Tools, cwd: &Path, revset: &str, template: &str) -> Result<String> {
-    jj(
-        tools,
-        cwd,
-        &[
-            "log",
-            "--ignore-working-copy",
-            "--no-graph",
-            "-r",
-            revset,
-            "-T",
-            template,
-        ],
-    )
+/// Whether a git command that answers with its exit code said yes. Fails only if git could not
+/// run or reported an error (exit codes other than 0 and 1).
+fn succeeds(tools: &Tools, cwd: &Path, args: &[&str]) -> Result<bool> {
+    let mut command = git_command(tools, cwd);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = command.output().context("Cannot start git")?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
 }
 
-fn operation(tools: &Tools, cwd: &Path) -> Result<String> {
-    jj(
-        tools,
-        cwd,
-        &[
-            "op",
-            "log",
-            "--ignore-working-copy",
-            "--no-graph",
-            "--limit",
-            "1",
-            "-T",
-            "id",
-        ],
-    )
-}
-
-fn stage(tools: &Tools, cwd: &Path, args: &[&str]) -> Result<String> {
-    let mut command = jj_command(tools, cwd);
-    command.args(args).arg("--no-integrate-operation");
-    let result = execute(command, MAX_OUTPUT_BYTES)
-        .context("Safe landing requires jj with --no-integrate-operation support")?;
-    result
-        .stderr
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix(
-                "Operation left uncommitted because --no-integrate-operation was requested: ",
-            )
-            .map(str::to_string)
-        })
-        .context("jj did not return the prepared landing operation")
-}
-
-fn jj(tools: &Tools, cwd: &Path, args: &[&str]) -> Result<String> {
-    let mut command = jj_command(tools, cwd);
+fn git(tools: &Tools, cwd: &Path, args: &[&str]) -> Result<String> {
+    let mut command = git_command(tools, cwd);
     command.args(args);
     let output = execute(command, MAX_OUTPUT_BYTES)?;
-    ensure!(!output.truncated, "jj output is too large");
+    ensure!(!output.truncated, "git output is too large");
     String::from_utf8(output.stdout)
         .map(|s| s.trim().to_string())
-        .context("jj returned non-UTF-8 output")
+        .context("git returned non-UTF-8 output")
 }
 
-fn jj_command(tools: &Tools, cwd: &Path) -> Command {
-    let mut command = Command::new(&tools.jj);
+fn git_command(tools: &Tools, cwd: &Path) -> Command {
+    let mut command = Command::new(&tools.git);
     command
-        .args(["--color=never", "--no-pager"])
+        .args([
+            "-c",
+            "color.ui=never",
+            "-c",
+            "core.quotepath=false",
+            "--no-pager",
+            "--literal-pathspecs",
+        ])
         .current_dir(cwd)
         .envs(tools.env.iter().map(|(key, value)| (key, value)));
     command
@@ -813,7 +637,6 @@ fn jj_command(tools: &Tools, cwd: &Path) -> Command {
 
 struct Output {
     stdout: Vec<u8>,
-    stderr: String,
     truncated: bool,
 }
 
@@ -852,11 +675,7 @@ fn execute(mut command: Command, limit: usize) -> Result<Output> {
     let (stderr, _) = stderr
         .join()
         .map_err(|_| anyhow!("Command error reader failed"))??;
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr);
     ensure!(status.success(), "{program} failed: {}", stderr.trim());
-    Ok(Output {
-        stdout,
-        stderr,
-        truncated,
-    })
+    Ok(Output { stdout, truncated })
 }

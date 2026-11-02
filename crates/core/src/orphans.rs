@@ -1,4 +1,4 @@
-//! A small registry of the `claude` and Rift copy processes Newjen started, so that processes left behind by
+//! A small registry of the `claude` and worktree processes Newjen started, so that processes left behind by
 //! a crashed Newjen can be cleaned up the next time it starts.
 //!
 //! Each running child gets a file in [`registry_dir`] named after the child's pid. The file

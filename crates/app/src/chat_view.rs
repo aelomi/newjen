@@ -35,11 +35,10 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use newjen_core::agent::NoteDelivery;
-use newjen_core::landing::LandingMode;
-use newjen_core::rift::{self, CopyError, Tools};
 use newjen_core::steps::SidebarGroup;
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
+use newjen_core::worktree::{self, CopyError, Tools};
 use newjen_core::{ApprovalIntent, Item, Project, SessionConfig, Status, Store, Thread, ToolState};
 
 use crate::approval::{self, Room};
@@ -84,12 +83,12 @@ const TICK: Duration = Duration::from_secs(1);
 /// and "4m ago" moves on.
 const MINUTE_TICKS: u64 = 60;
 
-/// While a Rift copy is made, a hook line redraws the window at most this often. The clock
+/// While a worktree is made, a hook line redraws the window at most this often. The clock
 /// redraws it every second anyway.
 const LINE_REDRAW: Duration = Duration::from_millis(100);
-const COPY_CANCELLING: &str = "Cancelling… Rift is being stopped";
+const COPY_CANCELLING: &str = "Cancelling…";
 const COPY_OUTPUT_LINES: usize = 8;
-const COPY_FAILED: &str = "Couldn't create the Rift copy";
+const COPY_FAILED: &str = "Couldn't create the worktree";
 
 /// A message from the app itself (not reported by Claude), shown as the thread's last row. It
 /// is cleared by the next message, answer or stop that reaches Claude.
@@ -103,12 +102,9 @@ enum NoticeKind {
     /// Try again starts a fresh `claude`.
     Error,
     /// Try again sends the composer's text again: the message went back there.
-    CopyFailed {
-        output: Vec<String>,
-    },
+    CopyFailed { output: Vec<String> },
     /// Nothing failed and nothing was sent, so no Try again.
     Held,
-    Snapshot,
 }
 
 impl Notice {
@@ -130,7 +126,7 @@ impl Notice {
 }
 
 /// What one row of the message list shows: the transcript's items, then, while the thread's
-/// Rift copy is made, the message waiting for it and the row that says so, then the notice.
+/// worktree is made, the message waiting for it and the row that says so, then the notice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Entry {
     Item(usize),
@@ -157,8 +153,8 @@ impl Entry {
 }
 
 enum CopyProgress {
-    Progress(rift::Progress),
-    Made(Result<rift::Copy, CopyError>),
+    Progress(worktree::Progress),
+    Made(Result<worktree::Worktree, CopyError>),
 }
 
 /// Opens a thread of any loaded project (see `ProjectView::reveal_thread`).
@@ -261,7 +257,7 @@ pub struct ChatView {
     review_panel: Option<review::ReviewPanel>,
     review_loading: bool,
     changes: changes::ChangesCard,
-    /// The root has the keyboard while the thread on screen waits for its Rift copy: the
+    /// The root has the keyboard while the thread on screen waits for its worktree: the
     /// composer is disabled until then.
     making_copy_shown: bool,
     /// How the thread on screen's items become rows: its turns' tool calls fold into work
@@ -373,7 +369,7 @@ impl ChatView {
         let pending = match self.store.pending_copies(self.project.id) {
             Ok(pending) => pending,
             Err(error) => {
-                self.save_problem = Some(format!("Couldn't recover Rift copies: {error:#}"));
+                self.save_problem = Some(format!("Couldn't recover worktrees: {error:#}"));
                 return;
             }
         };
@@ -396,19 +392,19 @@ impl ChatView {
             let _ = view.update_in(cx, |view, window, cx| {
                 if let Err(error) = cleanup {
                     view.save_problem =
-                        Some(format!("Couldn't remove unfinished Rift copies: {error:#}"));
+                        Some(format!("Couldn't remove unfinished worktrees: {error:#}"));
                 }
                 for (pending, result) in recovered {
                     match result {
                         Ok(thread::CopyRecovery::Kept(path)) => {
                             view.save_problem = Some(format!(
-                                "Newjen kept the Rift copy at {}: its thread couldn't be saved.",
+                                "Newjen kept the worktree at {}: its thread couldn't be saved.",
                                 path.display()
                             ));
                         }
                         Err(error) => {
                             view.save_problem = Some(format!(
-                                "Couldn't remove the unfinished Rift copy: {error:#}"
+                                "Couldn't remove the unfinished worktree: {error:#}"
                             ))
                         }
                         _ => {}
@@ -445,7 +441,7 @@ impl ChatView {
         field.update(cx, |field, cx| field.set_value(message.clone(), window, cx));
         if pending.state == PendingState::MakingCopy {
             self.slots[0].notice = Some(Notice::held(
-                "Newjen quit while making a Rift copy. Your message is back.",
+                "Newjen quit while making a worktree. Your message is back.",
                 String::new(),
             ));
         }
@@ -683,24 +679,6 @@ impl ChatView {
         if self.quit_saving {
             return;
         }
-        if !self
-            .slots
-            .iter()
-            .any(|slot| slot.thread.read(cx).blocks_project_send())
-        {
-            for slot in &mut self.slots {
-                if matches!(
-                    slot.notice.as_ref().map(|notice| &notice.kind),
-                    Some(NoticeKind::Snapshot)
-                ) {
-                    slot.notice = None;
-                    let thread = slot.thread.read(cx);
-                    let count = Entry::count(slot.shown.len(), thread.preparing().is_some(), false);
-                    slot.messages
-                        .update(cx, |messages, cx| messages.reset(count, cx));
-                }
-            }
-        }
         if let Some(ix) = self.slots.iter().position(|slot| slot.thread == *thread) {
             self.sync_replies(ix, cx);
             self.observe_attention(ix, window, cx);
@@ -880,7 +858,7 @@ impl ChatView {
         self.enter(window, cx);
     }
 
-    /// A thread in a Rift copy asks first: archiving it deletes the copy with Claude's work.
+    /// A thread in a worktree asks first: archiving it deletes the copy with Claude's work.
     fn ask_to_archive(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.index_of(thread_id, cx) else {
             return;
@@ -965,7 +943,7 @@ impl ChatView {
                 let thread = slot.thread.read(cx);
                 thread.cwd().starts_with(folder).then(|| {
                     format!(
-                        "Couldn't archive this thread. Its Rift copy is used by thread “{}”. \
+                        "Couldn't archive this thread. Its worktree is used by thread “{}”. \
                          Archive that thread before deleting this copy.",
                         thread.title()
                     )
@@ -980,7 +958,7 @@ impl ChatView {
             let peer = peer.read(cx);
             if peer.project.path.starts_with(folder) {
                 return Some(format!(
-                    "Couldn't archive this thread. Its Rift copy is open as project {}. \
+                    "Couldn't archive this thread. Its worktree is open as project {}. \
                      Quit Newjen and reopen only the original project before archiving this copy.",
                     tilde(&peer.project.path, self.home.as_deref())
                 ));
@@ -1313,13 +1291,13 @@ impl ChatView {
     /// Whether a thread other than `thread`, here or in a peer project sharing the repository,
     /// owns work in the project folder, so only it may work there until it is reviewed.
     pub(super) fn project_work_owned_elsewhere(&self, thread: &Entity<Thread>, cx: &App) -> bool {
-        let source = rift::project_root(&self.project.path).0;
+        let source = worktree::project_root(&self.project.path);
         let owned_in = |view: &ChatView| {
             view.slots.iter().any(|slot| {
                 let other = slot.thread.read(cx);
                 slot.thread != *thread
                     && other.owns_project_work()
-                    && same_repository(&source, &rift::project_root(other.cwd()).0)
+                    && same_repository(&source, &worktree::project_root(other.cwd()))
             })
         };
         owned_in(self)
@@ -1331,84 +1309,15 @@ impl ChatView {
     }
 
     /// Checked before `Thread::send`, which would hold the message and rename the thread.
-    /// Why `thread` cannot send yet, if it can't: a draft that wants a Rift copy waits for
-    /// threads busy in the project folder (and for another copy being made), and a
-    /// project-folder send waits while a copy's jj snapshot of the project runs. Threads of
-    /// other open projects count when they share the repository.
+    /// Why `thread` cannot send yet, if it can't: a draft that wants a worktree needs a git
+    /// repository.
     fn copy_hold(&self, thread: &Entity<Thread>, cx: &App) -> Option<Notice> {
-        let (project_folder, wants_copy) = {
-            let thread = thread.read(cx);
-            (
-                thread.works_in() == WorksIn::ProjectFolder,
-                thread.is_draft()
-                    && thread.works_in() == WorksIn::RiftCopy
-                    && thread.copy().is_none(),
-            )
-        };
-        if !project_folder && !wants_copy {
-            return None;
-        }
-        let source = rift::project_root(thread.read(cx).cwd()).0;
-        let jj_repo = in_jj_repo(&source);
-        if wants_copy && let Some(missing) = missing_tool(&self.tools, jj_repo) {
-            return Some(missing);
-        }
-        // A shell can change files while Rift snapshots the project.
-        if wants_copy && self.project_terminal_open(&source, cx) {
-            return Some(Notice::held(
-                "Close the project terminal first",
-                "A terminal can change files while Rift snapshots the project. Close the \
-                 terminal before making a copy."
-                    .to_string(),
-            ));
-        }
-        let blocks_send = |other: &Thread| {
-            let busy = if project_folder {
-                other.blocks_project_send()
-            } else {
-                other.preparing().is_some()
-                    || other.status().is_busy()
-                    || !other.background_tasks().is_empty()
-            };
-            if !busy {
-                return false;
-            }
-            let other_source = rift::project_root(other.cwd()).0;
-            source.starts_with(&other_source) || other_source.starts_with(&source)
-        };
-        let hold = |blocker: &Thread| {
-            if project_folder {
-                Notice {
-                    kind: NoticeKind::Snapshot,
-                    title: "Wait a moment".to_string(),
-                    detail: format!(
-                        "Newjen is taking a jj snapshot of the project to make the Rift copy for “{}”.",
-                        blocker.title()
-                    ),
-                }
-            } else {
-                refusal(blocker.title(), blocker.preparing().is_some(), jj_repo)
-            }
-        };
-        if let Some(blocker) = self
-            .slots
-            .iter()
-            .filter(|slot| slot.thread != *thread)
-            .map(|slot| slot.thread.read(cx))
-            .find(|other| blocks_send(other))
-        {
-            return Some(hold(blocker));
-        }
-        for peer in &self.copy_peers {
-            let Some(peer) = peer.upgrade() else { continue };
-            for slot in &peer.read(cx).slots {
-                let other = slot.thread.read(cx);
-                if blocks_send(other) {
-                    return Some(hold(other));
-                }
-            }
-        }
-        None
+        let thread = thread.read(cx);
+        let wants_copy =
+            thread.is_draft() && thread.works_in() == WorksIn::Worktree && thread.copy().is_none();
+        wants_copy
+            .then(|| worktree_unavailable(&self.project.path))
+            .flatten()
     }
 
     fn gone_copy(&self, thread: &Thread) -> Option<String> {
@@ -1456,7 +1365,7 @@ impl ChatView {
                     Ok(CopyProgress::Made(made)) => break made,
                     Err(_) => {
                         break Err(CopyError::Failed {
-                            command: "rift create".to_string(),
+                            command: "git worktree add".to_string(),
                             detail: "Newjen stopped before the copy was made".to_string(),
                             output: Vec::new(),
                         });
@@ -1475,7 +1384,7 @@ impl ChatView {
     fn copy_made(
         &mut self,
         thread: &Entity<Thread>,
-        made: Result<rift::Copy, CopyError>,
+        made: Result<worktree::Worktree, CopyError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1494,7 +1403,7 @@ impl ChatView {
             let tools = self.tools.clone();
             let path = tilde(&copy.path, self.home.as_deref());
             let removed = cx.background_spawn(async move {
-                rift::remove(&tools, &copy.source, &copy.path, &copy.rift_id)
+                worktree::remove_pending(&tools, &copy.source, &copy.path)
             });
             cx.spawn(async move |view, cx| {
                 if let Err(error) = removed.await {
@@ -1544,7 +1453,7 @@ impl ChatView {
             self.slots[self.active].notice = Some(Notice::held(
                 "Close the terminal before changing folders",
                 "The terminal stays in this thread's working folder. Close it before choosing \
-                 a Rift copy."
+                 a worktree."
                     .to_string(),
             ));
             cx.notify();
@@ -1558,7 +1467,7 @@ impl ChatView {
             return;
         }
         let missing = match works_in {
-            WorksIn::RiftCopy => missing_tool(&self.tools, in_jj_repo(&self.project.path)),
+            WorksIn::Worktree => worktree_unavailable(&self.project.path),
             WorksIn::ProjectFolder => None,
         };
         self.slots[self.active].notice = missing;
@@ -1619,7 +1528,7 @@ impl ChatView {
     }
 
     /// ⌘. or the stop button: deny-and-stop a pending approval, otherwise stop the turn. While
-    /// a Rift copy is made, it cancels that instead and the message comes back.
+    /// a worktree is made, it cancels that instead and the message comes back.
     fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = self.thread().clone();
         let (pending, busy) = {
@@ -2024,7 +1933,7 @@ impl ChatView {
                 |preparing| {
                     let took = Instant::now().saturating_duration_since(preparing.started_at());
                     let took = elapsed(took.as_secs());
-                    if thread.works_in() == WorksIn::RiftCopy {
+                    if thread.works_in() == WorksIn::Worktree {
                         rows::copy_card(
                             rows::CopyCard {
                                 project: &self.project_name,
@@ -2065,7 +1974,7 @@ impl ChatView {
                     cx,
                 ),
                 Some(Notice {
-                    kind: NoticeKind::Held | NoticeKind::Snapshot,
+                    kind: NoticeKind::Held,
                     title,
                     detail,
                 }) => rows::held("notice".into(), title, detail, cx),
@@ -2125,7 +2034,7 @@ impl ChatView {
             Bar {
                 title: thread.title().to_string().into(),
                 path,
-                copy: (making_copy && thread.works_in() == WorksIn::RiftCopy)
+                copy: (making_copy && thread.works_in() == WorksIn::Worktree)
                     || thread.copy().is_some(),
                 show_list,
                 grants: thread.grant_views(),
@@ -2538,7 +2447,7 @@ impl ChatView {
         } else if self.thread().read(cx).snapshot_waits_for_background() {
             ui::Footer::Stop(self.press(cx, |view, window, cx| view.stop(window, cx)))
         } else if self.thread().read(cx).work_pending() {
-            ui::Footer::Wait("Saving a jj snapshot…")
+            ui::Footer::Wait("Saving a snapshot…")
         } else if self.thread().read(cx).landing_finished() {
             ui::Footer::Wait("Work resolved. Start a new thread to continue.")
         } else if cancelling {
@@ -2575,7 +2484,7 @@ impl ChatView {
             .into_any_element()
     }
 
-    /// Local | Rift copy. The help is in each segment's tooltip, not on screen.
+    /// Local | worktree. The help is in each segment's tooltip, not on screen.
     fn render_works_in(
         &self,
         works_in: WorksIn,
@@ -2612,7 +2521,7 @@ impl ChatView {
             .rounded_lg()
             .bg(crate::theme::material(cx).glass_hover)
             .child(segment(WorksIn::ProjectFolder, "works-in-local", cx))
-            .child(segment(WorksIn::RiftCopy, "works-in-rift", cx))
+            .child(segment(WorksIn::Worktree, "works-in-worktree", cx))
             .into_any_element()
     }
 
@@ -2679,24 +2588,6 @@ impl ChatView {
             .collect()
     }
 
-    /// Changes the landing mode new threads in the project start with, and the mode of the
-    /// drafts that are open (a thread already sent keeps its own).
-    fn set_project_landing(&mut self, mode: LandingMode, cx: &mut Context<Self>) {
-        if self.quit_saving || self.project.landing_mode == mode {
-            return;
-        }
-        self.store.set_project_landing_mode(self.project.id, mode);
-        self.project.landing_mode = mode;
-        for slot in &self.slots {
-            slot.thread.update(cx, |thread, _| {
-                if thread.is_draft() {
-                    let _ = thread.follow_project_landing_mode(mode);
-                }
-            });
-        }
-        cx.notify();
-    }
-
     /// The list's content: the project row, the threads by group (or, with none yet, a line
     /// saying so) and the usage row.
     fn render_list(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -2707,15 +2598,10 @@ impl ChatView {
         if sidebar::is_empty_list(&drafts) {
             rows.push(sidebar::empty_caption(cx));
         }
-        let view = cx.weak_entity();
         let bar = sidebar::ProjectBar {
             name: self.project_name.clone(),
-            landing: self.project.landing_mode,
             on_switch: self.project_chooser.clone(),
             on_new_thread: self.press(cx, |view, window, cx| view.new_thread(window, cx)),
-            on_landing: Rc::new(move |mode, _, cx| {
-                let _ = view.update(cx, |view, cx| view.set_project_landing(mode, cx));
-            }),
         };
         let note = self
             .attention_note
@@ -3063,9 +2949,9 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
         .then(|| thread.failure_summary())
         .flatten();
     let folder = match (thread.preparing(), thread.works_in()) {
-        (Some(_), WorksIn::RiftCopy) => sidebar::Folder::MakingRiftCopy,
+        (Some(_), WorksIn::Worktree) => sidebar::Folder::MakingWorktree,
         (Some(_), WorksIn::ProjectFolder) => sidebar::Folder::Project,
-        (None, WorksIn::RiftCopy) => sidebar::Folder::RiftCopy,
+        (None, WorksIn::Worktree) => sidebar::Folder::Worktree,
         (None, WorksIn::ProjectFolder) => sidebar::Folder::Project,
     };
     RowFacts {
@@ -3087,7 +2973,7 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
 }
 
 fn removal_problem(path: &str, error: &anyhow::Error) -> String {
-    format!("Couldn't remove the Rift copy at {path}: {error:#}")
+    format!("Couldn't remove the worktree at {path}: {error:#}")
 }
 
 /// A draft with nothing typed in its composer: switching away drops it, and ⌘N on it just
@@ -3107,7 +2993,7 @@ fn spawn_notice(
         return Notice::error(
             presentation.start_failed,
             format!(
-                "This thread's Rift copy at {copy} is gone, so {} has nowhere to work. \
+                "This thread's worktree at {copy} is gone, so {} has nowhere to work. \
                  Archive the thread and start a new one.",
                 presentation.label
             ),
@@ -3117,7 +3003,7 @@ fn spawn_notice(
     Notice::error(&title, detail)
 }
 
-/// Rift's own message is the last line it printed, so it is not shown twice.
+/// git's own message is the last line it printed, so it is not shown twice.
 fn copy_failed(error: &CopyError, home: Option<&Path>) -> Notice {
     let (detail, output) = match error {
         CopyError::Cancelled => (error.to_string(), Vec::new()),
@@ -3140,15 +3026,6 @@ fn copy_failed(error: &CopyError, home: Option<&Path>) -> Notice {
             ),
             Vec::new(),
         ),
-        CopyError::Registered(path) => (
-            format!(
-                "Rift still lists a copy at {}, but its folder is gone. Run `rift gc` in a \
-                 terminal to make Rift forget it (it also empties every Rift trash on this \
-                 Mac), then try again.",
-                tilde(path, home)
-            ),
-            Vec::new(),
-        ),
     };
     Notice {
         kind: NoticeKind::CopyFailed { output },
@@ -3157,46 +3034,16 @@ fn copy_failed(error: &CopyError, home: Option<&Path>) -> Notice {
     }
 }
 
-/// A copy starts from the project folder, which `blocker`'s agent may be editing, and making
-/// one runs `jj new` there.
-fn refusal(blocker: &str, blocker_making_copy: bool, jj_repo: bool) -> Notice {
-    if blocker_making_copy {
-        return Notice::held(
-            "Another Rift copy is being made",
-            format!("Wait until “{blocker}” has its copy before starting work in this folder."),
-        );
-    }
-    let snapshot = if jj_repo {
-        "a jj snapshot of the project"
-    } else {
-        "the project folder as it is"
-    };
-    Notice::held(
-        "Another thread is working in the project folder",
-        format!(
-            "A Rift copy starts from {snapshot}, so wait until “{blocker}” finishes, or stop it."
-        ),
-    )
-}
-
-fn missing_tool(tools: &Tools, jj_repo: bool) -> Option<Notice> {
-    if !tools.rift.is_absolute() {
-        return Some(Notice::held(
-            "Rift isn't installed",
-            "Newjen makes Rift copies with `rift`. Install it with `npm i -g rift-snapshot`, then \
-             quit and reopen Newjen."
+/// Why the project at `project` can't have worktrees, if it can't.
+fn worktree_unavailable(project: &Path) -> Option<Notice> {
+    (!worktree::available(project)).then(|| {
+        Notice::held(
+            "Worktrees need a git repository",
+            "This project isn't in a git repository. Run `git init` and make a first commit, \
+             or work in the project folder."
                 .to_string(),
-        ));
-    }
-    if jj_repo && !tools.jj.is_absolute() {
-        return Some(Notice::held(
-            "jj isn't installed",
-            "This project is a jj repo, and a Rift copy of it needs `jj`. Install it with \
-             `brew install jj`, then quit and reopen Newjen."
-                .to_string(),
-        ));
-    }
-    None
+        )
+    })
 }
 
 fn archive_question(
@@ -3207,22 +3054,18 @@ fn archive_question(
     (
         format!("Archive “{title}”?"),
         format!(
-            "This deletes its Rift copy at {path}. Changes {} made there that aren't in your \
-             project are lost.",
+            "This deletes its worktree at {path}. Changes {} made there that aren't committed \
+             are lost; committed work stays on its branch until merged or deleted.",
             presentation.label
         ),
     )
 }
 
-fn in_jj_repo(project: &Path) -> bool {
-    project.ancestors().any(|dir| dir.join(".jj").exists())
-}
-
-/// Whether two project roots (`rift::project_root`) share a repository: the same root, or
-/// one inside the other where at least one is a jj or git repository. Plain folders that
-/// merely nest are not one repository: nothing snapshots them together.
+/// Whether two project roots (`worktree::project_root`) share a repository: the same root, or
+/// one inside the other where at least one is a git repository. Plain folders that merely
+/// nest are not one repository: nothing snapshots them together.
 fn same_repository(a: &Path, b: &Path) -> bool {
-    let is_repo = |root: &Path| root.join(".jj").exists() || root.join(".git").exists();
+    let is_repo = |root: &Path| root.join(".git").exists();
     inbox::overlaps(a, b) && (is_repo(a) || is_repo(b))
 }
 
@@ -3233,10 +3076,10 @@ fn works_in_label(works_in: WorksIn) -> (ui::IconName, &'static str, &'static st
             "Local",
             "Works in your project folder. Changes appear there as the agent makes them.",
         ),
-        WorksIn::RiftCopy => (
-            ui::IconName::Layers,
-            "Rift copy",
-            "Works in a private copy of the project. Your folder stays untouched until you land the work.",
+        WorksIn::Worktree => (
+            ui::IconName::GitBranch,
+            "Worktree",
+            "Works in its own git worktree and branch. Your folder stays untouched until you land the work.",
         ),
     }
 }
@@ -3296,11 +3139,11 @@ mod tests {
 
     #[test]
     fn a_failed_removal_names_the_copy_and_why() {
-        let error = anyhow::anyhow!("`rift remove` failed: permission denied");
+        let error = anyhow::anyhow!("`git worktree remove` failed: permission denied");
         assert_eq!(
-            removal_problem("~/.rifts/app/newjen-1a2b3c4d", &error),
-            "Couldn't remove the Rift copy at ~/.rifts/app/newjen-1a2b3c4d: `rift remove` failed: \
-             permission denied"
+            removal_problem("~/.newjen-worktrees/app/newjen-1a2b3c4d", &error),
+            "Couldn't remove the worktree at ~/.newjen-worktrees/app/newjen-1a2b3c4d: \
+             `git worktree remove` failed: permission denied"
         );
     }
 
@@ -3394,18 +3237,18 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_copy_shows_rifts_message_once_and_the_lines_before_it() {
+    fn a_failed_worktree_shows_gits_message_once_and_the_lines_before_it() {
         let mut output: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
         output.insert(3, "   ".to_string());
-        output.push("postcreate hook failed (exit 1)  ".to_string());
+        output.push("fatal: a checkout hook failed  ".to_string());
         let failed = CopyError::Failed {
-            command: "rift create --copy-all".to_string(),
-            detail: "postcreate hook failed (exit 1)".to_string(),
+            command: "git worktree add".to_string(),
+            detail: "fatal: a checkout hook failed".to_string(),
             output,
         };
         let notice = copy_failed(&failed, None);
-        assert_eq!(notice.title, "Couldn't create the Rift copy");
-        assert_eq!(notice.detail, "postcreate hook failed (exit 1)");
+        assert_eq!(notice.title, "Couldn't create the worktree");
+        assert_eq!(notice.detail, "fatal: a checkout hook failed");
         let NoticeKind::CopyFailed { output } = notice.kind else {
             panic!("not a copy failure");
         };
@@ -3414,57 +3257,30 @@ mod tests {
 
         let home = Path::new("/Users/someone");
         let exists = CopyError::Exists {
-            path: home.join(".rifts/app/newjen-1a2b3c4d"),
-            rift_id: None,
+            path: home.join(".newjen-worktrees/app/newjen-1a2b3c4d"),
         };
         assert!(
             copy_failed(&exists, Some(home))
                 .detail
-                .starts_with("A folder already exists at ~/.rifts/app/newjen-1a2b3c4d.")
+                .starts_with("A folder already exists at ~/.newjen-worktrees/app/newjen-1a2b3c4d.")
         );
-        let listed = CopyError::Registered(home.join(".rifts/app/newjen-1a2b3c4d"));
-        let detail = copy_failed(&listed, Some(home)).detail;
-        assert!(detail.contains("`rift gc`"), "{detail}");
     }
 
     #[test]
-    fn a_refused_copy_names_the_thread_to_wait_for() {
-        let busy = refusal("Fix the parser", false, true);
-        assert!(matches!(busy.kind, NoticeKind::Held));
-        assert_eq!(
-            busy.title,
-            "Another thread is working in the project folder"
-        );
-        assert_eq!(
-            busy.detail,
-            "A Rift copy starts from a jj snapshot of the project, so wait until “Fix the \
-             parser” finishes, or stop it."
-        );
+    fn a_project_outside_a_git_repository_says_how_to_get_worktrees() {
+        let plain = tempfile::tempdir().unwrap();
+        let notice = worktree_unavailable(plain.path()).expect("a plain folder has no worktrees");
+        assert!(matches!(notice.kind, NoticeKind::Held));
+        assert_eq!(notice.title, "Worktrees need a git repository");
+        assert!(notice.detail.contains("`git init`"));
+        std::fs::create_dir(plain.path().join(".git")).unwrap();
+        assert!(worktree_unavailable(plain.path()).is_none());
+        let inside = plain.path().join("packages/web");
+        std::fs::create_dir_all(&inside).unwrap();
         assert!(
-            refusal("Fix the parser", false, false)
-                .detail
-                .starts_with("A Rift copy starts from the project folder as it is,")
+            worktree_unavailable(&inside).is_none(),
+            "a subfolder of a repository can have worktrees too"
         );
-        let making = refusal("Fix the parser", true, true);
-        assert_eq!(making.title, "Another Rift copy is being made");
-        assert!(making.detail.contains("“Fix the parser” has its copy"));
-    }
-
-    #[test]
-    fn a_missing_tool_says_how_to_install_it() {
-        let tools = |rift: &str, jj: &str| Tools {
-            rift: PathBuf::from(rift),
-            jj: PathBuf::from(jj),
-            env: Vec::new(),
-        };
-        let rift = missing_tool(&tools("rift", "/bin/jj"), false).unwrap();
-        assert_eq!(rift.title, "Rift isn't installed");
-        assert!(rift.detail.contains("`npm i -g rift-snapshot`"));
-        let jj = missing_tool(&tools("/bin/rift", "jj"), true).unwrap();
-        assert!(jj.detail.contains("`brew install jj`"));
-        // A plain folder is copied without jj.
-        assert!(missing_tool(&tools("/bin/rift", "jj"), false).is_none());
-        assert!(missing_tool(&tools("/bin/rift", "/bin/jj"), true).is_none());
     }
 
     #[test]
@@ -3472,13 +3288,14 @@ mod tests {
         assert_eq!(
             archive_question(
                 "Fix the parser",
-                "~/.rifts/Newjen/newjen-1a2b3c4d",
+                "~/.newjen-worktrees/Newjen/newjen-1a2b3c4d",
                 &Default::default()
             ),
             (
                 "Archive “Fix the parser”?".to_string(),
-                "This deletes its Rift copy at ~/.rifts/Newjen/newjen-1a2b3c4d. Changes Claude \
-                 made there that aren't in your project are lost."
+                "This deletes its worktree at ~/.newjen-worktrees/Newjen/newjen-1a2b3c4d. Changes \
+                 Claude made there that aren't committed are lost; committed work stays on its \
+                 branch until merged or deleted."
                     .to_string()
             )
         );
@@ -3490,13 +3307,13 @@ mod tests {
             &failed(io::ErrorKind::NotFound),
             Path::new("/opt/bin/claude"),
             &Default::default(),
-            Some("~/.rifts/app/newjen-1a2b3c4d"),
+            Some("~/.newjen-worktrees/app/newjen-1a2b3c4d"),
         );
         assert_eq!(notice.title, "Could not start Claude");
         assert!(
-            notice
-                .detail
-                .starts_with("This thread's Rift copy at ~/.rifts/app/newjen-1a2b3c4d is gone"),
+            notice.detail.starts_with(
+                "This thread's worktree at ~/.newjen-worktrees/app/newjen-1a2b3c4d is gone"
+            ),
             "{}",
             notice.detail
         );

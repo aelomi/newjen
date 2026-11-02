@@ -102,7 +102,7 @@ impl PtySession {
         command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        // The login shell's PATH, as sessions and Rift hooks get it: an app started from
+        // The login shell's PATH, as sessions and landing checks get it: an app started from
         // Finder inherits a minimal one.
         command.env("PATH", newjen_core::resolved_path());
         for name in newjen_core::env::SESSION_ENV {

@@ -1,4 +1,4 @@
-//! Per-file change statistics for a thread: the exact ones from a jj diff (see
+//! Per-file change statistics for a thread: the exact ones from a git diff (see
 //! [`crate::landing::changed_files`]) and a live estimate from the agent's edit tool calls.
 
 use std::collections::{BTreeMap, HashSet};
@@ -51,7 +51,7 @@ impl ChangeSummary {
 /// What the agent's finished edit tool calls add up to, in transcript order. It never touches
 /// the folder, so it is safe mid-turn. It is an estimate: a `Write` over an existing file counts
 /// every line as added, `replace_all` counts one occurrence, and edits by shell commands are
-/// invisible. The jj result replaces it once the turn is snapshotted.
+/// invisible. The git result replaces it once the turn is snapshotted.
 pub fn estimate_from_items(items: &[Item], root: &Path) -> ChangeSummary {
     let mut running = Estimate::default();
     let fresh = running.unseen(items);

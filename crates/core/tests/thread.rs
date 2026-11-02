@@ -2,7 +2,7 @@
 //! folder. No network, no Claude login.
 //!
 //! The stand-in (`STAND_IN`) records the arguments of every start in `spawns.log`, the folder
-//! it started in with its `RIFT_ID` and `RIFT_SOURCE` in `cwd.log`, and every stdin line in
+//! it started in with its `NEWJEN_WORKTREE` and `NEWJEN_SOURCE` in `cwd.log`, and every stdin line in
 //! `stdin.log`. Empty files in its folder switch on odd behaviour, so a test can
 //! change it between turns:
 //! - `new_in_use` / `resume_in_use`: with `--session-id` / `--resume`, print claude's
@@ -44,7 +44,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use newjen_core::ApprovalIntent;
-use newjen_core::rift::{Copy, CopyError, Tools};
 use newjen_core::session::{SessionConfig, SessionEvent};
 use newjen_core::store::{Project, Store};
 use newjen_core::thread::{
@@ -54,6 +53,7 @@ use newjen_core::thread::{
 use newjen_core::transcript::{
     BACKGROUND_STOPPED_NOTE, Item, STOPPED_TOOL_NOTE, Status, ToolState,
 };
+use newjen_core::worktree::{CopyError, Tools, Worktree};
 use serde_json::Value;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,7 +61,7 @@ const FLUSH: Duration = Duration::from_secs(5);
 
 const STAND_IN: &str = r##"#!/bin/sh
 dir="$FAKE_DIR"
-printf '%s|%s|%s\n' "$(pwd -P)" "${RIFT_ID:-}" "${RIFT_SOURCE:-}" >> "$dir/cwd.log"
+printf '%s|%s|%s\n' "$(pwd -P)" "${NEWJEN_WORKTREE:-}" "${NEWJEN_SOURCE:-}" >> "$dir/cwd.log"
 { for arg in "$@"; do printf '%s\n' "$arg"; done; echo "---"; } >> "$dir/spawns.log"
 if [ -f "$dir/close_stdin" ]; then
   exec 0<&-
@@ -226,17 +226,6 @@ impl Fixture {
         Thread::new_draft(self.store.clone(), &self.project, self.config.clone())
     }
 
-    fn draft_in_mode(&self, mode: newjen_core::landing::LandingMode) -> Thread {
-        self.store.set_project_landing_mode(self.project.id, mode);
-        assert!(self.store.flush(FLUSH));
-        let project = self
-            .store
-            .open_project(&self.project.path)
-            .expect("the project is saved");
-        assert_eq!(project.landing_mode, mode);
-        Thread::new_draft(self.store.clone(), &project, self.config.clone())
-    }
-
     /// The thread as a relaunched Newjen would load it from the store.
     fn reload(&self, id: &str) -> Thread {
         assert!(self.store.flush(FLUSH));
@@ -301,8 +290,8 @@ impl Fixture {
         }
     }
 
-    /// Where each start of the stand-in ran, with the `RIFT_ID` and `RIFT_SOURCE` it saw, as
-    /// `folder|id|source`.
+    /// Where each start of the stand-in ran, with the `NEWJEN_WORKTREE` and `NEWJEN_SOURCE` it
+    /// saw, as `folder|branch|source`.
     fn cwds(&self) -> Vec<String> {
         std::fs::read_to_string(self.path("cwd.log"))
             .unwrap_or_default()
@@ -311,48 +300,92 @@ impl Fixture {
             .collect()
     }
 
-    /// A folder standing in for a Rift copy of the project, as `rift::create` would report it.
-    fn fake_copy(&self) -> Copy {
+    /// A folder standing in for a worktree of the project, as `worktree::create` would report it.
+    fn fake_copy(&self) -> Worktree {
         let path = self.path("copies/newjen-test");
         std::fs::create_dir_all(&path).unwrap();
         let path = std::fs::canonicalize(path).unwrap();
-        Copy {
+        Worktree {
             workdir: path.clone(),
             path,
             source: std::fs::canonicalize(&self.project.path).unwrap(),
-            rift_id: "01TESTCOPY".to_string(),
-            base: None,
+            branch: "newjen/test".to_string(),
+            base: "0123456789abcdef0123456789abcdef01234567".to_string(),
         }
     }
 
-    /// A draft that wants a Rift copy, with its first message sent and held.
+    /// A draft that wants a worktree, with its first message sent and held.
     fn preparing(&self, text: &str) -> (Thread, newjen_core::thread::CopyJob) {
         let mut thread = self.draft();
-        thread.set_works_in(WorksIn::RiftCopy).unwrap();
+        thread.set_works_in(WorksIn::Worktree).unwrap();
         let Sent::MakingCopy(job) = thread.send(text).unwrap() else {
-            panic!("the message should wait for the copy");
+            panic!("the message should wait for the worktree");
         };
         (thread, job)
     }
 
-    /// The installed `rift` and `jj` with a `HOME` of their own (so a Rift registry of their
-    /// own), or `None`, with the reason printed, when they are not installed.
-    fn rift_tools(&self) -> Option<Tools> {
-        let mut tools = Tools::find();
-        if !tools.rift.is_absolute() || !tools.jj.is_absolute() {
-            eprintln!("skipped: `rift` or `jj` is not installed");
-            return None;
-        }
-        let home = self.path("rift-home");
+    /// The installed `git` with a `HOME` and an identity of its own, so no configuration of
+    /// the machine reaches the tests.
+    fn git_tools(&self) -> Tools {
+        let home = self.path("git-home");
         std::fs::create_dir_all(&home).unwrap();
-        tools.env = vec![("HOME".to_string(), home.display().to_string())];
-        Some(tools)
+        let mut tools = Tools::find();
+        tools.env = vec![
+            ("HOME".to_string(), home.display().to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+            ("GIT_AUTHOR_NAME".to_string(), "Test".to_string()),
+            (
+                "GIT_AUTHOR_EMAIL".to_string(),
+                "test@example.invalid".to_string(),
+            ),
+            ("GIT_COMMITTER_NAME".to_string(), "Test".to_string()),
+            (
+                "GIT_COMMITTER_EMAIL".to_string(),
+                "test@example.invalid".to_string(),
+            ),
+        ];
+        tools
+    }
+
+    /// Makes the project folder a git repository with one commit, "base", holding `a.txt`.
+    fn git_project(&self) -> Tools {
+        let tools = self.git_tools();
+        git(
+            &tools,
+            &self.project.path,
+            &["init", "--quiet", "--initial-branch=main"],
+        );
+        std::fs::write(self.project.path.join("a.txt"), "a\n").unwrap();
+        git(&tools, &self.project.path, &["add", "--all"]);
+        git(
+            &tools,
+            &self.project.path,
+            &["commit", "--quiet", "-m", "base"],
+        );
+        tools
     }
 
     /// A second connection to the database, to change it behind the store's back.
     fn database(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(self.store.path()).unwrap()
     }
+}
+
+/// Runs git with `args` in `cwd` and returns its trimmed stdout.
+fn git(tools: &Tools, cwd: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new(&tools.git)
+        .args(args)
+        .current_dir(cwd)
+        .envs(tools.env.iter().cloned())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 /// The value after `flag` in `args`, if the flag is there.
@@ -1638,7 +1671,7 @@ fn a_gap_left_in_the_saved_rows_is_closed_when_the_thread_loads() {
 #[test]
 fn a_thread_always_restarts_from_its_own_folder() {
     // Claude ties `--resume` to the folder a conversation started in, so a thread whose
-    // folder differs from the project's (its own Rift copy, later) must come back to it.
+    // folder differs from the project's (its own worktree, later) must come back to it.
     let home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
     let copy_dir = tempfile::tempdir().unwrap();
@@ -1662,7 +1695,6 @@ fn a_thread_always_restarts_from_its_own_folder() {
         updated_at: 1,
         archived_at: None,
         copy: None,
-        landing_mode: newjen_core::landing::LandingMode::HarnessManaged,
         review_base: None,
         landing_resolved: false,
         snapshot_needed: false,
@@ -2176,11 +2208,11 @@ fn allow_in_this_thread_that_never_reaches_claude_saves_no_grant() {
 }
 
 #[test]
-fn a_rift_draft_holds_its_first_message_until_its_copy_is_ready_then_sends_it_once() {
+fn a_worktree_draft_holds_its_first_message_until_its_worktree_is_ready_then_sends_it_once() {
     let fixture = Fixture::new();
     let (mut thread, _job) = fixture.preparing("Fix the login bug");
     assert!(!thread.is_draft(), "kept when the user switches away");
-    assert_eq!(thread.works_in(), WorksIn::RiftCopy);
+    assert_eq!(thread.works_in(), WorksIn::Worktree);
     assert_eq!(thread.title(), "Fix the login bug");
     let held = thread.preparing().expect("preparing");
     assert_eq!(held.message(), "Fix the login bug");
@@ -2190,7 +2222,7 @@ fn a_rift_draft_holds_its_first_message_until_its_copy_is_ready_then_sends_it_on
         "busy while the copy is made"
     );
     assert!(thread.set_works_in(WorksIn::ProjectFolder).is_err());
-    thread.note_copy_progress(newjen_core::rift::Progress::Line(
+    thread.note_copy_progress(newjen_core::worktree::Progress::Line(
         "installing deps".to_string(),
     ));
     assert_eq!(
@@ -2223,7 +2255,7 @@ fn a_rift_draft_holds_its_first_message_until_its_copy_is_ready_then_sends_it_on
         [format!(
             "{}|{}|{}",
             copy.workdir.display(),
-            copy.rift_id,
+            copy.branch,
             copy.source.display()
         )]
     );
@@ -2254,18 +2286,18 @@ fn a_rift_draft_holds_its_first_message_until_its_copy_is_ready_then_sends_it_on
         loaded
             .session_config()
             .env
-            .contains(&("RIFT_ID".to_string(), copy.rift_id.clone()))
+            .contains(&("NEWJEN_WORKTREE".to_string(), copy.branch.clone()))
     );
 }
 
 #[test]
-fn a_copy_that_could_not_be_made_hands_the_message_back_to_a_draft_that_still_wants_one() {
+fn a_worktree_that_could_not_be_made_hands_the_message_back_to_a_draft_that_still_wants_one() {
     let fixture = Fixture::new();
     let (mut thread, _job) = fixture.preparing("Fix the login bug");
     let failure = CopyError::Failed {
-        command: "rift create".to_string(),
-        detail: "postcreate hook failed".to_string(),
-        output: vec!["npm ERR! missing script: setup".to_string()],
+        command: "git worktree add".to_string(),
+        detail: "fatal: could not create work tree dir".to_string(),
+        output: vec!["fatal: could not create work tree dir".to_string()],
     };
 
     let not_sent = thread.finish_copy(Err(failure.clone())).unwrap_err();
@@ -2273,7 +2305,7 @@ fn a_copy_that_could_not_be_made_hands_the_message_back_to_a_draft_that_still_wa
     assert_eq!(not_sent.error.downcast_ref::<CopyError>(), Some(&failure));
     assert!(thread.is_draft());
     assert!(thread.preparing().is_none());
-    assert_eq!(thread.works_in(), WorksIn::RiftCopy);
+    assert_eq!(thread.works_in(), WorksIn::Worktree);
     assert_eq!(thread.copy(), None);
     assert_eq!(thread.title(), NEW_THREAD_TITLE);
     settle(&mut thread);
@@ -2294,12 +2326,12 @@ fn a_copy_that_could_not_be_made_hands_the_message_back_to_a_draft_that_still_wa
 }
 
 #[test]
-fn a_claude_left_by_try_again_is_stopped_before_the_draft_moves_into_its_copy() {
+fn a_claude_left_by_try_again_is_stopped_before_the_draft_moves_into_its_worktree() {
     let fixture = Fixture::new();
     let mut thread = fixture.draft();
     thread.restart().unwrap();
     fixture.wait_for_spawns(1);
-    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    thread.set_works_in(WorksIn::Worktree).unwrap();
     let Sent::MakingCopy(_job) = thread.send("hello").unwrap() else {
         panic!("the message should wait for the copy");
     };
@@ -2314,12 +2346,9 @@ fn a_claude_left_by_try_again_is_stopped_before_the_draft_moves_into_its_copy() 
 }
 
 #[test]
-fn archiving_a_rift_thread_removes_its_copy_once_claude_has_stopped() {
+fn archiving_a_worktree_thread_removes_its_worktree_once_claude_has_stopped() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
-    std::fs::write(fixture.project.path.join("a.txt"), "a\n").unwrap();
+    let tools = fixture.git_project();
     let (mut thread, job) = fixture.preparing("Look around");
     let job_tools = tools.clone();
     let made = std::thread::spawn(move || job.run(&job_tools, |_| {}))
@@ -2339,17 +2368,24 @@ fn archiving_a_rift_thread_removes_its_copy_once_claude_has_stopped() {
     assert_eq!(removal.copy(), &copy);
     removal.run(&tools).unwrap();
     assert!(!copy.path.exists());
+    assert_eq!(
+        git(
+            &tools,
+            &fixture.project.path,
+            &["branch", "--list", "newjen/*"]
+        ),
+        "",
+        "its branch had nothing the project lacks, so it goes too"
+    );
     assert!(fixture.store.flush(FLUSH));
     assert_eq!(fixture.store.copy_owner(&copy.path).unwrap(), None);
     assert!(Removal::pending(&fixture.store).unwrap().is_empty());
 }
 
 #[test]
-fn copies_of_threads_archived_before_a_relaunch_are_removed_at_startup() {
+fn worktrees_of_threads_archived_before_a_relaunch_are_removed_at_startup() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
+    let tools = fixture.git_project();
     let (mut thread, job) = fixture.preparing("Look around");
     let copy = job.run(&tools, |_| {}).unwrap();
     thread.finish_copy(Ok(copy.clone())).unwrap();
@@ -2369,7 +2405,7 @@ fn copies_of_threads_archived_before_a_relaunch_are_removed_at_startup() {
 }
 
 #[test]
-fn a_new_copy_waits_for_agents_busy_in_the_project_folder_and_for_another_copy() {
+fn only_a_worktree_being_made_blocks_making_another() {
     let fixture = Fixture::new();
     let mut idle = fixture.draft();
     let _ = idle.send("one").unwrap();
@@ -2380,27 +2416,32 @@ fn a_new_copy_waits_for_agents_busy_in_the_project_folder_and_for_another_copy()
     let mut busy = fixture.draft();
     let _ = busy.send("two").unwrap();
     assert!(
-        busy.blocks_copy_creation(),
-        "mid-turn in the project folder"
+        !busy.blocks_copy_creation(),
+        "making a worktree reads only committed history, so an agent mid-turn in the project folder is no reason to wait"
     );
 
     let (preparing, _job) = fixture.preparing("three");
     assert!(
         preparing.blocks_copy_creation(),
-        "another copy is being made"
+        "its own worktree is being made"
     );
 
     let (mut in_copy, _job) = fixture.preparing("four");
     in_copy.finish_copy(Ok(fixture.fake_copy())).unwrap();
     assert!(in_copy.status().is_busy());
-    assert!(!in_copy.blocks_copy_creation(), "it works in its own copy");
+    assert!(
+        !in_copy.blocks_copy_creation(),
+        "it works in its own worktree"
+    );
     busy.shutdown_for_quit().unwrap();
     in_copy.shutdown_for_quit().unwrap();
-    assert!(!busy.blocks_copy_creation(), "stopped");
     fixture.switch("hang", false);
 
     let background = thread_with_a_background_task(&fixture);
-    assert!(background.blocks_copy_creation(), "a background task runs");
+    assert!(
+        !background.blocks_copy_creation(),
+        "a background task in the project folder does not block it either"
+    );
 }
 
 #[test]
@@ -2420,16 +2461,14 @@ fn a_held_first_message_is_durable_before_the_copy_job_runs() {
 }
 
 #[test]
-fn quit_before_copy_completion_recovers_the_message_without_a_send() {
+fn quit_before_the_worktree_is_ready_recovers_the_message_without_a_send() {
     enum Exit {
         Quit,
         Crash,
     }
     for exit in [Exit::Quit, Exit::Crash] {
         let fixture = Fixture::new();
-        let Some(tools) = fixture.rift_tools() else {
-            return;
-        };
+        let tools = fixture.git_project();
         let (mut thread, job) = fixture.preparing("Fix the login bug");
         let copy = job.run(&tools, |_| {}).unwrap();
         match exit {
@@ -2453,7 +2492,7 @@ fn quit_before_copy_completion_recovers_the_message_without_a_send() {
         );
         assert!(!copy.path.exists());
         assert!(recovered.is_draft());
-        assert_eq!(recovered.works_in(), WorksIn::RiftCopy);
+        assert_eq!(recovered.works_in(), WorksIn::Worktree);
         assert!(!recovered.has_session());
         assert!(recovered.transcript().items().is_empty());
         assert!(fixture.spawns().is_empty());
@@ -2468,15 +2507,13 @@ fn quit_before_copy_completion_recovers_the_message_without_a_send() {
 }
 
 #[test]
-fn quit_after_a_failed_first_send_cleans_the_copy_and_restores_the_message() {
+fn quit_after_a_failed_first_send_cleans_the_worktree_and_restores_the_message() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
+    let tools = fixture.git_project();
     let mut config = fixture.config.clone();
     config.program = fixture.path("no-such-claude");
     let mut thread = Thread::new_draft(fixture.store.clone(), &fixture.project, config);
-    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    thread.set_works_in(WorksIn::Worktree).unwrap();
     let Sent::MakingCopy(job) = thread.send("hello").unwrap() else {
         panic!()
     };
@@ -2500,17 +2537,15 @@ fn quit_after_a_failed_first_send_cleans_the_copy_and_restores_the_message() {
 }
 
 #[test]
-fn an_archived_copy_job_returns_its_copy_for_removal_and_never_sends() {
+fn an_archived_worktree_job_returns_its_worktree_for_removal_and_never_sends() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
+    let tools = fixture.git_project();
     let (mut thread, job) = fixture.preparing("hello");
     let copy = job.run(&tools, |_| {}).unwrap();
     assert!(thread.archive().is_none());
     let not_sent = thread.finish_copy(Ok(copy.clone())).unwrap_err();
     assert_eq!(not_sent.copy_to_remove.as_deref(), Some(&copy));
-    newjen_core::rift::remove(&tools, &copy.source, &copy.path, &copy.rift_id).unwrap();
+    newjen_core::worktree::remove(&tools, &copy.source, &copy.path, &copy.branch).unwrap();
     assert!(!copy.path.exists());
     assert!(not_sent.message.is_empty());
     assert!(fixture.spawns().is_empty());
@@ -2536,7 +2571,7 @@ fn a_failed_pending_write_does_not_start_a_copy_or_hold_the_message() {
     let fixture = Fixture::new();
     fixture.database().execute_batch("CREATE TRIGGER refuse_pending BEFORE INSERT ON pending_copies BEGIN SELECT RAISE(ABORT, 'disk full'); END;").unwrap();
     let mut thread = fixture.draft();
-    thread.set_works_in(WorksIn::RiftCopy).unwrap();
+    thread.set_works_in(WorksIn::Worktree).unwrap();
     assert!(thread.send("keep this").is_err());
     assert!(thread.is_draft());
     assert!(thread.preparing().is_none());
@@ -2571,15 +2606,14 @@ fn sending_a_recovered_draft_in_the_project_folder_clears_its_pending_record() {
 #[test]
 fn recovering_again_never_removes_a_replacement_after_the_original_was_cleaned() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
+    let tools = fixture.git_project();
     let (thread, job) = fixture.preparing("keep my message");
     let copy = job.run(&tools, |_| {}).unwrap();
     drop(thread);
     let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
     Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending[0], &tools).unwrap();
-    let replacement = newjen_core::rift::create(
+    assert!(!copy.path.exists());
+    let replacement = newjen_core::worktree::create(
         &tools,
         &fixture.project.path,
         copy.path.file_name().unwrap().to_str().unwrap(),
@@ -2596,50 +2630,9 @@ fn recovering_again_never_removes_a_replacement_after_the_original_was_cleaned()
 }
 
 #[test]
-fn recovery_preserves_a_replacement_before_the_first_cleanup() {
+fn a_failed_first_thread_write_never_sweeps_a_worktree_with_work() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
-    let status = std::process::Command::new(&tools.jj)
-        .args(["git", "init", "--colocate"])
-        .arg(&fixture.project.path)
-        .envs(tools.env.iter().cloned())
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let (thread, job) = fixture.preparing("keep my message");
-    let own = job.run(&tools, |_| {}).unwrap();
-    drop(thread);
-    newjen_core::rift::remove(&tools, &own.source, &own.path, &own.rift_id).unwrap();
-    let replacement = newjen_core::rift::create(
-        &tools,
-        &fixture.project.path,
-        own.path.file_name().unwrap().to_str().unwrap(),
-        |_| {},
-    )
-    .unwrap();
-    std::fs::write(replacement.path.join("valuable.txt"), "replacement work").unwrap();
-    let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
-    assert_eq!(pending[0].rift_id.as_deref(), Some(own.rift_id.as_str()));
-    assert_eq!(
-        Thread::recover_pending_copy(&fixture.store, &fixture.project, &pending[0], &tools)
-            .unwrap(),
-        newjen_core::thread::CopyRecovery::Draft
-    );
-    assert!(
-        replacement.path.join("valuable.txt").exists(),
-        "recovery deleted a different Rift id at the pending destination"
-    );
-}
-
-#[test]
-fn a_failed_first_thread_write_never_sweeps_a_copy_with_work() {
-    let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
-    std::fs::write(fixture.project.path.join("a.txt"), "a\n").unwrap();
+    let tools = fixture.git_project();
     fixture
         .database()
         .execute_batch("CREATE TRIGGER refuse_threads BEFORE INSERT ON threads BEGIN SELECT RAISE(ABORT, 'disk full'); END;")
@@ -2680,16 +2673,14 @@ fn a_failed_first_thread_write_never_sweeps_a_copy_with_work() {
     );
     assert!(
         copy.workdir.join("parser.rs").exists(),
-        "a copy in which claude already worked was deleted at relaunch"
+        "a worktree in which claude already worked was deleted at relaunch"
     );
 }
 
 #[test]
 fn a_failed_sent_checkpoint_returns_the_message_without_sending_it() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
+    let tools = fixture.git_project();
     let (mut thread, job) = fixture.preparing("keep this message");
     let copy = job.run(&tools, |_| {}).unwrap();
     fixture.database().execute_batch("CREATE TRIGGER refuse_sent BEFORE INSERT ON pending_copies WHEN NEW.state = 'sent' BEGIN SELECT RAISE(ABORT, 'disk full'); END;").unwrap();
@@ -2714,33 +2705,29 @@ fn a_failed_sent_checkpoint_returns_the_message_without_sending_it() {
 }
 
 #[test]
-fn quitting_stops_rift_and_postcreate_hooks_before_recovery() {
+fn quitting_stops_git_and_its_checkout_hook_before_recovery() {
     for provider in [
         newjen_core::providers::Provider::Claude,
         newjen_core::providers::Provider::Codex,
     ] {
-        quitting_stops_rift_and_postcreate_hooks_before_recovery_for(provider);
+        quitting_stops_git_and_its_checkout_hook_before_recovery_for(provider);
     }
 }
 
-fn quitting_stops_rift_and_postcreate_hooks_before_recovery_for(
+fn quitting_stops_git_and_its_checkout_hook_before_recovery_for(
     provider: newjen_core::providers::Provider,
 ) {
     let mut fixture = Fixture::new();
     fixture.config.agent = newjen_core::agent::AgentConfig::cli_default(provider);
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
+    let tools = fixture.git_project();
     let pid_file = fixture.path("hook-pid");
-    let hook = format!(
-        "echo $$ > '{}'; trap '' TERM; while :; do sleep 1; done",
-        pid_file.display()
+    install_hook(
+        &fixture,
+        &format!(
+            "echo $$ > '{}'\ntrap '' TERM\nwhile :; do sleep 1; done",
+            pid_file.display()
+        ),
     );
-    std::fs::write(
-        fixture.project.path.join(".rift.toml"),
-        format!("version = 1\n[[hooks.postcreate]]\nrun = {hook:?}\n"),
-    )
-    .unwrap();
     let (mut thread, job) = fixture.preparing("wait for setup");
     let job_thread = std::thread::spawn(move || job.run(&tools, |_| {}));
     // The hook creates the file before it writes the pid, so wait for the number itself.
@@ -2753,7 +2740,7 @@ fn quitting_stops_rift_and_postcreate_hooks_before_recovery_for(
         {
             break pid;
         }
-        assert!(Instant::now() < deadline, "the postcreate hook never ran");
+        assert!(Instant::now() < deadline, "the checkout hook never ran");
         std::thread::sleep(Duration::from_millis(10));
     };
     let group = std::process::Command::new("/bin/ps")
@@ -2776,29 +2763,27 @@ fn quitting_stops_rift_and_postcreate_hooks_before_recovery_for(
         }
     }
     let result = job_thread.join().unwrap();
-    assert!(!alive, "postcreate survived quit");
+    assert!(!alive, "the checkout hook survived quit");
     assert!(result.is_err());
     assert!(fixture.messages_received().is_empty());
 }
 
 #[test]
-fn a_copy_job_not_yet_started_never_runs_rift_after_quit() {
+fn a_worktree_job_not_yet_started_never_runs_git_after_quit() {
     for provider in [
         newjen_core::providers::Provider::Claude,
         newjen_core::providers::Provider::Codex,
     ] {
-        a_copy_job_not_yet_started_never_runs_rift_after_quit_for(provider);
+        a_worktree_job_not_yet_started_never_runs_git_after_quit_for(provider);
     }
 }
 
-fn a_copy_job_not_yet_started_never_runs_rift_after_quit_for(
+fn a_worktree_job_not_yet_started_never_runs_git_after_quit_for(
     provider: newjen_core::providers::Provider,
 ) {
     let mut fixture = Fixture::new();
     fixture.config.agent = newjen_core::agent::AgentConfig::cli_default(provider);
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
+    let tools = fixture.git_project();
     let (mut thread, job) = fixture.preparing("wait for setup");
     let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
     thread.shutdown_for_quit().unwrap();
@@ -2807,47 +2792,38 @@ fn a_copy_job_not_yet_started_never_runs_rift_after_quit_for(
 }
 
 #[test]
-fn quitting_lets_a_running_jj_finish_and_prevents_the_copy_start() {
+fn quitting_lets_a_running_git_finish_and_prevents_the_worktree_start() {
     for provider in [
         newjen_core::providers::Provider::Claude,
         newjen_core::providers::Provider::Codex,
     ] {
-        quitting_lets_a_running_jj_finish_and_prevents_the_copy_start_for(provider);
+        quitting_lets_a_running_git_finish_and_prevents_the_worktree_start_for(provider);
     }
 }
 
-fn quitting_lets_a_running_jj_finish_and_prevents_the_copy_start_for(
+fn quitting_lets_a_running_git_finish_and_prevents_the_worktree_start_for(
     provider: newjen_core::providers::Provider,
 ) {
     use std::os::unix::fs::PermissionsExt;
     let mut fixture = Fixture::new();
     fixture.config.agent = newjen_core::agent::AgentConfig::cli_default(provider);
-    let Some(mut tools) = fixture.rift_tools() else {
-        return;
-    };
-    let status = std::process::Command::new(&tools.jj)
-        .args(["git", "init", "--colocate"])
-        .arg(&fixture.project.path)
-        .envs(tools.env.iter().cloned())
-        .output()
-        .unwrap();
-    assert!(status.status.success());
-    let started = fixture.path("jj-started");
-    let release = fixture.path("jj-release");
-    let wrapper = fixture.path("jj-wait");
+    let mut tools = fixture.git_project();
+    let started = fixture.path("git-started");
+    let release = fixture.path("git-release");
+    let wrapper = fixture.path("git-wait");
     std::fs::write(
         &wrapper,
         format!(
             "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep .02; done\nexec '{}' \"$@\"\n",
             started.display(),
             release.display(),
-            tools.jj.display()
+            tools.git.display()
         ),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    tools.jj = wrapper;
-    let (mut thread, job) = fixture.preparing("snapshot first");
+    tools.git = wrapper;
+    let (mut thread, job) = fixture.preparing("check first");
     let pending = fixture.store.pending_copies(fixture.project.id).unwrap();
     let running = std::thread::spawn(move || job.run(&tools, |_| {}));
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2866,9 +2842,7 @@ fn quitting_lets_a_running_jj_finish_and_prevents_the_copy_start_for(
 fn recovery_refuses_symlinked_copy_parents_and_preserves_unrelated_work() {
     for parent_depth in [1, 2] {
         let fixture = Fixture::new();
-        let Some(tools) = fixture.rift_tools() else {
-            return;
-        };
+        let tools = fixture.git_tools();
         let (thread, job) = fixture.preparing("keep my message");
         drop(job);
         let pending = fixture
@@ -2902,64 +2876,33 @@ fn recovery_refuses_symlinked_copy_parents_and_preserves_unrelated_work() {
 
 #[test]
 fn retrying_a_draft_keeps_its_failed_attempt_for_cleanup() {
-    failed_attempt_stays_tracked(WorksIn::RiftCopy, CleanupFailure::RiftRemove);
+    failed_attempt_stays_tracked(WorksIn::Worktree);
 }
 
 #[test]
 fn sending_a_draft_in_the_project_keeps_its_failed_attempt_for_cleanup() {
-    failed_attempt_stays_tracked(WorksIn::ProjectFolder, CleanupFailure::RiftRemove);
+    failed_attempt_stays_tracked(WorksIn::ProjectFolder);
 }
 
-#[test]
-fn retrying_after_a_hook_blocks_trash_keeps_the_leftover_for_cleanup() {
-    failed_attempt_stays_tracked(WorksIn::RiftCopy, CleanupFailure::TrashSymlink);
+/// Installs the project's `post-checkout` hook, which `git worktree add` runs inside the new
+/// worktree. One that exits non-zero fails the add after the checkout, leaving the worktree.
+fn install_hook(fixture: &Fixture, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = fixture.project.path.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-enum CleanupFailure {
-    RiftRemove,
-    TrashSymlink,
-}
-
-fn failed_attempt_stays_tracked(works_in: WorksIn, failure: CleanupFailure) {
+/// The hook seals a folder git cannot delete in the worktree, so the failed attempt stays on
+/// disk until the test unseals it.
+fn failed_attempt_stays_tracked(works_in: WorksIn) {
+    use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
-    let Some(mut tools) = fixture.rift_tools() else {
-        return;
-    };
-    let real_tools = tools.clone();
-    let wrapper = fixture.path("rift-without-remove");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = remove ]; then exit 1; fi\nexec '{}' \"$@\"\n",
-            tools.rift.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        std::process::Command::new(&tools.jj)
-            .args(["git", "init", "--colocate"])
-            .arg(&fixture.project.path)
-            .envs(tools.env.iter().cloned())
-            .output()
-            .unwrap()
-            .status
-            .success()
+    let tools = fixture.git_project();
+    install_hook(
+        &fixture,
+        "mkdir sealed && touch sealed/inside && chmod 000 sealed\nexit 3",
     );
-    let hook = match failure {
-        CleanupFailure::RiftRemove => {
-            tools.rift = wrapper;
-            "exit 3"
-        }
-        CleanupFailure::TrashSymlink => {
-            r#"mkdir -p "$RIFT_DESTINATION/../safe"; ln -s safe "$RIFT_DESTINATION/../.trash"; exit 7"#
-        }
-    };
-    std::fs::write(
-        fixture.project.path.join(".rift.toml"),
-        format!("version = 1\n[[hooks.postcreate]]\nrun = '{hook}'\n"),
-    )
-    .unwrap();
     let (mut thread, job) = fixture.preparing("first try");
     let first = fixture
         .store
@@ -2967,12 +2910,14 @@ fn failed_attempt_stays_tracked(works_in: WorksIn, failure: CleanupFailure) {
         .unwrap()
         .remove(0);
     let error = job.run(&tools, |_| {}).unwrap_err();
-    assert!(first.path.exists());
+    let sealed = first.path.join("sealed");
+    assert!(first.path.exists(), "git could not remove the leftover");
+    let unlock = || std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755));
     assert_eq!(
         thread.finish_copy(Err(error)).unwrap_err().message,
         "first try"
     );
-    std::fs::remove_file(fixture.project.path.join(".rift.toml")).unwrap();
+    std::fs::remove_file(fixture.project.path.join(".git/hooks/post-checkout")).unwrap();
     thread.set_works_in(works_in).unwrap();
     match thread.send("second try").unwrap() {
         Sent::MakingCopy(job) => drop(job),
@@ -2995,16 +2940,13 @@ fn failed_attempt_stays_tracked(works_in: WorksIn, failure: CleanupFailure) {
     assert!(first.path.exists());
     let cleanup = fixture.store.copy_cleanup(fixture.project.id).unwrap();
     assert_eq!(cleanup.len(), 1);
-    assert!(cleanup[0].rift_id.is_some());
     assert!(Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &tools).is_err());
     assert_eq!(
         fixture.store.copy_cleanup(fixture.project.id).unwrap(),
         cleanup
     );
-    if matches!(failure, CleanupFailure::TrashSymlink) {
-        std::fs::remove_file(first.path.parent().unwrap().join(".trash")).unwrap();
-    }
-    Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &real_tools).unwrap();
+    unlock().unwrap();
+    Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &tools).unwrap();
     assert!(fixture.store.flush(FLUSH));
     assert!(!first.path.exists());
     assert!(
@@ -3014,7 +2956,7 @@ fn failed_attempt_stays_tracked(works_in: WorksIn, failure: CleanupFailure) {
             .unwrap()
             .is_empty()
     );
-    Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &real_tools).unwrap();
+    Thread::recover_copy_cleanup(&fixture.store, &fixture.project, &tools).unwrap();
     thread.shutdown_for_quit().unwrap();
 }
 
@@ -3080,7 +3022,7 @@ fn cancelling_before_the_copy_is_made_never_starts_an_agent() {
     assert!(thread.send("too early").is_err());
     let made = job.run(&Tools::find(), |_| {});
     assert_eq!(made, Err(CopyError::Cancelled));
-    assert!(!fixture.project.path.join(".rift").exists());
+    assert!(!fixture.path(".newjen-worktrees").exists());
     let failed = thread.finish_copy(made).unwrap_err();
     assert_eq!(failed.message, "Do not send this");
     assert!(failed.copy_to_remove.is_none());
@@ -3090,22 +3032,19 @@ fn cancelling_before_the_copy_is_made_never_starts_an_agent() {
 }
 
 #[test]
-fn cancelling_during_a_rift_hook_stops_it_and_removes_the_copy() {
+fn cancelling_during_a_checkout_hook_stops_it_and_removes_the_worktree() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
-    std::fs::write(
-        fixture.project.path.join(".rift.toml"),
-        "version = 1\n[[hooks.postcreate]]\nrun = \"echo hook-ready >&2; sleep 30; echo finished > hook-finished\"\n",
-    )
-    .unwrap();
+    let tools = fixture.git_project();
+    install_hook(
+        &fixture,
+        "echo hook-ready >&2\nsleep 30\necho finished > hook-finished",
+    );
     let (mut thread, job) = fixture.preparing("Held until ready");
     let (ready, started) = std::sync::mpsc::channel();
     let worker_tools = tools.clone();
     let worker = std::thread::spawn(move || {
         job.run(&worker_tools, |progress| {
-            if let newjen_core::rift::Progress::Line(line) = progress
+            if let newjen_core::worktree::Progress::Line(line) = progress
                 && line.contains("hook-ready")
             {
                 let _ = ready.send(());
@@ -3127,7 +3066,16 @@ fn cancelling_during_a_rift_hook_stops_it_and_removes_the_copy() {
         thread.finish_copy(made).unwrap_err().message,
         "Held until ready"
     );
-    assert!(!path.exists(), "the half-made copy is removed");
+    assert!(!path.exists(), "the half-made worktree is removed");
+    assert_eq!(
+        git(
+            &tools,
+            &fixture.project.path,
+            &["branch", "--list", "newjen/*"]
+        ),
+        "",
+        "and so is its branch"
+    );
     assert!(fixture.store.flush(Duration::from_secs(5)));
     assert!(
         fixture
@@ -3141,11 +3089,9 @@ fn cancelling_during_a_rift_hook_stops_it_and_removes_the_copy() {
 }
 
 #[test]
-fn a_copy_finished_after_cancelling_is_removed_instead_of_used() {
+fn a_worktree_finished_after_cancelling_is_removed_instead_of_used() {
     let fixture = Fixture::new();
-    let Some(tools) = fixture.rift_tools() else {
-        return;
-    };
+    let tools = fixture.git_project();
     let (mut thread, job) = fixture.preparing("Never deliver");
     let copy = job.run(&tools, |_| {}).unwrap();
     thread.stop().unwrap();
@@ -3157,32 +3103,10 @@ fn a_copy_finished_after_cancelling_is_removed_instead_of_used() {
     assert!(fixture.spawns().is_empty());
 }
 
-fn init_thread_jj(fixture: &Fixture) -> Option<Tools> {
-    let mut tools = fixture.rift_tools()?;
-    tools.env.extend([
-        ("JJ_USER".to_string(), "Test".to_string()),
-        ("JJ_EMAIL".to_string(), "test@example.invalid".to_string()),
-    ]);
-    let output = std::process::Command::new(&tools.jj)
-        .args(["git", "init", "--colocate"])
-        .current_dir(&fixture.project.path)
-        .envs(tools.env.iter().map(|(key, value)| (key, value)))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Some(tools)
-}
-
 #[test]
 fn project_preparation_sends_the_held_message_once_and_snapshot_blocks_the_next_send() {
     let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
+    let tools = fixture.git_project();
     let mut thread = fixture.draft();
     let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
         panic!("prepare project");
@@ -3205,7 +3129,7 @@ fn project_preparation_sends_the_held_message_once_and_snapshot_blocks_the_next_
     let job = thread.take_snapshot_job().expect("snapshot");
     assert!(
         !thread.has_session(),
-        "the agent must stop before jj can snapshot"
+        "the agent must stop before git can snapshot"
     );
     assert!(thread.take_snapshot_job().is_none());
     thread.finish_snapshot(job.run(&tools));
@@ -3228,9 +3152,7 @@ fn project_preparation_sends_the_held_message_once_and_snapshot_blocks_the_next_
 #[test]
 fn try_again_waits_for_project_preparation_and_the_snapshot_job() {
     let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
+    let tools = fixture.git_project();
     let mut thread = fixture.draft();
     let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
         panic!("prepare project");
@@ -3261,9 +3183,7 @@ fn try_again_waits_for_project_preparation_and_the_snapshot_job() {
 #[test]
 fn archiving_project_preparation_invalidates_its_held_message() {
     let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
+    let tools = fixture.git_project();
     let mut thread = fixture.draft();
     let Sent::PreparingProject(job) = thread.send("Do not send after archive").unwrap() else {
         panic!("prepare project");
@@ -3275,79 +3195,59 @@ fn archiving_project_preparation_invalidates_its_held_message() {
 }
 
 #[test]
-fn a_new_thread_takes_the_projects_landing_mode_and_a_sent_thread_keeps_its_own() {
-    use newjen_core::landing::LandingMode;
+fn project_preparation_leaves_the_projects_branch_index_and_files_alone() {
     let fixture = Fixture::new();
-    assert_eq!(fixture.draft().landing_mode(), LandingMode::HarnessManaged);
+    let tools = fixture.git_project();
+    let project = &fixture.project.path;
+    std::fs::write(project.join("a.txt"), "edited\n").unwrap();
+    std::fs::write(project.join("staged.txt"), "staged\n").unwrap();
+    git(&tools, project, &["add", "staged.txt"]);
+    std::fs::write(project.join("loose.txt"), "loose\n").unwrap();
+    let head = git(&tools, project, &["rev-parse", "HEAD"]);
+    let status = git(
+        &tools,
+        project,
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
 
-    let mut agent = fixture.draft_in_mode(LandingMode::AgentManaged);
-    assert_eq!(agent.landing_mode(), LandingMode::AgentManaged);
-    agent.send("first").unwrap();
-    finish_turn(&mut agent);
-    let id = agent.id().to_string();
-
-    fixture
-        .store
-        .set_project_landing_mode(fixture.project.id, LandingMode::HarnessManaged);
-    assert!(fixture.store.flush(FLUSH));
-    assert_eq!(
-        fixture.store.landing_mode(fixture.project.id).unwrap(),
-        LandingMode::HarnessManaged
-    );
-    assert_eq!(agent.landing_mode(), LandingMode::AgentManaged);
-    assert!(
-        agent
-            .follow_project_landing_mode(LandingMode::HarnessManaged)
-            .is_err()
-    );
-    assert_eq!(
-        fixture.reload(&id).landing_mode(),
-        LandingMode::AgentManaged
-    );
-    assert_eq!(fixture.draft().landing_mode(), LandingMode::HarnessManaged);
-}
-
-#[test]
-fn agent_managed_project_prepares_a_baseline_but_does_not_schedule_turn_snapshots() {
-    let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
-    let before = newjen_core::landing::head(&tools, &fixture.project.path).unwrap();
-    let mut thread = fixture.draft_in_mode(newjen_core::landing::LandingMode::AgentManaged);
-    assert!(
-        thread
-            .session_config()
-            .args()
-            .iter()
-            .any(|arg| arg.contains("Use jj, not git"))
-    );
-    let Sent::PreparingProject(job) = thread.send("Manage changes yourself").unwrap() else {
+    let mut thread = fixture.draft();
+    let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
         panic!("prepare project");
     };
     let base = job.run(&tools).unwrap();
-    assert_eq!(base, before);
-    assert_ne!(
-        newjen_core::landing::head(&tools, &fixture.project.path).unwrap(),
-        before
-    );
-    thread.finish_project(Ok(base)).unwrap();
+    thread.finish_project(Ok(base.clone())).unwrap();
     finish_turn(&mut thread);
-    assert!(!thread.work_pending());
-    assert!(thread.take_snapshot_job().is_none());
-    assert!(
-        thread
-            .follow_project_landing_mode(newjen_core::landing::LandingMode::HarnessManaged)
-            .is_err()
+
+    assert_eq!(git(&tools, project, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git(
+            &tools,
+            project,
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
+        status
     );
+    assert_eq!(git(&tools, project, &["branch", "--list"]), "* main");
+    assert_ne!(base, head, "the base holds the uncommitted files too");
+    assert_eq!(
+        git(
+            &tools,
+            project,
+            &["rev-parse", &format!("refs/newjen/{}", thread.id())]
+        ),
+        base
+    );
+    assert_eq!(
+        git(&tools, project, &["show", &format!("{base}:loose.txt")]),
+        "loose"
+    );
+    assert_eq!(thread.review_base(), Some(base.as_str()));
 }
 
 #[test]
 fn a_snapshot_failure_keeps_the_next_message_blocked_until_explicit_retry() {
     let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
+    let tools = fixture.git_project();
     let mut thread = fixture.draft();
     let Sent::PreparingProject(job) = thread.send("Keep my work").unwrap() else {
         panic!("prepare project");
@@ -3367,11 +3267,9 @@ fn a_snapshot_failure_keeps_the_next_message_blocked_until_explicit_retry() {
 }
 
 #[test]
-fn relaunch_requires_a_snapshot_before_sending_after_an_interrupted_jj_turn() {
+fn relaunch_requires_a_snapshot_before_sending_after_an_interrupted_turn() {
     let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
+    let tools = fixture.git_project();
     fixture.switch("hang_after_init", true);
     let mut thread = fixture.draft();
     let Sent::PreparingProject(job) = thread.send("Save interrupted files").unwrap() else {
@@ -3407,9 +3305,7 @@ fn a_legacy_project_thread_prepares_its_next_turn_without_changing_its_title_or_
     thread.send("Original title").unwrap();
     finish_turn(&mut thread);
     let id = thread.session_id().to_string();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
+    let tools = fixture.git_project();
     let Sent::PreparingProject(job) = thread.send("Follow up").unwrap() else {
         panic!("prepare legacy project");
     };
@@ -3433,9 +3329,7 @@ fn a_legacy_project_thread_prepares_its_next_turn_without_changing_its_title_or_
 #[test]
 fn graceful_quit_keeps_the_snapshot_requirement_for_partial_work() {
     let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
+    let tools = fixture.git_project();
     fixture.switch("hang_after_init", true);
     let mut thread = fixture.draft();
     let Sent::PreparingProject(job) = thread.send("Keep partial work").unwrap() else {
@@ -3456,17 +3350,20 @@ fn graceful_quit_keeps_the_snapshot_requirement_for_partial_work() {
     let job = loaded.take_snapshot_job().unwrap();
     loaded.finish_snapshot(job.run(&tools));
     assert!(!loaded.work_pending());
-    let review =
-        newjen_core::landing::review(&tools, loaded.cwd(), loaded.review_base().unwrap()).unwrap();
+    let review = newjen_core::landing::review(
+        &tools,
+        loaded.cwd(),
+        loaded.id(),
+        loaded.review_base().unwrap(),
+    )
+    .unwrap();
     assert!(review.patch.contains("partial.txt"));
 }
 
 #[test]
 fn idle_background_tasks_can_be_stopped_to_finish_the_pending_snapshot() {
     let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
-    };
+    let tools = fixture.git_project();
     fixture.switch("background", true);
     let mut thread = fixture.draft();
     let Sent::PreparingProject(job) = thread.send("Start a dev server").unwrap() else {
@@ -3494,12 +3391,10 @@ fn idle_background_tasks_can_be_stopped_to_finish_the_pending_snapshot() {
 }
 
 #[test]
-fn closing_project_tracking_after_user_jj_changes_keeps_files_and_history() {
+fn closing_project_tracking_after_the_users_own_git_changes_keeps_files_and_history() {
     for move_away in [false, true] {
         let fixture = Fixture::new();
-        let Some(tools) = init_thread_jj(&fixture) else {
-            return;
-        };
+        let tools = fixture.git_project();
         std::fs::write(fixture.project.path.join("owner.txt"), "owner work\n").unwrap();
         let mut thread = fixture.draft();
         let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
@@ -3512,36 +3407,20 @@ fn closing_project_tracking_after_user_jj_changes_keeps_files_and_history() {
         let job = thread.take_snapshot_job().unwrap();
         assert!(!thread.can_release_project_tracking());
         thread.finish_snapshot(job.run(&tools));
-        let run = |args: &[&str]| {
-            let output = std::process::Command::new(&tools.jj)
-                .args(args)
-                .current_dir(&fixture.project.path)
-                .envs(tools.env.iter().cloned())
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap()
-        };
+        let run = |args: &[&str]| git(&tools, &fixture.project.path, args);
         if move_away {
-            run(&["new", "root()"]);
+            run(&["switch", "--quiet", "--create", "elsewhere"]);
         } else {
             std::fs::write(fixture.project.path.join("agent.txt"), "my tweak\n").unwrap();
-            run(&["commit", "-m", "My own commit"]);
+            run(&["add", "agent.txt"]);
+            run(&["commit", "--quiet", "-m", "My own commit"]);
         }
-        let operation = run(&[
-            "op",
-            "log",
-            "--ignore-working-copy",
-            "--no-graph",
-            "-n",
-            "1",
-            "-T",
-            "id",
+        let history = run(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
         ]);
+        let head = run(&["rev-parse", "HEAD"]);
         let files = ["owner.txt", "agent.txt"]
             .map(|file| std::fs::read(fixture.project.path.join(file)).ok());
         assert!(thread.can_release_project_tracking());
@@ -3556,17 +3435,13 @@ fn closing_project_tracking_after_user_jj_changes_keeps_files_and_history() {
         );
         assert_eq!(
             run(&[
-                "op",
-                "log",
-                "--ignore-working-copy",
-                "--no-graph",
-                "-n",
-                "1",
-                "-T",
-                "id"
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads"
             ]),
-            operation
+            history
         );
+        assert_eq!(run(&["rev-parse", "HEAD"]), head);
         assert!(fixture.store.flush(FLUSH));
         let row = fixture.store.thread(thread.id()).unwrap().unwrap();
         assert!(row.archived_at.is_some());
@@ -3578,7 +3453,7 @@ fn closing_project_tracking_after_user_jj_changes_keeps_files_and_history() {
 }
 
 #[test]
-fn landing_instructions_are_sent_only_where_landing_is_available() {
+fn landing_instructions_are_sent_only_inside_a_git_repository() {
     let fixture = Fixture::new();
     let mut thread = fixture.draft();
     let told = |thread: &Thread| {
@@ -3589,20 +3464,6 @@ fn landing_instructions_are_sent_only_where_landing_is_available() {
         None,
         "a plain folder is never snapshotted, so claude must not be told it is"
     );
-    std::fs::create_dir(fixture.project.path.join(".git")).unwrap();
-    assert_eq!(
-        told(&thread),
-        None,
-        "a git-only folder is never snapshotted"
-    );
-    thread
-        .follow_project_landing_mode(newjen_core::landing::LandingMode::AgentManaged)
-        .unwrap();
-    assert_eq!(told(&thread), None);
-    thread
-        .follow_project_landing_mode(newjen_core::landing::LandingMode::HarnessManaged)
-        .unwrap();
-    std::fs::remove_dir(fixture.project.path.join(".git")).unwrap();
     thread.send("hello").unwrap();
     finish_turn(&mut thread);
     assert!(
@@ -3615,29 +3476,33 @@ fn landing_instructions_are_sent_only_where_landing_is_available() {
     assert!(!thread.work_pending());
 
     let other = Fixture::new();
-    let Some(_tools) = init_thread_jj(&other) else {
-        return;
-    };
-    let colocated = other.draft();
-    let instructions = told(&colocated).expect("a colocated jj repo gets the instructions");
+    other.git_project();
+    let instructions = told(&other.draft()).expect("a git repository gets the instructions");
+    assert_eq!(instructions, newjen_core::landing::instructions());
     assert!(instructions.contains("Newjen snapshots the folder after each turn"));
 }
 
 #[test]
-fn agent_managed_threads_are_told_to_record_and_bookmark_their_work_with_jj() {
-    let fixture = Fixture::new();
-    let Some(tools) = init_thread_jj(&fixture) else {
-        return;
+fn a_worktree_thread_is_told_how_its_work_is_recorded_and_a_legacy_copy_is_not() {
+    let told = |thread: &Thread| {
+        flag(&thread.session_config().args(), "--append-system-prompt").map(str::to_string)
     };
-    let mut thread = fixture.draft_in_mode(newjen_core::landing::LandingMode::AgentManaged);
-    let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
-        panic!("prepare");
-    };
-    thread.finish_project(job.run(&tools)).unwrap();
-    finish_turn(&mut thread);
-    let spawns = fixture.spawns();
-    let instructions = flag(spawns.last().unwrap(), "--append-system-prompt").unwrap();
-    assert!(instructions.contains("Use jj, not git"));
-    assert!(instructions.contains("bookmark covering all your work"));
-    assert!(!thread.work_pending());
+    for legacy in [false, true] {
+        let fixture = Fixture::new();
+        let mut copy = fixture.fake_copy();
+        std::fs::create_dir(copy.path.join(".git")).unwrap();
+        if legacy {
+            copy.branch.clear();
+            copy.base.clear();
+        }
+        let (mut thread, _job) = fixture.preparing("hello");
+        thread.finish_copy(Ok(copy)).unwrap();
+        finish_turn(&mut thread);
+        let expected = (!legacy).then_some(newjen_core::landing::instructions());
+        assert_eq!(told(&thread).as_deref(), expected);
+        assert_eq!(
+            flag(fixture.spawns().last().unwrap(), "--append-system-prompt"),
+            expected
+        );
+    }
 }

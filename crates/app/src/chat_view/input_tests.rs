@@ -10,13 +10,14 @@ fn setup<'a>(
     setup_in(cx, name, with_approvals, None)
 }
 
-/// `rift` is a script that runs `create` as `rift_create` says (see `fake_rift`), and the
-/// project is `<path>/project`, so its copies go to `<path>/.rifts/project/`.
+/// With a `checkout_hook`, the project is the git repository `<path>/project` with one commit,
+/// whose `post-checkout` hook is that script (see `install_hook`), so its worktrees go to
+/// `<path>/.newjen-worktrees/project/`. Without one it is the plain folder `<path>`.
 fn setup_in<'a>(
     cx: &'a mut TestAppContext,
     name: &str,
     with_approvals: bool,
-    rift_create: Option<&str>,
+    checkout_hook: Option<&str>,
 ) -> (Entity<ChatView>, PathBuf, &'a mut VisualTestContext) {
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -30,14 +31,24 @@ fn setup_in<'a>(
     ));
     let store = Store::open_in(&path).unwrap();
     let mut tools = Tools::find();
-    let project_dir = match rift_create {
-        Some(create) => {
-            // The copy job runs rift on threads of its own.
+    let project_dir = match checkout_hook {
+        Some(hook) => {
+            // The worktree job runs git on threads of its own.
             cx.executor().allow_parking();
-            tools.rift = fake_rift(&path, create);
+            tools = git_tools(&path);
             let project = path.join("project");
             std::fs::create_dir_all(&project).unwrap();
-            project.canonicalize().unwrap()
+            let project = project.canonicalize().unwrap();
+            git(
+                &tools,
+                &project,
+                &["init", "--quiet", "--initial-branch=main"],
+            );
+            std::fs::write(project.join("a.txt"), "a\n").unwrap();
+            git(&tools, &project, &["add", "--all"]);
+            git(&tools, &project, &["commit", "--quiet", "-m", "base"]);
+            install_hook(&project, hook);
+            project
         }
         None => path.clone(),
     };
@@ -124,43 +135,59 @@ fn early_approval_keys_back_off_from_the_latest_press(cx: &mut TestAppContext) {
     std::fs::remove_dir_all(path).unwrap();
 }
 
-/// What the fake `rift create` does: make the copy after printing two lines.
+/// A checkout hook that prints two lines, as a project's setup might.
 const CREATE_COPY: &str = r#"echo "copying files" >&2
-    echo "postcreate: npm install" >&2
-    mkdir -p "$into/$name" && printf 'copy01\n' > "$into/$name/.rift""#;
-/// A `rift create` whose postcreate hook fails.
+echo "postcreate: npm install" >&2"#;
+/// A checkout hook that fails, which fails `git worktree add`.
 const FAIL_HOOK: &str = r#"echo "npm ERR! code ERESOLVE" >&2
-    echo "postcreate hook failed (exit 1)" >&2
-    exit 1"#;
+echo "postcreate hook failed (exit 1)" >&2
+exit 1"#;
 
-/// A stand-in for `rift`: `init` marks the root, `create` runs `create`, and `remove` moves the
-/// copy into the `.trash` folder beside it, as Rift does.
-fn fake_rift(path: &Path, create: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let program = path.join("rift-test");
-    std::fs::write(
-        &program,
-        format!(
-            r#"#!/bin/sh
-case "$1" in
-  init) printf 'root01
-' > "$2/.rift" ;;
-  create)
-    while [ $# -gt 1 ]; do
-      case "$1" in --name) name=$2; shift ;; --into) into=$2; shift ;; esac
-      shift
-    done
-    {create} ;;
-  remove)
-    trash="$(dirname "$2")/.trash"
-    mkdir -p "$trash" && mv "$2" "$trash/$(cat "$2/.rift")-$(basename "$2")" ;;
-esac
-"#
+/// The installed `git` with a `HOME` and an identity of its own, so no configuration of the
+/// machine reaches the tests.
+fn git_tools(path: &Path) -> Tools {
+    let home = path.join("git-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut tools = Tools::find();
+    tools.env = vec![
+        ("HOME".to_string(), home.display().to_string()),
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_AUTHOR_NAME".to_string(), "Test".to_string()),
+        (
+            "GIT_AUTHOR_EMAIL".to_string(),
+            "test@example.invalid".to_string(),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    program
+        ("GIT_COMMITTER_NAME".to_string(), "Test".to_string()),
+        (
+            "GIT_COMMITTER_EMAIL".to_string(),
+            "test@example.invalid".to_string(),
+        ),
+    ];
+    tools
+}
+
+fn git(tools: &Tools, cwd: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new(&tools.git)
+        .args(args)
+        .current_dir(cwd)
+        .envs(tools.env.iter().cloned())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// Sets the project's `post-checkout` hook, which `git worktree add` runs in the new worktree.
+fn install_hook(project: &Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let hook = project.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 pub(crate) fn script(path: &Path) -> PathBuf {
@@ -534,9 +561,9 @@ fn composer_focused(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> bool
     cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window))
 }
 
-/// Clicks the composer's Local (0) or Rift copy (1) segment.
+/// Clicks the composer's Local (0) or worktree (1) segment.
 fn choose(nth: usize, cx: &mut VisualTestContext) {
-    click(cx, ["works-in-local", "works-in-rift"][nth]);
+    click(cx, ["works-in-local", "works-in-worktree"][nth]);
 }
 
 #[gpui::test]
@@ -570,7 +597,7 @@ async fn the_new_thread_screen_centres_the_composer_and_a_working_thread_offers_
         "{composer:?}"
     );
     assert!(cx.debug_bounds("works-in-local").is_some());
-    assert!(cx.debug_bounds("works-in-rift").is_some());
+    assert!(cx.debug_bounds("works-in-worktree").is_some());
     assert!(cx.debug_bounds("agent-picker").is_some());
     assert!(cx.debug_bounds("effort-picker").is_some());
     cx.simulate_input("do a thing");
@@ -584,14 +611,14 @@ async fn the_new_thread_screen_centres_the_composer_and_a_working_thread_offers_
 }
 
 #[gpui::test]
-fn the_works_in_control_chooses_a_rift_copy_and_hands_the_keys_back(cx: &mut TestAppContext) {
+fn the_works_in_control_chooses_a_worktree_and_hands_the_keys_back(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup_in(cx, "picker", false, Some(CREATE_COPY));
     cx.simulate_input("half typed");
     assert!(cx.debug_bounds("works-in").is_some());
     assert_eq!(works_in(&chat, cx), WorksIn::ProjectFolder);
 
     choose(1, cx);
-    assert_eq!(works_in(&chat, cx), WorksIn::RiftCopy);
+    assert_eq!(works_in(&chat, cx), WorksIn::Worktree);
     assert!(composer_focused(&chat, cx));
     cx.simulate_input(", still typing");
     assert_eq!(
@@ -604,8 +631,8 @@ fn the_works_in_control_chooses_a_rift_copy_and_hands_the_keys_back(cx: &mut Tes
 }
 
 #[gpui::test]
-async fn a_rift_draft_sends_its_first_message_from_its_new_copy(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup_in(cx, "rift-send", true, Some(CREATE_COPY));
+async fn a_worktree_draft_sends_its_first_message_from_its_new_worktree(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "worktree-send", true, Some(CREATE_COPY));
     choose(1, cx);
     cx.simulate_input("two approvals");
     cx.simulate_keystrokes("enter");
@@ -619,21 +646,25 @@ async fn a_rift_draft_sends_its_first_message_from_its_new_copy(cx: &mut TestApp
             thread.is_draft(),
         )
     });
-    let copy = copy.expect("the thread works in its copy");
-    let rifts = path.canonicalize().unwrap().join(".rifts/project");
-    assert!(copy.path.starts_with(rifts), "{copy:?}");
+    let copy = copy.expect("the thread works in its worktree");
+    let worktrees = path
+        .canonicalize()
+        .unwrap()
+        .join(".newjen-worktrees/project");
+    assert!(copy.path.starts_with(worktrees), "{copy:?}");
+    assert!(copy.branch.starts_with("newjen/"), "{copy:?}");
     assert_eq!(cwd, copy.workdir);
     assert!(!draft);
     assert!(matches!(first, Some(Item::User { text, .. }) if text == "two approvals"));
     assert_eq!(cx.update(|_, cx| chat.read(cx).composer_text(0, cx)), "");
-    assert!(cx.debug_bounds("rift-copy-tag").is_some());
+    assert!(cx.debug_bounds("worktree-tag").is_some());
     assert!(cx.debug_bounds("works-in").is_none());
     finish(&chat, path, cx);
 }
 
 #[gpui::test]
-async fn a_failed_copy_puts_the_message_back_and_try_again_sends_it(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup_in(cx, "rift-fail", true, Some(FAIL_HOOK));
+async fn a_failed_worktree_puts_the_message_back_and_try_again_sends_it(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "worktree-fail", true, Some(FAIL_HOOK));
     choose(1, cx);
     cx.simulate_input("add a benchmark");
     cx.simulate_keystrokes("enter");
@@ -651,20 +682,26 @@ async fn a_failed_copy_puts_the_message_back_and_try_again_sends_it(cx: &mut Tes
         (notice.detail.clone(), output.clone())
     });
     assert_eq!(detail, "postcreate hook failed (exit 1)");
-    assert_eq!(output, ["npm ERR! code ERESOLVE"]);
+    assert_eq!(
+        output.last().map(String::as_str),
+        Some("npm ERR! code ERESOLVE")
+    );
+    assert!(
+        !path
+            .join(".newjen-worktrees/project")
+            .read_dir()
+            .is_ok_and(|mut left| left.next().is_some()),
+        "the half-made worktree is removed"
+    );
     assert_eq!(
         cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
         "add a benchmark"
     );
     assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
-    assert_eq!(works_in(&chat, cx), WorksIn::RiftCopy);
+    assert_eq!(works_in(&chat, cx), WorksIn::Worktree);
     assert!(composer_focused(&chat, cx));
 
-    cx.update(|_, cx| {
-        chat.update(cx, |view, _| {
-            view.tools.rift = fake_rift(&path, CREATE_COPY);
-        })
-    });
+    install_hook(&path.join("project"), CREATE_COPY);
     cx.run_until_parked();
     click(cx, "retry");
     cx.condition(&chat, |view, cx| view.thread().read(cx).copy().is_some())
@@ -675,41 +712,37 @@ async fn a_failed_copy_puts_the_message_back_and_try_again_sends_it(cx: &mut Tes
 }
 
 #[gpui::test]
-async fn a_copy_waits_while_another_thread_works_in_the_project_folder(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup_in(cx, "rift-refused", true, Some(CREATE_COPY));
+async fn a_worktree_is_made_while_another_thread_works_in_the_project_folder(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup_in(cx, "worktree-beside-busy", true, Some(CREATE_COPY));
     cx.simulate_input("two approvals");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).owns_project_work()));
     cx.simulate_keystrokes("cmd-n");
     choose(1, cx);
     cx.simulate_input("rename the keys");
     cx.simulate_keystrokes("enter");
-    assert_eq!(
-        notice_title(&chat, cx).as_deref(),
-        Some("Another thread is working in the project folder")
+    cx.condition(&chat, |view, cx| view.thread().read(cx).copy().is_some())
+        .await;
+    assert_eq!(notice_title(&chat, cx), None);
+    assert_eq!(cx.update(|_, cx| chat.read(cx).composer_text(1, cx)), "");
+    assert!(
+        path.join(".newjen-worktrees/project").is_dir(),
+        "the busy project folder did not hold it back"
     );
-    let (preparing, text) = cx.update(|_, cx| {
-        let view = chat.read(cx);
-        (
-            view.thread().read(cx).preparing().is_some(),
-            view.composer_text(view.active, cx),
-        )
-    });
-    assert!(!preparing);
-    assert_eq!(text, "rename the keys");
-    assert!(!path.join(".rifts").exists());
     finish(&chat, path, cx);
 }
 
 #[gpui::test]
-fn choosing_a_rift_copy_without_rift_says_how_to_install_it(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup(cx, "rift-missing", false);
-    cx.update(|_, cx| chat.update(cx, |view, _| view.tools.rift = PathBuf::from("rift")));
+fn choosing_a_worktree_outside_a_git_repository_says_what_it_needs(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "worktree-no-git", false);
     choose(1, cx);
-    assert_eq!(works_in(&chat, cx), WorksIn::RiftCopy);
+    assert_eq!(works_in(&chat, cx), WorksIn::Worktree);
     assert_eq!(
         notice_title(&chat, cx).as_deref(),
-        Some("Rift isn't installed")
+        Some("Worktrees need a git repository")
     );
     cx.simulate_input("go");
     cx.simulate_keystrokes("enter");
@@ -726,7 +759,7 @@ fn while_its_copy_is_made_the_thread_shows_it_and_cannot_be_archived(cx: &mut Te
     let thread = cx.update(|_, cx| chat.read(cx).thread().clone());
     let job = cx.update(|_, cx| {
         thread.update(cx, |thread, cx| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            thread.set_works_in(WorksIn::Worktree).unwrap();
             let sent = thread.send("fix the parser");
             cx.notify();
             match sent {
@@ -737,7 +770,7 @@ fn while_its_copy_is_made_the_thread_shows_it_and_cannot_be_archived(cx: &mut Te
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("making-copy").is_some());
-    assert!(cx.debug_bounds("rift-copy-tag").is_some());
+    assert!(cx.debug_bounds("worktree-tag").is_some());
     assert!(cx.debug_bounds("works-in").is_none());
     assert!(cx.update(|window, cx| chat.read(cx).root.is_focused(window)));
     let look =
@@ -841,7 +874,7 @@ fn the_copy_card_has_a_cancel_that_stops_the_copy(cx: &mut TestAppContext) {
     let thread = cx.update(|_, cx| chat.read(cx).thread().clone());
     let job = cx.update(|_, cx| {
         thread.update(cx, |thread, cx| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            thread.set_works_in(WorksIn::Worktree).unwrap();
             let sent = thread.send("fix the parser");
             cx.notify();
             match sent {
@@ -875,7 +908,7 @@ fn a_failed_copy_notice_hides_its_log_until_asked(cx: &mut TestAppContext) {
     let thread = cx.update(|_, cx| chat.read(cx).thread().clone());
     let job = cx.update(|_, cx| {
         thread.update(cx, |thread, _| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            thread.set_works_in(WorksIn::Worktree).unwrap();
             match thread.send("fix the parser") {
                 Ok(Sent::MakingCopy(job)) => job,
                 other => panic!("expected a copy job, got {other:?}"),
@@ -884,7 +917,7 @@ fn a_failed_copy_notice_hides_its_log_until_asked(cx: &mut TestAppContext) {
     });
     drop(job);
     let failed = CopyError::Failed {
-        command: "rift create".to_string(),
+        command: "git worktree add".to_string(),
         detail: "postcreate hook failed (exit 1)".to_string(),
         output: vec!["npm ERR! code ERESOLVE".to_string()],
     };
@@ -912,7 +945,7 @@ fn a_failed_copy_names_what_failed(cx: &mut TestAppContext) {
     let thread = cx.update(|_, cx| chat.read(cx).thread().clone());
     let job = cx.update(|_, cx| {
         thread.update(cx, |thread, cx| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            thread.set_works_in(WorksIn::Worktree).unwrap();
             let sent = thread.send("fix the parser");
             cx.notify();
             match sent {
@@ -923,7 +956,7 @@ fn a_failed_copy_names_what_failed(cx: &mut TestAppContext) {
     });
     drop(job);
     let failed = CopyError::Failed {
-        command: "rift create".to_string(),
+        command: "git worktree add".to_string(),
         detail: "postcreate hook failed (exit 1)".to_string(),
         output: vec!["postcreate hook failed (exit 1)".to_string()],
     };
@@ -940,6 +973,17 @@ fn a_failed_copy_names_what_failed(cx: &mut TestAppContext) {
     assert_eq!(notice_title(&chat, cx).as_deref(), Some(COPY_FAILED));
     assert!(composer_focused(&chat, cx));
     finish(&chat, path, cx);
+}
+
+/// The thread on screen has had its work landed or discarded, so archiving it only has its
+/// worktree left to delete.
+fn finish_landing(chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
+    cx.update(|_, cx| {
+        chat.read(cx)
+            .thread()
+            .clone()
+            .update(cx, |thread, _| thread.finish_landing())
+    });
 }
 
 /// Right click on the thread on screen's row, then "Archive thread".
@@ -964,8 +1008,8 @@ fn archive_from_menu(cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
-async fn archiving_a_rift_thread_asks_then_deletes_its_copy(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup_in(cx, "rift-archive", true, Some(CREATE_COPY));
+async fn archiving_a_worktree_thread_asks_then_deletes_its_worktree(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "worktree-archive", true, Some(CREATE_COPY));
     choose(1, cx);
     cx.simulate_input("two approvals");
     cx.simulate_keystrokes("enter");
@@ -973,6 +1017,19 @@ async fn archiving_a_rift_thread_asks_then_deletes_its_copy(cx: &mut TestAppCont
     let copy = cx
         .update(|_, cx| chat.read(cx).thread().read(cx).copy().cloned())
         .unwrap();
+
+    archive_from_menu(cx);
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "work that is not landed or discarded is reviewed before anything is deleted"
+    );
+    assert_eq!(
+        notice_title(&chat, cx).as_deref(),
+        Some("Wait for the thread"),
+        "it goes to the review, which waits for the running turn"
+    );
+    assert!(copy.path.exists());
+    finish_landing(&chat, cx);
 
     archive_from_menu(cx);
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
@@ -1022,12 +1079,12 @@ async fn a_project_folder_thread_archives_without_asking(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn project_send_must_wait_for_preparing_copy(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup(cx, "review-reverse-exclusion", true);
+fn a_project_folder_send_does_not_wait_for_a_worktree_being_made(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "send-beside-worktree", true);
     let copying = cx.update(|_, cx| chat.read(cx).thread().clone());
     let job = cx.update(|_, cx| {
         copying.update(cx, |thread, cx| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            thread.set_works_in(WorksIn::Worktree).unwrap();
             let sent = thread.send("copy work").unwrap();
             cx.notify();
             match sent {
@@ -1042,61 +1099,26 @@ fn project_send_must_wait_for_preparing_copy(cx: &mut TestAppContext) {
     let accepted = cx.update(|window, cx| {
         chat.update(cx, |view, cx| view.send_text("edit project", window, cx))
     });
-    let preparing = cx.update(|_, cx| copying.read(cx).preparing().is_some());
-    let busy = cx.update(|_, cx| chat.read(cx).thread().read(cx).status().is_busy());
-    println!(
-        "copy preparing: {preparing}; project send accepted: {accepted}; project agent busy: {busy}"
-    );
+    assert!(cx.update(|_, cx| copying.read(cx).preparing().is_some()));
     assert!(
-        !accepted,
-        "project send must wait until the snapshot is done"
+        accepted,
+        "making a worktree reads only committed history, so the project folder is free"
     );
-    assert!(!busy);
-    assert_eq!(
-        cx.update(|_, cx| chat.read(cx).composer_text(chat.read(cx).active, cx)),
-        "edit project"
-    );
-    assert_eq!(
-        cx.update(|_, cx| chat.read(cx).slots[chat.read(cx).active]
-            .notice
-            .as_ref()
-            .unwrap()
-            .detail
-            .clone()),
-        "Newjen is taking a jj snapshot of the project to make the Rift copy for “copy work”."
-    );
-    cx.update(|_, cx| {
-        copying.update(cx, |thread, _| {
-            thread.note_copy_progress(rift::Progress::Line("still preparing".to_string()))
-        })
-    });
-    assert!(cx.update(|_, cx| copying.read(cx).blocks_project_send()));
-    cx.update(|_, cx| {
-        copying.update(cx, |thread, _| {
-            thread.note_copy_progress(rift::Progress::MainRepoReady)
-        })
-    });
-    assert!(!cx.update(|_, cx| copying.read(cx).blocks_project_send()));
-    assert!(
-        cx.update(|window, cx| chat.update(cx, |view, cx| view.send_text(
-            "edit project",
-            window,
-            cx
-        )))
-    );
+    assert_eq!(notice_title(&chat, cx), None);
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).status().is_busy()));
     drop(job);
     finish(&chat, path, cx);
 }
 
 #[gpui::test]
-async fn startup_restores_a_pending_copy_message_to_a_rift_draft(cx: &mut TestAppContext) {
+async fn startup_restores_a_pending_copy_message_to_a_worktree_draft(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup_in(cx, "recover-copy", true, Some(CREATE_COPY));
     let (job, tools) = cx.update(|_, cx| {
         let view = chat.read(cx);
         let tools = view.tools.clone();
         let thread = view.thread().clone();
         let job = thread.update(cx, |thread, _| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            thread.set_works_in(WorksIn::Worktree).unwrap();
             let Sent::MakingCopy(job) = thread.send("my first message").unwrap() else {
                 panic!()
             };
@@ -1132,13 +1154,13 @@ async fn startup_restores_a_pending_copy_message_to_a_rift_draft(cx: &mut TestAp
         let view = recovered.read(cx);
         assert_eq!(view.slots.len(), 1);
         assert_eq!(view.composer_text(0, cx), "my first message");
-        assert_eq!(view.thread().read(cx).works_in(), WorksIn::RiftCopy);
+        assert_eq!(view.thread().read(cx).works_in(), WorksIn::Worktree);
         assert!(view.thread().read(cx).is_draft());
         assert!(!view.thread().read(cx).has_session());
         assert!(view.thread().read(cx).transcript().items().is_empty());
         assert_eq!(
             view.slots[0].notice.as_ref().unwrap().title,
-            "Newjen quit while making a Rift copy. Your message is back."
+            "Newjen quit while making a worktree. Your message is back."
         );
     });
     assert!(!copy.path.exists());
@@ -1153,7 +1175,7 @@ async fn a_copy_completion_after_archive_is_removed_by_the_app(cx: &mut TestAppC
         let thread = view.thread().clone();
         let tools = view.tools.clone();
         let job = thread.update(cx, |thread, _| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            thread.set_works_in(WorksIn::Worktree).unwrap();
             let Sent::MakingCopy(job) = thread.send("don't send after archive").unwrap() else {
                 panic!()
             };
@@ -1184,58 +1206,6 @@ async fn a_copy_completion_after_archive_is_removed_by_the_app(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn the_snapshot_notice_clears_when_the_guard_releases(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup(cx, "snapshot-release", true);
-    let copying = cx.update(|_, cx| chat.read(cx).thread().clone());
-    let job = cx.update(|_, cx| {
-        copying.update(cx, |thread, cx| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
-            let Sent::MakingCopy(job) = thread.send("copy work").unwrap() else {
-                panic!()
-            };
-            cx.notify();
-            job
-        })
-    });
-    cx.run_until_parked();
-    cx.simulate_keystrokes("cmd-n");
-    cx.simulate_input("edit project");
-    cx.simulate_keystrokes("enter");
-    assert_eq!(notice_title(&chat, cx).as_deref(), Some("Wait a moment"));
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("chat-notice").is_some());
-    assert_eq!(
-        cx.update(|_, cx| chat.read(cx).slots[chat.read(cx).active]
-            .messages
-            .read(cx)
-            .item_count()),
-        1
-    );
-    cx.update(|_, cx| {
-        copying.update(cx, |thread, cx| {
-            thread.note_copy_progress(rift::Progress::MainRepoReady);
-            cx.notify();
-        })
-    });
-    cx.run_until_parked();
-    assert!(!cx.update(|_, cx| copying.read(cx).blocks_project_send()));
-    assert_eq!(notice_title(&chat, cx), None);
-    assert!(
-        cx.debug_bounds("chat-notice").is_none(),
-        "the cleared notice is still drawn"
-    );
-    assert_eq!(
-        cx.update(|_, cx| chat.read(cx).slots[chat.read(cx).active]
-            .messages
-            .read(cx)
-            .item_count()),
-        0
-    );
-    drop(job);
-    finish(&chat, path, cx);
-}
-
-#[gpui::test]
 async fn an_emptied_recovered_draft_is_discarded_on_quit(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup_in(cx, "recover-twice", true, Some(CREATE_COPY));
     let (job, tools) = cx.update(|_, cx| {
@@ -1243,7 +1213,7 @@ async fn an_emptied_recovered_draft_is_discarded_on_quit(cx: &mut TestAppContext
         let tools = view.tools.clone();
         let thread = view.thread().clone();
         let job = thread.update(cx, |thread, _| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
+            thread.set_works_in(WorksIn::Worktree).unwrap();
             let Sent::MakingCopy(job) = thread.send("my first message").unwrap() else {
                 panic!()
             };
@@ -1492,97 +1462,36 @@ async fn hidden_project_events_keep_the_other_projects_focus_and_unread(cx: &mut
 }
 
 #[gpui::test]
-async fn a_busy_project_in_the_same_repository_blocks_a_peers_copy(cx: &mut TestAppContext) {
-    let (busy, path, cx) = setup(cx, "copy-peer", true);
-    std::fs::create_dir_all(path.join(".git")).unwrap();
-    let sibling = path.join("subproject");
-    std::fs::create_dir_all(&sibling).unwrap();
-    let peer = cx.update(|window, cx| {
-        let store = busy.read(cx).store.clone();
-        let project = store.open_project(&sibling).unwrap();
-        let startup = Startup {
-            store,
-            project,
-            base_config: SessionConfig::new(&sibling),
-            threads: vec![],
-            problem: None,
-            home: None,
-            tools: Tools {
-                rift: PathBuf::from("/bin/rift"),
-                jj: PathBuf::from("/bin/jj"),
-                env: vec![],
-            },
-        };
-        let peer = cx.new(|cx| ChatView::new(startup, window, cx));
+async fn a_busy_project_in_the_same_repository_does_not_hold_back_a_peers_worktree(
+    cx: &mut TestAppContext,
+) {
+    let (busy, path, cx) = setup_in(cx, "worktree-peer", true, Some(CREATE_COPY));
+    let base = path.canonicalize().unwrap();
+    let peer = peer_project("project/subproject", false, vec![&busy], &base, cx);
+    cx.update(|_, cx| {
         peer.update(cx, |view, cx| {
-            view.set_copy_peers(vec![busy.downgrade()]);
             view.thread().clone().update(cx, |thread, _| {
-                thread.set_works_in(WorksIn::RiftCopy).unwrap()
+                thread.set_works_in(WorksIn::Worktree).unwrap()
             });
-            view.set_visible(false, window, cx);
-        });
-        busy.update(cx, |view, cx| view.set_visible(true, window, cx));
-        peer
+            view.set_copy_peers(vec![busy.downgrade()]);
+        })
     });
     cx.simulate_input("work in the repository");
     cx.simulate_keystrokes("enter");
     pending(&busy, cx).await;
+    assert!(cx.update(|_, cx| busy.read(cx).thread().read(cx).status().is_busy()));
     assert!(cx.update(|_, cx| {
         peer.read(cx)
             .copy_hold(peer.read(cx).thread(), cx)
-            .is_some()
-    }));
-    std::fs::remove_dir_all(path.join(".git")).unwrap();
-    assert!(cx.update(|_, cx| {
-        peer.read(cx)
-            .copy_hold(peer.read(cx).thread(), cx)
-            .is_some()
-    }));
-    let unrelated_path = path.with_extension("unrelated");
-    std::fs::create_dir_all(&unrelated_path).unwrap();
-    let unrelated = cx.update(|window, cx| {
-        let store = busy.read(cx).store.clone();
-        let project = store.open_project(&unrelated_path).unwrap();
-        let tools = peer.read(cx).tools.clone();
-        let unrelated = cx.new(|cx| {
-            ChatView::new(
-                Startup {
-                    store,
-                    project,
-                    base_config: SessionConfig::new(&unrelated_path),
-                    threads: vec![],
-                    problem: None,
-                    home: None,
-                    tools,
-                },
-                window,
-                cx,
-            )
-        });
-        unrelated.update(cx, |view, cx| {
-            view.set_copy_peers(vec![busy.downgrade()]);
-            view.thread().clone().update(cx, |thread, _| {
-                thread.set_works_in(WorksIn::RiftCopy).unwrap();
-            });
-        });
-        unrelated
-    });
-    assert!(cx.update(|_, cx| {
-        unrelated
-            .read(cx)
-            .copy_hold(unrelated.read(cx).thread(), cx)
             .is_none()
     }));
-    cx.update(|_, cx| unrelated.update(cx, |view, cx| view.quit(cx)))
-        .unwrap();
     cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
         .unwrap();
     finish(&busy, path, cx);
-    std::fs::remove_dir_all(unrelated_path).unwrap();
 }
 
 #[gpui::test]
-fn a_project_folder_send_waits_for_an_overlapping_copy_job(cx: &mut TestAppContext) {
+fn a_project_folder_send_does_not_wait_for_an_overlapping_worktree_job(cx: &mut TestAppContext) {
     let (copying, path, cx) = setup(cx, "review-copy-first", true);
     let child = path.join("child");
     std::fs::create_dir_all(&child).unwrap();
@@ -1608,10 +1517,10 @@ fn a_project_folder_send_waits_for_an_overlapping_copy_job(cx: &mut TestAppConte
         });
         copying.update(cx, |view, cx| view.set_visible(false, window, cx));
         let job = copying.read(cx).thread().clone().update(cx, |thread, _| {
-            thread.set_works_in(WorksIn::RiftCopy).unwrap();
-            match thread.send("create isolated copy").unwrap() {
+            thread.set_works_in(WorksIn::Worktree).unwrap();
+            match thread.send("create isolated worktree").unwrap() {
                 Sent::MakingCopy(job) => job,
-                _ => panic!("expected copy preparation"),
+                _ => panic!("expected worktree preparation"),
             }
         });
         peer.update(cx, |view, cx| {
@@ -1632,14 +1541,14 @@ fn a_project_folder_send_waits_for_an_overlapping_copy_job(cx: &mut TestAppConte
         (preparing, allowed, started)
     });
     assert!(preparing);
-    assert!(!allowed);
+    assert!(allowed);
     drop(job);
     cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
         .unwrap();
     finish(&copying, path, cx);
     assert!(
-        !started,
-        "source writer must wait for overlapping copy preparation"
+        started,
+        "a worktree being made does not hold the source folder back"
     );
 }
 
@@ -1651,6 +1560,7 @@ async fn switching_projects_cancels_the_archive_dialog(cx: &mut TestAppContext) 
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
     let id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    finish_landing(&chat, cx);
     cx.update(|window, cx| chat.update(cx, |view, cx| view.ask_to_archive(&id, window, cx)));
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     cx.run_until_parked();
@@ -1676,54 +1586,6 @@ async fn switching_projects_cancels_the_archive_dialog(cx: &mut TestAppContext) 
     finish(&chat, path, cx);
     assert!(!draft, "switching cancels the archive confirmation");
     assert!(kept_focus, "hidden archive completion must not take focus");
-}
-
-#[gpui::test]
-async fn a_busy_rift_folder_cannot_be_copied_as_another_project(cx: &mut TestAppContext) {
-    let (busy, path, cx) = setup_in(cx, "review-rift-peer", true, Some(CREATE_COPY));
-    choose(1, cx);
-    cx.simulate_input("two approvals");
-    cx.simulate_keystrokes("enter");
-    pending(&busy, cx).await;
-    let peer = cx.update(|window, cx| {
-        let view = busy.read(cx);
-        let thread = view.thread().read(cx);
-        assert!(thread.status().is_busy());
-        let cwd = thread.cwd().to_path_buf();
-        let store = view.store.clone();
-        let tools = view.tools.clone();
-        let project = store.open_project(&cwd).unwrap();
-        let startup = Startup {
-            store,
-            project,
-            base_config: SessionConfig::new(&cwd),
-            threads: vec![],
-            problem: None,
-            home: None,
-            tools,
-        };
-        let peer = cx.new(|cx| ChatView::new(startup, window, cx));
-        peer.update(cx, |view, cx| {
-            view.set_copy_peers(vec![busy.downgrade()]);
-            view.thread().clone().update(cx, |thread, _| {
-                thread.set_works_in(WorksIn::RiftCopy).unwrap();
-            });
-        });
-        peer
-    });
-    let blocked = cx.update(|_, cx| {
-        let view = peer.read(cx);
-        let running = busy.read(cx).thread().read(cx);
-        assert_eq!(rift::project_root(&view.project.path).0, running.cwd());
-        view.copy_hold(view.thread(), cx).is_some()
-    });
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
-        .unwrap();
-    finish(&busy, path, cx);
-    assert!(
-        blocked,
-        "must block copying a folder with a busy peer working in it"
-    );
 }
 
 fn open_copy_as_project(
@@ -1880,11 +1742,7 @@ fn peer_project(
         threads: vec![],
         problem: None,
         home: None,
-        tools: Tools {
-            rift: PathBuf::from("/bin/rift"),
-            jj: PathBuf::from("/bin/jj"),
-            env: vec![],
-        },
+        tools: Tools::find(),
     };
     cx.update(|window, cx| {
         let peer = cx.new(|cx| ChatView::new(startup, window, cx));
@@ -2055,41 +1913,25 @@ fn archiving_the_selected_terminal_returns_to_a_visible_conversation(cx: &mut Te
 #[gpui::test]
 fn a_terminal_keeps_its_draft_and_working_folder_until_closed(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "terminal-folder-retention", false);
-    cx.update(|_, cx| chat.update(cx, |view, _| view.tools.rift = PathBuf::from("/bin/rift")));
     cx.executor().allow_parking();
     cx.simulate_keystrokes("cmd-`");
     cx.update(|window, cx| {
         chat.update(cx, |view, cx| {
             view.toggle_terminal(window, cx);
-            view.choose_works_in(WorksIn::RiftCopy, window, cx);
+            view.choose_works_in(WorksIn::Worktree, window, cx);
             assert_eq!(view.thread().read(cx).works_in(), WorksIn::ProjectFolder);
+            assert_eq!(
+                view.slots[view.active].notice.as_ref().unwrap().title,
+                "Close the terminal before changing folders"
+            );
         })
     });
     cx.simulate_keystrokes("cmd-n");
-    cx.update(|window, cx| {
-        chat.update(cx, |view, cx| {
-            assert_eq!(view.slots.len(), 2);
-            assert!(view.slots[1].terminal.is_some());
-            // The project-folder shell could change files under a copy's snapshot.
-            view.choose_works_in(WorksIn::RiftCopy, window, cx);
-            let hold = view.copy_hold(&view.thread().clone(), cx).unwrap();
-            assert_eq!(hold.title, "Close the project terminal first");
-        })
-    });
-    // A peer project in the same repository sees that terminal too.
-    let peer = peer_project("sibling", false, vec![&chat], &path, cx);
-    std::fs::create_dir_all(path.join(".git")).unwrap();
     cx.update(|_, cx| {
-        peer.update(cx, |view, cx| {
-            view.thread().clone().update(cx, |thread, _| {
-                thread.set_works_in(WorksIn::RiftCopy).unwrap()
-            });
-            let hold = view.copy_hold(&view.thread().clone(), cx).unwrap();
-            assert_eq!(hold.title, "Close the project terminal first");
-        })
+        let view = chat.read(cx);
+        assert_eq!(view.slots.len(), 2);
+        assert!(view.slots[1].terminal.is_some());
     });
-    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
-        .unwrap();
     finish(&chat, path, cx);
 }
 
@@ -2098,13 +1940,13 @@ fn a_terminal_keeps_its_draft_and_working_folder_until_closed(cx: &mut TestAppCo
 /// as it would be in the same project.
 #[gpui::test]
 async fn a_second_project_folder_thread_in_the_same_repository_is_refused(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup(cx, "two-projects-one-repo", true);
-    std::fs::create_dir_all(path.join(".git")).unwrap();
+    let (chat, path, cx) = setup_in(cx, "two-projects-one-repo", true, Some(CREATE_COPY));
     cx.simulate_input("thread A in the root");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
     assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).owns_project_work()));
-    let peer = peer_project("packages/web", true, vec![&chat], &path, cx);
+    let base = path.canonicalize().unwrap();
+    let peer = peer_project("project/packages/web", true, vec![&chat], &base, cx);
     cx.update(|_, cx| chat.update(cx, |view, _| view.set_copy_peers(vec![peer.downgrade()])));
     let went_out = cx.update(|window, cx| {
         peer.update(cx, |view, cx| {
@@ -2245,7 +2087,7 @@ async fn a_kept_denial_note_follows_the_composer_draft(cx: &mut TestAppContext) 
 /// ⌘1–9 switch threads (closing the panel) as they do anywhere else.
 #[gpui::test]
 fn thread_jump_keys_work_while_the_review_panel_is_open(cx: &mut TestAppContext) {
-    use newjen_core::landing::{LandingMode, Review};
+    use newjen_core::landing::Review;
     let (chat, path, cx) = setup(cx, "review-keys", false);
     cx.simulate_input("first thread");
     cx.simulate_keystrokes("cmd-n");
@@ -2260,7 +2102,7 @@ fn thread_jump_keys_work_while_the_review_panel_is_open(cx: &mut TestAppContext)
                 patch: String::new(),
                 truncated: false,
             };
-            view.show_review(id, receipt, LandingMode::HarnessManaged, window, cx);
+            view.show_review(id, receipt, window, cx);
         })
     });
     cx.run_until_parked();
@@ -2288,7 +2130,7 @@ fn thread_jump_keys_work_while_the_review_panel_is_open(cx: &mut TestAppContext)
 /// Closing the review panel gives the keyboard back to the composer, which took its place.
 #[gpui::test]
 fn closing_the_review_panel_returns_the_keyboard_to_the_composer(cx: &mut TestAppContext) {
-    use newjen_core::landing::{LandingMode, Review};
+    use newjen_core::landing::Review;
     let (chat, path, cx) = setup(cx, "review-close-focus", false);
     cx.simulate_input("a draft");
     cx.update(|window, cx| {
@@ -2300,7 +2142,7 @@ fn closing_the_review_panel_returns_the_keyboard_to_the_composer(cx: &mut TestAp
                 patch: String::new(),
                 truncated: false,
             };
-            view.show_review(id, receipt, LandingMode::HarnessManaged, window, cx);
+            view.show_review(id, receipt, window, cx);
         })
     });
     cx.run_until_parked();
@@ -2344,7 +2186,6 @@ async fn review_completion_during_saving_does_not_disable_keep_open(cx: &mut Tes
                 updated_at: 1,
                 archived_at: None,
                 copy: None,
-                landing_mode: newjen_core::landing::LandingMode::HarnessManaged,
                 review_base: Some("a".repeat(40)),
                 landing_resolved: false,
                 snapshot_needed: false,
@@ -2390,7 +2231,7 @@ async fn review_completion_during_saving_does_not_disable_keep_open(cx: &mut Tes
 /// The review lists every file of the patch and shows one at a time.
 #[gpui::test]
 fn the_review_shows_the_selected_file_only(cx: &mut TestAppContext) {
-    use newjen_core::landing::{LandingMode, Review};
+    use newjen_core::landing::Review;
     let patch = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,2 @@\n keep\n+added\n\
                  diff --git a/b.toml b/b.toml\n--- a/b.toml\n+++ b/b.toml\n@@ -1 +1 @@\n-old\n+new\n";
     let (chat, path, cx) = setup(cx, "review-files", false);
@@ -2403,7 +2244,7 @@ fn the_review_shows_the_selected_file_only(cx: &mut TestAppContext) {
                 patch: patch.into(),
                 truncated: false,
             };
-            view.show_review(id, receipt, LandingMode::HarnessManaged, window, cx);
+            view.show_review(id, receipt, window, cx);
         })
     });
     cx.run_until_parked();
@@ -2417,18 +2258,22 @@ fn the_review_shows_the_selected_file_only(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn the_project_chevron_opens_a_menu_with_the_landing_modes(cx: &mut TestAppContext) {
+async fn the_project_chevron_opens_a_menu_that_switches_projects(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "project-menu", false);
+    let chosen = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = chosen.clone();
+    cx.update(|_, cx| {
+        chat.update(cx, |view, _| {
+            view.set_project_chooser(std::rc::Rc::new(move |_, _| counted.set(counted.get() + 1)))
+        })
+    });
     cx.run_until_parked();
-    let landing =
-        |cx: &mut VisualTestContext| cx.update(|_, cx| chat.read(cx).project.landing_mode);
-    assert_eq!(landing(cx), LandingMode::HarnessManaged);
     click(cx, "project-menu");
     cx.run_until_parked();
     assert!(cx.update(|window, _| overlay_focused(window)));
-    cx.simulate_keystrokes("down down down enter");
+    cx.simulate_keystrokes("down enter");
     cx.run_until_parked();
-    assert_eq!(landing(cx), LandingMode::AgentManaged);
+    assert_eq!(chosen.get(), 1);
     finish(&chat, path, cx);
 }
 
@@ -2452,9 +2297,7 @@ fn a_dismissed_notification_note_stays_dismissed(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn the_sidebar_groups_threads_and_the_project_row_sets_the_landing_mode(
-    cx: &mut TestAppContext,
-) {
+async fn the_sidebar_groups_threads_and_its_usage_row_opens_a_panel(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "sidebar-groups", true);
     cx.run_until_parked();
     for selector in [
@@ -2482,22 +2325,7 @@ async fn the_sidebar_groups_threads_and_the_project_row_sets_the_landing_mode(
             ]
         );
     });
-    // The project's landing mode changes the open draft too.
     cx.simulate_keystrokes("cmd-n");
-    cx.update(|_, cx| {
-        chat.update(cx, |view, cx| {
-            view.set_project_landing(LandingMode::AgentManaged, cx);
-            assert_eq!(view.project.landing_mode, LandingMode::AgentManaged);
-            let draft = view.thread().read(cx);
-            assert!(draft.is_draft());
-            assert_eq!(draft.landing_mode(), LandingMode::AgentManaged);
-            // The thread already sent keeps its own mode.
-            assert_eq!(
-                view.slots[1].thread.read(cx).landing_mode(),
-                LandingMode::HarnessManaged
-            );
-        })
-    });
     cx.run_until_parked();
     assert!(cx.debug_bounds("thread-row").is_some());
     // The usage row opens its panel, and a click elsewhere closes it.

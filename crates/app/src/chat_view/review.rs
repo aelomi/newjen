@@ -1,11 +1,10 @@
 use super::changes::{FileRow, counts, file_row, files_label, totals};
 use super::*;
 use gpui_kit::component::Disableable as _;
-use gpui_kit::component::button::DropdownButton;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
-use gpui_kit::component::menu::PopupMenuItem;
 use newjen_core::edits::{EditPreview, ReadEdit};
-use newjen_core::landing::{self, Integration, LandingMode, Review};
+use newjen_core::landing::{self, Review};
+use newjen_core::worktree::Worktree;
 
 pub(super) struct ApprovalPreview {
     request: newjen_core::ApprovalKey,
@@ -79,10 +78,10 @@ pub(super) struct ReviewPanel {
 struct Resolution {
     id: String,
     receipt: Review,
-    copy: Option<rift::Copy>,
+    copy: Option<Worktree>,
     cwd: PathBuf,
-    mode: LandingMode,
-    integration: Option<Integration>,
+    title: String,
+    land: bool,
 }
 
 impl ChatView {
@@ -267,19 +266,19 @@ impl ChatView {
         {
             self.slots[self.active].notice = Some(Notice::held(
                 "Wait for the thread",
-                "The turn and its jj snapshot must finish before review.".into(),
+                "The turn and its snapshot must finish before review.".into(),
             ));
             cx.notify();
             return;
         }
         let Some(base) = thread.review_base().map(str::to_string) else {
-            self.slots[self.active].notice = Some(Notice::held("Landing unavailable", "Landing currently requires a jj repository colocated with git and a thread started with review tracking.".into()));
+            self.slots[self.active].notice = Some(Notice::held("Landing unavailable", "Review and landing need a git repository with a first commit, and a thread started with review tracking.".into()));
             cx.notify();
             return;
         };
         let id = thread.id().to_string();
+        let id_for_review = id.clone();
         let cwd = thread.cwd().to_path_buf();
-        let mode = thread.landing_mode();
         let tools = self.tools.clone();
         self.review_loading = true;
         let stopping = self.thread().update(cx, |thread, _| thread.begin_quit());
@@ -290,7 +289,7 @@ impl ChatView {
         let task = cx.background_spawn(async move {
             let result = thread::finish_quit(&store, [stopping])
                 .map_err(anyhow::Error::from)
-                .and_then(|()| landing::review(&tools, &cwd, &base));
+                .and_then(|()| landing::review(&tools, &cwd, &id_for_review, &base));
             let _ = completion.send(());
             result
         });
@@ -302,7 +301,7 @@ impl ChatView {
                     return;
                 }
                 match result {
-                    Ok(receipt) => view.show_review(id, receipt, mode, window, cx),
+                    Ok(receipt) => view.show_review(id, receipt, window, cx),
                     Err(error) => {
                         view.slots[view.active].notice =
                             Some(Notice::held("Couldn't review work", format!("{error:#}")))
@@ -322,7 +321,6 @@ impl ChatView {
         &mut self,
         id: String,
         receipt: Review,
-        mode: LandingMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -333,7 +331,14 @@ impl ChatView {
             DiffFile::parse(&receipt.patch)
         } {
             Ok(files) => {
-                let message = if receipt.truncated { "The diff is too large to show. Landing is blocked." } else if mode == LandingMode::AgentManaged { "Only work recorded with jj is shown. Git commits are not imported; use jj and bookmark your work. The copy stays after landing." } else if receipt.patch.is_empty() { "No changes." } else { "" }.into();
+                let message = if receipt.truncated {
+                    "The diff is too large to show. Landing is blocked."
+                } else if receipt.patch.is_empty() {
+                    "No changes."
+                } else {
+                    ""
+                }
+                .into();
                 let selected = target
                     .and_then(|path| files.iter().position(|file| file.path().as_ref() == path))
                     .unwrap_or(0);
@@ -391,17 +396,11 @@ impl ChatView {
             .as_ref()
             .is_some_and(|panel| !panel.busy && !panel.receipt.truncated);
         if ready {
-            self.resolve_review(false, Integration::Rebase, window, cx);
+            self.resolve_review(false, window, cx);
         }
     }
 
-    fn resolve_review(
-        &mut self,
-        discard: bool,
-        integration: Integration,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn resolve_review(&mut self, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.review_panel.as_ref() else {
             return;
         };
@@ -419,7 +418,7 @@ impl ChatView {
             || self.project_work_owned_elsewhere(&self.slots[ix].thread, cx)
         {
             self.review_panel.as_mut().unwrap().message =
-                "Land, discard, or keep the files and close the project-folder thread before landing copy work.".into();
+                "Land, discard, or keep the files and close the project-folder thread before landing worktree work.".into();
             cx.notify();
             return;
         }
@@ -427,18 +426,18 @@ impl ChatView {
         let receipt = panel.receipt.clone();
         let copy = thread.copy().cloned();
         let cwd = thread.cwd().to_path_buf();
-        let mode = thread.landing_mode();
+        let title = thread.title().to_string();
         let oversized_copy = copy.is_some() && receipt.truncated;
         let resolution = Resolution {
             id,
             receipt,
             copy,
             cwd,
-            mode,
-            integration: (!discard).then_some(integration),
+            title,
+            land: !discard,
         };
         if discard {
-            let question = window.prompt(gpui::PromptLevel::Warning, "Discard this thread's work?", Some(if oversized_copy { "The diff is too large to display. This deletes the entire Rift copy, including changes you have not reviewed. The conversation is archived." } else { "This removes the Rift copy, or restores the project-folder work to this thread's base. The conversation is archived." }), &["Cancel", "Discard"], cx);
+            let question = window.prompt(gpui::PromptLevel::Warning, "Discard this thread's work?", Some(if oversized_copy { "The diff is too large to display. This removes the whole worktree, including changes you have not reviewed. Its branch stays until you delete it with git. The conversation is archived." } else { "This removes the worktree (its branch stays until you delete it with git), or restores the project-folder files to this thread's base. The conversation is archived." }), &["Cancel", "Discard"], cx);
             cx.spawn_in(window, async move |view, cx| {
                 if question.await.ok() == Some(1) {
                     let _ = view.update_in(cx, |view, window, cx| {
@@ -469,8 +468,8 @@ impl ChatView {
             receipt,
             copy,
             cwd,
-            mode,
-            integration,
+            title,
+            land,
         } = resolution;
         let Some(ix) = self.index_of(&id, cx) else {
             return;
@@ -497,13 +496,11 @@ impl ChatView {
             .update(cx, |thread, _| thread.track_background_work());
         let tools = self.tools.clone();
         let task = cx.background_spawn(async move {
-            match (integration, copy) {
-                (Some(integration), Some(copy)) => {
-                    landing::land_copy(&tools, &copy, mode, &id, integration, &receipt)
-                }
-                (Some(_), None) => landing::land_project(&tools, &cwd, mode, &id, &receipt),
-                (None, Some(_)) => Ok(()),
-                (None, None) => landing::discard_project(&tools, &cwd, mode, &id, &receipt),
+            match (land, copy) {
+                (true, Some(copy)) => landing::land_worktree(&tools, &copy, &id, &title, &receipt),
+                (true, None) => landing::land_project(&tools, &cwd, &id, &title, &receipt),
+                (false, Some(_)) => Ok(()),
+                (false, None) => landing::discard_project(&tools, &cwd, &id, &receipt),
             }
         });
         let id = self.review_panel.as_ref().unwrap().thread.clone();
@@ -516,7 +513,7 @@ impl ChatView {
                             view.slots[ix].thread.update(cx, |thread, cx| { thread.finish_landing(); cx.notify(); });
                             view.review_panel = None;
                             if view.quit_saving { cx.notify(); return; }
-                            if integration.is_none() { view.archive(&id, window, cx); }
+                            if !land { view.archive(&id, window, cx); }
                             else {
                                 view.slots[ix].notice = Some(Notice::held("Work landed", "The work is in the project. Archive the thread when you are ready to close it.".into()));
                                 view.focus_panel(window, cx);
@@ -548,7 +545,7 @@ impl ChatView {
             return;
         }
         let id = thread.read(cx).id().to_string();
-        let question = window.prompt(gpui::PromptLevel::Warning, "Keep files and close this thread?", Some("Newjen stops tracking this thread. Files and jj history stay as they are. Manage this work in your terminal. Other threads can then use the project folder."), &["Cancel", "Keep files and close"], cx);
+        let question = window.prompt(gpui::PromptLevel::Warning, "Keep files and close this thread?", Some("Newjen stops tracking this thread. Its files stay as they are, uncommitted. Manage this work in your terminal. Other threads can then use the project folder."), &["Cancel", "Keep files and close"], cx);
         cx.spawn_in(window, async move |view, cx| {
             if question.await.ok() != Some(1) {
                 return;
@@ -569,9 +566,15 @@ impl ChatView {
                 let stopping = thread.update(cx, |thread, _| thread.begin_quit());
                 let completion = thread.update(cx, |thread, _| thread.track_background_work());
                 let store = view.store.clone();
+                let tools = view.tools.clone();
+                let cwd = thread.read(cx).cwd().to_path_buf();
+                let thread_id = id.clone();
                 cx.notify();
                 Some(cx.background_spawn(async move {
                     let result = thread::finish_quit(&store, [stopping]);
+                    if result.is_ok() {
+                        let _ = landing::release(&tools, &cwd, &thread_id);
+                    }
                     let _ = completion.send(());
                     result
                 }))
@@ -689,9 +692,6 @@ impl ChatView {
         let colors = cx.theme().colors;
         let stroke = crate::theme::material(cx).card_stroke;
         let can_land = !panel.busy && !panel.receipt.truncated;
-        let has_copy = self
-            .index_of(&panel.thread, cx)
-            .is_some_and(|ix| self.slots[ix].thread.read(cx).copy().is_some());
         let (added, removed) = totals(&panel.rows);
 
         let back = ui::icon_button(
@@ -710,9 +710,7 @@ impl ChatView {
         }));
         let discard = ui::button("discard-work", "Discard", ui::Look::Ghost, ui::Size::Sm, cx)
             .text_color(colors.danger)
-            .on_click(cx.listener(|view, _, window, cx| {
-                view.resolve_review(true, Integration::Rebase, window, cx)
-            }));
+            .on_click(cx.listener(|view, _, window, cx| view.resolve_review(true, window, cx)));
         let land = ui::button_with_icon(
             "land-rebase",
             "Land",
@@ -726,34 +724,7 @@ impl ChatView {
         .on_click(cx.listener(|view, _, window, cx| {
             view.land_with_key(window, cx);
         }));
-        // Only a Rift copy has two ways to land; project-folder work is already in place.
-        let land = if has_copy {
-            let view = cx.weak_entity();
-            DropdownButton::new("land")
-                .button(land)
-                .disabled(!can_land)
-                .menu_accessibility_label("Choose how to land")
-                .dropdown_menu(move |menu, _, _| {
-                    let item = |label: &'static str, integration| {
-                        let view = view.clone();
-                        PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                            let _ =
-                                view.update(cx, |view, cx| {
-                                    if view.review_panel.as_ref().is_some_and(|panel| {
-                                        !panel.busy && !panel.receipt.truncated
-                                    }) {
-                                        view.resolve_review(false, integration, window, cx)
-                                    }
-                                });
-                        })
-                    };
-                    menu.item(item("Rebase and land", Integration::Rebase))
-                        .item(item("Merge and land", Integration::Merge))
-                })
-                .into_any_element()
-        } else {
-            land.into_any_element()
-        };
+        let land = land.into_any_element();
 
         let top = h_flex()
             .flex_none()
