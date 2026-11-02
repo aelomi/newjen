@@ -53,7 +53,8 @@ impl Provider {
             Self::Codex => ("0.156.0", "0.166.0"),
         }
     }
-    fn api_key_var(self) -> &'static str {
+    /// The environment variable that makes the CLI bill an API account instead of the plan.
+    pub fn api_key_var(self) -> &'static str {
         match self {
             Self::Claude => "ANTHROPIC_API_KEY",
             Self::Codex => "OPENAI_API_KEY",
