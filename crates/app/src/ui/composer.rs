@@ -1,10 +1,11 @@
-#[cfg(test)]
 use std::rc::Rc;
 
 use gpui::Focusable as _;
+use std::cell::Cell;
+
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
-    prelude::*,
+    AnyElement, App, Context, Entity, IntoElement, ParentElement, Pixels, RenderOnce, Styled,
+    Window, canvas, div, prelude::*,
 };
 use gpui_kit::base::input::{Enter, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, input::Textarea};
@@ -35,6 +36,7 @@ pub struct Composer {
     chips: Option<AnyElement>,
     works_in: Option<AnyElement>,
     meter: Option<AnyElement>,
+    top: Option<Rc<Cell<Option<Pixels>>>>,
 }
 
 impl Composer {
@@ -45,7 +47,14 @@ impl Composer {
             chips: None,
             works_in: None,
             meter: None,
+            top: None,
         }
+    }
+
+    /// Where the card's top edge is written as it paints, for what opens above the card.
+    pub fn top_sink(mut self, top: Rc<Cell<Option<Pixels>>>) -> Self {
+        self.top = Some(top);
+        self
     }
 
     /// The agent and effort chips, at the left of the bottom row.
@@ -169,6 +178,7 @@ impl RenderOnce for Composer {
         div()
             .id("composer")
             .debug_selector(|| "composer".to_string())
+            .relative()
             .flex()
             .flex_col()
             .gap_1()
@@ -201,6 +211,15 @@ impl RenderOnce for Composer {
                     ),
             )
             .child(footer)
+            .children(self.top.map(|top| {
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, _, _| top.set(Some(bounds.top())),
+                )
+                .absolute()
+                .inset_0()
+                .size_full()
+            }))
     }
 }
 

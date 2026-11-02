@@ -2509,6 +2509,7 @@ impl ChatView {
             (self.render_frozen_chips(config, status, cx), None)
         };
         ui::Composer::new(field, footer)
+            .top_sink(self.chip.read(cx).tops.composer())
             .chips(Some(chips))
             .works_in(works_in)
             .meter(self.render_context_chip(cx))

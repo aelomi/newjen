@@ -2,9 +2,12 @@
 //! is, what each model used, and what that is worth. Only this thread's models count here; the
 //! account's limits live in the Usage view.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
     Anchor, AnyElement, App, ClickEvent, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement, RenderOnce, Styled, Window, div, px, relative,
+    IntoElement, ParentElement, Pixels, RenderOnce, Styled, Window, canvas, div, px, relative,
 };
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -29,6 +32,32 @@ const SEGMENT_GAP: f32 = 1.0;
 const MODELS_SHOWN: usize = 5;
 const MODELS_KEPT_WHEN_CUT: usize = 4;
 const RING: f32 = 16.0;
+/// Between the popover's bottom edge and the top of the composer card.
+const GAP: f32 = 6.0;
+
+/// Where the chip and the composer card began, as the last frame painted them: the popover
+/// opens above the whole card, whatever the field's height.
+#[derive(Clone, Default)]
+pub struct Tops {
+    chip: Rc<Cell<Option<Pixels>>>,
+    composer: Rc<Cell<Option<Pixels>>>,
+}
+
+impl Tops {
+    /// What the popover's surface must clear above the chip's top edge.
+    fn offset(&self) -> Pixels {
+        let rise = match (self.chip.get(), self.composer.get()) {
+            (Some(chip), Some(composer)) if chip > composer => chip - composer,
+            _ => px(0.),
+        };
+        rise + px(GAP)
+    }
+
+    /// The sink the composer card writes its top edge to.
+    pub fn composer(&self) -> Rc<Cell<Option<Pixels>>> {
+        self.composer.clone()
+    }
+}
 
 /// What the chip shows. It follows the thread's usage and whether the account's limit has
 /// paused the thread.
@@ -304,11 +333,15 @@ fn price_model(facts: &Facts) -> PriceModel {
 /// Whether the popover opened with the pointer (so it fades in) or from the keyboard.
 pub struct ChipMenu {
     pointer: bool,
+    pub tops: Tops,
 }
 
 impl ChipMenu {
     pub fn new() -> Self {
-        Self { pointer: false }
+        Self {
+            pointer: false,
+            tops: Tops::default(),
+        }
     }
 }
 
@@ -321,15 +354,18 @@ pub fn context_chip(
     cx: &App,
 ) -> AnyElement {
     let pointer = menu.read(cx).pointer;
+    let tops = menu.read(cx).tops.clone();
     let trigger = Trigger {
         state,
         charge: model.charge().map(str::to_owned),
         now,
         owner: menu.downgrade(),
+        top: tops.chip.clone(),
     };
     let reset = menu.downgrade();
     Popover::new("thread-usage")
         .anchor(Anchor::BottomRight)
+        .offset(tops.offset())
         .appearance(false)
         .trigger(trigger)
         .on_open_change(move |open, _, cx| {
@@ -349,6 +385,7 @@ struct Trigger {
     charge: Option<String>,
     now: i64,
     owner: gpui::WeakEntity<ChipMenu>,
+    top: Rc<Cell<Option<Pixels>>>,
 }
 
 impl Selectable for Trigger {
@@ -376,6 +413,7 @@ impl RenderOnce for Trigger {
             muted
         };
         let owner = self.owner;
+        let top = self.top;
         let ring = match self.state {
             ChipState::Ring { fraction } | ChipState::NearFull { fraction } => Some(ui::ring(
                 fraction,
@@ -416,11 +454,20 @@ impl RenderOnce for Trigger {
                 });
             })
             .child(content);
-        if paused {
+        let button = if paused {
             button.bg(colors.danger.opacity(0.14)).into_any_element()
         } else {
             button.tooltip("Usage in this thread").into_any_element()
-        }
+        };
+        div().relative().child(button).child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, _, _| top.set(Some(bounds.top())),
+            )
+            .absolute()
+            .inset_0()
+            .size_full(),
+        )
     }
 }
 
@@ -844,5 +891,85 @@ mod tests {
                 note: "Claude has not reported a price yet.".into()
             }
         );
+    }
+
+    struct Bench {
+        menu: Entity<ChipMenu>,
+        field: Entity<gpui_kit::base::input::TextareaState>,
+    }
+
+    impl gpui::Render for Bench {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let usage = usage(
+                Some((68_000, Some(200_000))),
+                &[vec![("main", tokens(5, 5, 5, 0), None)]],
+            );
+            let facts = Facts {
+                provider: Provider::Claude,
+                usage: &usage,
+                billing: Billing::Subscription,
+                plan: Some("Max".into()),
+                effort: None,
+            };
+            let chip = context_chip(
+                &self.menu,
+                ChipState::of(&usage, None),
+                PopoverModel::build(&facts),
+                0,
+                cx,
+            );
+            let top = self.menu.read(cx).tops.composer();
+            div().size_full().flex().flex_col().justify_end().child(
+                div().w(px(520.)).child(
+                    ui::Composer::new(self.field.clone(), ui::Footer::Disabled("off"))
+                        .top_sink(top)
+                        .meter(Some(chip)),
+                ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn the_popover_opens_above_the_whole_composer_whatever_its_height(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AppContext as _, Modifiers};
+        cx.update(gpui_kit::init);
+        let mut bench = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| Bench {
+                menu: cx.new(|_| ChipMenu::new()),
+                field: cx.new(|cx| ui::composer_field(window, cx)),
+            });
+            bench = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let bench = bench.unwrap();
+        for rows in [1, 6] {
+            let text = vec!["row"; rows].join("\n");
+            cx.update(|window, cx| {
+                bench.update(cx, |bench, cx| {
+                    bench
+                        .field
+                        .update(cx, |field, cx| field.set_value(text.clone(), window, cx));
+                    cx.notify();
+                })
+            });
+            cx.run_until_parked();
+            cx.run_until_parked();
+            let chip = cx.debug_bounds("context-chip").unwrap();
+            cx.simulate_click(chip.center(), Modifiers::default());
+            cx.run_until_parked();
+            let card = cx.debug_bounds("composer").unwrap();
+            let panel = cx.debug_bounds("thread-usage-panel").unwrap();
+            assert!(
+                panel.bottom() <= card.top(),
+                "{rows} rows: panel {panel:?} overlaps the composer {card:?}"
+            );
+            assert!(card.top() - panel.bottom() < px(24.), "{panel:?} {card:?}");
+            assert!((panel.right() - chip.right()).abs() < px(24.));
+            cx.simulate_click(chip.center(), Modifiers::default());
+            cx.run_until_parked();
+        }
     }
 }
