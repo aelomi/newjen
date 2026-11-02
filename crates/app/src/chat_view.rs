@@ -820,9 +820,11 @@ impl ChatView {
         self.sync_replies(self.active, cx);
         // No `notify` on the thread: this view redraws itself below. (It also runs while the
         // view is being built, when nothing can observe the thread yet.)
-        self.thread()
-            .clone()
-            .update(cx, |thread, _| thread.set_active(true));
+        if self.pane == Pane::Thread {
+            self.thread()
+                .clone()
+                .update(cx, |thread, _| thread.set_active(true));
+        }
         // As if no dock was up: a waiting approval on this thread then takes the keyboard (and
         // gets the short key delay) exactly as a new one would.
         self.dock_request = None;
@@ -834,6 +836,8 @@ impl ChatView {
             let field = self.ensure_field(window, cx);
             let handle = field.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
+        } else if self.pane == Pane::Usage {
+            self.focus_panel(window, cx);
         }
         let entries = self.sidebar_entries(cx);
         if let Some(at) = sidebar::entry_of(&entries, self.active) {
@@ -1624,7 +1628,13 @@ impl ChatView {
                 .transcript()
                 .pending_approval()
                 .is_some();
-        keys::key_route(event, self.drawer_open, overlay_focused(window), pending)
+        keys::key_route(
+            event,
+            self.drawer_open,
+            overlay_focused(window),
+            self.pane == Pane::Usage,
+            pending,
+        )
     }
 
     /// Esc closes the thread drawer. GPUI calls this for every key press inside the view
@@ -1672,6 +1682,10 @@ impl ChatView {
             {
                 cx.stop_propagation();
                 self.run_primary_action(window, cx);
+            }
+            KeyRoute::LeaveUsage => {
+                cx.stop_propagation();
+                self.show(self.active, window, cx);
             }
             KeyRoute::CloseDrawer | KeyRoute::Pass => {}
         }

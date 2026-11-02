@@ -621,11 +621,11 @@ pub fn usage_row(
 ) -> AnyElement {
     let muted = crate::theme::material(cx).glass_muted;
     div()
-        .id("usage-menu")
+        .id("usage-row")
         .flex_none()
         .pb_2()
         .child(
-            ListItem::new("usage-row")
+            ListItem::new("usage-row-item")
                 .w_full()
                 .px_2p5()
                 .py_1p5()
@@ -634,7 +634,7 @@ pub fn usage_row(
                 .accessibility_label("Usage")
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                 .on_click(move |_, window, cx| on_press(window, cx))
-                .debug_selector(|| "usage-trigger".to_string())
+                .debug_selector(|| "usage-row".to_string())
                 .child(
                     h_flex()
                         .items_center()

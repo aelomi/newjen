@@ -2268,12 +2268,7 @@ async fn the_sidebar_groups_threads_and_its_usage_row_opens_the_usage_view(
 ) {
     let (chat, path, cx) = setup(cx, "sidebar-groups", true);
     cx.run_until_parked();
-    for selector in [
-        "switch-project",
-        "new-thread",
-        "usage-trigger",
-        "thread-row",
-    ] {
+    for selector in ["switch-project", "new-thread", "usage-row", "thread-row"] {
         assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
     }
     // The first message starts a thread that waits for an approval: "Needs you".
@@ -2298,12 +2293,56 @@ async fn the_sidebar_groups_threads_and_its_usage_row_opens_the_usage_view(
     assert!(cx.debug_bounds("thread-row").is_some());
     // The usage row opens the Usage view in place of the thread, and a thread row returns.
     assert!(cx.debug_bounds("usage-view").is_none());
-    click(cx, "usage-trigger");
+    click(cx, "usage-row");
     cx.run_until_parked();
     assert!(cx.debug_bounds("usage-view").is_some());
     click(cx, "thread-row");
     cx.run_until_parked();
     assert!(cx.debug_bounds("usage-view").is_none());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn esc_in_the_usage_view_returns_to_the_thread_and_its_composer(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "usage-esc", false);
+    cx.simulate_input("keep this draft");
+    click(cx, "usage-row");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("usage-view").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("usage-view").is_none());
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "keep this draft"
+    );
+    assert!(cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window)));
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_project_shown_again_keeps_the_usage_view_and_the_threads_unread_mark(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "usage-reenter", true);
+    cx.simulate_input("approval behind the usage view");
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.send(window, cx);
+            view.show_usage(window, cx);
+            view.set_visible(false, window, cx);
+        })
+    });
+    pending(&chat, cx).await;
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_unread()));
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.set_visible(true, window, cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("usage-view").is_some());
+    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_unread()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("usage-view").is_none());
+    assert!(!cx.update(|_, cx| chat.read(cx).thread().read(cx).is_unread()));
     finish(&chat, path, cx);
 }
 

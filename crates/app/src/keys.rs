@@ -135,6 +135,8 @@ pub fn approval_key(event: &KeyDownEvent) -> Option<ApprovalKey> {
 pub enum KeyRoute {
     /// Esc while the thread drawer is open: close it.
     CloseDrawer,
+    /// Esc in the Usage view: back to the thread.
+    LeaveUsage,
     /// ⌘↵ or Esc while an approval waits: answer it.
     Answer(ApprovalIntent),
     /// ⌘↵ or Esc held down while an approval waits: ours, but it answers nothing.
@@ -143,14 +145,15 @@ pub enum KeyRoute {
     Pass,
 }
 
-/// Where a key press goes. Esc first closes the thread drawer; otherwise ⌘↵ and Esc answer
-/// a pending approval. Neither happens while a popover or menu holds the keyboard (the "N
-/// allowed" list, a row's "Archive thread"): there Esc closes that popover or menu, and ⌘↵
-/// must not allow something the user is not looking at.
+/// Where a key press goes. Esc first closes the thread drawer, then leaves the Usage view;
+/// otherwise ⌘↵ and Esc answer a pending approval. None of this happens while a popover or
+/// menu holds the keyboard (the "N allowed" list, a row's "Archive thread"): there Esc closes
+/// that popover or menu, and ⌘↵ must not allow something the user is not looking at.
 pub fn key_route(
     event: &KeyDownEvent,
     drawer_open: bool,
     overlay_focused: bool,
+    usage_open: bool,
     approval_pending: bool,
 ) -> KeyRoute {
     if overlay_focused {
@@ -158,6 +161,9 @@ pub fn key_route(
     }
     if drawer_open && event.keystroke.key == "escape" {
         return KeyRoute::CloseDrawer;
+    }
+    if usage_open && approval_key(event) == Some(ApprovalKey::Answer(ApprovalIntent::Deny)) {
+        return KeyRoute::LeaveUsage;
     }
     if !approval_pending {
         return KeyRoute::Pass;
@@ -225,13 +231,13 @@ mod tests {
         // menu): Esc closes that, it never denies the request, and ⌘↵ allows nothing.
         for key in ["escape", "cmd-enter"] {
             assert_eq!(
-                key_route(&press(key, false), false, true, true),
+                key_route(&press(key, false), false, true, false, true),
                 KeyRoute::Pass
             );
         }
         // A menu open in the drawer: its Esc closes the menu, not the whole drawer.
         assert_eq!(
-            key_route(&press("escape", false), true, true, false),
+            key_route(&press("escape", false), true, true, false, false),
             KeyRoute::Pass
         );
     }
@@ -239,17 +245,17 @@ mod tests {
     #[test]
     fn esc_closes_the_drawer_before_it_answers_anything() {
         assert_eq!(
-            key_route(&press("escape", false), true, false, true),
+            key_route(&press("escape", false), true, false, false, true),
             KeyRoute::CloseDrawer
         );
         // With the drawer shut, the same press denies the waiting request.
         assert_eq!(
-            key_route(&press("escape", false), false, false, true),
+            key_route(&press("escape", false), false, false, false, true),
             KeyRoute::Answer(ApprovalIntent::Deny)
         );
         // The drawer does not use ⌘↵, so it still allows once.
         assert_eq!(
-            key_route(&press("cmd-enter", false), true, false, true),
+            key_route(&press("cmd-enter", false), true, false, false, true),
             KeyRoute::Answer(ApprovalIntent::AllowOnce)
         );
     }
@@ -258,15 +264,30 @@ mod tests {
     fn approval_keys_are_ours_only_while_a_request_waits() {
         // Nothing waits: Esc goes on to the text field (a half-typed IME character).
         assert_eq!(
-            key_route(&press("escape", false), false, false, false),
+            key_route(&press("escape", false), false, false, false, false),
             KeyRoute::Pass
         );
         assert_eq!(
-            key_route(&press("escape", true), false, false, true),
+            key_route(&press("escape", true), false, false, false, true),
             KeyRoute::Ignore
         );
         assert_eq!(
-            key_route(&press("a", false), false, false, true),
+            key_route(&press("a", false), false, false, false, true),
+            KeyRoute::Pass
+        );
+    }
+
+    #[test]
+    fn esc_leaves_the_usage_view_unless_something_else_owns_it() {
+        let route =
+            |key, held, drawer, overlay| key_route(&press(key, held), drawer, overlay, true, false);
+        assert_eq!(route("escape", false, false, false), KeyRoute::LeaveUsage);
+        assert_eq!(route("escape", false, false, true), KeyRoute::Pass);
+        assert_eq!(route("escape", false, true, false), KeyRoute::CloseDrawer);
+        assert_eq!(route("escape", true, false, false), KeyRoute::Pass);
+        assert_eq!(route("a", false, false, false), KeyRoute::Pass);
+        assert_eq!(
+            key_route(&press("escape", false), false, false, false, false),
             KeyRoute::Pass
         );
     }
