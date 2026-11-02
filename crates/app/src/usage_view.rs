@@ -500,7 +500,14 @@ pub fn render(input: &Input, cx: &App) -> AnyElement {
         .overflow_y_scroll()
         .p_4()
         .gap_4()
-        .child(h_flex().flex_wrap().gap_4().child(claude).child(codex))
+        .child(
+            h_flex()
+                .flex_wrap()
+                .items_stretch()
+                .gap_4()
+                .child(claude)
+                .child(codex),
+        )
         .child(
             h_flex()
                 .flex_wrap()
@@ -911,9 +918,16 @@ fn week_card(snapshot: &Snapshot, cx: &App) -> AnyElement {
     let line = |label: &str, value: String| {
         h_flex()
             .justify_between()
+            .gap_3()
             .text_sm()
-            .child(div().text_color(muted).child(label.to_string()))
-            .child(div().font_weight(FontWeight::MEDIUM).child(value))
+            .child(div().flex_none().text_color(muted).child(label.to_string()))
+            .child(
+                div()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(value),
+            )
     };
     panel(cx)
         .min_w(px(280.))
