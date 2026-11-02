@@ -60,6 +60,10 @@ impl Provider {
             Self::Codex => "OPENAI_API_KEY",
         }
     }
+    /// Whether the CLI says what a turn cost. Codex does not.
+    pub fn reports_price(self) -> bool {
+        matches!(self, Self::Claude)
+    }
     fn install_hint(self) -> String {
         match self {
             Self::Claude => "Install the `claude` CLI: https://code.claude.com/docs/en/setup",

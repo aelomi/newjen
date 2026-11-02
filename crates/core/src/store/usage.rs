@@ -163,44 +163,46 @@ impl Store {
 
     /// Tokens per provider for each of the last `days` local days, oldest first, today last.
     /// Every day has an entry for every provider, empty when nothing ran.
-    /// `utc_offset_seconds` is the local time zone's offset (see [`local_utc_offset_seconds`]).
+    /// `utc_offset_at` gives the local time zone's offset at a Unix instant (see
+    /// [`local_utc_offset_seconds`]), so a day that a clock change shortens or lengthens still
+    /// starts at its own local midnight.
     pub fn daily_tokens(
         &self,
         now_ms: i64,
         days: u32,
-        utc_offset_seconds: i32,
+        utc_offset_at: impl Fn(i64) -> i32,
     ) -> Result<Vec<DailyTokens>> {
-        let offset = i64::from(utc_offset_seconds);
-        let today = (now_ms.div_euclid(1000) + offset).div_euclid(SECONDS_PER_DAY);
-        let first = today - i64::from(days.max(1)) + 1;
-        let start_ms = (first * SECONDS_PER_DAY - offset) * 1000;
-        let end_ms = ((today + 1) * SECONDS_PER_DAY - offset) * 1000;
+        let starts = local_day_starts(now_ms.div_euclid(1000), days, utc_offset_at);
+        let (first, end) = (starts[0], starts[starts.len() - 1]);
         let connection = self.reader();
         let mut statement = connection.prepare(
-            "SELECT provider, (ended_at / 1000 + ?3) / ?4, SUM(input), SUM(cached_input),
-                    SUM(cache_write_input), SUM(output), SUM(reasoning_output)
-             FROM turn_usage WHERE ended_at >= ?1 AND ended_at < ?2
-             GROUP BY provider, (ended_at / 1000 + ?3) / ?4",
+            "SELECT provider, ended_at, input, cached_input, cache_write_input, output,
+                    reasoning_output
+             FROM turn_usage WHERE ended_at >= ?1 AND ended_at < ?2",
         )?;
-        let mut found: HashMap<(i64, Provider), TokenCounts> = HashMap::new();
-        let rows =
-            statement.query_map(params![start_ms, end_ms, offset, SECONDS_PER_DAY], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    token_counts(row, 2)?,
-                ))
-            })?;
+        let rows = statement.query_map(params![first * 1000, end * 1000], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                token_counts(row, 2)?,
+            ))
+        })?;
+        let mut found: HashMap<(usize, Provider), TokenCounts> = HashMap::new();
         for row in rows {
-            let (provider, day, tokens) = row?;
-            if let Some(provider) = Provider::from_id(&provider) {
-                found.insert((day, provider), tokens);
-            }
+            let (provider, ended_at, tokens) = row?;
+            let Some(provider) = Provider::from_id(&provider) else {
+                continue;
+            };
+            let day = starts.partition_point(|start| start * 1000 <= ended_at) - 1;
+            let total = found.entry((day, provider)).or_default();
+            *total = total.saturating_add(tokens);
         }
-        Ok((first..=today)
-            .flat_map(|day| {
+        Ok(starts[..starts.len() - 1]
+            .iter()
+            .enumerate()
+            .flat_map(|(day, start)| {
                 [Provider::Claude, Provider::Codex].map(|provider| DailyTokens {
-                    day_start_unix_seconds: day * SECONDS_PER_DAY - offset,
+                    day_start_unix_seconds: *start,
                     provider,
                     tokens: found.get(&(day, provider)).copied().unwrap_or_default(),
                 })
@@ -208,16 +210,34 @@ impl Store {
             .collect())
     }
 
-    /// What turns billed to an API key cost since `since_ms`. Subscription turns never count:
-    /// their cost is only what the tokens would list for.
+    /// What turns billed to an API key cost since `since_ms`, for a provider whose account is
+    /// billed to an API key now. A turn that ran before the billing was known counts too;
+    /// subscription turns never do, as their cost is only what the tokens would list for.
     pub fn charged_since(&self, provider: Provider, since_ms: i64) -> Result<f64> {
         Ok(self.reader().query_row(
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM turn_usage
-             WHERE provider = ?1 AND billing = 'api_key' AND ended_at >= ?2",
+             WHERE provider = ?1 AND billing IN ('api_key', 'unknown') AND ended_at >= ?2",
             params![provider.id(), since_ms],
             |row| row.get(0),
         )?)
     }
+}
+
+/// The instants, Unix seconds, at which the last `days` local days began and then the one
+/// after today does: `days + 1` entries, oldest first.
+fn local_day_starts(now: i64, days: u32, utc_offset_at: impl Fn(i64) -> i32) -> Vec<i64> {
+    let today = (now + i64::from(utc_offset_at(now))).div_euclid(SECONDS_PER_DAY);
+    let first = today - i64::from(days.max(1)) + 1;
+    (first..=today + 1)
+        .map(|day| {
+            let local = day * SECONDS_PER_DAY;
+            let mut start = local - i64::from(utc_offset_at(now));
+            for _ in 0..3 {
+                start = local - i64::from(utc_offset_at(start));
+            }
+            start
+        })
+        .collect()
 }
 
 /// The local time zone's offset from UTC at `unix_seconds`, for [`Store::daily_tokens`].
@@ -696,7 +716,7 @@ mod tests {
                 ),
             ],
         );
-        let days = store.daily_tokens(now, 7, offset).unwrap();
+        let days = store.daily_tokens(now, 7, |_| offset).unwrap();
         assert_eq!(days.len(), 14);
         let starts: Vec<i64> = days
             .iter()
@@ -730,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn only_turns_billed_to_an_api_key_count_as_charged() {
+    fn turns_billed_to_an_api_key_or_to_nothing_known_yet_count_as_charged() {
         let (_dir, store, project) = open();
         store.save_thread(thread_row("t1", project));
         let mut api = usage_row(0, 5_000, Provider::Claude, "m", tokens(1, 1, 1), Some(0.5));
@@ -749,9 +769,71 @@ mod tests {
             "t1",
             vec![api, api_late, api_early, subscription, unknown, codex],
         );
-        assert_eq!(store.charged_since(Provider::Claude, 1_000).unwrap(), 0.75);
+        assert_eq!(store.charged_since(Provider::Claude, 1_000).unwrap(), 2.75);
         assert_eq!(store.charged_since(Provider::Claude, 7_000).unwrap(), 0.0);
         assert_eq!(store.charged_since(Provider::Codex, 0).unwrap(), 16.0);
+    }
+
+    #[test]
+    fn a_clock_change_gives_each_day_its_own_midnight() {
+        let (_dir, store, project) = open();
+        store.save_thread(thread_row("t1", project));
+        let today = 20_000i64;
+        let change = today - 3;
+        let offset_at = move |unix: i64| {
+            if unix < change * 86_400 + 7 * 3600 {
+                5 * 3600
+            } else {
+                4 * 3600
+            }
+        };
+        let day_start = |day: i64| {
+            let offset = if day <= change { 5 * 3600 } else { 4 * 3600 };
+            day * 86_400 - offset
+        };
+        let now_ms = (day_start(today) + 15 * 3600) * 1000;
+        let row = |turn, day: i64, extra_ms: i64, input| {
+            usage_row(
+                turn,
+                (day_start(day) + extra_ms / 1000) * 1000 + extra_ms % 1000,
+                Provider::Claude,
+                "a",
+                tokens(input, 0, 0),
+                None,
+            )
+        };
+        save(
+            &store,
+            "t1",
+            vec![
+                row(0, change, 0, 1),
+                row(1, change + 1, -1, 10),
+                row(2, change + 1, 0, 100),
+                row(3, today - 6, -1, 1000),
+            ],
+        );
+        let days = store.daily_tokens(now_ms, 7, offset_at).unwrap();
+        let claude: Vec<_> = days
+            .iter()
+            .filter(|day| day.provider == Provider::Claude)
+            .map(|day| (day.day_start_unix_seconds, day.tokens.input))
+            .collect();
+        let expected: Vec<_> = (today - 6..=today)
+            .map(|day| {
+                let input = match day {
+                    d if d == change => 11,
+                    d if d == change + 1 => 100,
+                    _ => 0,
+                };
+                (day_start(day), input)
+            })
+            .collect();
+        assert_eq!(claude, expected);
+        assert_eq!(
+            claude[4].0 - claude[3].0,
+            25 * 3600,
+            "the clocks went back that day, so it is 25 hours long"
+        );
     }
 
     #[test]

@@ -29,7 +29,8 @@ const WEEK_DAYS: u32 = 7;
 const THREAD_ROWS: usize = 8;
 const CHART_HEIGHT: f32 = 130.0;
 const METER_WIDTH: f32 = 56.0;
-const TABLE_BAR: f32 = 84.0;
+const TABLE_BAR: f32 = 64.0;
+const TABLE_AGENT: f32 = 112.0;
 const LIMIT_REACHED: &str = "You choose when to continue; Newjen never resumes on its own.";
 const NOTHING_REPORTED: &str = "They show here after this account's next reply.";
 
@@ -249,10 +250,12 @@ pub fn card_model(
                 None,
                 CardBody::ApiKey {
                     variable,
-                    charged: charged.map(|(week, today)| Charged {
-                        week: dollars(week),
-                        today: dollars(today),
-                    }),
+                    charged: charged
+                        .filter(|_| provider.reports_price())
+                        .map(|(week, today)| Charged {
+                            week: dollars(week),
+                            today: dollars(today),
+                        }),
                 },
             )
         };
@@ -280,13 +283,20 @@ pub fn card_model(
     card(usage.plan_label(), meta, body)
 }
 
-/// The window whose start bounds "the threads that used it": the shortest one still open.
-pub fn current_window(usage: &ProviderUsage, now: i64) -> Option<&UsageWindow> {
-    usage
+/// The shortest window with a known length, and when to count its threads from: its start,
+/// or a whole length back from now once it has reset without a newer report.
+pub fn current_window(usage: &ProviderUsage, now: i64) -> Option<(&UsageWindow, i64)> {
+    let window = usage
         .windows
         .iter()
-        .filter(|window| !window.expired(now) && window.started_at().is_some())
-        .min_by_key(|window| window.length_seconds)
+        .filter(|window| window.started_at().is_some())
+        .min_by_key(|window| window.length_seconds)?;
+    let started = if window.expired(now) {
+        now - window.length_seconds?
+    } else {
+        window.started_at()?
+    };
+    Some((window, started))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -330,9 +340,8 @@ impl Snapshot {
     pub fn load(store: &Store, now_ms: i64) -> Self {
         let now = now_ms / 1000;
         let mut snapshot = Self::default();
-        let offset = local_utc_offset_seconds(now);
         let days = store
-            .daily_tokens(now_ms, WEEK_DAYS, offset)
+            .daily_tokens(now_ms, WEEK_DAYS, local_utc_offset_seconds)
             .unwrap_or_default();
         let week_start = days
             .first()
@@ -356,16 +365,17 @@ impl Snapshot {
                 entry.1 += thread.tokens.total();
             }
             let usage = usage::latest(provider);
-            if usage.as_ref().is_some_and(|u| u.billing == Billing::ApiKey) {
+            if provider.reports_price()
+                && usage.as_ref().is_some_and(|u| u.billing == Billing::ApiKey)
+            {
                 let charged = |since| store.charged_since(provider, since).unwrap_or_default();
                 snapshot
                     .charged
                     .insert(provider, (charged(week_start), charged(today_start)));
             }
-            let Some(window) = usage.as_ref().and_then(|usage| current_window(usage, now)) else {
-                continue;
-            };
-            let Some(started) = window.started_at() else {
+            let Some((window, started)) =
+                usage.as_ref().and_then(|usage| current_window(usage, now))
+            else {
                 continue;
             };
             names.push(window.label.clone());
@@ -490,14 +500,7 @@ pub fn render(input: &Input, cx: &App) -> AnyElement {
         .overflow_y_scroll()
         .p_4()
         .gap_4()
-        .child(
-            h_flex()
-                .flex_wrap()
-                .items_start()
-                .gap_4()
-                .child(claude)
-                .child(codex),
-        )
+        .child(h_flex().flex_wrap().gap_4().child(claude).child(codex))
         .child(
             h_flex()
                 .flex_wrap()
@@ -596,7 +599,7 @@ fn card_view(model: &CardModel, cx: &App) -> AnyElement {
             "{} reports its limits during a turn. {NOTHING_REPORTED}",
             provider.presentation().label
         ))),
-        CardBody::ApiKey { charged, .. } => {
+        CardBody::ApiKey { variable, charged } => {
             let line = |label: &str, value: String| {
                 h_flex()
                     .justify_between()
@@ -614,6 +617,12 @@ fn card_view(model: &CardModel, cx: &App) -> AnyElement {
                     .map(|c| line("Charged in the last 7 days", c.week.clone())),
             )
             .children(charged.as_ref().map(|c| line("Today", c.today.clone())))
+            .children((charged.is_none() && !provider.reports_price()).then(|| {
+                note(format!(
+                    "{} does not report a price. Charged to your API key ({variable}).",
+                    provider.presentation().label
+                ))
+            }))
         }
         CardBody::Plan { windows, credits } => body
             .children(
@@ -759,7 +768,7 @@ fn threads_card(input: &Input, cx: &App) -> AnyElement {
             .child(
                 h_flex()
                     .flex_none()
-                    .w(px(130.))
+                    .w(px(TABLE_AGENT))
                     .gap_1p5()
                     .items_center()
                     .text_color(muted)
@@ -769,7 +778,7 @@ fn threads_card(input: &Input, cx: &App) -> AnyElement {
             .child(
                 h_flex()
                     .flex_none()
-                    .w(px(TABLE_BAR + 52.))
+                    .w(px(TABLE_BAR + 48.))
                     .gap_2()
                     .items_center()
                     .child(
@@ -812,8 +821,8 @@ fn threads_card(input: &Input, cx: &App) -> AnyElement {
                 .pb_1p5()
                 .gap_3()
                 .child(head("Thread").flex_1())
-                .child(head("Agent").flex_none().w(px(130.)))
-                .child(head("Tokens").flex_none().w(px(TABLE_BAR + 52.)))
+                .child(head("Agent").flex_none().w(px(TABLE_AGENT)))
+                .child(head("Tokens").flex_none().w(px(TABLE_BAR + 48.)))
                 .child(head("Active").flex_none().w(px(44.)).text_right()),
         );
     if snapshot.threads.is_empty() {
@@ -908,7 +917,7 @@ fn week_card(snapshot: &Snapshot, cx: &App) -> AnyElement {
     };
     panel(cx)
         .min_w(px(280.))
-        .max_w(px(360.))
+        .max_w(px(320.))
         .child(
             h_flex()
                 .justify_between()
@@ -1273,6 +1282,25 @@ mod tests {
             }
         );
 
+        let codex_keyed = ProviderUsage {
+            provider: Provider::Codex,
+            ..keyed.clone()
+        };
+        let card = card_model(
+            Provider::Codex,
+            Some(&ready(Provider::Codex, Billing::ApiKey)),
+            Some(&codex_keyed),
+            Some((0.0, 0.0)),
+            NOW,
+        );
+        assert_eq!(
+            card.body,
+            CardBody::ApiKey {
+                variable: "OPENAI_API_KEY",
+                charged: None
+            }
+        );
+
         let planned = usage(vec![five_hours(0.38, 6600, UsageStatus::Ok)]);
         let card = card_model(Provider::Claude, None, Some(&planned), None, NOW);
         let CardBody::Plan { windows, credits } = card.body else {
@@ -1283,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn the_table_counts_from_the_shortest_open_window() {
+    fn the_table_counts_from_the_shortest_window_and_a_reset_one_counts_a_length_back() {
         let mixed = usage(vec![
             window(
                 "seven_day",
@@ -1294,12 +1322,23 @@ mod tests {
             ),
             five_hours(0.4, 3600, UsageStatus::Ok),
         ]);
-        let picked = current_window(&mixed, NOW).unwrap();
+        let (picked, started) = current_window(&mixed, NOW).unwrap();
         assert_eq!(picked.key, "five_hour");
-        assert_eq!(picked.started_at(), Some(NOW + 3600 - 18_000));
+        assert_eq!(started, NOW + 3600 - 18_000);
 
-        let expired = usage(vec![five_hours(0.4, -5, UsageStatus::Ok)]);
-        assert!(current_window(&expired, NOW).is_none());
+        let reset = usage(vec![
+            window(
+                "seven_day",
+                Some(0.1),
+                Some(NOW + 300_000),
+                Some(604_800),
+                UsageStatus::Ok,
+            ),
+            five_hours(0.4, -5, UsageStatus::Ok),
+        ]);
+        let (picked, started) = current_window(&reset, NOW).unwrap();
+        assert_eq!(picked.key, "five_hour");
+        assert_eq!(started, NOW - 18_000);
         let unmeasured = usage(vec![window(
             "x",
             Some(0.1),
