@@ -142,7 +142,9 @@ const MIGRATIONS: &[&str] = &[
      UPDATE projects SET landing_mode = 'harness_managed';
      UPDATE threads SET landing_mode = 'harness_managed';
      DELETE FROM copy_cleanup;
-     DELETE FROM pending_copies;",
+     UPDATE pending_copies SET path = replace(path, '/.rifts/', '/.newjen-worktrees/'), rift_id = NULL
+         WHERE state = 'draft';
+     DELETE FROM pending_copies WHERE state != 'draft';",
 ];
 
 /// The `user_version` of a database at the current schema.
@@ -1455,17 +1457,28 @@ mod tests {
     }
 
     #[test]
-    fn rift_era_pending_copies_do_not_survive_the_move_to_worktrees() {
+    fn rift_era_drafts_keep_their_message_and_other_pending_copies_go() {
         let mut connection = Connection::open_in_memory().unwrap();
         migrate(&mut connection, &MIGRATIONS[..5]).unwrap();
         connection.execute_batch("INSERT INTO projects (id, path, created_at, last_opened_at) VALUES (1, '/tmp/project', 1, 1);
             INSERT INTO pending_copies VALUES ('draft', 1, '/tmp/.rifts/project/a', 'held', 'draft', NULL, 1);
             INSERT INTO pending_copies VALUES ('sent', 1, '/tmp/.rifts/project/b', 'held', 'sent', 'rift-id', 1);").unwrap();
         migrate(&mut connection, MIGRATIONS).unwrap();
-        let left: i64 = connection
-            .query_row("SELECT count(*) FROM pending_copies", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(left, 0);
+        let left: Vec<(String, String, String)> = connection
+            .prepare("SELECT thread_id, path, message FROM pending_copies")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            left,
+            [(
+                "draft".to_string(),
+                "/tmp/.newjen-worktrees/project/a".to_string(),
+                "held".to_string()
+            )]
+        );
     }
 
     #[test]

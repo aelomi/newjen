@@ -73,7 +73,7 @@ pub fn snapshot(tools: &Tools, cwd: &Path, title: &str, thread_id: &str) -> Resu
     ensure!(
         git(tools, cwd, &["symbolic-ref", "--quiet", "HEAD"])
             .is_ok_and(|branch| branch.starts_with("refs/heads/newjen/")),
-        "This thread's recorded base is missing, so Newjen won't snapshot the project folder"
+        "Newjen has no recorded base for this folder and it is not on a Newjen branch, so it won't snapshot here"
     );
     let root = root(tools, cwd)?;
     add_all(tools, &root, None)?;

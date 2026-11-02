@@ -272,7 +272,7 @@ impl ChatView {
             return;
         }
         let Some(base) = thread.review_base().map(str::to_string) else {
-            self.slots[self.active].notice = Some(Notice::held("Landing unavailable", "Review and landing need a git repository with a first commit, and a thread started with review tracking.".into()));
+            self.slots[self.active].notice = Some(Notice::held("Landing unavailable", "Review and landing need a git repository, and a thread started with review tracking.".into()));
             cx.notify();
             return;
         };
