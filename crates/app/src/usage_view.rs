@@ -381,6 +381,7 @@ mod tests {
             label: key.into(),
             used_fraction: used,
             resets_at_unix_seconds: resets,
+            length_seconds: None,
             status,
         }
     }

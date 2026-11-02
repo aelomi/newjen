@@ -316,6 +316,7 @@ fn summary_shows_a_percentage_only_when_reported_and_drops_it_after_the_reset() 
         label: "5 hours".into(),
         used_fraction: fraction,
         resets_at_unix_seconds: resets,
+        length_seconds: None,
         status: UsageStatus::Ok,
     };
     assert!(
@@ -336,4 +337,132 @@ fn summary_shows_a_percentage_only_when_reported_and_drops_it_after_the_reset() 
     assert_eq!(credits(true, true, None).summary(), "Credits unlimited");
     assert_eq!(credits(true, false, Some(12.5)).summary(), "Credits 12.50");
     assert_eq!(credits(false, false, None).summary(), "No credits");
+}
+
+fn paced(used: Option<f32>, resets: i64, length: Option<i64>) -> UsageWindow {
+    UsageWindow {
+        key: "k".into(),
+        label: "5 hours".into(),
+        used_fraction: used,
+        resets_at_unix_seconds: Some(resets),
+        length_seconds: length,
+        status: UsageStatus::Ok,
+    }
+}
+
+#[test]
+fn recorded_windows_know_how_long_they_last() {
+    let usage =
+        ProviderUsage::from_claude_rate_limit(&claude_infos("text_reply.jsonl")[0]).unwrap();
+    assert_eq!(window(&usage, "five_hour").length_seconds, Some(18_000));
+    assert_eq!(window(&usage, "seven_day").length_seconds, Some(604_800));
+    let rejected =
+        ProviderUsage::from_claude_rate_limit(&claude_infos("claude/limit-rejected.jsonl")[0])
+            .unwrap();
+    assert_eq!(window(&rejected, "five_hour").length_seconds, Some(18_000));
+
+    let codex = ProviderUsage::from_codex_report(&codex_report("codex/read-only.jsonl", "read"));
+    let primary = window(&codex, "codex:primary");
+    assert_eq!(
+        primary.length_seconds,
+        Some(primary_minutes(&codex_report("codex/read-only.jsonl", "read")) * 60)
+    );
+    assert_eq!(
+        primary.started_at(),
+        Some(primary.resets_at_unix_seconds.unwrap() - primary.length_seconds.unwrap())
+    );
+}
+
+fn primary_minutes(report: &RateLimits) -> i64 {
+    report
+        .rate_limits
+        .primary
+        .as_ref()
+        .unwrap()
+        .window_duration_mins
+        .unwrap()
+}
+
+#[test]
+fn an_unnamed_claude_window_and_a_spend_window_have_no_length() {
+    let info = json!({"status":"allowed","unifiedWindows":{"seven_day_opus":{"utilization":0.5,"resetsAt":100}}});
+    let usage = ProviderUsage::from_claude_rate_limit(&info).unwrap();
+    assert_eq!(window(&usage, "seven_day_opus").length_seconds, None);
+    assert_eq!(window(&usage, "seven_day_opus").started_at(), None);
+}
+
+#[test]
+fn billing_comes_from_the_account_and_a_turn_report_never_erases_it() {
+    let mut board = UsageBoard::new();
+    let mut api = status(Provider::Claude, "max", "a@example.com", None);
+    if let Availability::Ready { account, .. } = &mut api.availability {
+        account.billing = Billing::ApiKey;
+    }
+    board.record_status(&api, 1);
+    assert_eq!(board.get(Provider::Claude), None, "nothing to show yet");
+    let turn = ProviderUsage::from_claude_rate_limit(&claude_infos("text_reply.jsonl")[0]).unwrap();
+    assert_eq!(turn.billing, Billing::Unknown);
+    board.record(&turn, 2);
+    assert_eq!(
+        board.get(Provider::Claude).unwrap().billing,
+        Billing::ApiKey
+    );
+    board.record_status(&status(Provider::Claude, "max", "a@example.com", None), 3);
+    assert_eq!(
+        board.get(Provider::Claude).unwrap().billing,
+        Billing::Subscription
+    );
+}
+
+#[test]
+fn elapsed_fraction_is_the_share_of_the_window_since_it_began() {
+    let window = paced(Some(0.0), 18_000, Some(18_000));
+    assert_eq!(window.elapsed_fraction(0), Some(0.0));
+    assert_eq!(window.elapsed_fraction(4_500), Some(0.25));
+    assert_eq!(window.elapsed_fraction(18_000), Some(1.0));
+    assert_eq!(window.elapsed_fraction(-100), Some(0.0));
+    assert_eq!(paced(None, 100, None).elapsed_fraction(50), None);
+    assert_eq!(paced(None, 100, Some(0)).elapsed_fraction(50), None);
+}
+
+#[test]
+fn pace_has_a_five_point_band_either_side_of_even() {
+    let at = |used| paced(Some(used), 20_000, Some(10_000)).pace(15_000);
+    assert_eq!(at(0.20), Some(Pace::Under));
+    assert_eq!(at(0.44), Some(Pace::Under));
+    assert_eq!(at(0.45), Some(Pace::On));
+    assert_eq!(at(0.50), Some(Pace::On));
+    assert_eq!(at(0.55), Some(Pace::On));
+    assert!(matches!(at(0.56), Some(Pace::Ahead { .. })));
+}
+
+#[test]
+fn running_ahead_projects_when_the_window_empties() {
+    let window = |used| paced(Some(used), 20_000, Some(10_000));
+    // Half the window gone (5,000 s of 10,000) and 80% used: empty after 6,250 s.
+    assert_eq!(
+        window(0.8).pace(15_000),
+        Some(Pace::Ahead {
+            runs_out_at: Some(10_000 + 6_250)
+        })
+    );
+    // Nothing has elapsed yet, so there is no rate to project.
+    assert_eq!(
+        paced(Some(0.3), 20_000, Some(10_000)).pace(10_000),
+        Some(Pace::Ahead { runs_out_at: None })
+    );
+    assert_eq!(
+        window(1.0).pace(15_000),
+        Some(Pace::Ahead {
+            runs_out_at: Some(15_000)
+        })
+    );
+}
+
+#[test]
+fn pace_needs_a_known_use_and_length_and_a_window_still_open() {
+    assert_eq!(paced(None, 20_000, Some(10_000)).pace(15_000), None);
+    assert_eq!(paced(Some(0.5), 20_000, None).pace(15_000), None);
+    assert_eq!(paced(Some(0.5), 20_000, Some(10_000)).pace(20_000), None);
+    assert_eq!(paced(Some(0.5), 20_000, Some(10_000)).pace(25_000), None);
 }

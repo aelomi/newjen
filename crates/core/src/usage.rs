@@ -31,8 +31,27 @@ pub struct UsageWindow {
     /// 0.0 to 1.0, only when the CLI reported a utilisation.
     pub used_fraction: Option<f32>,
     pub resets_at_unix_seconds: Option<i64>,
+    /// How long the window lasts, when the CLI says (or the window's name does).
+    #[serde(default)]
+    pub length_seconds: Option<i64>,
     pub status: UsageStatus,
 }
+
+/// Whether use is running ahead of or behind an even spend of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pace {
+    Under,
+    On,
+    /// `runs_out_at` is when the window empties at the current rate, Unix seconds, only if
+    /// that comes before it resets.
+    Ahead {
+        runs_out_at: Option<i64>,
+    },
+}
+
+/// Use within this many points of the elapsed share of the window counts as on pace.
+const PACE_BAND: f64 = 0.05;
+const PACE_EPSILON: f64 = 1e-4;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UsageCredits {
@@ -46,6 +65,9 @@ pub struct ProviderUsage {
     pub provider: Provider,
     /// As the CLI names it (`max`, `plus`); see [`ProviderUsage::plan_label`].
     pub plan: Option<String>,
+    /// What pays for this provider's turns. A plan's windows mean little under `ApiKey`.
+    #[serde(default)]
+    pub billing: Billing,
     pub windows: Vec<UsageWindow>,
     pub credits: Option<UsageCredits>,
     /// Set by [`UsageBoard`] when it stores the report; adapters leave it `None`.
@@ -56,6 +78,49 @@ impl UsageWindow {
     pub fn expired(&self, now: i64) -> bool {
         self.resets_at_unix_seconds
             .is_some_and(|reset| reset <= now)
+    }
+
+    /// When the window began, Unix seconds.
+    pub fn started_at(&self) -> Option<i64> {
+        Some(self.resets_at_unix_seconds? - self.length_seconds.filter(|length| *length > 0)?)
+    }
+
+    /// How much of the window has passed, 0.0 to 1.0.
+    pub fn elapsed_fraction(&self, now: i64) -> Option<f32> {
+        let length = self.length_seconds.filter(|length| *length > 0)?;
+        let start = self.started_at()?;
+        Some(((now - start) as f64 / length as f64).clamp(0.0, 1.0) as f32)
+    }
+
+    /// Use against the share of the window that has passed. `None` when either is unknown or the
+    /// window has already reset.
+    pub fn pace(&self, now: i64) -> Option<Pace> {
+        if self.expired(now) {
+            return None;
+        }
+        let used = f64::from(self.used_fraction?);
+        let elapsed = f64::from(self.elapsed_fraction(now)?);
+        let gap = used - elapsed;
+        Some(if gap < -(PACE_BAND + PACE_EPSILON) {
+            Pace::Under
+        } else if gap <= PACE_BAND + PACE_EPSILON {
+            Pace::On
+        } else {
+            Pace::Ahead {
+                runs_out_at: self.runs_out_at(now, used),
+            }
+        })
+    }
+
+    fn runs_out_at(&self, now: i64, used: f64) -> Option<i64> {
+        let start = self.started_at()?;
+        let reset = self.resets_at_unix_seconds?;
+        let elapsed = now - start;
+        if used <= 0.0 || elapsed <= 0 {
+            return None;
+        }
+        let empty = start + (elapsed as f64 / used).round() as i64;
+        (empty < reset).then_some(empty)
     }
 
     /// `5 hours · 38% · resets 4:10pm`. A window past its reset time drops the old percentage.
@@ -98,6 +163,7 @@ impl ProviderUsage {
         Self {
             provider,
             plan: None,
+            billing: Billing::Unknown,
             windows: Vec::new(),
             credits: None,
             updated_at_unix_seconds: None,
@@ -133,6 +199,9 @@ impl ProviderUsage {
         if newer.credits.is_some() {
             self.credits = newer.credits.clone();
         }
+        if newer.billing != Billing::Unknown {
+            self.billing = newer.billing;
+        }
         if newer.updated_at_unix_seconds.is_some() {
             self.updated_at_unix_seconds = newer.updated_at_unix_seconds;
         }
@@ -160,9 +229,12 @@ impl ProviderUsage {
                 windows.push(window_from(
                     key,
                     claude_label(key),
-                    window["utilization"].as_f64(),
-                    window["resetsAt"].as_i64(),
-                    window["status"].as_str().and_then(claude_status),
+                    WindowReport {
+                        utilization: window["utilization"].as_f64(),
+                        resets_at: window["resetsAt"].as_i64(),
+                        length_seconds: claude_length(key),
+                        status: window["status"].as_str().and_then(claude_status),
+                    },
                 ));
             }
         }
@@ -171,9 +243,12 @@ impl ProviderUsage {
             windows.push(window_from(
                 key,
                 claude_label(key),
-                None,
-                info["resetsAt"].as_i64(),
-                top_status,
+                WindowReport {
+                    utilization: None,
+                    resets_at: info["resetsAt"].as_i64(),
+                    length_seconds: claude_length(key),
+                    status: top_status,
+                },
             ));
         } else if let (Some(status), Some(kind)) = (top_status, top_type)
             && let Some(window) = windows.iter_mut().find(|w| w.key == kind)
@@ -209,18 +284,20 @@ impl ProviderUsage {
             ("secondary", "Secondary limit", &snapshot.secondary),
         ] {
             if let Some(window) = window {
+                let minutes = window.window_duration_mins.filter(|m| *m > 0);
                 usage.windows.push(window_from(
                     &format!("{bucket}:{slot}"),
                     named(
-                        window
-                            .window_duration_mins
-                            .filter(|m| *m > 0)
+                        minutes
                             .map(duration_label)
                             .unwrap_or_else(|| fallback.into()),
                     ),
-                    Some(f64::from(window.used_percent) / 100.0),
-                    window.resets_at,
-                    None,
+                    WindowReport {
+                        utilization: Some(f64::from(window.used_percent) / 100.0),
+                        resets_at: window.resets_at,
+                        length_seconds: minutes.map(|m| m * 60),
+                        status: None,
+                    },
                 ));
             }
         }
@@ -228,9 +305,12 @@ impl ProviderUsage {
             usage.windows.push(window_from(
                 &format!("{bucket}:spend"),
                 named("Spend".into()),
-                Some(f64::from(100 - spend.remaining_percent) / 100.0),
-                Some(spend.resets_at),
-                None,
+                WindowReport {
+                    utilization: Some(f64::from(100 - spend.remaining_percent) / 100.0),
+                    resets_at: Some(spend.resets_at),
+                    length_seconds: None,
+                    status: None,
+                },
             ));
         }
         usage.credits = snapshot.credits.as_ref().map(|credits| UsageCredits {
@@ -262,13 +342,21 @@ impl ProviderUsage {
     }
 }
 
-fn window_from(
-    key: &str,
-    label: String,
+/// What a CLI reported about one window.
+struct WindowReport {
     utilization: Option<f64>,
     resets_at: Option<i64>,
-    reported: Option<UsageStatus>,
-) -> UsageWindow {
+    length_seconds: Option<i64>,
+    status: Option<UsageStatus>,
+}
+
+fn window_from(key: &str, label: String, report: WindowReport) -> UsageWindow {
+    let WindowReport {
+        utilization,
+        resets_at,
+        length_seconds,
+        status: reported,
+    } = report;
     let used_fraction = utilization
         .filter(|n| n.is_finite())
         .map(|n| n.clamp(0.0, 1.0) as f32);
@@ -282,6 +370,7 @@ fn window_from(
         label,
         used_fraction,
         resets_at_unix_seconds: resets_at.filter(|n| *n >= 0),
+        length_seconds: length_seconds.filter(|n| *n > 0),
         status: derived.max(reported.unwrap_or(UsageStatus::Ok)),
     }
 }
@@ -291,6 +380,14 @@ fn claude_status(status: &str) -> Option<UsageStatus> {
         "allowed" => Some(UsageStatus::Ok),
         "allowed_warning" | "warning" => Some(UsageStatus::Warning),
         "rejected" => Some(UsageStatus::Limited),
+        _ => None,
+    }
+}
+
+fn claude_length(key: &str) -> Option<i64> {
+    match key {
+        "five_hour" => Some(5 * 3600),
+        "seven_day" => Some(7 * 86_400),
         _ => None,
     }
 }
@@ -382,6 +479,7 @@ impl UsageBoard {
                 let stored = entry
                     .usage
                     .get_or_insert_with(|| ProviderUsage::empty(status.provider));
+                stored.billing = account.billing;
                 stored.plan = match account.billing {
                     Billing::ApiKey => None,
                     _ => account

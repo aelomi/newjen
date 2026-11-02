@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::env::{self, Cli};
 use crate::probe::{self, Probe};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Provider {
     Claude,
     Codex,
@@ -104,10 +104,13 @@ pub enum Availability {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What pays for the CLI's turns, as the CLI reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Billing {
     Subscription,
     ApiKey,
+    #[default]
     Unknown,
 }
 
