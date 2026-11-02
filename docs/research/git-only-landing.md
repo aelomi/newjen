@@ -1,5 +1,7 @@
 # Landing work without an existing jj repository
 
+> **Note (2026-11-02):** Newjen switched to git worktrees and git landing, and no longer uses Rift or jj. The jj and Rift decisions in this memo are historical. See [how landing works now](../landing.md).
+
 The later [project source-control design](project-source-control.md) supersedes the blanket copy-local jj policy below. Git mode now requires a Git implementation without jj, while jj modes use the selected layout. The transfer experiments and automatic apply requirement remain relevant. The decision sections below record the earlier discussion, not the current per-project mode policy.
 
 Research and decision date 2026-10-31. The owner chose jj confined to Rift copies for plain Git projects and required automatic apply for folders without version control. This memo changes no Newjen behavior.

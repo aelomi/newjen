@@ -1,6 +1,6 @@
 # Newjen
 
-Newjen is a native macOS agent development environment built with Rust and GPUI. It runs Claude Code and Codex in parallel threads, in your project or isolated Rift copies. Approve their tools, review their changes, and land their work from one window.
+Newjen is a native macOS agent development environment built with Rust and GPUI. It runs Claude Code and Codex in parallel threads, in your project or isolated git worktrees. Approve their tools, review their changes, and land their work from one window.
 
 ## Install
 
@@ -38,7 +38,7 @@ brew uninstall --cask aelomi/newjen/newjen
 ```
 
 Add `--zap` to also remove the default data folder, `~/Library/Application Support/Newjen`, and macOS state.
-Custom `NEWJEN_HOME` folders, projects, Rift copies, and agent CLI data are left alone.
+Custom `NEWJEN_HOME` folders, projects, git worktrees (the `.newjen-worktrees` folder beside your repository), and agent CLI data are left alone.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) to build from source.
 

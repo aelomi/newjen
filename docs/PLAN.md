@@ -9,7 +9,7 @@ Newjen is a macOS-only agent development environment: run many isolated Claude C
 
 Parallel agents and speed. The stack provides both. Workflow/UX and customizability follow from owning the code; they are not v1 features.
 
-**Done when:** you can open a project, start several threads, have each agent work in the project or in its own Rift copy, approve its tool calls, review its diff, and land or discard the work, all in a native window that stays light on memory.
+**Done when:** you can open a project, start several threads, have each agent work in the project or in its own git worktree, approve its tool calls, review its diff, and land or discard the work, all in a native window that stays light on memory.
 
 ## Stack
 
@@ -19,9 +19,9 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
 | UI framework | GPUI: `gpui-pre =0.3.10`, `gpui-pre-platform =0.3.10` (`font-kit`) | The version GPUI Kit pins |
 | Components | GPUI Kit (Longbridge): `gpui-kit =0.8.1` | Plain pinned dependency, Apache-2.0. Kit components with Kit's default theme, sizes and fonts: title bar, list items, Sheet, Popover, messages/scroller, markdown, input, buttons, tags and menus; diff in slice 4. Newjen hand-builds only the approval card, tool card and working-dot pulse, with thin behavior helpers. |
 | Agent | Claude Code CLI (`claude`) over stream-json and Codex CLI (`codex app-server`), both in the MVP (decided 2026-10-31) | Newjen detects which CLIs are installed without spending usage; each thread picks its provider, model, effort and speed. API-key providers and ACP later |
-| Isolation | Rift (`rift-snapshot`), an APFS copy-on-write copy, opt-in per thread | Installed. By default a thread works in the project folder; no git worktrees for now |
-| Version control | jj 0.46.0, colocated with git | Installed |
-| Code hosting | GitHub, a normal git remote; `jj git push` | Moved from GitCafe on 2026-11-01: GitCafe has no releases and no hosted macOS runners, and contributors know GitHub. `gh` is logged in |
+| Isolation | Git worktrees, opt-in per thread (decided 2026-11-02) | By default a thread works in the project folder. Rift copies were used from 2026-10-30 to 2026-11-02 and may return as an experiment |
+| Version control | Plain git (decided 2026-11-02) | jj 0.46.0 was used until then and may return as an experiment |
+| Code hosting | GitHub, a normal git remote; `git push` | Moved from GitCafe on 2026-11-01: GitCafe has no releases and no hosted macOS runners, and contributors know GitHub. `gh` is logged in |
 | Storage | SQLite (threads, settings); Claude keeps its own transcripts | Resume with `--resume <session-id>` |
 | Platform | macOS only | No signing or notarization until it's shared |
 
@@ -39,19 +39,17 @@ Parallel agents and speed. The stack provides both. Workflow/UX and customizabil
   - Each tool call that needs approval arrives as `{"type":"control_request","request":{"subtype":"can_use_tool","tool_name":…,"input":…}}`.
   - Answer with `{"type":"control_response","response":{"subtype":"success","request_id":…,"response":{"behavior":"allow","updatedInput":…}}}`, or `"behavior":"deny"`.
   - No MCP server is needed. Keep stdin open for the whole session.
-- **Rift + jj work together** (checked with real Rift on 2026-10-31, `crates/core/tests/rift.rs`):
-  - **Use `rift create --copy-all`.** By default Rift skips gitignored files such as `node_modules` and build output, which removes the main benefit.
-  - **Start the copy's work on a change the main repo no longer edits.** In the main repo, snapshot and run `jj new` only if `@` has changes; the base is `@-`. After `rift create`, run `jj new <base>` in the copy. Otherwise the copy keeps editing a change the original also edits, and fetching it back creates a *divergent* change. The fetched work then shows only the agent's diff, on top of the original's state when the copy was made. The first rule tried (describe, then `jj new` in both repos) also avoids divergence but leaves two empty changes in the main repo for every copy.
-  - **Land only the thread's bookmark:** run `jj git remote add <thread> <copy path>` and `jj git fetch --remote <thread> --branch newjen/<id8>` in the main repo. A full fetch brings inherited bookmarks and divergent changes.
-- **Harmless jj warning:** jj notes "repo appears to have been copied" the first time it runs in a copy.
-- **`rift remove` takes the copy's path, not its name.** It moves the copy to a `.trash` folder beside it. `rift gc` empties every Rift trash on the Mac, so Newjen deletes only its own trash entry instead.
-- **Copy speed:** this repo (158,661 files, a 32 GB `target/`) copies in 4.3 s, so the copy is made off the UI thread with progress shown.
+- **Git worktrees and landing** (rebuilt on git on 2026-11-02; [the isolation memo](research/isolation.md) holds the research behind the Rift choice this replaces):
+  - **A worktree** is `git worktree add -b newjen/<id8>-<random> <path> HEAD`, made when the first message is sent, beside the repository in `.newjen-worktrees/<repository folder name>/`. It starts at the checked-out commit. Uncommitted and gitignored files (`node_modules`, `target/`) are not in it, so each worktree rebuilds its own dependencies.
+  - **It needs a git repository with at least one commit.** Otherwise the worktree choice is unavailable.
+  - **Landing** is one mode, where Newjen commits. A worktree thread's snapshots are commits on its branch, and Land merges with `git merge --no-ff` after a `git merge-tree --write-tree` conflict check. A project-folder thread's snapshots are commits under `refs/newjen/<thread id>`, built from a separate index file, and Land commits only the thread's files with `git commit --only`. [How it works](landing.md).
+  - **Archiving** runs `git worktree remove --force` and `git worktree prune`, then `git branch -d`, so an unmerged branch stays and its work can be recovered.
 
 ## Architecture
 
 ```
 crates/
-  core/      # no UI: agent sessions, Rift, jj, SQLite, events. Tested headlessly.
+  core/      # no UI: agent sessions, git worktrees and landing, SQLite, events. Tested headlessly.
   app/       # GPUI + GPUI Kit shell; Kit's default themes and fonts follow system appearance.
              # Renders core state, sends user intents to core; ui/ holds the two agent cards, pulse and thin helpers.
   cli/       # (optional) small CLI that drives core, used for testing and debugging
@@ -59,24 +57,23 @@ crates/
 
 - **Core owns state.** It runs one actor per thread, which owns the agent's child process (`claude` or `codex app-server`) and emits one set of provider-neutral events (`agent.rs`): text, tool use, approval needed, result, error, usage limits. Each provider has an adapter under `providers/` that translates its wire protocol into those events and back.
 - **The app subscribes to those events** and renders them with Kit's own components and default theme (`cx.theme()`). Newjen owns only the approval card, tool card, working-dot pulse and thin key/focus helpers (`crates/app/src/ui/`). Replies keep lazily built `TextViewState` entities; Kit draws markdown and highlighted code blocks, and `MessageScroller` follows the tail. No bundled fonts or separate palette. `diff` comes in slice 4.
-- **Thread model:** projects → threads, several projects open in one window. Each thread has its own working folder (the project folder by default, or its own Rift copy when you choose one), one provider with its model, effort and speed, one agent process, one landing mode, and optionally one terminal. A thread always runs from the same folder, because Claude ties `--resume` to the folder a conversation started in.
+- **Thread model:** projects → threads, several projects open in one window. Each thread has its own working folder (the project folder by default, or its own git worktree when you choose one), one provider with its model, effort and speed, one agent process, and optionally one terminal. A thread always runs from the same folder, because Claude ties `--resume` to the folder a conversation started in.
 
 ## Thread lifecycle
 
-1. **New thread:** works in the project folder unless you choose a Rift copy (decided 2026-10-30: Rift is a choice, like worktrees are elsewhere, and must be seamless when chosen). For a Rift copy, the copy is made when the first message is sent, and that message waits until it is ready: snapshot the original and `jj new` there only if `@` has changes, `rift create --copy-all` (copies go to `.rifts/<project>/newjen-<id8>-<6 random lowercase letters or digits>` beside the project, on the same disk, as copy-on-write needs), then `jj new <base>` in the copy. Rift `postcreate` hooks run per-copy setup, such as rebuilding venvs; `RIFT_ID` and `RIFT_SOURCE` are also set for claude, so dev servers can derive ports. A failed copy or hook gives the message back. Each attempt gets a fresh name. The held message and destination are saved before copying, and the Rift id before `jj new` in the copy. An acknowledged sent state precedes the first write to claude. After a quit, Newjen stops Rift and its hooks before recovery, lets jj finish, removes only unfinished copies, and restores unsent messages to the composer without sending them. Sent copies are kept even if their thread could not be saved, with their path shown. Restored drafts show the recovery notice once; clearing one discards it. Newjen refuses to make a copy while another thread works in the project folder, and holds project-folder sends until the copy's main-repo snapshot and `jj new` step finishes. Each copy is saved with its thread (path, Rift id and the jj base commit), which is what landing needs.
-2. **Run:** spawn `claude` with the copy as its working directory, stream events, and surface approvals in the UI.
-3. **Land work** using one of two modes, chosen per thread with a project default. Fetch only the thread's bookmark (`jj git fetch --remote <thread> --branch newjen/<id8>`), then `jj bookmark track newjen/<id8>@<thread>`. If the user rewrote the base in main, run `jj rebase -s 'roots(<base>..<bookmark>)' -d <base change's current commit>` and `jj abandon <old base commit>`; `divergent()` stays empty. A full fetch brings inherited bookmarks and divergent changes:
-   - **Harness-managed:** the agent is told not to commit. At the end of each turn the harness snapshots the copy with jj (`jj describe`/`jj new`). You review the diff in the app, then:
-     - **Land:** fetch the copy's change into the main repo as bookmark `newjen/<id8>`, then rebase or merge.
-     - **Discard:** remove the copy.
-   - **Agent-managed:** the harness never writes to version control in the copy, and reads only with `--ignore-working-copy`. Landing fetches only the thread's `newjen/<id8>` bookmark.
-4. **Close:** archiving a thread in a copy always asks first, then removes the copy in the background (`rift remove <copy path>` and its trash entry), and a removal Newjen quit before finishing is done at the next launch. The unique attempt name proves ownership of the exact project-copy destination; recovery checks its parent and thread name. A different Rift id is never removed, but our own trash entry is still deleted. An owned folder without `.rift` is deleted directly, with parent and symlink checks. Slice 4 adds `jj git remote remove <thread>` in the main repo and Land or Discard before this.
+1. **New thread:** works in the project folder unless you choose a git worktree (a choice, and it must be seamless when chosen). For a worktree, it is made when the first message is sent, and that message waits until it is ready: `git worktree add -b newjen/<id8>-<6 random lowercase letters or digits> <path> HEAD`, with the path under `<parent>/.newjen-worktrees/<repository folder name>/` beside the repository. The worktree starts at the checked-out commit; uncommitted and gitignored files are not in it. It needs a git repository with at least one commit. There are no setup hooks. The agent gets `NEWJEN_WORKTREE` (its branch) and `NEWJEN_SOURCE` (the repository root) in its environment, so dev servers can derive ports. A failed attempt gives the message back. The held message and destination are saved before git runs, and Cancel (⌘.) stops git and removes the half-made worktree. Each worktree is saved with its thread (path, branch and base commit), which is what landing needs.
+2. **Run:** spawn `claude` or `codex` with the thread's working folder as its working directory, stream events, and surface approvals in the UI.
+3. **Land work** in one mode, **Newjen commits** ([how it works](landing.md)): the agent is told not to commit, stage or branch, and Newjen snapshots after each turn. You review the diff in the app, then:
+   - **Land:** for a worktree thread, merge its branch into the project's current branch (`git merge --no-ff`, after a conflict check). For a project-folder thread, commit only the thread's files on the current branch.
+   - **Discard:** remove the worktree, or restore the project-folder thread's files to its base.
+   - **Keep files and close:** release the thread without touching any files.
+4. **Close:** archiving a worktree thread removes the worktree in the background (`git worktree remove --force`, `git worktree prune`) and deletes its branch with `git branch -d`, which refuses an unmerged branch so its work stays recoverable with git. A removal Newjen quit before finishing is done at the next launch.
 
 ## Approvals and agent lifecycle
 
 Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zeron, Paseo, Synara, Zed, Vibe Kanban, Claude Squad and Cursor ([memo](research/approvals-and-lifecycle.md)).
 
-- **Grants live only in the session.** "Always allow" never writes to settings files (each Rift copy would get its own), and it remembers only what it can name exactly: CLI `addRules` suggestions whose rules all carry `ruleContent` (or a single MCP tool), or an exact Bash command without `*`. Everything else, including edits, is allowed once. The dock says which, before the click.
+- **Grants live only in the session.** "Always allow" never writes to settings files (each worktree would get its own), and it remembers only what it can name exactly: CLI `addRules` suggestions whose rules all carry `ruleContent` (or a single MCP tool), or an exact Bash command without `*`. Everything else, including edits, is allowed once. The dock says which, before the click.
 - **Deny and stop are separate.** Esc denies and Claude carries on; ⌘. denies and ends the turn.
 - **Claude dies with Newjen.** A watcher kills claude's process group as soon as Newjen exits, and the pid registry reaps anything left at the next launch.
 - **Later slices:**
@@ -86,12 +83,11 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 
 ## Known gotchas
 
-- **Copied absolute paths.** Python virtual environments and some build caches embed absolute paths. Use Rift `postcreate` hooks to rebuild them.
-- **Port clashes** between copies running dev servers. Derive ports from `$RIFT_ID`.
-- **jj ignores git hooks**, so husky and pre-commit won't run. Any checks they did must run from the harness.
-- **UI reads must not snapshot the working copy.** Always pass `--ignore-working-copy` when the UI polls jj.
+- **A worktree has no dependencies.** Gitignored files (`node_modules`, `target/`, virtual environments) are not in it, so each worktree rebuilds its own. This costs time and disk.
+- **Port clashes** between worktrees running dev servers. Derive ports from `$NEWJEN_WORKTREE`.
+- **Newjen's commits skip git hooks** (`--no-verify`), so husky and pre-commit won't run. Any checks they did go in `.newjen/checks.json`, which landing runs.
 - **Orphan processes.** Kill `claude` children on crash or quit, using process groups and a cleanup check at startup.
-- **No sandbox.** Rift copies isolate files, not permissions. Agents still have full access to your Mac.
+- **No sandbox.** Worktrees isolate files, not permissions. Agents still have full access to your Mac.
 - **GPUI Kit is pre-1.0.** Pin exact versions and commit `Cargo.lock`. It has no terminal and no Mermaid diagrams: Mermaid fences show as code until diagrams are built separately.
 - **The "already in use" repair is timing-bound.** It needs claude's stderr line to arrive within the 500 ms drain after claude exits; a later line shows as a plain "Claude exited" error instead.
 - **⌘{ and ⌘} assume a US layout.** On layouts that type braces another way, previous/next thread may not fire.
@@ -103,26 +99,27 @@ Decided on 2026-10-27 after comparing Claude Code, Codex, T3 Code, MonoCode, Zer
 
 ## Build order (one vertical slice first)
 
-1. **Slice (done 2026-10-27):** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in the chat, with approve/deny working. One thread, no Rift, no jj.
+1. **Slice (done 2026-10-27):** `cargo run` opens a window → type a prompt → Claude replies over stream-json → the reply renders in the chat, with approve/deny working. One thread, no worktrees, no landing.
 2. **Done 2026-10-31.** Threads list, SQLite persistence, resume. Decided 2026-10-30 ([memo](research/threads-and-persistence.md)):
    - **Store:** `~/Library/Application Support/Newjen/newjen.db` (`NEWJEN_HOME` overrides it), WAL, migrations by `user_version`. Tables: projects, threads (with `provider`, the Claude session id and an unread flag), rendered transcript items, and grants. Writes run off the UI thread, at checkpoints only, never per streamed token.
-   - **Resume:** the Claude session id is allocated when the thread is created: `--session-id` until `init` arrives, `--resume` after. Each thread stores its own working folder and always spawns from it, so slice 3 only has to set it to a Rift copy.
+   - **Resume:** the Claude session id is allocated when the thread is created: `--session-id` until `init` arrives, `--resume` after. Each thread stores its own working folder and always spawns from it, so slice 3 only has to set it to a worktree.
    - **Relaunch:** approvals left pending show as expired and running work as interrupted. Continuing is manual; nothing restarts on its own.
    - **Processes:** a thread's `claude` keeps running when you switch away, and stops after 30 minutes idle, never mid-turn or with an approval pending. Quitting stops all of them.
    - **Grants:** "Always allow" rules are saved per thread and re-applied at every spawn with `--allowedTools`, so the dock says "for this thread". They can be listed and revoked.
    - **List:** new threads on top, a status per thread (needs approval, working, failed, stopped, unread), titles from the first message (no hidden model calls). ⌘N opens a draft that is saved only once its first message is sent, so empty threads never pile up. The sidebar hides below 760 px of window width (⌘B toggles it) and shows a dot when a hidden thread needs you. Mocks: `design/newjen.pen` screens 8–12.
    - **Deferred:** deny with a note. The approval dock replaces the composer, so it needs its own text field; it moves to slice 4 with the diff view.
-3. **Done 2026-10-31.** Rift copies, chosen per thread when you create it, with postcreate hooks. The default stays the project folder. Landing (slice 4) must handle both kinds of thread. Every other ADE checked isolates with git worktrees; none uses copy-on-write copies. Their most common complaint is cleanup that deleted work ([memo](research/isolation.md)).
-4. **Done 2026-10-31.** jj snapshots, diff view (GPUI Kit `diff`), and both landing modes ([how it works](landing.md)). Each thread chooses **Harness manages jj** (Newjen snapshots after every turn and the agent is told not to commit) or **Agent manages jj** (Newjen never writes version control there), with a project default. Review shows the diff since the thread's base; **Rebase and land**, **Merge and land**, **Discard work** and **Keep files and close** resolve it. Landing runs the checks declared in `.newjen/checks.json`, since jj runs no git hooks. Edit approvals show the before-and-after diff and recheck the file before allowing; a denial can carry a note (Claude receives it as the deny message; Codex's decision carries no text, so the note stays in the composer). Only colocated jj repositories can land; [what Git-only projects and plain folders need](research/git-only-landing.md) and [the per-project source-control modes](research/project-source-control.md) are decided on paper, not built.
-5. **Done 2026-10-31.** One approvals inbox across every loaded project (Allow once and Deny; grants stay in the thread's dock), a Dock badge counting threads waiting on you, notifications only when Newjen is in the background, a per-thread terminal panel on `alacritty_terminal` and `portable-pty`, and one quit prompt for ⌘Q, ⌘W and the native quit that counts running turns, approvals, background tasks, Rift preparation, snapshots and terminals ([memo](research/slice5-lifecycle.md)).
+3. **Done 2026-10-31, rebuilt on git worktrees 2026-11-02.** Isolated copies of the project, chosen per thread when you create it. The default stays the project folder. Landing (slice 4) handles both kinds of thread. The slice was first built on Rift copies with postcreate hooks. On 2026-11-02 it was rebuilt on git worktrees, which every other ADE checked uses ([memo](research/isolation.md)).
+4. **Done 2026-10-31, rebuilt on git 2026-11-02.** Snapshots, diff view (GPUI Kit `diff`), and landing ([how it works](landing.md)). The slice was first built on jj with two landing modes (**Harness manages jj** and **Agent manages jj**), a project default, and **Rebase and land**. On 2026-11-02 it was rebuilt on git with one mode, where Newjen commits. Review shows the diff since the thread's base; **Land**, **Discard** and **Keep files and close** resolve it. Landing runs the checks declared in `.newjen/checks.json`, since Newjen's commits skip git hooks. Edit approvals show the before-and-after diff and recheck the file before allowing; a denial can carry a note (Claude receives it as the deny message; Codex's decision carries no text, so the note stays in the composer). Review and landing need a git repository; [what plain folders need](research/git-only-landing.md) and [the per-project source-control modes](research/project-source-control.md) are older memos, decided on paper, not built.
+5. **Done 2026-10-31.** One approvals inbox across every loaded project (Allow once and Deny; grants stay in the thread's dock), a Dock badge counting threads waiting on you, notifications only when Newjen is in the background, a per-thread terminal panel on `alacritty_terminal` and `portable-pty`, and one quit prompt for ⌘Q, ⌘W and the native quit that counts running turns, approvals, background tasks, worktree preparation, snapshots and terminals ([memo](research/slice5-lifecycle.md)).
 6. **Done 2026-10-31, in the MVP** (decided 2026-10-31; the plan had put it after the MVP). Providers: Newjen detects the installed agent CLIs without spending usage ([memo](research/provider-detection.md)), drives Claude over stream-json and Codex over `codex app-server` ([memo](research/codex-codec.md)) through one neutral event and approval model, and each new thread picks its agent, model, effort and speed in the composer; the last choice becomes the project's default. It shows the account and plan, warns about API keys in the environment, and pauses sending when a usage limit is rejected until the reset time (Codex can confirm an early reset with Refresh; Claude cannot report its limits without spending usage). Codex approvals keep the exact-scope rule. Nothing retries or resumes on its own.
 
-**Also done 2026-10-31:** opening and switching projects in one window, with recent projects and a welcome screen ([memo](research/opening-projects.md)); one Newjen per data folder; cancelling a Rift copy while it is made; a broken connection to the agent ends its session at once so the next message starts a fresh one.
+**Also done 2026-10-31:** opening and switching projects in one window, with recent projects and a welcome screen ([memo](research/opening-projects.md)); one Newjen per data folder; cancelling a worktree while it is made; a broken connection to the agent ends its session at once so the next message starts a fresh one.
 
 **Planned next:**
 
-- **Disk use per thread.** Show each thread's real disk cost (the space its Rift copy uses that isn't shared with the project, mostly build output), warn before making a Rift copy when disk is low, and offer "free this thread's build output" when a thread finishes. Making a copy costs about nothing; copies grow because agents change code and rebuild, and every rebuilt artifact takes new, unshared blocks (seven copies of this repo grew 2.5 to 5.9 GB each in one session). Worktree-based ADEs leave users to find this out on their own.
-- **Landing for Git-only projects and plain folders**, per the memos above.
+- **Disk use per thread.** Show each thread's real disk cost (a worktree rebuilds its own `target/` or `node_modules`), warn before making a worktree when disk is low, and offer "free this thread's build output" when a thread finishes.
+- **Rift copies and jj, as an experiment.** The 2026-11-02 decision (below) says they may return once the build is solid.
+- **Landing for plain folders that are not git repositories**, per the memos above.
 - **Switching a thread's provider with a context handoff**, as T3 Code does.
 
 ## Subscription safety
@@ -140,5 +137,7 @@ Kit's default light and dark themes follow the system appearance. Components kee
 
 ## Open questions
 
+- **Decided 2026-11-02: git worktrees and plain git replace Rift copies and jj.** The owner wants to nail this build on the common git-worktree model first, before experimenting with Rift and jj. Slices 3 and 4 were first built on Rift and jj (2026-10-31) and rebuilt on git. Rift and jj may return later as an experiment. Threads from the Rift and jj era are marked resolved by a database migration, and their Rift copies stay on disk.
+
 - None blocking. All five MVP slices and providers are built (2026-10-27 to 2026-10-31). Ely was replaced with GPUI Kit on 2026-10-31. Next: the planned items above.
-- **Rift gaps found in slice 3:** a copy folder deleted by hand, or removed directly after its `.rift` marker was lost (including `git clean -fdx`), stays in Rift's registry until the user runs `rift gc`. Newjen deletes its own trash entry instead of running `rift gc`. Rift keeps that trash row until the user runs `rift gc`.
+- **Rift gaps found in slice 3 (historical):** a copy folder deleted by hand, or removed directly after its `.rift` marker was lost (including `git clean -fdx`), stayed in Rift's registry until the user ran `rift gc`. Newjen deleted its own trash entry instead of running `rift gc`. Newjen no longer makes or removes Rift copies; old ones stay on disk (remove one with `rift remove <path>`).
