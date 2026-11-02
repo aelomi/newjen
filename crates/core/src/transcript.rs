@@ -383,6 +383,9 @@ impl Transcript {
     pub fn usage(&self) -> &crate::thread_usage::ThreadUsage {
         &self.usage
     }
+    pub(crate) fn restore_usage(&mut self, usage: crate::thread_usage::ThreadUsage) {
+        self.usage = usage;
+    }
     pub fn rate_limit(&self) -> Option<&crate::agent::RateLimitEvent> {
         self.rate_limit.as_ref()
     }

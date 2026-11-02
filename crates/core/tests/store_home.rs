@@ -45,9 +45,11 @@ fn newjen_home_holds_a_freshly_created_database() {
             "pending_copies",
             "project_agent_choices",
             "projects",
+            "provider_usage",
             "thread_items",
             "thread_limits",
-            "threads"
+            "threads",
+            "turn_usage"
         ]
     );
 }

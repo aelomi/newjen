@@ -29,8 +29,12 @@ use anyhow::{Context, Result, anyhow};
 use async_channel::{Receiver, Sender};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
+use crate::thread_usage::TurnUsageRow;
 use crate::transcript::Status;
 use crate::worktree::Worktree;
+
+mod usage;
+pub use usage::{DailyTokens, ThreadWindowUsage, local_utc_offset_seconds};
 
 /// The database file's name inside the Newjen folder.
 pub const DB_FILE: &str = "newjen.db";
@@ -145,6 +149,31 @@ const MIGRATIONS: &[&str] = &[
      UPDATE pending_copies SET path = replace(path, '/.rifts/', '/.newjen-worktrees/'), rift_id = NULL
          WHERE state = 'draft';
      DELETE FROM pending_copies WHERE state != 'draft';",
+    // Version 7: tokens and value per model for every turn, and the latest plan report per
+    // provider. A turn's rows are keyed so that writing them again replaces them.
+    "CREATE TABLE turn_usage (
+         thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+         turn INTEGER NOT NULL,
+         model TEXT NOT NULL,
+         ended_at INTEGER NOT NULL,
+         provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+         billing TEXT NOT NULL CHECK (billing IN ('subscription', 'api_key', 'unknown')),
+         input INTEGER NOT NULL,
+         cached_input INTEGER NOT NULL,
+         cache_write_input INTEGER NOT NULL,
+         output INTEGER NOT NULL,
+         reasoning_output INTEGER NOT NULL,
+         cost_usd REAL,
+         context_used INTEGER,
+         context_window INTEGER,
+         PRIMARY KEY (thread_id, turn, model)
+     );
+     CREATE INDEX turn_usage_by_time ON turn_usage(ended_at);
+     CREATE TABLE provider_usage (
+         provider TEXT PRIMARY KEY,
+         report TEXT NOT NULL,
+         updated_at INTEGER NOT NULL
+     );",
 ];
 
 /// The `user_version` of a database at the current schema.
@@ -287,6 +316,8 @@ pub(crate) struct Unsaved {
     pub row: bool,
     /// Its transcript rows from this position on.
     pub items_from: Option<usize>,
+    /// Its usage rows from this turn on.
+    pub usage_from: Option<u32>,
     /// Its grants.
     pub grants: bool,
 }
@@ -296,6 +327,10 @@ impl Unsaved {
     fn merge(&mut self, other: Unsaved) {
         self.row |= other.row;
         self.grants |= other.grants;
+        self.usage_from = match (self.usage_from, other.usage_from) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         self.items_from = match (self.items_from, other.items_from) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -384,6 +419,11 @@ enum Write {
     RemoveGrant {
         thread_id: String,
         rule: String,
+    },
+    /// A thread's usage rows, written again over any already there.
+    TurnUsage {
+        thread_id: String,
+        rows: Vec<TurnUsageRow>,
     },
     /// Replaces all of a thread's grants (to redo grant writes that failed).
     ReplaceGrants {
@@ -1096,6 +1136,13 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
                 ..Unsaved::default()
             },
         ),
+        Write::TurnUsage { thread_id, rows } => (
+            thread_id,
+            Unsaved {
+                usage_from: rows.iter().map(|row| row.turn).min(),
+                ..Unsaved::default()
+            },
+        ),
         // The unread flag is part of the row.
         Write::SetUnread { thread_id, .. } => (
             thread_id,
@@ -1223,6 +1270,11 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
             let transaction = connection.transaction()?;
             save_thread_row(&transaction, &row)?;
             replace_item_rows(&transaction, &row.id, from_ix, &items)?;
+            transaction.commit()?;
+        }
+        Write::TurnUsage { thread_id, rows } => {
+            let transaction = connection.transaction()?;
+            usage::write_turn_rows(&transaction, &thread_id, &rows)?;
             transaction.commit()?;
         }
         Write::AddGrant { thread_id, grant } => {
@@ -1586,6 +1638,7 @@ mod tests {
             Some(Unsaved {
                 row: true,
                 items_from: Some(1),
+                usage_from: None,
                 grants: true,
             })
         );
@@ -1595,6 +1648,7 @@ mod tests {
             Some(Unsaved {
                 row: true,
                 items_from: Some(0),
+                usage_from: None,
                 grants: false,
             })
         );

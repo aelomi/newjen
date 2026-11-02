@@ -60,6 +60,7 @@ use crate::store::{
     Grant, PendingCopy, PendingIntent, PendingState, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow,
     now_ms,
 };
+use crate::thread_usage::{ThreadUsage, TurnUsageRow};
 use crate::transcript::{Item, Status, Transcript};
 use crate::vcs;
 use crate::worktree::{self, CopyError, Tools};
@@ -144,6 +145,10 @@ pub struct Thread {
     stop_after_turn: bool,
     /// What the store last got for the thread's row, so unchanged rows are not rewritten.
     saved_row: Option<RowState>,
+    /// The thread's usage rows, oldest turn first; those from `usage_saved` on are not yet with
+    /// the store.
+    usage_rows: Vec<TurnUsageRow>,
+    usage_saved: usize,
     store: Store,
 }
 
@@ -500,6 +505,8 @@ impl Thread {
             turn_started: None,
             stop_after_turn: false,
             saved_row: None,
+            usage_rows: Vec::new(),
+            usage_saved: 0,
             store,
         }
     }
@@ -592,7 +599,9 @@ impl Thread {
             .map(|saved| Item::from_saved(saved.schema_version, &saved.json))
             .collect();
         let grants = store.grants(&row.id)?;
+        let usage_rows = store.turn_usage(&row.id)?;
         let mut transcript = Transcript::from_saved(row.workdir.clone(), items, row.status);
+        transcript.restore_usage(ThreadUsage::from_rows(&usage_rows));
         transcript.normalize_after_relaunch();
         if let Some(position) = first_gap {
             transcript.mark_changed_from(position);
@@ -627,6 +636,8 @@ impl Thread {
         thread.controller = crate::session::Controller::new(thread.base_config.agent.provider);
         transcript.set_presentation(crate::session::saved_presentation(&thread.provider));
         thread.transcript = transcript;
+        thread.usage_saved = usage_rows.len();
+        thread.usage_rows = usage_rows;
         thread.grants = grants;
         thread.unread = row.unread;
         thread.stage = Stage::Saved;
@@ -1626,6 +1637,11 @@ impl Thread {
             }
         }
         self.transcript.apply(&batch);
+        for event in &batch.events {
+            if let crate::agent::AgentEvent::TurnUsage(turns) = event {
+                self.record_turn_usage(turns);
+            }
+        }
         let turn_ended = was_busy && !self.status().is_busy();
         // claude started a turn by itself (see `Transcript::apply`).
         if !was_busy && self.status().is_busy() {
@@ -1795,6 +1811,33 @@ impl Thread {
         self.grants.push(grant);
     }
 
+    fn record_turn_usage(&mut self, turns: &[crate::agent::ModelTurn]) {
+        let Some(provider) = crate::providers::Provider::from_id(&self.provider) else {
+            return;
+        };
+        let turn = self.usage_rows.last().map_or(0, |row| row.turn + 1);
+        let billing = crate::usage::latest(provider).map_or_default(|usage| usage.billing);
+        let usage = self.transcript.usage();
+        let main = usage.main_model().map(str::to_owned);
+        let context = usage.context();
+        let ended_at = now_ms();
+        self.usage_rows.extend(turns.iter().map(|model| {
+            TurnUsageRow {
+                turn,
+                ended_at,
+                provider,
+                billing,
+                model: model.model.clone(),
+                tokens: model.tokens,
+                cost_usd: model.cost_usd,
+                context_used: context
+                    .filter(|_| main.as_deref() == Some(model.model.as_str()))
+                    .map(|fill| fill.used),
+                context_window: model.context_window,
+            }
+        }));
+    }
+
     fn set_unread(&mut self, unread: bool) {
         if self.unread == unread {
             return;
@@ -1825,6 +1868,9 @@ impl Thread {
             if let Some(from) = lost.items_from {
                 self.transcript.mark_changed_from(from);
             }
+            if let Some(from) = lost.usage_from {
+                self.usage_saved = self.usage_rows.partition_point(|row| row.turn < from);
+            }
             if lost.grants {
                 self.store.replace_grants(&self.id, self.grants.clone());
                 queued = true;
@@ -1840,7 +1886,8 @@ impl Thread {
             snapshot_needed: self.work_pending(),
         };
         let items_from = self.transcript.dirty_from();
-        if items_from.is_none() && self.saved_row.as_ref() == Some(&state) {
+        let usage_pending = self.usage_saved < self.usage_rows.len();
+        if items_from.is_none() && self.saved_row.as_ref() == Some(&state) && !usage_pending {
             return queued;
         }
         if touch_time {
@@ -1858,6 +1905,11 @@ impl Thread {
                 self.transcript.mark_saved();
             }
             None => self.store.save_thread(self.row()),
+        }
+        if usage_pending {
+            self.store
+                .save_turn_usage(&self.id, self.usage_rows[self.usage_saved..].to_vec());
+            self.usage_saved = self.usage_rows.len();
         }
         self.saved_row = Some(state);
         true
