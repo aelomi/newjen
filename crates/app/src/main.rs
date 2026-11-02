@@ -29,7 +29,7 @@ use gpui::{
 };
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use newjen_core::instance::{HandoffError, Instance, LaunchRequest, PendingLaunch, Startup};
-use newjen_core::{Project, Store, orphans, store};
+use newjen_core::{Project, Store, orphans, store, usage};
 
 use crate::assets::AppAssets;
 use crate::keys::{
@@ -60,6 +60,9 @@ fn main() {
                     problem,
                     folder: instance.directory().to_path_buf(),
                 });
+            if let Ok(store) = &startup {
+                usage::attach_store(store);
+            }
             (Some(Arc::new(instance)), startup)
         }
         Err(problem) if problem.is::<HandoffError>() => {
