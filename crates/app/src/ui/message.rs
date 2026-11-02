@@ -5,7 +5,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
     ActiveTheme as _,
     bubble::{Bubble, BubbleVariant},
-    message::{Message, MessageAlignment, MessageContent},
+    message::{Message, MessageAlignment, MessageContent, MessageFooter},
 };
 
 pub fn assistant(body: impl IntoElement, _: &App) -> Div {
@@ -65,19 +65,18 @@ pub fn user_pending(id: ElementId, text: String, pending: Pending, cx: &App) -> 
             }))
             .into_any_element(),
     };
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .justify_end()
-        .items_center()
-        .gap_2()
-        .child(lead)
-        .child(
-            div()
-                .min_w_0()
-                .max_w(relative(0.8))
-                .child(Bubble::new().child(text)),
+    Message::new()
+        .alignment(MessageAlignment::End)
+        .content(
+            MessageContent::new().bubble(
+                Bubble::new().child(
+                    div()
+                        .debug_selector(|| "not-sent-text".to_string())
+                        .child(text),
+                ),
+            ),
         )
+        .footer(MessageFooter::new().child(lead))
         .into_any_element()
 }
 
@@ -206,6 +205,7 @@ mod tests {
 
     struct Example {
         retries: Rc<Cell<usize>>,
+        text: String,
     }
 
     impl Render for Example {
@@ -214,7 +214,7 @@ mod tests {
             let retry: OnRestart = Rc::new(move |_, _| retries.set(retries.get() + 1));
             div().w(px(600.)).child(user_pending(
                 "sent".into(),
-                "Run the full test suite.".to_string(),
+                self.text.clone(),
                 Pending::NotSent(Some(retry)),
                 cx,
             ))
@@ -227,10 +227,53 @@ mod tests {
         let retries = Rc::new(Cell::new(0));
         let (_, cx) = cx.add_window_view(|_, _| Example {
             retries: retries.clone(),
+            text: "Run the full test suite.".to_string(),
         });
         cx.run_until_parked();
         let retry = cx.debug_bounds("not-sent-retry").unwrap();
         cx.simulate_click(retry.center(), Modifiers::none());
         assert_eq!(retries.get(), 1);
+    }
+
+    fn not_sent_bubble(cx: &mut TestAppContext, text: &str) -> gpui::Bounds<gpui::Pixels> {
+        cx.update(gpui_kit::init);
+        let text = text.to_string();
+        let (_, cx) = cx.add_window_view(|_, _| Example {
+            retries: Rc::new(Cell::new(0)),
+            text,
+        });
+        cx.run_until_parked();
+        cx.debug_bounds("not-sent-text").unwrap()
+    }
+
+    #[gpui::test]
+    fn a_short_not_sent_message_keeps_its_text_width(cx: &mut TestAppContext) {
+        let bubble = not_sent_bubble(cx, "Run the full test suite.");
+        assert!(bubble.size.width > px(120.), "{:?} wide", bubble.size.width);
+        assert!(
+            bubble.size.height < px(30.),
+            "{:?} tall",
+            bubble.size.height
+        );
+        assert_eq!(bubble.right(), px(587.));
+    }
+
+    #[gpui::test]
+    fn a_long_not_sent_message_wraps_at_four_fifths_of_the_row(cx: &mut TestAppContext) {
+        let text =
+            "Run the full test suite and report every failure with its file and line. ".repeat(6);
+        let bubble = not_sent_bubble(cx, &text);
+        assert!(bubble.size.width > px(300.), "{:?} wide", bubble.size.width);
+        assert!(
+            bubble.size.width <= px(454.),
+            "{:?} wide",
+            bubble.size.width
+        );
+        assert!(
+            bubble.size.height > px(60.),
+            "{:?} tall",
+            bubble.size.height
+        );
+        assert_eq!(bubble.right(), px(587.));
     }
 }
