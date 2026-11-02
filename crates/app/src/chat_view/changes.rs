@@ -14,7 +14,7 @@ use gpui_kit::base::motion::{Presence, Transition};
 use gpui_kit::component::diff::{DiffFile, DiffFileStatus};
 use gpui_kit::component::tooltip::Tooltip;
 use newjen_core::changes::{ChangeKind, ChangeSummary, Estimate, FileStat, edit_stats};
-use newjen_core::landing;
+use newjen_core::vcs::{self, Scope};
 
 use crate::title_bar::ChangesToggle;
 
@@ -283,7 +283,7 @@ pub(super) fn file_row(
 
 impl ChangesCard {
     /// What the card lists for `thread`: git's answer while it is current, the estimate
-    /// otherwise. Nothing once the work has landed.
+    /// otherwise. Nothing for an older thread whose work was resolved.
     /// The second value is false for an estimate.
     fn summary(&self, thread: &Thread) -> Option<(&ChangeSummary, bool)> {
         if thread.landing_finished() {
@@ -346,9 +346,11 @@ impl ChatView {
             && !thread.work_pending()
             && thread.background_tasks().is_empty()
             && !thread.landing_finished();
-        let Some(base) = thread.review_base().map(str::to_string) else {
+        if thread.review_base().is_none()
+            || thread.copy().is_some_and(worktree::Worktree::is_legacy)
+        {
             return;
-        };
+        }
         if !quiet || tracked.loading || tracked.asked == Some(length) {
             return;
         }
@@ -359,7 +361,7 @@ impl ChatView {
         let thread_id = id.clone();
         let task =
             cx.background_spawn(
-                async move { landing::changed_files(&tools, &cwd, &thread_id, &base) },
+                async move { vcs::changed_files(&tools, &cwd, &thread_id, Scope::All) },
             );
         cx.spawn_in(window, async move |view, cx| {
             let result = task.await;

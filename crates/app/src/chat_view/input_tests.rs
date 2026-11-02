@@ -1,6 +1,7 @@
 use super::*;
 use gpui::{AppContext, TestAppContext, VisualTestContext, size};
 use gpui_kit::base::Root;
+use newjen_core::vcs::Scope;
 
 fn setup<'a>(
     cx: &'a mut TestAppContext,
@@ -8,6 +9,20 @@ fn setup<'a>(
     with_approvals: bool,
 ) -> (Entity<ChatView>, PathBuf, &'a mut VisualTestContext) {
     setup_in(cx, name, with_approvals, None)
+}
+
+fn loaded(patch: &str) -> review::Loaded {
+    review::Loaded {
+        diff: newjen_core::vcs::Diff {
+            patch: patch.into(),
+            truncated: false,
+        },
+        facts: None,
+    }
+}
+
+fn working(thread: &Thread) -> bool {
+    is_busy(thread.status())
 }
 
 /// With a `checkout_hook`, the project is the git repository `<path>/project` with one commit,
@@ -719,7 +734,7 @@ async fn a_worktree_is_made_while_another_thread_works_in_the_project_folder(
     cx.simulate_input("two approvals");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
-    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).owns_project_work()));
+    assert!(cx.update(|_, cx| working(chat.read(cx).thread().read(cx))));
     cx.simulate_keystrokes("cmd-n");
     choose(1, cx);
     cx.simulate_input("rename the keys");
@@ -975,17 +990,6 @@ fn a_failed_copy_names_what_failed(cx: &mut TestAppContext) {
     finish(&chat, path, cx);
 }
 
-/// The thread on screen has had its work landed or discarded, so archiving it only has its
-/// worktree left to delete.
-fn finish_landing(chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
-    cx.update(|_, cx| {
-        chat.read(cx)
-            .thread()
-            .clone()
-            .update(cx, |thread, _| thread.finish_landing())
-    });
-}
-
 /// Right click on the thread on screen's row, then "Archive thread".
 fn archive_from_menu(cx: &mut VisualTestContext) {
     let bounds = cx.debug_bounds("thread-row").unwrap();
@@ -1017,19 +1021,6 @@ async fn archiving_a_worktree_thread_asks_then_deletes_its_worktree(cx: &mut Tes
     let copy = cx
         .update(|_, cx| chat.read(cx).thread().read(cx).copy().cloned())
         .unwrap();
-
-    archive_from_menu(cx);
-    assert!(
-        !cx.update(|window, cx| window.has_active_dialog(cx)),
-        "work that is not landed or discarded is reviewed before anything is deleted"
-    );
-    assert_eq!(
-        notice_title(&chat, cx).as_deref(),
-        Some("Wait for the thread"),
-        "it goes to the review, which waits for the running turn"
-    );
-    assert!(copy.path.exists());
-    finish_landing(&chat, cx);
 
     archive_from_menu(cx);
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
@@ -1560,7 +1551,6 @@ async fn switching_projects_cancels_the_archive_dialog(cx: &mut TestAppContext) 
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
     let id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
-    finish_landing(&chat, cx);
     cx.update(|window, cx| chat.update(cx, |view, cx| view.ask_to_archive(&id, window, cx)));
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     cx.run_until_parked();
@@ -1935,36 +1925,33 @@ fn a_terminal_keeps_its_draft_and_working_folder_until_closed(cx: &mut TestAppCo
     finish(&chat, path, cx);
 }
 
-/// The repository root and one of its subfolders are open as two projects. While a thread
-/// works in the root's project folder, a project-folder send in the subfolder is refused,
-/// as it would be in the same project.
+/// The repository root and one of its subfolders are open as two projects. Both may have a
+/// thread working in the project folder at once, but neither may commit while the other works,
+/// because a commit takes every file in the folder.
 #[gpui::test]
-async fn a_second_project_folder_thread_in_the_same_repository_is_refused(cx: &mut TestAppContext) {
+async fn project_folder_threads_in_one_repository_work_together_but_commit_one_at_a_time(
+    cx: &mut TestAppContext,
+) {
     let (chat, path, cx) = setup_in(cx, "two-projects-one-repo", true, Some(CREATE_COPY));
     cx.simulate_input("thread A in the root");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
-    assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).owns_project_work()));
     let base = path.canonicalize().unwrap();
     let peer = peer_project("project/packages/web", true, vec![&chat], &base, cx);
     cx.update(|_, cx| chat.update(cx, |view, _| view.set_copy_peers(vec![peer.downgrade()])));
+    let b_id = cx.update(|_, cx| peer.read(cx).thread().read(cx).id().to_string());
+    assert_eq!(
+        cx.update(|_, cx| peer.read(cx).git_gate(&b_id, cx)),
+        Some("Another thread is working in this folder")
+    );
     let went_out = cx.update(|window, cx| {
         peer.update(cx, |view, cx| {
             view.send_text("thread B in the subfolder", window, cx)
         })
     });
-    assert!(
-        !went_out,
-        "the subfolder must wait for the root's project thread"
-    );
-    assert_eq!(
-        notice_title(&peer, cx).as_deref(),
-        Some("Review the project thread first")
-    );
-    assert!(cx.update(|_, cx| {
-        let thread = peer.read(cx).thread().read(cx);
-        !thread.has_session() && thread.preparing().is_none()
-    }));
+    assert!(went_out, "a second project-folder thread may work too");
+    assert_eq!(notice_title(&peer, cx), None);
+    pending(&peer, cx).await;
     cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
         .unwrap();
     finish(&chat, path, cx);
@@ -2087,7 +2074,6 @@ async fn a_kept_denial_note_follows_the_composer_draft(cx: &mut TestAppContext) 
 /// ⌘1–9 switch threads (closing the panel) as they do anywhere else.
 #[gpui::test]
 fn thread_jump_keys_work_while_the_review_panel_is_open(cx: &mut TestAppContext) {
-    use newjen_core::landing::Review;
     let (chat, path, cx) = setup(cx, "review-keys", false);
     cx.simulate_input("first thread");
     cx.simulate_keystrokes("cmd-n");
@@ -2096,13 +2082,7 @@ fn thread_jump_keys_work_while_the_review_panel_is_open(cx: &mut TestAppContext)
     cx.update(|window, cx| {
         chat.update(cx, |view, cx| {
             let id = view.thread().read(cx).id().to_string();
-            let receipt = Review {
-                base: "base".into(),
-                head: "head".into(),
-                patch: String::new(),
-                truncated: false,
-            };
-            view.show_review(id, receipt, window, cx);
+            view.show_review(id, Scope::All, loaded(""), window, cx);
         })
     });
     cx.run_until_parked();
@@ -2130,19 +2110,12 @@ fn thread_jump_keys_work_while_the_review_panel_is_open(cx: &mut TestAppContext)
 /// Closing the review panel gives the keyboard back to the composer, which took its place.
 #[gpui::test]
 fn closing_the_review_panel_returns_the_keyboard_to_the_composer(cx: &mut TestAppContext) {
-    use newjen_core::landing::Review;
     let (chat, path, cx) = setup(cx, "review-close-focus", false);
     cx.simulate_input("a draft");
     cx.update(|window, cx| {
         chat.update(cx, |view, cx| {
             let id = view.thread().read(cx).id().to_string();
-            let receipt = Review {
-                base: "base".into(),
-                head: "head".into(),
-                patch: String::new(),
-                truncated: false,
-            };
-            view.show_review(id, receipt, window, cx);
+            view.show_review(id, Scope::All, loaded(""), window, cx);
         })
     });
     cx.run_until_parked();
@@ -2231,20 +2204,13 @@ async fn review_completion_during_saving_does_not_disable_keep_open(cx: &mut Tes
 /// The review lists every file of the patch and shows one at a time.
 #[gpui::test]
 fn the_review_shows_the_selected_file_only(cx: &mut TestAppContext) {
-    use newjen_core::landing::Review;
     let patch = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,2 @@\n keep\n+added\n\
                  diff --git a/b.toml b/b.toml\n--- a/b.toml\n+++ b/b.toml\n@@ -1 +1 @@\n-old\n+new\n";
     let (chat, path, cx) = setup(cx, "review-files", false);
     cx.update(|window, cx| {
         chat.update(cx, |view, cx| {
             let id = view.thread().read(cx).id().to_string();
-            let receipt = Review {
-                base: "base".into(),
-                head: "head".into(),
-                patch: patch.into(),
-                truncated: false,
-            };
-            view.show_review(id, receipt, window, cx);
+            view.show_review(id, Scope::All, loaded(patch), window, cx);
         })
     });
     cx.run_until_parked();
@@ -2336,5 +2302,311 @@ async fn the_sidebar_groups_threads_and_its_usage_row_opens_a_panel(cx: &mut Tes
     click(cx, "thread-row");
     cx.run_until_parked();
     assert!(cx.debug_bounds("usage-panel").is_none());
+    finish(&chat, path, cx);
+}
+
+const IDLE_THREAD: &str = "6f1c1f4e-2b1e-4c8e-9a51-0d9a7c2f3b11";
+
+/// Makes the thread on screen an idle project-folder thread with its starting checkpoint
+/// recorded, and keeps the commit message from being written by a real `claude`.
+fn idle_project_thread(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> PathBuf {
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.base_config.program = PathBuf::from("/nonexistent/claude");
+            let dir = view.project.path.clone();
+            let base = newjen_core::vcs::checkpoint(&view.tools, &dir, IDLE_THREAD).unwrap();
+            let row = newjen_core::store::ThreadRow {
+                id: IDLE_THREAD.into(),
+                project_id: view.project.id,
+                workdir: dir.clone(),
+                title: "Port the parser".into(),
+                provider: "claude".into(),
+                conversation: newjen_core::agent::ConversationState::Established(
+                    "6f1c1f4e-2b1e-4c8e-9a51-0d9a7c2f3b10".into(),
+                ),
+                model: newjen_core::providers::ModelSelection::CliDefault,
+                effort: newjen_core::agent::EffortSelection::CliDefault,
+                speed: newjen_core::agent::Speed::Normal,
+                status: Status::Done,
+                unread: false,
+                created_at: 1,
+                updated_at: 1,
+                archived_at: None,
+                copy: None,
+                review_base: Some(base),
+                landing_resolved: false,
+                snapshot_needed: false,
+            };
+            view.store.save_thread(row.clone());
+            assert!(view.store.flush(Duration::from_secs(5)));
+            let thread = Thread::load(
+                view.store.clone(),
+                &view.project,
+                row,
+                view.base_config.clone(),
+            )
+            .unwrap();
+            view.slots[0].thread = cx.new(|_| thread);
+            dir
+        })
+    })
+}
+
+async fn open_changes(chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.open_review(window, cx)));
+    cx.condition(chat, |view, _| view.review_panel.is_some())
+        .await;
+    settled(chat, cx).await;
+}
+
+async fn settled(chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
+    cx.condition(chat, |view, _| view.review_settled()).await;
+    cx.run_until_parked();
+}
+
+async fn pick_scope(chat: &Entity<ChatView>, scope: Scope, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.select_scope(scope, window, cx)));
+    settled(chat, cx).await;
+}
+
+fn review_files(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> (usize, Vec<String>) {
+    let (_, rows, shown) = cx.update(|_, cx| chat.read(cx).review_shown(cx)).unwrap();
+    (rows, shown)
+}
+
+#[gpui::test]
+async fn the_git_button_commits_with_the_message_the_user_confirms(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "git-commit", false, Some(CREATE_COPY));
+    let project = idle_project_thread(&chat, cx);
+    let tools = cx.update(|_, cx| chat.read(cx).tools.clone());
+    std::fs::write(project.join("notes.txt"), "hello\n").unwrap();
+    open_changes(&chat, cx).await;
+    assert_eq!(review_files(&chat, cx), (1, vec!["notes.txt".to_string()]));
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).review_primary()),
+        Some(Ok("Commit".to_string())),
+        "a repository with no remote can only commit"
+    );
+
+    cx.simulate_keystrokes("cmd-enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "⌘↵ asks for the commit message first"
+    );
+    assert!(git(&tools, &project, &["log", "-1", "--format=%s"]) == "base");
+    cx.condition(&chat, |view, _| {
+        view.review_sheet().is_some_and(|(writing, _)| !writing)
+    })
+    .await;
+    let field = cx.update(|_, cx| chat.read(cx).review_sheet().unwrap().1);
+    assert_eq!(
+        cx.update(|_, cx| field.read(cx).value().to_string()),
+        "Port the parser",
+        "without claude the thread's title is the message"
+    );
+    cx.update(|window, cx| {
+        field.update(cx, |field, cx| {
+            field.set_value("feat: add notes", window, cx)
+        })
+    });
+    cx.simulate_keystrokes("cmd-enter");
+    cx.condition(&chat, |view, _| {
+        view.review_message_text().is_some() && view.review_settled()
+    })
+    .await;
+
+    assert_eq!(
+        git(&tools, &project, &["log", "-1", "--format=%s"]),
+        "feat: add notes"
+    );
+    assert_eq!(git(&tools, &project, &["status", "--porcelain"]), "");
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).review_message_text()),
+        Some(("Committed".to_string(), true))
+    );
+    assert_eq!(
+        notice_title(&chat, cx).as_deref(),
+        Some("Committed"),
+        "the thread says so too"
+    );
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).review_primary()),
+        Some(Err("Up to date"))
+    );
+    assert_eq!(
+        review_files(&chat, cx).0,
+        1,
+        "all changes still lists what was committed"
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn the_scope_menu_picks_all_changes_uncommitted_work_or_one_turn(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "git-scope", false, Some(CREATE_COPY));
+    let project = idle_project_thread(&chat, cx);
+    let tools = cx.update(|_, cx| chat.read(cx).tools.clone());
+    std::fs::write(project.join("one.txt"), "1\n").unwrap();
+    newjen_core::vcs::checkpoint(&tools, &project, IDLE_THREAD).unwrap();
+    std::fs::write(project.join("two.txt"), "2\n").unwrap();
+    newjen_core::vcs::checkpoint(&tools, &project, IDLE_THREAD).unwrap();
+    open_changes(&chat, cx).await;
+    assert_eq!(cx.update(|_, cx| chat.read(cx).review_turns()), 2);
+    assert_eq!(
+        review_files(&chat, cx).0,
+        2,
+        "the default shows every change"
+    );
+
+    pick_scope(&chat, Scope::Turn(2), cx).await;
+    assert_eq!(review_files(&chat, cx), (1, vec!["two.txt".to_string()]));
+    pick_scope(&chat, Scope::Turn(1), cx).await;
+    assert_eq!(review_files(&chat, cx), (1, vec!["one.txt".to_string()]));
+
+    git(&tools, &project, &["add", "--all"]);
+    git(&tools, &project, &["commit", "--quiet", "-m", "agent work"]);
+    pick_scope(&chat, Scope::Uncommitted, cx).await;
+    assert_eq!(review_files(&chat, cx).0, 0, "everything is committed");
+    pick_scope(&chat, Scope::All, cx).await;
+    assert_eq!(
+        review_files(&chat, cx).0,
+        2,
+        "committed work stays in all changes"
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn git_actions_wait_while_the_turn_runs(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "git-gated", true, Some(CREATE_COPY));
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let facts = git::GitFacts {
+        status: newjen_core::vcs::Status {
+            branch: Some("main".into()),
+            dirty: true,
+            ..Default::default()
+        },
+        gh: false,
+        unpushed: false,
+        source: None,
+        turns: 0,
+    };
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let id = view.thread().read(cx).id().to_string();
+            let mut loaded = loaded("");
+            loaded.facts = Some(facts);
+            view.show_review(id, Scope::All, loaded, window, cx);
+            view.run_primary_action(window, cx);
+        })
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "no commit sheet while the agent may still be writing files"
+    );
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).review_message_text()),
+        Some(("Wait for the turn to finish".to_string(), false))
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_worktree_thread_commits_then_merges_into_the_project_branch(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup_in(cx, "git-merge", true, Some(CREATE_COPY));
+    choose(1, cx);
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    cx.condition(&chat, |view, cx| view.thread().read(cx).copy().is_some())
+        .await;
+    pending(&chat, cx).await;
+    let copy = cx
+        .update(|_, cx| chat.read(cx).thread().read(cx).copy().cloned())
+        .unwrap();
+    for _ in 0..6 {
+        if cx.update(|_, cx| !working(chat.read(cx).thread().read(cx))) {
+            break;
+        }
+        cx.update(|window, cx| chat.update(cx, |view, cx| view.stop(window, cx)));
+        cx.background_executor
+            .timer(Duration::from_millis(100))
+            .await;
+        cx.run_until_parked();
+    }
+    cx.condition(&chat, |view, cx| {
+        let thread = view.thread().read(cx);
+        !is_busy(thread.status()) && !thread.work_pending()
+    })
+    .await;
+    let tools = cx.update(|_, cx| chat.read(cx).tools.clone());
+    cx.update(|_, cx| {
+        chat.update(cx, |view, _| {
+            view.base_config.program = PathBuf::from("/nonexistent/claude")
+        })
+    });
+    std::fs::write(copy.workdir.join("feature.txt"), "feature\n").unwrap();
+    open_changes(&chat, cx).await;
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).review_primary()),
+        Some(Ok("Commit".to_string()))
+    );
+
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.start_git_action(git::GitAction::CommitMerge, window, cx)
+        })
+    });
+    cx.condition(&chat, |view, _| {
+        view.review_sheet().is_some_and(|(writing, _)| !writing)
+    })
+    .await;
+    click(cx, "commit-confirm");
+    cx.condition(&chat, |view, _| {
+        view.review_message_text().is_some() && view.review_settled()
+    })
+    .await;
+
+    let project = path.join("project").canonicalize().unwrap();
+    assert!(
+        project.join("feature.txt").exists(),
+        "the merge brings the thread's work into the project's branch"
+    );
+    assert_eq!(git(&tools, &project, &["status", "--porcelain"]), "");
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).review_primary()),
+        Some(Err("Up to date"))
+    );
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).review_message_text().map(|m| m.1)),
+        Some(true)
+    );
+    finish(&chat, path, cx);
+}
+
+/// The diff takes the pane's height: a percentage height under a row that centres its
+/// children collapses to the content, and the diff shows nothing.
+#[gpui::test]
+fn the_review_diff_fills_the_pane(cx: &mut TestAppContext) {
+    let patch =
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n keep\n+added\n";
+    let (chat, path, cx) = setup(cx, "review-fill", false);
+    cx.simulate_resize(size(px(1100.), px(800.)));
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let id = view.thread().read(cx).id().to_string();
+            view.show_review(id, Scope::All, loaded(patch), window, cx);
+        })
+    });
+    cx.run_until_parked();
+    let pane = cx.debug_bounds("review-diff").unwrap();
+    assert!(
+        pane.size.height > px(500.),
+        "the diff pane is {:?} tall in an 800 px window",
+        pane.size.height
+    );
     finish(&chat, path, cx);
 }

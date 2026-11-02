@@ -53,6 +53,7 @@ use newjen_core::thread::{
 use newjen_core::transcript::{
     BACKGROUND_STOPPED_NOTE, Item, STOPPED_TOOL_NOTE, Status, ToolState,
 };
+use newjen_core::vcs;
 use newjen_core::worktree::{CopyError, Tools, Worktree};
 use serde_json::Value;
 
@@ -386,6 +387,22 @@ fn git(tools: &Tools, cwd: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// The checkpoint numbers a thread has in `repo`, in order.
+fn checkpoint_names(tools: &Tools, repo: &Path, thread_id: &str) -> Vec<String> {
+    let listed = git(
+        tools,
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=3)",
+            &format!("refs/newjen/{thread_id}/"),
+        ],
+    );
+    let mut names: Vec<String> = listed.lines().map(str::to_string).collect();
+    names.sort_by_key(|name| name.parse::<usize>().unwrap());
+    names
 }
 
 /// The value after `flag` in `args`, if the flag is there.
@@ -3112,13 +3129,13 @@ fn project_preparation_sends_the_held_message_once_and_snapshot_blocks_the_next_
         panic!("prepare project");
     };
     assert!(fixture.spawns().is_empty());
-    assert!(
-        thread.owns_project_work(),
-        "preparation reserves the project folder"
-    );
     assert!(thread.send("second").is_err());
     assert!(thread.finish_copy(Ok(fixture.fake_copy())).is_err());
     let base = job.run(&tools).unwrap();
+    assert_eq!(
+        checkpoint_names(&tools, &fixture.project.path, thread.id()),
+        ["0"]
+    );
     thread.finish_project(Ok(base.clone())).unwrap();
     finish_turn(&mut thread);
     assert_eq!(fixture.messages_received(), ["Make a change"]);
@@ -3135,10 +3152,13 @@ fn project_preparation_sends_the_held_message_once_and_snapshot_blocks_the_next_
     thread.finish_snapshot(job.run(&tools));
     assert!(!thread.work_pending());
     assert!(thread.snapshot_error().is_none());
+    assert_eq!(
+        checkpoint_names(&tools, &fixture.project.path, thread.id()),
+        ["0", "1"]
+    );
     assert!(fixture.store.flush(FLUSH));
     let loaded = fixture.reload(thread.id());
     assert_eq!(loaded.review_base(), thread.review_base());
-    assert!(loaded.owns_project_work());
     thread.send("second").unwrap();
     finish_turn(&mut thread);
     assert_eq!(fixture.messages_received(), ["Make a change", "second"]);
@@ -3195,7 +3215,7 @@ fn archiving_project_preparation_invalidates_its_held_message() {
 }
 
 #[test]
-fn project_preparation_leaves_the_projects_branch_index_and_files_alone() {
+fn project_preparation_checkpoints_without_touching_the_projects_branch_index_and_files() {
     let fixture = Fixture::new();
     let tools = fixture.git_project();
     let project = &fixture.project.path;
@@ -3233,7 +3253,7 @@ fn project_preparation_leaves_the_projects_branch_index_and_files_alone() {
         git(
             &tools,
             project,
-            &["rev-parse", &format!("refs/newjen/{}", thread.id())]
+            &["rev-parse", &format!("refs/newjen/{}/0", thread.id())]
         ),
         base
     );
@@ -3310,7 +3330,6 @@ fn a_legacy_project_thread_prepares_its_next_turn_without_changing_its_title_or_
         panic!("prepare legacy project");
     };
     assert_eq!(thread.title(), "Original title");
-    assert!(thread.owns_project_work());
     thread.finish_project(job.run(&tools)).unwrap();
     finish_turn(&mut thread);
     assert_eq!(thread.title(), "Original title");
@@ -3350,14 +3369,8 @@ fn graceful_quit_keeps_the_snapshot_requirement_for_partial_work() {
     let job = loaded.take_snapshot_job().unwrap();
     loaded.finish_snapshot(job.run(&tools));
     assert!(!loaded.work_pending());
-    let review = newjen_core::landing::review(
-        &tools,
-        loaded.cwd(),
-        loaded.id(),
-        loaded.review_base().unwrap(),
-    )
-    .unwrap();
-    assert!(review.patch.contains("partial.txt"));
+    let changes = vcs::diff(&tools, loaded.cwd(), loaded.id(), vcs::Scope::All).unwrap();
+    assert!(changes.patch.contains("partial.txt"));
 }
 
 #[test]
@@ -3391,102 +3404,34 @@ fn idle_background_tasks_can_be_stopped_to_finish_the_pending_snapshot() {
 }
 
 #[test]
-fn closing_project_tracking_after_the_users_own_git_changes_keeps_files_and_history() {
-    for move_away in [false, true] {
-        let fixture = Fixture::new();
-        let tools = fixture.git_project();
-        std::fs::write(fixture.project.path.join("owner.txt"), "owner work\n").unwrap();
-        let mut thread = fixture.draft();
-        let Sent::PreparingProject(job) = thread.send("Make a change").unwrap() else {
-            panic!("prepare");
-        };
-        thread.finish_project(job.run(&tools)).unwrap();
-        assert!(!thread.can_release_project_tracking());
-        finish_turn(&mut thread);
-        std::fs::write(fixture.project.path.join("agent.txt"), "agent work\n").unwrap();
-        let job = thread.take_snapshot_job().unwrap();
-        assert!(!thread.can_release_project_tracking());
-        thread.finish_snapshot(job.run(&tools));
-        let run = |args: &[&str]| git(&tools, &fixture.project.path, args);
-        if move_away {
-            run(&["switch", "--quiet", "--create", "elsewhere"]);
-        } else {
-            std::fs::write(fixture.project.path.join("agent.txt"), "my tweak\n").unwrap();
-            run(&["add", "agent.txt"]);
-            run(&["commit", "--quiet", "-m", "My own commit"]);
-        }
-        let history = run(&[
-            "for-each-ref",
-            "--format=%(refname) %(objectname)",
-            "refs/heads",
-        ]);
-        let head = run(&["rev-parse", "HEAD"]);
-        let files = ["owner.txt", "agent.txt"]
-            .map(|file| std::fs::read(fixture.project.path.join(file)).ok());
-        assert!(thread.can_release_project_tracking());
-        thread.release_project_tracking().unwrap();
-        thread.release_project_tracking().unwrap();
-        assert!(thread.archive().is_none());
-        assert!(!thread.owns_project_work());
-        assert_eq!(
-            ["owner.txt", "agent.txt"]
-                .map(|file| std::fs::read(fixture.project.path.join(file)).ok()),
-            files
-        );
-        assert_eq!(
-            run(&[
-                "for-each-ref",
-                "--format=%(refname) %(objectname)",
-                "refs/heads"
-            ]),
-            history
-        );
-        assert_eq!(run(&["rev-parse", "HEAD"]), head);
-        assert!(fixture.store.flush(FLUSH));
-        let row = fixture.store.thread(thread.id()).unwrap().unwrap();
-        assert!(row.archived_at.is_some());
-        assert!(row.landing_resolved);
-        let reloaded = fixture.reload(thread.id());
-        assert!(!reloaded.owns_project_work());
-        assert!(!reloaded.work_pending());
-    }
-}
-
-#[test]
-fn landing_instructions_are_sent_only_inside_a_git_repository() {
-    let fixture = Fixture::new();
-    let mut thread = fixture.draft();
-    let told = |thread: &Thread| {
-        flag(&thread.session_config().args(), "--append-system-prompt").map(str::to_string)
+fn the_agent_is_told_nothing_about_version_control() {
+    let silent = |args: &[String]| {
+        flag(args, "--append-system-prompt").is_none()
+            && args
+                .iter()
+                .all(|arg| !arg.to_lowercase().contains("commit"))
     };
-    assert_eq!(
-        told(&thread),
-        None,
-        "a plain folder is never snapshotted, so claude must not be told it is"
-    );
+
+    let plain = Fixture::new();
+    let mut thread = plain.draft();
+    assert!(silent(&thread.session_config().args()));
     thread.send("hello").unwrap();
     finish_turn(&mut thread);
-    assert!(
-        fixture
-            .spawns()
-            .iter()
-            .all(|args| flag(args, "--append-system-prompt").is_none())
-    );
-    assert!(thread.review_base().is_none());
-    assert!(!thread.work_pending());
+    assert!(plain.spawns().iter().all(|args| silent(args)));
+    assert_eq!(plain.messages_received(), ["hello"]);
 
-    let other = Fixture::new();
-    other.git_project();
-    let instructions = told(&other.draft()).expect("a git repository gets the instructions");
-    assert_eq!(instructions, newjen_core::landing::instructions());
-    assert!(instructions.contains("Newjen snapshots the folder after each turn"));
-}
-
-#[test]
-fn a_worktree_thread_is_told_how_its_work_is_recorded_and_a_legacy_copy_is_not() {
-    let told = |thread: &Thread| {
-        flag(&thread.session_config().args(), "--append-system-prompt").map(str::to_string)
+    let repo = Fixture::new();
+    let tools = repo.git_project();
+    let mut thread = repo.draft();
+    assert!(silent(&thread.session_config().args()));
+    let Sent::PreparingProject(job) = thread.send("hello").unwrap() else {
+        panic!("prepare project");
     };
+    thread.finish_project(job.run(&tools)).unwrap();
+    finish_turn(&mut thread);
+    assert!(repo.spawns().iter().all(|args| silent(args)));
+    assert_eq!(repo.messages_received(), ["hello"]);
+
     for legacy in [false, true] {
         let fixture = Fixture::new();
         let mut copy = fixture.fake_copy();
@@ -3498,11 +3443,83 @@ fn a_worktree_thread_is_told_how_its_work_is_recorded_and_a_legacy_copy_is_not()
         let (mut thread, _job) = fixture.preparing("hello");
         thread.finish_copy(Ok(copy)).unwrap();
         finish_turn(&mut thread);
-        let expected = (!legacy).then_some(newjen_core::landing::instructions());
-        assert_eq!(told(&thread).as_deref(), expected);
-        assert_eq!(
-            flag(fixture.spawns().last().unwrap(), "--append-system-prompt"),
-            expected
-        );
+        assert!(silent(&thread.session_config().args()));
+        assert!(fixture.spawns().iter().all(|args| silent(args)));
+        assert_eq!(fixture.messages_received(), ["hello"]);
     }
+}
+
+#[test]
+fn a_new_worktree_starts_at_checkpoint_zero_and_each_turn_end_writes_the_next() {
+    let fixture = Fixture::new();
+    let tools = fixture.git_project();
+    let project = fixture.project.path.clone();
+    let head = git(&tools, &project, &["rev-parse", "HEAD"]);
+    let (mut thread, job) = fixture.preparing("Make a change");
+    let copy = job.run(&tools, |_| {}).unwrap();
+
+    assert_eq!(checkpoint_names(&tools, &project, thread.id()), ["0"]);
+    assert_eq!(vcs::turns(&tools, &copy.workdir, thread.id()).unwrap(), 0);
+    let start = vcs::diff(&tools, &copy.workdir, thread.id(), vcs::Scope::All).unwrap();
+    assert_eq!(start.patch, "", "nothing has changed since the start");
+
+    thread.finish_copy(Ok(copy.clone())).unwrap();
+    std::fs::write(copy.workdir.join("agent.txt"), "agent work\n").unwrap();
+    finish_turn(&mut thread);
+    let job = thread
+        .take_snapshot_job()
+        .expect("a turn end asks for the next checkpoint");
+    thread.finish_snapshot(job.run(&tools));
+    assert!(!thread.work_pending());
+    assert_eq!(checkpoint_names(&tools, &project, thread.id()), ["0", "1"]);
+    let turn = vcs::diff(&tools, &copy.workdir, thread.id(), vcs::Scope::Turn(1)).unwrap();
+    assert!(turn.patch.contains("+++ b/agent.txt"), "{}", turn.patch);
+
+    assert_eq!(git(&tools, &project, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&tools, &project, &["status", "--porcelain"]), "");
+    assert_eq!(
+        git(&tools, &copy.workdir, &["log", "--format=%s", "-n", "1"]),
+        "base",
+        "the thread's branch gets no commit from Newjen"
+    );
+}
+
+#[test]
+fn a_worktree_whose_starting_checkpoint_cannot_be_written_is_removed() {
+    let fixture = Fixture::new();
+    let tools = fixture.git_project();
+    let project = fixture.project.path.clone();
+    std::fs::write(
+        project.join(".git/refs/newjen"),
+        "blocks the checkpoint refs",
+    )
+    .unwrap();
+    let (mut thread, job) = fixture.preparing("Keep my message");
+
+    let made = job.run(&tools, |_| {});
+    let Err(CopyError::Failed { command, .. }) = &made else {
+        panic!("the worktree should fail: {made:?}");
+    };
+    assert!(command.contains("starting point"), "{command}");
+    assert_eq!(git(&tools, &project, &["branch", "--list", "newjen/*"]), "");
+    assert_eq!(
+        git(&tools, &project, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1
+    );
+    assert_eq!(
+        thread.finish_copy(made).unwrap_err().message,
+        "Keep my message"
+    );
+    assert!(thread.is_draft());
+    assert!(fixture.store.flush(FLUSH));
+    assert!(
+        fixture
+            .store
+            .pending_copies(fixture.project.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(fixture.spawns().is_empty());
 }

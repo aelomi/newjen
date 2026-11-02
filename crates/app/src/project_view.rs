@@ -1297,7 +1297,7 @@ fn load_project(
 ) -> anyhow::Result<Startup> {
     let base_config = SessionConfig::new(project.path.clone());
     let threads = Thread::load_all(&store, &project, &base_config)?;
-    // Landing checks run with the login shell's PATH, not the minimal one an app started from
+    // Git checks run with the login shell's PATH, not the minimal one an app started from
     // Finder has. Resolving it can take a moment, which is why this runs off the UI thread.
     let tools = tools.with_env([(
         "PATH".to_string(),

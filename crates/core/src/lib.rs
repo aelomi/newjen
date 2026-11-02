@@ -17,10 +17,10 @@
 pub mod agent;
 mod approval_text;
 pub mod changes;
+pub mod commit_message;
 pub mod edits;
 pub mod env;
 pub mod instance;
-pub mod landing;
 pub mod orphans;
 mod probe;
 pub mod protocol;
@@ -31,6 +31,7 @@ pub mod store;
 pub mod thread;
 pub mod transcript;
 pub mod usage;
+pub mod vcs;
 pub mod worktree;
 
 pub use agent::{

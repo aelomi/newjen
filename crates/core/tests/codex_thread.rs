@@ -239,14 +239,14 @@ fn command_allow_deny_and_exact_session_grants_use_the_right_decision() {
             .unwrap();
         assert!(
             opened["params"].get("developerInstructions").is_none(),
-            "a plain folder is never snapshotted, so Codex gets no landing instructions: {opened}"
+            "Codex gets no developer instructions from Newjen: {opened}"
         );
         assert!(!opened.to_string().contains("--append-system-prompt"));
     }
 }
 
 #[test]
-fn landing_instructions_reach_codex_as_developer_instructions_in_a_git_repo() {
+fn codex_gets_no_developer_instructions_about_version_control_in_a_git_repo() {
     let lab = Lab::new("reply");
     let tools = lab.git_project();
     let mut thread = lab.draft();
@@ -260,11 +260,11 @@ fn landing_instructions_reach_codex_as_developer_instructions_in_a_git_repo() {
         .into_iter()
         .find(|m| m["method"] == "thread/start")
         .unwrap();
-    assert_eq!(
-        opened["params"]["developerInstructions"],
-        newjen_core::landing::instructions(),
-        "Newjen's instructions reach Codex as developer instructions: {opened}"
+    assert!(
+        opened["params"].get("developerInstructions").is_none(),
+        "Newjen tells the agent nothing about commits: {opened}"
     );
+    assert!(!opened.to_string().to_lowercase().contains("commit"));
 }
 
 #[test]
@@ -840,10 +840,9 @@ fn live_codex_worktree_creates_resumes_and_removes_in_the_worktree() {
         complete(&mut thread, true, &copy.workdir) > 0,
         "expected a shell approval"
     );
-    // Newjen commits a worktree's changes after each turn; the app runs this job.
     let snapshot = thread
         .take_snapshot_job()
-        .expect("a snapshot is due after the turn");
+        .expect("a checkpoint is due after the turn");
     thread.finish_snapshot(snapshot.run(&tools));
     assert!(!thread.work_pending(), "{:?}", thread.snapshot_error());
     let users: Vec<_> = thread
@@ -874,24 +873,17 @@ fn live_codex_worktree_creates_resumes_and_removes_in_the_worktree() {
     let base = copy.base.as_str();
     assert_eq!(git(&tools, &project.path, &["rev-parse", "HEAD"]), base);
     assert_eq!(
-        git(
-            &tools,
-            &project.path,
-            &["rev-parse", &format!("{}~1", copy.branch)]
-        ),
-        base
+        git(&tools, &project.path, &["rev-parse", &copy.branch]),
+        base,
+        "Newjen adds no commit to the thread's branch"
     );
-    assert_eq!(
-        git(
-            &tools,
-            &project.path,
-            &["show", &format!("{}:hello.txt", copy.branch)]
-        ),
-        "hi"
-    );
+    let turn = newjen_core::vcs::diff(&tools, &copy.workdir, &id, newjen_core::vcs::Scope::Turn(1))
+        .unwrap();
+    assert!(turn.patch.contains("+++ b/hello.txt"), "{}", turn.patch);
+    assert!(turn.patch.contains("+hi"), "{}", turn.patch);
     assert!(store.pending_copies(project.id).unwrap().is_empty());
     println!(
-        "checks: user_items=1, hello.txt=hi only in copy, process_cwd={}, saved_workdir/copy=matched, main_base={base}, snapshot_on_branch=hello.txt, pending_copies=0",
+        "checks: user_items=1, hello.txt=hi only in copy, process_cwd={}, saved_workdir/copy=matched, main_base={base}, checkpoint_turn_1=hello.txt, pending_copies=0",
         copy.workdir.display()
     );
 

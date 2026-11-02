@@ -14,6 +14,7 @@
 //! `cx.notify()`, which asks GPUI to call `render` again.
 
 mod changes;
+mod git;
 mod inbox;
 mod lifecycle;
 mod limits;
@@ -103,6 +104,8 @@ enum NoticeKind {
     CopyFailed { output: Vec<String> },
     /// Nothing failed and nothing was sent, so no Try again.
     Held,
+    /// A git action the user asked for worked.
+    Done,
 }
 
 impl Notice {
@@ -117,6 +120,14 @@ impl Notice {
     fn held(title: &str, detail: String) -> Notice {
         Notice {
             kind: NoticeKind::Held,
+            title: title.to_string(),
+            detail,
+        }
+    }
+
+    fn done(title: &str, detail: String) -> Notice {
+        Notice {
+            kind: NoticeKind::Done,
             title: title.to_string(),
             detail,
         }
@@ -726,7 +737,12 @@ impl ChatView {
     /// can become unread again), and a draft left with an empty composer is dropped: it was
     /// never saved, and empty threads should not pile up.
     fn show(&mut self, target: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review_loading || self.review_panel.as_ref().is_some_and(|panel| panel.busy) {
+        if self.review_loading
+            || self
+                .review_panel
+                .as_ref()
+                .is_some_and(review::ReviewPanel::busy)
+        {
             return;
         }
         self.review_panel = None;
@@ -857,13 +873,6 @@ impl ChatView {
             return;
         };
         if self.hold_archive(ix, cx) {
-            return;
-        }
-        if self.slots[ix].thread.read(cx).review_base().is_some()
-            && !self.slots[ix].thread.read(cx).landing_finished()
-        {
-            self.show_thread(thread_id, window, cx);
-            self.open_review(window, cx);
             return;
         }
         let question = {
@@ -1226,13 +1235,6 @@ impl ChatView {
         if self.review_loading || self.review_panel.is_some() {
             return false;
         }
-        if thread.read(cx).works_in() == WorksIn::ProjectFolder
-            && self.project_work_owned_elsewhere(&thread, cx)
-        {
-            self.slots[self.active].notice = Some(Notice::held("Review the project thread first", "Land, discard, or keep the files and close the existing project-folder thread before starting another one here.".into()));
-            cx.notify();
-            return false;
-        }
         if let Some(held) = self.copy_hold(&thread, cx) {
             self.slots[self.active].notice = Some(held);
             cx.notify();
@@ -1279,26 +1281,6 @@ impl ChatView {
         self.sync_field(window, cx);
         cx.notify();
         went_out
-    }
-
-    /// Whether a thread other than `thread`, here or in a peer project sharing the repository,
-    /// owns work in the project folder, so only it may work there until it is reviewed.
-    pub(super) fn project_work_owned_elsewhere(&self, thread: &Entity<Thread>, cx: &App) -> bool {
-        let source = worktree::project_root(&self.project.path);
-        let owned_in = |view: &ChatView| {
-            view.slots.iter().any(|slot| {
-                let other = slot.thread.read(cx);
-                slot.thread != *thread
-                    && other.owns_project_work()
-                    && same_repository(&source, &worktree::project_root(other.cwd()))
-            })
-        };
-        owned_in(self)
-            || self
-                .copy_peers
-                .iter()
-                .filter_map(|peer| peer.upgrade())
-                .any(|peer| owned_in(peer.read(cx)))
     }
 
     /// Checked before `Thread::send`, which would hold the message and rename the thread.
@@ -1555,7 +1537,12 @@ impl ChatView {
     /// "Try again" on an error: a fresh `claude` for the same conversation (core works out
     /// whether it resumes or starts over).
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review_loading || self.review_panel.as_ref().is_some_and(|panel| panel.busy) {
+        if self.review_loading
+            || self
+                .review_panel
+                .as_ref()
+                .is_some_and(review::ReviewPanel::busy)
+        {
             return;
         }
         let thread = self.thread().clone();
@@ -1647,11 +1634,11 @@ impl ChatView {
             KeyRoute::Pass
                 if !self.terminal_focused(window, cx)
                     && self.review_panel.is_some()
-                    && review::is_land_key(event)
+                    && review::is_primary_action_key(event)
                     && !overlay_focused(window) =>
             {
                 cx.stop_propagation();
-                self.land_with_key(window, cx);
+                self.run_primary_action(window, cx);
             }
             KeyRoute::CloseDrawer | KeyRoute::Pass => {}
         }
@@ -1967,6 +1954,11 @@ impl ChatView {
                     title,
                     detail,
                 }) => rows::held("notice".into(), title, detail, cx),
+                Some(Notice {
+                    kind: NoticeKind::Done,
+                    title,
+                    detail,
+                }) => rows::done("notice".into(), title, detail, cx),
                 None => div().into_any_element(),
             },
             None => div().into_any_element(),
@@ -3047,11 +3039,6 @@ fn archive_question(
     )
 }
 
-fn same_repository(a: &Path, b: &Path) -> bool {
-    let is_repo = |root: &Path| root.join(".git").exists();
-    inbox::overlaps(a, b) && (is_repo(a) || is_repo(b))
-}
-
 fn works_in_label(works_in: WorksIn) -> (ui::IconName, &'static str, &'static str) {
     match works_in {
         WorksIn::ProjectFolder => (
@@ -3062,7 +3049,7 @@ fn works_in_label(works_in: WorksIn) -> (ui::IconName, &'static str, &'static st
         WorksIn::Worktree => (
             ui::IconName::GitBranch,
             "Worktree",
-            "Works in its own git worktree and branch. Your folder stays untouched until you land the work.",
+            "Works in its own git worktree and branch. Your folder stays untouched until you merge the work.",
         ),
     }
 }

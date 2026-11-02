@@ -51,7 +51,6 @@ use anyhow::{Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 
 use crate::agent::NoteDelivery;
-use crate::landing;
 #[cfg(test)]
 use crate::protocol::{Incoming, ResultMessage};
 #[cfg(test)]
@@ -62,6 +61,7 @@ use crate::store::{
     now_ms,
 };
 use crate::transcript::{Item, Status, Transcript};
+use crate::vcs;
 use crate::worktree::{self, CopyError, Tools};
 
 /// A thread's title before its first message.
@@ -308,7 +308,7 @@ impl ProjectJob {
         for stopping in self.stopping {
             let _ = stopping.join();
         }
-        let result = landing::prepare_project(tools, &self.cwd, &self.thread_id);
+        let result = vcs::checkpoint(tools, &self.cwd, &self.thread_id);
         let _ = self.completion.send(());
         result
     }
@@ -319,7 +319,6 @@ impl ProjectJob {
 pub struct SnapshotJob {
     completion: std::sync::mpsc::Sender<()>,
     cwd: PathBuf,
-    title: String,
     thread_id: String,
     stopping: Vec<JoinHandle<()>>,
 }
@@ -329,7 +328,7 @@ impl SnapshotJob {
         for stopping in self.stopping {
             let _ = stopping.join();
         }
-        let result = landing::snapshot(tools, &self.cwd, &self.title, &self.thread_id);
+        let result = vcs::checkpoint(tools, &self.cwd, &self.thread_id).map(|_| ());
         let _ = self.completion.send(());
         result
     }
@@ -361,7 +360,7 @@ impl CopyJob {
         tools: &Tools,
         on_progress: impl FnMut(worktree::Progress),
     ) -> Result<worktree::Worktree, CopyError> {
-        worktree::create_controlled(
+        let made = worktree::create_controlled(
             tools,
             &self.project_dir,
             &self.name,
@@ -376,7 +375,16 @@ impl CopyJob {
                     })
             },
             on_progress,
-        )
+        )?;
+        if let Err(error) = vcs::checkpoint(tools, &made.workdir, &self.thread_id) {
+            let _ = worktree::remove_pending(tools, &made.source, &made.path);
+            return Err(CopyError::Failed {
+                command: "record the worktree's starting point".to_string(),
+                detail: format!("{error:#}"),
+                output: Vec::new(),
+            });
+        }
+        Ok(made)
     }
 }
 
@@ -893,10 +901,6 @@ impl Thread {
         let mut config = self.base_config.clone();
         config.bind(&self.session_id, self.session_started, &rules);
         config.cwd = self.cwd.clone();
-        if landing::available(&self.cwd) && !self.copy().is_some_and(worktree::Worktree::is_legacy)
-        {
-            config.instructions = Some(landing::instructions().to_string());
-        }
         if let Place::Copy(copy) = &self.place {
             config.env.extend(copy.env());
         }
@@ -937,15 +941,6 @@ impl Thread {
         self.landing_resolved
     }
 
-    pub fn owns_project_work(&self) -> bool {
-        self.place == Place::ProjectFolder
-            && !self.landing_resolved
-            && (self.review_base.is_some()
-                || matches!(self.stage, Stage::PreparingProject(_))
-                || self.status().is_busy()
-                || !self.background_tasks().is_empty())
-    }
-
     pub fn work_pending(&self) -> bool {
         !matches!(self.snapshot, SnapshotState::Clean)
     }
@@ -971,7 +966,6 @@ impl Thread {
         Some(SnapshotJob {
             completion,
             cwd: self.cwd.clone(),
-            title: self.title.clone(),
             thread_id: self.id.clone(),
             stopping,
         })
@@ -994,46 +988,10 @@ impl Thread {
         }
     }
 
-    pub fn can_release_project_tracking(&self) -> bool {
-        self.owns_project_work()
-            && !self.is_draft()
-            && self.preparing().is_none()
-            && !self.status().is_busy()
-            && self.background_tasks().is_empty()
-            && matches!(
-                self.snapshot,
-                SnapshotState::Clean | SnapshotState::Failed(_)
-            )
-    }
-
-    pub fn release_project_tracking(&mut self) -> Result<()> {
-        if self.landing_resolved && self.place == Place::ProjectFolder {
-            return Ok(());
-        }
-        if !self.can_release_project_tracking() {
-            bail!(
-                "Wait for the turn and any snapshot to finish before keeping the files and closing"
-            );
-        }
-        if self.session.is_some() || self.stopping.iter().any(|job| !job.is_finished()) {
-            bail!("Stop the agent before releasing project tracking");
-        }
-        self.snapshot = SnapshotState::Clean;
-        self.landing_resolved = true;
-        self.save();
-        Ok(())
-    }
-
     pub fn snapshot_waits_for_background(&self) -> bool {
         matches!(self.snapshot, SnapshotState::Pending)
             && !self.status().is_busy()
             && !self.background_tasks().is_empty()
-    }
-
-    pub fn finish_landing(&mut self) {
-        self.end_session();
-        self.landing_resolved = true;
-        self.save();
     }
 
     pub fn set_works_in(&mut self, works_in: WorksIn) -> Result<()> {
@@ -1118,7 +1076,7 @@ impl Thread {
                 store: self.store.clone(),
             }));
         }
-        if self.review_base.is_none() && landing::available(&self.cwd) {
+        if self.review_base.is_none() && vcs::available(&self.cwd) {
             self.end_session();
             let was_saved = self.is_saved();
             if !was_saved {

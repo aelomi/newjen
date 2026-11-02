@@ -1,5 +1,5 @@
 //! Per-file change statistics for a thread: the exact ones from a git diff (see
-//! [`crate::landing::changed_files`]) and a live estimate from the agent's edit tool calls.
+//! [`crate::vcs::changed_files`]) and a live estimate from the agent's edit tool calls.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead};
@@ -393,7 +393,7 @@ pub(crate) fn count_git_diff(mut reader: impl BufRead) -> io::Result<ChangeSumma
 }
 
 fn clean(token: &str) -> String {
-    let token = token.trim_end_matches(['\r', '\n']);
+    let token = token.trim_end_matches(['\r', '\n', '\t']);
     let token = if token.starts_with('"') {
         serde_json::from_str::<String>(token).unwrap_or_else(|_| token.to_string())
     } else {

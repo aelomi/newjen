@@ -959,6 +959,15 @@ pub fn held(id: ElementId, title: &str, detail: &str, cx: &App) -> AnyElement {
     ui::assistant(alert, cx).into_any_element()
 }
 
+pub fn done(id: ElementId, title: &str, detail: &str, cx: &App) -> AnyElement {
+    let alert = if detail.is_empty() {
+        gpui_kit::component::alert::Alert::success(id, title.to_string())
+    } else {
+        gpui_kit::component::alert::Alert::success(id, detail.to_string()).title(title.to_string())
+    };
+    ui::assistant(alert, cx).into_any_element()
+}
+
 pub fn preparing_work(label: &str, took: &str, last_line: Option<&str>, cx: &App) -> AnyElement {
     use gpui_kit::component::Sizable as _;
     let color = cx.theme().colors.muted_foreground;

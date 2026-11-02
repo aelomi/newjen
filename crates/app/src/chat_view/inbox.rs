@@ -117,8 +117,3 @@ impl ChatView {
 }
 
 const TERMINAL_HEIGHT: f32 = 250.0;
-
-/// Whether two project roots are the same repository, or one lies in the other.
-pub(super) fn overlaps(a: &Path, b: &Path) -> bool {
-    a.starts_with(b) || b.starts_with(a)
-}
