@@ -9,7 +9,7 @@ use super::Store;
 use crate::agent::TokenCounts;
 use crate::providers::{Billing, Provider};
 use crate::thread_usage::TurnUsageRow;
-use crate::usage::ProviderUsage;
+use crate::usage::{ProviderUsage, SavedUsage};
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -53,22 +53,35 @@ impl Store {
     }
 
     /// The plan reports saved for each provider, as the last run left them.
-    pub fn provider_usages(&self) -> Result<Vec<ProviderUsage>> {
+    pub fn provider_usages(&self) -> Result<Vec<SavedUsage>> {
         let connection = self.reader();
-        let mut statement = connection.prepare("SELECT report FROM provider_usage")?;
-        let reports = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut statement = connection.prepare("SELECT report, account FROM provider_usage")?;
+        let reports = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
         Ok(reports
             .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .filter_map(|report| serde_json::from_str(report).ok())
+            .into_iter()
+            .filter_map(|(report, account)| {
+                Some(SavedUsage {
+                    usage: serde_json::from_str(&report).ok()?,
+                    account,
+                })
+            })
             .collect())
     }
 
     /// Keeps the provider's latest plan report, or forgets it when there is none.
-    pub(crate) fn save_provider_usage(&self, provider: Provider, usage: Option<&ProviderUsage>) {
+    pub(crate) fn save_provider_usage(
+        &self,
+        provider: Provider,
+        usage: Option<&ProviderUsage>,
+        account: Option<&str>,
+    ) {
         self.queue(super::Write::ProviderUsage {
             provider: provider.id().into(),
             report: usage.map(|usage| serde_json::to_string(usage).expect("usage serialization")),
+            account: account.map(str::to_owned),
             updated_at: super::now_ms(),
         });
     }
@@ -417,7 +430,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!((SCHEMA_VERSION, version), (7, 7));
+        assert_eq!((SCHEMA_VERSION, version), (8, 8));
         assert_eq!(store.thread("t1").unwrap().unwrap().title, "Old");
         assert!(store.turn_usage("t1").unwrap().is_empty());
         save(
@@ -483,18 +496,36 @@ mod tests {
         claude.plan = Some("max".into());
         claude.billing = Billing::Subscription;
         let codex = ProviderUsage::empty(Provider::Codex);
-        store.save_provider_usage(Provider::Claude, Some(&claude));
-        store.save_provider_usage(Provider::Codex, Some(&codex));
+        store.save_provider_usage(Provider::Claude, Some(&claude), Some("a@example.com"));
+        store.save_provider_usage(Provider::Codex, Some(&codex), None);
         assert!(store.flush(Duration::from_secs(5)));
         let mut saved = store.provider_usages().unwrap();
-        saved.sort_by_key(|usage| usage.provider.id());
-        assert_eq!(saved, [claude.clone(), codex]);
+        saved.sort_by_key(|saved| saved.usage.provider.id());
+        assert_eq!(
+            saved,
+            [
+                SavedUsage {
+                    usage: claude.clone(),
+                    account: Some("a@example.com".into())
+                },
+                SavedUsage {
+                    usage: codex,
+                    account: None
+                },
+            ]
+        );
 
         claude.plan = Some("pro".into());
-        store.save_provider_usage(Provider::Claude, Some(&claude));
-        store.save_provider_usage(Provider::Codex, None);
+        store.save_provider_usage(Provider::Claude, Some(&claude), Some("b@example.com"));
+        store.save_provider_usage(Provider::Codex, None, None);
         assert!(store.flush(Duration::from_secs(5)));
-        assert_eq!(store.provider_usages().unwrap(), [claude]);
+        assert_eq!(
+            store.provider_usages().unwrap(),
+            [SavedUsage {
+                usage: claude,
+                account: Some("b@example.com".into())
+            }]
+        );
     }
 
     #[test]

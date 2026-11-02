@@ -39,8 +39,12 @@ fn the_plan_report_a_turn_brings_is_saved_as_it_arrives() {
     assert!(store.flush(Duration::from_secs(5)));
     let saved = store.provider_usages().unwrap();
     assert_eq!(saved.len(), 1);
-    assert_eq!(Some(&saved[0]), usage::latest(Provider::Claude).as_ref());
+    assert_eq!(
+        Some(&saved[0].usage),
+        usage::latest(Provider::Claude).as_ref()
+    );
     let five = saved[0]
+        .usage
         .windows
         .iter()
         .find(|w| w.key == "five_hour")

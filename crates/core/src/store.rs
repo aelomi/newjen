@@ -174,6 +174,9 @@ const MIGRATIONS: &[&str] = &[
          report TEXT NOT NULL,
          updated_at INTEGER NOT NULL
      );",
+    // Version 8: the account a provider's plan report was read for, so a report restored at
+    // launch is still dropped when the CLI is signed in to someone else.
+    "ALTER TABLE provider_usage ADD COLUMN account TEXT;",
 ];
 
 /// The `user_version` of a database at the current schema.
@@ -429,6 +432,7 @@ enum Write {
     ProviderUsage {
         provider: String,
         report: Option<String>,
+        account: Option<String>,
         updated_at: i64,
     },
     /// Replaces all of a thread's grants (to redo grant writes that failed).
@@ -1287,13 +1291,16 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
         Write::ProviderUsage {
             provider,
             report: Some(report),
+            account,
             updated_at,
         } => {
             connection.execute(
-                "INSERT INTO provider_usage (provider, report, updated_at) VALUES (?1, ?2, ?3)
+                "INSERT INTO provider_usage (provider, report, account, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT (provider) DO UPDATE
-                 SET report = excluded.report, updated_at = excluded.updated_at",
-                params![provider, report, updated_at],
+                 SET report = excluded.report, account = excluded.account,
+                     updated_at = excluded.updated_at",
+                params![provider, report, account, updated_at],
             )?;
         }
         Write::ProviderUsage {

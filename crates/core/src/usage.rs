@@ -424,6 +424,13 @@ fn duration_label(minutes: i64) -> String {
     }
 }
 
+/// A plan report as an earlier run saved it, with the account it was read for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedUsage {
+    pub usage: ProviderUsage,
+    pub account: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct Entry {
     usage: Option<ProviderUsage>,
@@ -457,12 +464,26 @@ impl UsageBoard {
         .filter(|usage| !usage.is_empty())
     }
 
-    /// Fills providers the board knows nothing about with reports an earlier run saved.
-    pub fn restore(&mut self, saved: Vec<ProviderUsage>) {
-        for usage in saved {
+    /// The account the provider's report was read for, when known.
+    pub fn account(&self, provider: Provider) -> Option<&str> {
+        match provider {
+            Provider::Claude => &self.claude,
+            Provider::Codex => &self.codex,
+        }
+        .account
+        .as_deref()
+    }
+
+    /// Fills providers the board knows nothing about with reports an earlier run saved, along
+    /// with the account each was read for, so a later account switch still clears them.
+    pub fn restore(&mut self, saved: Vec<SavedUsage>) {
+        for SavedUsage { usage, account } in saved {
             let entry = self.entry(usage.provider);
             if entry.usage.as_ref().is_none_or(ProviderUsage::is_empty) {
                 entry.usage = Some(usage);
+                if entry.account.is_none() {
+                    entry.account = account;
+                }
             }
         }
     }
@@ -543,7 +564,8 @@ pub fn attach_store(store: &Store) {
 fn persist(provider: Provider) {
     let sink = sink().lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(store) = &*sink {
-        store.save_provider_usage(provider, latest(provider).as_ref());
+        let board = board().lock().unwrap_or_else(PoisonError::into_inner);
+        store.save_provider_usage(provider, board.get(provider), board.account(provider));
     }
 }
 

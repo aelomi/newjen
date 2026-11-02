@@ -478,8 +478,14 @@ fn a_restored_report_fills_only_a_provider_the_board_knows_nothing_about() {
     saved.plan = Some("max".into());
     saved.billing = Billing::Subscription;
     saved.updated_at_unix_seconds = Some(50);
+    let restored = |usage: &ProviderUsage| {
+        vec![SavedUsage {
+            usage: usage.clone(),
+            account: None,
+        }]
+    };
     let mut board = UsageBoard::new();
-    board.restore(vec![saved.clone()]);
+    board.restore(restored(&saved));
     assert_eq!(board.get(Provider::Claude), Some(&saved));
     assert!(board.get(Provider::Codex).is_none());
 
@@ -488,11 +494,38 @@ fn a_restored_report_fills_only_a_provider_the_board_knows_nothing_about() {
             .unwrap();
     let mut board = UsageBoard::new();
     board.record(&live, 900);
-    board.restore(vec![saved]);
+    board.restore(restored(&saved));
     assert_eq!(
         board.get(Provider::Claude).unwrap().updated_at_unix_seconds,
         Some(900)
     );
+}
+
+#[test]
+fn a_restored_report_is_dropped_when_the_cli_is_signed_in_to_another_account() {
+    let mut saved =
+        ProviderUsage::from_claude_rate_limit(&claude_infos("text_reply.jsonl")[0]).unwrap();
+    saved.plan = Some("max".into());
+    let restored = || {
+        vec![SavedUsage {
+            usage: saved.clone(),
+            account: Some("a@example.com".into()),
+        }]
+    };
+
+    let mut board = UsageBoard::new();
+    board.restore(restored());
+    assert_eq!(board.account(Provider::Claude), Some("a@example.com"));
+    board.record_status(&status(Provider::Claude, "max", "a@example.com", None), 10);
+    assert!(!board.get(Provider::Claude).unwrap().windows.is_empty());
+
+    let mut board = UsageBoard::new();
+    board.restore(restored());
+    board.record_status(&status(Provider::Claude, "pro", "b@example.com", None), 10);
+    let stored = board.get(Provider::Claude).unwrap();
+    assert!(stored.windows.is_empty());
+    assert_eq!(stored.plan.as_deref(), Some("pro"));
+    assert_eq!(board.account(Provider::Claude), Some("b@example.com"));
 }
 
 #[test]
