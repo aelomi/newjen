@@ -142,7 +142,7 @@ const MIGRATIONS: &[&str] = &[
      UPDATE projects SET landing_mode = 'harness_managed';
      UPDATE threads SET landing_mode = 'harness_managed';
      DELETE FROM copy_cleanup;
-     DELETE FROM pending_copies WHERE state = 'making_copy';",
+     DELETE FROM pending_copies;",
 ];
 
 /// The `user_version` of a database at the current schema.
@@ -1452,6 +1452,20 @@ mod tests {
         // An older Newjen that knows only step one leaves the newer database alone.
         migrate(&mut connection, &[step_one]).unwrap();
         assert_eq!(user_version(&connection), 2);
+    }
+
+    #[test]
+    fn rift_era_pending_copies_do_not_survive_the_move_to_worktrees() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &MIGRATIONS[..5]).unwrap();
+        connection.execute_batch("INSERT INTO projects (id, path, created_at, last_opened_at) VALUES (1, '/tmp/project', 1, 1);
+            INSERT INTO pending_copies VALUES ('draft', 1, '/tmp/.rifts/project/a', 'held', 'draft', NULL, 1);
+            INSERT INTO pending_copies VALUES ('sent', 1, '/tmp/.rifts/project/b', 'held', 'sent', 'rift-id', 1);").unwrap();
+        migrate(&mut connection, MIGRATIONS).unwrap();
+        let left: i64 = connection
+            .query_row("SELECT count(*) FROM pending_copies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]

@@ -767,7 +767,7 @@ fn a_stale_review_cannot_discard() {
 }
 
 #[test]
-fn reading_a_review_leaves_unsnapshotted_files_unsnapshotted() {
+fn a_review_records_edits_made_after_the_last_turn() {
     let lab = lab();
     let repo = lab.repo();
     let base = lab.prepare(&repo);
@@ -777,7 +777,9 @@ fn reading_a_review_leaves_unsnapshotted_files_unsnapshotted() {
     write(&repo, "agent.txt", "second\n");
     write(&repo, "later.txt", "later\n");
     let after = lab.review(&repo, &base);
-    assert_eq!(before, after);
+    assert_ne!(before, after);
+    assert!(after.patch.contains("+second") && after.patch.contains("later.txt"));
+    lab.land_project(&repo, &after).unwrap();
     assert_eq!(lab.staged(&repo), "");
 }
 

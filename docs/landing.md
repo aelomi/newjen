@@ -10,7 +10,9 @@ At each turn's end, Newjen snapshots what the agent changed. The next message wa
 
 **Worktree thread.** The worktree has its own branch, `newjen/<id8>-<random>`. Each snapshot is a real git commit on it: `git add --all`, then `git commit --no-verify`, with signing off. If you have no git identity, the commit is made as `Newjen <newjen@localhost>`. The worktree starts at the commit the project had checked out, so review shows the branch's diff since that base.
 
-**Project-folder thread.** Newjen never commits to your branch until you land. The thread's base and its snapshots are commits built from a separate index file (`.git/newjen/<thread id>.index`) and kept under `refs/newjen/<thread id>`. Your own index, staged changes and branch are not touched. Uncommitted work that was there before the thread started is part of the base, so review shows only what the thread changed.
+**Project-folder thread.** Newjen never commits to your branch until you land. The thread's base and its snapshots are commits built from a separate index file (`.git/newjen/<thread id>.index`) and kept under `refs/newjen/<thread id>`. Your own index, staged changes and branch are not touched. Uncommitted work that was there before the thread started is part of the base, so review shows only what the thread changed. Snapshots cover only the project folder, so a project in a subfolder of its repository never picks up edits elsewhere in the repository.
+
+Embedded git repositories (a nested `git clone` or `git init`) are left out of every snapshot, so review, Land and Discard never touch them.
 
 ## Review
 
@@ -22,15 +24,16 @@ Press **Review** in the card after the turn finishes, or click a file to open th
 
 - **Land** (⌘↵) runs the checks, then lands the reviewed work. There is only this one way; the old Rebase and land is gone.
   - **Worktree thread:** merges the reviewed commit into the project's current branch with `git merge --no-ff --no-verify`, with the message `Land newjen/<…>: <thread title>`. Work that is already merged lands as a no-op.
-  - **Project-folder thread:** commits only the thread's files on the current branch (`git add`, then `git commit --only -- <those files>`). If any of those files also had other uncommitted changes from before the thread, Newjen refuses, because git cannot separate them. Commit them in your terminal, or choose **Keep files and close**.
-- **Discard** asks for confirmation. For a worktree thread, it archives the thread and removes the worktree. For a project-folder thread, it returns the thread's files to the base (and deletes files the thread added), then archives the conversation. Landing and discarding a project-folder thread both delete its ref and index file.
+  - **Project-folder thread:** commits only the thread's files on the current branch (`git add`, then `git commit --only -- <those files>`). If any of those files also had other uncommitted or staged changes from before the thread, Newjen refuses, because git cannot separate them. Commit them in your terminal, or choose **Keep files and close**.
+- **Discard** asks for confirmation. For a worktree thread, it archives the thread and removes the worktree. For a project-folder thread, it returns the thread's files to the base (and deletes files the thread added), then archives the conversation. It refuses, before changing anything, when the thread moved a submodule. Landing and discarding a project-folder thread both delete its ref and index file.
 - **Keep files and close** releases the thread's tracking and archives the conversation. It changes no files and no history, and it lets other threads use the project folder. Use it to keep unfinished work for manual handling, or when landing is refused. The agent must stop first; a running snapshot must finish.
 
 Before landing, Newjen checks the following.
 
-- **Files changed since review:** it rejects the land and asks you to refresh the review. Refresh the review after changing files.
+- **Files changed since review:** it rejects the land and asks you to refresh the review. Opening or refreshing the review records the folder as it is, so edits you made by hand are part of what lands.
 - **Oversized diffs:** it rejects them. Review and land those with git in your terminal. A worktree diff over the display limit still allows Discard, with an explicit warning that it deletes unreviewed work after confirmation.
 - **A merge in progress** in the project: it refuses until you finish or abort it.
+- **No branch checked out** (detached `HEAD`): it refuses until you check out a branch.
 - **Predicted conflicts:** for a worktree thread, `git merge-tree --write-tree` predicts the merge. If it would conflict, Newjen refuses. Fix the changes in the worktree and review again.
 - **A failed merge:** if the merge itself fails, for example because your own uncommitted changes touch the same files, Newjen runs `git merge --abort` and reports. The project's files are unchanged. Commit or stash your changes to those files and try again.
 

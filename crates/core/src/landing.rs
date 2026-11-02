@@ -71,15 +71,12 @@ pub fn snapshot(tools: &Tools, cwd: &Path, title: &str, thread_id: &str) -> Resu
         return Ok(());
     }
     ensure!(
-        git(tools, cwd, &["rev-parse", "--absolute-git-dir"])?
-            != git(
-                tools,
-                cwd,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"]
-            )?,
+        git(tools, cwd, &["symbolic-ref", "--quiet", "HEAD"])
+            .is_ok_and(|branch| branch.starts_with("refs/heads/newjen/")),
         "This thread's recorded base is missing, so Newjen won't snapshot the project folder"
     );
-    git(tools, cwd, &["add", "--all"])?;
+    let root = root(tools, cwd)?;
+    add_all(tools, &root, None)?;
     if succeeds(tools, cwd, &["diff", "--cached", "--quiet"])? {
         return Ok(());
     }
@@ -91,7 +88,15 @@ pub fn snapshot(tools: &Tools, cwd: &Path, title: &str, thread_id: &str) -> Resu
     Ok(())
 }
 
+/// Records the folder as it is now, then diffs it against `base`, so edits made after the last
+/// turn are part of the review.
 pub fn review(tools: &Tools, cwd: &Path, thread_id: &str, base: &str) -> Result<Review> {
+    validate_commit(base)?;
+    snapshot(tools, cwd, "Changes made outside a turn", thread_id)?;
+    diff(tools, cwd, thread_id, base)
+}
+
+fn diff(tools: &Tools, cwd: &Path, thread_id: &str, base: &str) -> Result<Review> {
     ensure!(available(cwd), "Review and landing need a git repository");
     validate_commit(base)?;
     let head = head(tools, cwd, thread_id)?;
@@ -178,6 +183,7 @@ pub fn land_worktree(
     )? {
         return Ok(());
     }
+    ensure_on_branch(tools, source)?;
     ensure!(
         !succeeds(
             tools,
@@ -243,9 +249,10 @@ pub fn land_project(
     run_checks(tools, cwd, cwd)?;
     ensure_review(tools, cwd, thread_id, reviewed)?;
     let root = root(tools, cwd)?;
+    ensure_on_branch(tools, &root)?;
     let changed = changed_paths(tools, &root, &reviewed.base, &reviewed.head)?;
     if !changed.is_empty() {
-        let paths: Vec<&str> = changed.iter().map(|(_, path)| path.as_str()).collect();
+        let paths: Vec<&str> = changed.iter().map(|change| change.path.as_str()).collect();
         let head = revision(tools, &root, "HEAD").or_else(|_| empty_tree(tools, &root))?;
         let mut compare = vec![
             "diff",
@@ -256,8 +263,10 @@ pub fn land_project(
             "--",
         ];
         compare.extend(&paths);
+        let mut staged = vec!["diff", "--cached", "--quiet", "--no-renames", "--"];
+        staged.extend(&paths);
         ensure!(
-            succeeds(tools, &root, &compare)?,
+            succeeds(tools, &root, &compare)? && succeeds(tools, &root, &staged)?,
             "Some of these files had other uncommitted changes. Commit them in your terminal, or choose Keep files and close"
         );
         let mut add = vec!["add", "--all", "--"];
@@ -292,10 +301,14 @@ pub fn discard_project(
     ensure_review(tools, cwd, thread_id, reviewed)?;
     let root = root(tools, cwd)?;
     let changed = changed_paths(tools, &root, &reviewed.base, &reviewed.head)?;
+    ensure!(
+        !changed.iter().any(|change| change.submodule),
+        "This thread changed a submodule. Discard its work in your terminal, or choose Keep files and close"
+    );
     let restore: Vec<&str> = changed
         .iter()
-        .filter(|(status, _)| status != "A")
-        .map(|(_, path)| path.as_str())
+        .filter(|change| !change.added)
+        .map(|change| change.path.as_str())
         .collect();
     if !restore.is_empty() {
         let index = index_path(tools, cwd, thread_id)?;
@@ -310,15 +323,13 @@ pub fn discard_project(
             .args(&restore);
         execute(checkout, MAX_OUTPUT_BYTES)?;
     }
-    for (status, path) in &changed {
-        if status == "A" {
-            let file = root.join(path);
-            match std::fs::remove_file(&file) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| format!("Cannot delete {}", file.display()));
-                }
+    for change in changed.iter().filter(|change| change.added) {
+        let file = root.join(&change.path);
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot delete {}", file.display()));
             }
         }
     }
@@ -349,20 +360,20 @@ fn ensure_review(tools: &Tools, cwd: &Path, thread_id: &str, reviewed: &Review) 
                 || tree != git(tools, cwd, &["rev-parse", &format!("{snapshot}^{{tree}}")])?
         }
         None => {
+            let root = root(tools, cwd)?;
+            let mut status = git_command_with(tools, &root, false);
+            status
+                .args(["status", "--porcelain", "--untracked-files=all", "--"])
+                .args(pathspec(tools, &root, None)?);
             revision(tools, cwd, "HEAD")? != reviewed.head
-                || !git(
-                    tools,
-                    cwd,
-                    &["status", "--porcelain", "--untracked-files=all"],
-                )?
-                .is_empty()
+                || !execute(status, MAX_OUTPUT_BYTES)?.stdout.is_empty()
         }
     };
     ensure!(
         !changed,
         "The files changed since this review. Refresh the diff before continuing"
     );
-    let current = review(tools, cwd, thread_id, &reviewed.base)?;
+    let current = diff(tools, cwd, thread_id, &reviewed.base)?;
     ensure!(
         current == *reviewed,
         "The diff changed. Refresh it before continuing"
@@ -370,21 +381,28 @@ fn ensure_review(tools: &Tools, cwd: &Path, thread_id: &str, reviewed: &Review) 
     Ok(())
 }
 
-fn changed_paths(
-    tools: &Tools,
-    root: &Path,
-    base: &str,
-    head: &str,
-) -> Result<Vec<(String, String)>> {
+struct Change {
+    path: String,
+    added: bool,
+    submodule: bool,
+}
+
+fn changed_paths(tools: &Tools, root: &Path, base: &str, head: &str) -> Result<Vec<Change>> {
     let mut command = git_command(tools, root);
-    command.args(["diff", "--name-status", "--no-renames", "-z", base, head]);
+    command.args(["diff", "--raw", "--no-renames", "-z", base, head]);
     let output = execute(command, MAX_OUTPUT_BYTES)?;
     ensure!(!output.truncated, "Too many files changed to land here");
     let text = String::from_utf8(output.stdout).context("A changed file name is not UTF-8")?;
     let mut fields = text.split('\0').filter(|field| !field.is_empty());
     let mut changed = Vec::new();
-    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
-        changed.push((status.to_string(), path.to_string()));
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let meta: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        ensure!(meta.len() == 5, "Unexpected git diff output");
+        changed.push(Change {
+            path: path.to_string(),
+            added: meta[4] == "A",
+            submodule: meta[0] == "160000" || meta[1] == "160000",
+        });
     }
     Ok(changed)
 }
@@ -397,13 +415,51 @@ fn snapshot_tree(tools: &Tools, cwd: &Path, index: &Path, parent: &str) -> Resul
             .args(["read-tree", parent]);
         execute(read, MAX_OUTPUT_BYTES)?;
     }
-    let mut add = git_command(tools, &root);
-    add.env("GIT_INDEX_FILE", index).args(["add", "--all"]);
-    execute(add, MAX_OUTPUT_BYTES)?;
+    add_all(tools, cwd, Some(index))?;
     let mut write = git_command(tools, &root);
     write.env("GIT_INDEX_FILE", index).arg("write-tree");
     let output = execute(write, MAX_OUTPUT_BYTES)?;
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+/// Stages every file under `dir` except embedded git repositories (a nested clone or a fresh
+/// `git init`), which git cannot snapshot as files.
+fn add_all(tools: &Tools, dir: &Path, index: Option<&Path>) -> Result<()> {
+    let mut add = git_command_with(tools, dir, false);
+    if let Some(index) = index {
+        add.env("GIT_INDEX_FILE", index);
+    }
+    add.args(["add", "--all", "--"])
+        .args(pathspec(tools, dir, index)?);
+    execute(add, MAX_OUTPUT_BYTES)?;
+    Ok(())
+}
+
+/// `dir` without the embedded git repositories in it, as magic pathspecs.
+fn pathspec(tools: &Tools, dir: &Path, index: Option<&Path>) -> Result<Vec<String>> {
+    let mut others = git_command(tools, dir);
+    if let Some(index) = index {
+        others.env("GIT_INDEX_FILE", index);
+    }
+    others.args(["ls-files", "--others", "--exclude-standard", "-z"]);
+    let output = execute(others, MAX_OUTPUT_BYTES)?;
+    ensure!(!output.truncated, "Too many new folders to snapshot");
+    let text = String::from_utf8(output.stdout).context("A new file name is not UTF-8")?;
+    let mut spec = vec![".".to_string()];
+    for entry in text.split('\0').filter(|entry| entry.ends_with('/')) {
+        if dir.join(entry).join(".git").exists() {
+            spec.push(format!(":(exclude,literal){entry}"));
+        }
+    }
+    Ok(spec)
+}
+
+fn ensure_on_branch(tools: &Tools, dir: &Path) -> Result<()> {
+    ensure!(
+        succeeds(tools, dir, &["symbolic-ref", "--quiet", "HEAD"])?,
+        "The project has no branch checked out (detached HEAD). Check out a branch, then land"
+    );
+    Ok(())
 }
 
 fn commit_tree(
@@ -593,16 +649,22 @@ fn git(tools: &Tools, cwd: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_command(tools: &Tools, cwd: &Path) -> Command {
+    git_command_with(tools, cwd, true)
+}
+
+fn git_command_with(tools: &Tools, cwd: &Path, literal: bool) -> Command {
     let mut command = Command::new(&tools.git);
+    command.args([
+        "-c",
+        "color.ui=never",
+        "-c",
+        "core.quotepath=false",
+        "--no-pager",
+    ]);
+    if literal {
+        command.arg("--literal-pathspecs");
+    }
     command
-        .args([
-            "-c",
-            "color.ui=never",
-            "-c",
-            "core.quotepath=false",
-            "--no-pager",
-            "--literal-pathspecs",
-        ])
         .current_dir(cwd)
         .envs(tools.env.iter().map(|(key, value)| (key, value)));
     command

@@ -254,6 +254,19 @@ pub(crate) fn create_controlled(
     if let Err(error) = created {
         return Err(remove_after(tools, &root, &path, error));
     }
+    if !path.join(&rel).is_dir() {
+        return Err(remove_after(
+            tools,
+            &root,
+            &path,
+            failure(
+                "git worktree add",
+                "The project folder isn't committed in its repository yet. Commit it, then make \
+                 a worktree"
+                    .to_string(),
+            ),
+        ));
+    }
     let finish = on_created(&branch).map(|()| Worktree {
         workdir: path.join(&rel),
         path: path.clone(),
