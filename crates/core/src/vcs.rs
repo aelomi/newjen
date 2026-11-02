@@ -50,18 +50,24 @@ pub fn checkpoint(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<String> 
         .trim()
         .to_string();
     validate_commit(&id)?;
-    git(
-        tools,
-        cwd,
-        &[
-            "-c",
-            "core.hooksPath=/dev/null",
-            "update-ref",
-            &checkpoint_ref(thread_id, ordinal)?,
-            &id,
-        ],
-    )?;
-    Ok(id)
+    for next in ordinal..ordinal + 16 {
+        let created = git(
+            tools,
+            cwd,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                &checkpoint_ref(thread_id, next)?,
+                &id,
+                "",
+            ],
+        );
+        if created.is_ok() {
+            return Ok(id);
+        }
+    }
+    bail!("Could not record the checkpoint: its place was taken")
 }
 
 /// How many turns have a checkpoint after them (the first checkpoint is the start).
@@ -101,7 +107,15 @@ pub struct Diff {
 pub fn diff(tools: &Tools, cwd: &Path, thread_id: &str, scope: Scope) -> Result<Diff> {
     let (from, to) = range(tools, cwd, thread_id, scope)?;
     let mut command = git_command(tools, cwd);
-    command.args(["diff", "--no-ext-diff", "--no-renames", &from, &to]);
+    command.args([
+        "diff",
+        "--no-ext-diff",
+        "--no-renames",
+        &from,
+        &to,
+        "--",
+        ".",
+    ]);
     let output = execute(command, MAX_PATCH_BYTES)?;
     Ok(Diff {
         patch: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -127,6 +141,8 @@ pub fn changed_files(
             "--unified=0",
             &from,
             &to,
+            "--",
+            ".",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -198,13 +214,13 @@ pub fn status(tools: &Tools, cwd: &Path) -> Result<Status> {
         .args(["status", "--porcelain", "--untracked-files=all", "--"])
         .args(pathspec(tools, cwd, None)?);
     let dirty = !execute(porcelain, MAX_OUTPUT_BYTES)?.stdout.is_empty();
-    let remote = git(tools, &root, &["remote", "get-url", "origin"]).is_ok();
     let counts = git(
         tools,
         cwd,
         &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
     )
     .ok();
+    let remote = counts.is_some() || git(tools, &root, &["remote", "get-url", "origin"]).is_ok();
     let (behind, ahead) = counts
         .as_deref()
         .and_then(|counts| counts.split_once(char::is_whitespace))
@@ -276,15 +292,28 @@ pub fn uncommitted_patch(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<D
 pub fn commit(tools: &Tools, cwd: &Path, message: &str) -> Result<()> {
     ensure!(!message.trim().is_empty(), "Write a commit message first");
     ensure_on_branch(tools, cwd)?;
+    let staged = names(tools, cwd, &["diff", "--cached", "--name-only", "-z"])?;
+    let edited = names(tools, cwd, &["diff", "--name-only", "-z"])?;
+    if let Some(path) = staged.iter().find(|path| edited.contains(path)) {
+        bail!(
+            "{path} has staged changes that differ from the file. Commit or unstage them in your terminal first"
+        );
+    }
     add_all(tools, cwd, None)?;
     ensure!(
         !succeeds(tools, cwd, &["diff", "--cached", "--quiet"])?,
         "There is nothing to commit"
     );
+    let merging = succeeds(
+        tools,
+        cwd,
+        &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+    )?;
     let mut commit = git_command_with(tools, cwd, false);
-    commit
-        .args(["commit", "--quiet", "-m", message, "--"])
-        .args(pathspec(tools, cwd, None)?);
+    commit.args(["commit", "--quiet", "-m", message]);
+    if !merging {
+        commit.arg("--").args(pathspec(tools, cwd, None)?);
+    }
     execute(commit, MAX_OUTPUT_BYTES)?;
     Ok(())
 }
@@ -381,28 +410,60 @@ pub fn merge_worktree(tools: &Tools, worktree: &Worktree, title: &str) -> Result
 /// Puts a worktree thread's files back to how they were before `turn`. Commits and `HEAD`
 /// stay as they are, so a commit the turn made shows as an uncommitted undo.
 pub fn revert_turn(tools: &Tools, worktree: &Worktree, thread_id: &str, turn: usize) -> Result<()> {
-    let dir = &worktree.path;
-    let checkpoints = checkpoints(tools, dir, thread_id)?;
+    let checkpoints = checkpoints(tools, &worktree.workdir, thread_id)?;
     ensure!(
         turn >= 1 && turn < checkpoints.len(),
         "This thread has no turn {turn}"
     );
-    let before = &checkpoints[turn - 1];
-    git(
-        tools,
-        dir,
-        &[
-            "restore",
-            "--source",
-            before,
-            "--staged",
-            "--worktree",
-            "--",
-            ".",
-        ],
-    )?;
-    git(tools, dir, &["clean", "-fd", "--quiet"])?;
-    git(tools, dir, &["reset", "--quiet"])?;
+    let (before, after) = (&checkpoints[turn - 1], &checkpoints[turn]);
+    let mut listed = git_command(tools, &worktree.workdir);
+    listed.args([
+        "diff",
+        "--raw",
+        "--no-renames",
+        "-z",
+        before,
+        after,
+        "--",
+        ".",
+    ]);
+    let output = execute(listed, MAX_OUTPUT_BYTES)?;
+    ensure!(
+        !output.truncated,
+        "This turn changed too many files to revert here"
+    );
+    let text = String::from_utf8(output.stdout).context("A changed file name is not UTF-8")?;
+    let mut fields = text.split('\0').filter(|field| !field.is_empty());
+    let (mut restore, mut added) = (Vec::new(), Vec::new());
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let meta: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        ensure!(meta.len() == 5, "Unexpected git diff output");
+        if meta[0] == "160000" || meta[1] == "160000" {
+            continue;
+        }
+        if meta[4] == "A" {
+            added.push(path.to_string());
+        } else {
+            restore.push(path.to_string());
+        }
+    }
+    if !restore.is_empty() {
+        let mut command = git_command(tools, &worktree.path);
+        command
+            .args(["restore", "--source", before, "--worktree", "--"])
+            .args(&restore);
+        execute(command, MAX_OUTPUT_BYTES)?;
+    }
+    for path in added {
+        let file = worktree.path.join(&path);
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot delete {}", file.display()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -413,6 +474,7 @@ fn live_tree(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<String> {
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = root(tools, cwd)?;
     let index = index_path(tools, cwd, thread_id)?;
+    let _ = std::fs::remove_file(index.with_extension("index.lock"));
     let mut read = git_command(tools, &root);
     read.env("GIT_INDEX_FILE", &index);
     match revision(tools, cwd, "HEAD") {
@@ -493,17 +555,48 @@ fn pathspec(tools: &Tools, dir: &Path, index: Option<&Path>) -> Result<Vec<Strin
     if let Some(index) = index {
         others.env("GIT_INDEX_FILE", index);
     }
-    others.args(["ls-files", "--others", "--exclude-standard", "-z"]);
-    let output = execute(others, MAX_OUTPUT_BYTES)?;
-    ensure!(!output.truncated, "Too many new folders to snapshot");
-    let text = String::from_utf8(output.stdout).context("A new file name is not UTF-8")?;
+    others
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = others.spawn().context("Cannot start git")?;
+    let out = child.stdout.take().expect("piped stdout");
+    let err = child.stderr.take().expect("piped stderr");
+    let stderr = thread::spawn(move || read_bounded(err, 16_000));
     let mut spec = vec![".".to_string()];
-    for entry in text.split('\0').filter(|entry| entry.ends_with('/')) {
-        if dir.join(entry).join(".git").exists() {
+    for entry in std::io::BufRead::split(std::io::BufReader::new(out), 0) {
+        let entry = entry?;
+        if entry.last() != Some(&b'/') {
+            continue;
+        }
+        let entry = String::from_utf8(entry).context("A new folder name is not UTF-8")?;
+        if dir.join(&entry).join(".git").exists() {
             spec.push(format!(":(exclude,literal){entry}"));
         }
     }
+    let status = child.wait()?;
+    let (stderr, _) = stderr
+        .join()
+        .map_err(|_| anyhow!("Command error reader failed"))??;
+    ensure!(
+        status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&stderr).trim()
+    );
     Ok(spec)
+}
+
+fn names(tools: &Tools, dir: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let mut command = git_command(tools, dir);
+    command.args(args);
+    let output = execute(command, MAX_OUTPUT_BYTES)?;
+    let text = String::from_utf8(output.stdout).context("A file name is not UTF-8")?;
+    Ok(text
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn ensure_on_branch(tools: &Tools, dir: &Path) -> Result<()> {

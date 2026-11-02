@@ -8,7 +8,7 @@ A thread works in the project folder, or in a git worktree of its own on a `newj
 
 When a thread starts, and after each turn, Newjen records the thread's folder as a private commit under `refs/newjen/<thread id>/<n>`. Checkpoint 0 is the starting point; checkpoint *n* is the folder after turn *n*.
 
-- They are built in a separate index file (`.git/newjen/<thread id>.index`), so your index, staged changes, `HEAD` and branches are never touched, and `git log` never shows them.
+- They are built in a separate index file (`.git/newjen/<thread id>.index`), so your index, staged changes, `HEAD` and branches are never touched. Plain `git log` never shows them, but `git log --all`, GUI clients that list every ref, and `git push --mirror` do.
 - They cover only the thread's folder. A project in a subfolder of its repository never picks up edits elsewhere in the repository. Embedded git repositories (a nested `git clone` or `git init`) are left out.
 - The next message waits for the turn's checkpoint. A failed checkpoint shows an error and a retry button.
 - Archiving a thread forgets its checkpoints. Files and commits stay.
@@ -23,7 +23,7 @@ The review panel shows a diff in one of three scopes:
 - **Uncommitted**: the folder against `HEAD`.
 - **Turn N**: what one turn changed, between its two checkpoints.
 
-**Revert turn N** puts a worktree thread's files back to how they were before that turn. It never moves `HEAD`, so a commit the turn made shows as an uncommitted undo. Like T3 Code, Newjen offers file restore only in a worktree, where no other thread shares the files.
+**Revert turn N** puts the files that turn changed, inside the thread's folder, back to how they were before it, and deletes the files it added. Other files are left alone, including ones you added by hand; later turns' edits to the same files are lost. It never moves `HEAD` or the index, so a commit the turn made shows as an uncommitted undo. Like T3 Code, Newjen offers file restore only in a worktree, where no other thread shares the files.
 
 ## The git button
 
@@ -39,8 +39,8 @@ One button picks the next sensible action from the folder's state, and its menu 
 
 Worktree threads also offer **Commit & merge**. ⌘↵ runs the main action. Actions are disabled while a turn runs.
 
-- **Commit** stages the thread's folder and commits it on the current branch with your own git identity and hooks. Its message is written by your own `claude` CLI on a small model with no tools (`claude -p --model haiku`), from the uncommitted diff, only when you press the button. You can edit it before committing. Without `claude`, the thread title is used.
-- **Push** pushes the current branch and sets its upstream on `origin` the first time.
+- **Commit** stages the thread's folder and commits it on the current branch with your own git identity and hooks. It refuses a file whose staged version differs from the file itself, so it never throws away what you staged. Its message is written by your own `claude` CLI on a small model with no tools (`claude -p --model haiku`), from the uncommitted diff, only when you press the button. You can edit it before committing. Without `claude`, the thread title is used.
+- **Push** pushes the current branch to its upstream, or to `origin` the first time.
 - **Create PR** runs `gh pr create` for the current branch, titled with the commit's first line.
 - **Merge** merges a worktree's branch into the branch the project has checked out, with `git merge --no-ff`. It refuses a detached `HEAD`, a merge in progress, and a merge `git merge-tree` predicts would conflict. A merge that still fails is aborted, leaving your files as they were. Uncommitted work in the worktree is not merged; commit it first.
 

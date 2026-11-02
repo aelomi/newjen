@@ -845,11 +845,23 @@ impl ChatView {
         if let Some(terminal) = slot.terminal.take() {
             terminal.update(cx, |terminal, _| terminal.shutdown());
         }
+        let checkpoints = {
+            let thread = slot.thread.read(cx);
+            (thread.copy().is_none() && thread.review_base().is_some())
+                .then(|| (thread.cwd().to_path_buf(), thread.id().to_string()))
+        };
         let removal = slot.thread.update(cx, |thread, cx| {
             cx.notify();
             thread.archive()
         });
         drop(slot);
+        if let Some((cwd, id)) = checkpoints {
+            let tools = self.tools.clone();
+            cx.background_spawn(async move {
+                let _ = newjen_core::vcs::release(&tools, &cwd, &id);
+            })
+            .detach();
+        }
         cx.emit(Attention::Dismiss(thread_id.to_string()));
         self.remove_copies(removal, cx);
         if ix != self.active {

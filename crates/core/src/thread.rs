@@ -436,6 +436,9 @@ impl Removal {
         for stopping in self.stopping {
             let _ = stopping.join();
         }
+        if !self.copy.is_legacy() {
+            vcs::release(tools, &self.copy.source, &self.thread_id)?;
+        }
         worktree::remove(tools, &self.copy.source, &self.copy.path, &self.copy.branch)?;
         self.store.mark_copy_removed(&self.thread_id, now_ms());
         Ok(())

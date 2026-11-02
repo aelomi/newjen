@@ -2610,3 +2610,58 @@ fn the_review_diff_fills_the_pane(cx: &mut TestAppContext) {
     );
     finish(&chat, path, cx);
 }
+
+#[gpui::test]
+async fn merging_a_worktree_waits_while_a_thread_works_in_the_project_folder(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup_in(cx, "git-merge-gate", true, Some(CREATE_COPY));
+    choose(1, cx);
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    cx.condition(&chat, |view, cx| view.thread().read(cx).copy().is_some())
+        .await;
+    pending(&chat, cx).await;
+    for _ in 0..6 {
+        if cx.update(|_, cx| !working(chat.read(cx).thread().read(cx))) {
+            break;
+        }
+        cx.update(|window, cx| chat.update(cx, |view, cx| view.stop(window, cx)));
+        cx.background_executor
+            .timer(Duration::from_millis(100))
+            .await;
+        cx.run_until_parked();
+    }
+    cx.condition(&chat, |view, cx| {
+        let thread = view.thread().read(cx);
+        !is_busy(thread.status()) && !thread.work_pending()
+    })
+    .await;
+    let wt_id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).git_gate(&wt_id, cx)),
+        None,
+        "the idle worktree thread may use the git button on its own"
+    );
+
+    let base = path.canonicalize().unwrap();
+    let peer = peer_project("project/packages/web", true, vec![&chat], &base, cx);
+    cx.update(|_, cx| chat.update(cx, |view, _| view.set_copy_peers(vec![peer.downgrade()])));
+    cx.update(|window, cx| {
+        peer.update(cx, |view, cx| {
+            assert!(view.send_text("work in the project folder", window, cx));
+        })
+    });
+    pending(&peer, cx).await;
+    assert!(cx.update(|_, cx| peer.read(cx).thread().read(cx).status().is_busy()));
+
+    let gate = cx.update(|_, cx| chat.read(cx).git_gate(&wt_id, cx));
+    cx.update(|_, cx| peer.update(cx, |view, cx| view.quit(cx)))
+        .unwrap();
+    finish(&chat, path, cx);
+    assert_eq!(
+        gate,
+        Some("Another thread is working in this folder"),
+        "the worktree thread's Merge into main would run `git merge` in the project folder while its agent is mid-turn"
+    );
+}

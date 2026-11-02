@@ -658,12 +658,13 @@ impl ChatView {
         if working(target.read(cx)) {
             return Some("Wait for the turn to finish");
         }
-        let root = worktree::project_root(target.read(cx).cwd());
+        let mut roots = vec![worktree::project_root(target.read(cx).cwd())];
+        roots.extend(target.read(cx).copy().map(|copy| copy.source.clone()));
         let shared = |view: &ChatView| {
             view.slots.iter().any(|slot| {
                 slot.thread != *target && {
                     let other = slot.thread.read(cx);
-                    working(other) && worktree::project_root(other.cwd()) == root
+                    working(other) && roots.contains(&worktree::project_root(other.cwd()))
                 }
             })
         };

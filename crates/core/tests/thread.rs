@@ -2394,6 +2394,15 @@ fn archiving_a_worktree_thread_removes_its_worktree_once_claude_has_stopped() {
         "",
         "its branch had nothing the project lacks, so it goes too"
     );
+    assert_eq!(
+        git(
+            &tools,
+            &fixture.project.path,
+            &["for-each-ref", "refs/newjen/"]
+        ),
+        "",
+        "archiving forgets the thread's checkpoints"
+    );
     assert!(fixture.store.flush(FLUSH));
     assert_eq!(fixture.store.copy_owner(&copy.path).unwrap(), None);
     assert!(Removal::pending(&fixture.store).unwrap().is_empty());
