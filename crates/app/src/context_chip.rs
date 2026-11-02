@@ -921,7 +921,7 @@ mod tests {
             let top = self.menu.read(cx).tops.composer();
             div().size_full().flex().flex_col().justify_end().child(
                 div().w(px(520.)).child(
-                    ui::Composer::new(self.field.clone(), ui::Footer::Disabled("off"))
+                    ui::Composer::new(self.field.clone(), ui::Footer::Disabled(Some("off")))
                         .top_sink(top)
                         .meter(Some(chip)),
                 ),

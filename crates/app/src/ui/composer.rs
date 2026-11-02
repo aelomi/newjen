@@ -26,7 +26,7 @@ pub enum Footer {
     Cancel(OnPress),
     /// Disabled, with this hint.
     Wait(&'static str),
-    Disabled(&'static str),
+    Disabled(Option<&'static str>),
 }
 
 #[derive(IntoElement)]
@@ -141,7 +141,7 @@ impl RenderOnce for Composer {
             ),
             Footer::Wait(why) => (Some(why), None),
             Footer::Disabled(why) => (
-                Some(why),
+                why,
                 Some((
                     "send",
                     icon_button_with_look(

@@ -2468,12 +2468,13 @@ impl ChatView {
             .read(cx)
             .paused_until(now_ms() / 1000)
             .is_some();
+        let chip = self.render_context_chip(cx);
         let footer = if paused {
-            ui::Footer::Disabled("Limit reached")
+            ui::Footer::Disabled(chip.is_none().then_some("Limit reached"))
         } else if no_agent {
-            ui::Footer::Disabled("Install an agent, then Refresh")
+            ui::Footer::Disabled(Some("Install an agent, then Refresh"))
         } else if checking {
-            ui::Footer::Disabled("Checking agents…")
+            ui::Footer::Disabled(Some("Checking agents…"))
         } else if self.thread().read(cx).snapshot_waits_for_background() {
             ui::Footer::Stop(self.press(cx, |view, window, cx| view.stop(window, cx)))
         } else if self.thread().read(cx).work_pending() {
@@ -2512,7 +2513,7 @@ impl ChatView {
             .top_sink(self.chip.read(cx).tops.composer())
             .chips(Some(chips))
             .works_in(works_in)
-            .meter(self.render_context_chip(cx))
+            .meter(chip)
             .into_any_element()
     }
 
