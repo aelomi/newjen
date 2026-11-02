@@ -1,6 +1,6 @@
 # Decision memo: isolating a thread's work (2026-10-31)
 
-> **Note (2026-11-02):** Newjen switched to git worktrees and git landing, and no longer uses Rift or jj. The jj and Rift decisions in this memo are historical. See [how landing works now](../landing.md).
+> **Note (2026-11-02):** Newjen switched to git worktrees and git landing, and no longer uses Rift or jj. The jj and Rift decisions in this memo are historical. See [how git works now](../git.md).
 
 Research for slice 3: a thread can work in its own Rift copy instead of the project folder. It covers how other agent development environments isolate parallel agent work. Sources are each product's docs and the public source of T3 Code (`9c0fb54e8cb3`), Vibe Kanban (`7c3807084daa`), Claude Squad (`ce1ffb4392b0`), Synara (`0cf5ea460d19`), MonoCode (`b9ab5065d341`) and Zeron (`4f55b0e1fe6d`). "Not documented" means the primary docs and source say nothing. The decisions taken from this memo are in [`docs/PLAN.md`](../PLAN.md#thread-lifecycle).
 

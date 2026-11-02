@@ -1,79 +1,64 @@
-# Review and land thread work
+# Git in Newjen
 
-Review and landing need a git repository. There is one mode: **Newjen commits**. Newjen asks the agent not to commit, stage, stash or branch, and it records the agent's work itself after each turn. Until 2026-11-02 this used jj and had a second, agent-managed mode; both are gone.
+Agents do version control themselves, as in T3 Code. Newjen sends them no instructions about git: an agent may commit, branch, push or open a pull request, and those commands go through the same approvals as any other command. Newjen adds three things around that: private checkpoints, a Changes view, and one git button. Decided 2026-11-02, after an earlier design in which only Newjen could commit ([why it changed](PLAN.md)).
 
-A thread works either in a git worktree of its own or in the project folder. Review, Land and Discard work for both, but they record the work differently.
+A thread works in the project folder, or in a git worktree of its own on a `newjen/<id8>-<random>` branch. Everything below works for both unless it says otherwise.
 
-## How work is recorded
+## Checkpoints
 
-At each turn's end, Newjen snapshots what the agent changed. The next message waits for that snapshot. A failed snapshot shows an error and a retry button. If a background task keeps the folder busy, Stop remains available. Stop ends those tasks and lets the snapshot finish.
+When a thread starts, and after each turn, Newjen records the thread's folder as a private commit under `refs/newjen/<thread id>/<n>`. Checkpoint 0 is the starting point; checkpoint *n* is the folder after turn *n*.
 
-**Worktree thread.** The worktree has its own branch, `newjen/<id8>-<random>`. Each snapshot is a real git commit on it: `git add --all`, then `git commit --no-verify`, with signing off. If you have no git identity, the commit is made as `Newjen <newjen@localhost>`. The worktree starts at the commit the project had checked out, so review shows the branch's diff since that base.
+- They are built in a separate index file (`.git/newjen/<thread id>.index`), so your index, staged changes, `HEAD` and branches are never touched, and `git log` never shows them.
+- They cover only the thread's folder. A project in a subfolder of its repository never picks up edits elsewhere in the repository. Embedded git repositories (a nested `git clone` or `git init`) are left out.
+- The next message waits for the turn's checkpoint. A failed checkpoint shows an error and a retry button.
+- Archiving a thread forgets its checkpoints. Files and commits stay.
 
-**Project-folder thread.** Newjen never commits to your branch until you land. The thread's base and its snapshots are commits built from a separate index file (`.git/newjen/<thread id>.index`) and kept under `refs/newjen/<thread id>`. Your own index, staged changes and branch are not touched. Uncommitted work that was there before the thread started is part of the base, so review shows only what the thread changed. Snapshots cover only the project folder, so a project in a subfolder of its repository never picks up edits elsewhere in the repository.
+## Changes
 
-Embedded git repositories (a nested `git clone` or `git init`) are left out of every snapshot, so review, Land and Discard never touch them.
+The **Changes** card beside the conversation lists every file the thread changed since it started, with added and removed lines. While a turn runs the numbers are an estimate from the agent's edit tool calls; git's count replaces them when the turn's checkpoint is written.
 
-## Review
+The review panel shows a diff in one of three scopes:
 
-The **Changes** card beside the conversation lists every file the thread touched, with its added and removed lines. While a turn runs the numbers are an estimate from the agent's edit tool calls. After the turn ends and its snapshot finishes, git's own count replaces them. The header button next to the terminal button shows or hides the card; in windows too narrow for it, the button opens the review instead.
+- **All changes**: the folder now against checkpoint 0, so the agent's own commits and its uncommitted work show together, and uncommitted work that was there before the thread started does not.
+- **Uncommitted**: the folder against `HEAD`.
+- **Turn N**: what one turn changed, between its two checkpoints.
 
-Press **Review** in the card after the turn finishes, or click a file to open the review on it. The review lists the files on the left and shows the selected file's diff on the right (Kit's diff viewer, changes since the thread's base).
+**Revert turn N** puts a worktree thread's files back to how they were before that turn. It never moves `HEAD`, so a commit the turn made shows as an uncommitted undo. Like T3 Code, Newjen offers file restore only in a worktree, where no other thread shares the files.
 
-## Land, Discard, Keep files and close
+## The git button
 
-- **Land** (⌘↵) runs the checks, then lands the reviewed work. There is only this one way; the old Rebase and land is gone.
-  - **Worktree thread:** merges the reviewed commit into the project's current branch with `git merge --no-ff --no-verify`, with the message `Land newjen/<…>: <thread title>`. Work that is already merged lands as a no-op.
-  - **Project-folder thread:** commits only the thread's files on the current branch (`git add`, then `git commit --only -- <those files>`). If any of those files also had other uncommitted or staged changes from before the thread, Newjen refuses, because git cannot separate them. Commit them in your terminal, or choose **Keep files and close**.
-- **Discard** asks for confirmation. For a worktree thread, it archives the thread and removes the worktree. For a project-folder thread, it returns the thread's files to the base (and deletes files the thread added), then archives the conversation. Opening the review records hand edits too, so Discard also reverts files in the project folder that you changed by hand after the last turn. It refuses, before changing anything, when the thread moved a submodule. Landing and discarding a project-folder thread both delete its ref and index file.
-- **Keep files and close** releases the thread's tracking and archives the conversation. It changes no files and no history, and it lets other threads use the project folder. Use it to keep unfinished work for manual handling, or when landing is refused. The agent must stop first; a running snapshot must finish.
+One button picks the next sensible action from the folder's state, and its menu lists the others:
 
-Before landing, Newjen checks the following.
+| State | Main action |
+| --- | --- |
+| Uncommitted changes, a remote, `gh` installed, not the default branch | Commit, push & PR |
+| Uncommitted changes and a remote | Commit & push |
+| Uncommitted changes, no remote | Commit |
+| Committed work not pushed | Push (or Push & create PR) |
+| Worktree thread, clean, not merged into the project | Merge into the project's branch |
 
-- **Files changed since review:** it rejects the land and asks you to refresh the review. Opening or refreshing the review records the folder as it is, so edits you made by hand are part of what lands.
-- **Oversized diffs:** it rejects them. Review and land those with git in your terminal. A worktree diff over the display limit still allows Discard, with an explicit warning that it deletes unreviewed work after confirmation.
-- **A merge in progress** in the project: it refuses until you finish or abort it.
-- **No branch checked out** (detached `HEAD`): it refuses until you check out a branch.
-- **Predicted conflicts:** for a worktree thread, `git merge-tree --write-tree` predicts the merge. If it would conflict, Newjen refuses. Fix the changes in the worktree and review again.
-- **A failed merge:** if the merge itself fails, for example because your own uncommitted changes touch the same files, Newjen runs `git merge --abort` and reports. The project's files are unchanged. Commit or stash your changes to those files and try again.
+Worktree threads also offer **Commit & merge**. ⌘↵ runs the main action. Actions are disabled while a turn runs.
 
-A failed land keeps the worktree.
+- **Commit** stages the thread's folder and commits it on the current branch with your own git identity and hooks. Its message is written by your own `claude` CLI on a small model with no tools (`claude -p --model haiku`), from the uncommitted diff, only when you press the button. You can edit it before committing. Without `claude`, the thread title is used.
+- **Push** pushes the current branch and sets its upstream on `origin` the first time.
+- **Create PR** runs `gh pr create` for the current branch, titled with the commit's first line.
+- **Merge** merges a worktree's branch into the branch the project has checked out, with `git merge --no-ff`. It refuses a detached `HEAD`, a merge in progress, and a merge `git merge-tree` predicts would conflict. A merge that still fails is aborted, leaving your files as they were. Uncommitted work in the worktree is not merged; commit it first.
 
-## Archiving
+A thread stays usable after any of these.
 
-Archiving a worktree thread removes its worktree: `git worktree remove --force`, then `git worktree prune`. It then deletes the branch with `git branch -d`, which succeeds only if the branch is merged into the project's `HEAD`. An unmerged branch stays, so its work can still be recovered with git; delete it yourself with `git branch -D` when you are sure.
+## Worktrees
 
-## Declare landing checks
+- Made when the first message is sent: `git worktree add -b newjen/<id8>-<random> <path> HEAD`, beside the repository in `.newjen-worktrees/<repository>/`. It starts at the commit the project has checked out; uncommitted and gitignored files (`node_modules`, `target/`) are not in it.
+- It needs a git repository with a first commit, and a project in a subfolder must be committed.
+- The agent gets `NEWJEN_WORKTREE` (its branch) and `NEWJEN_SOURCE` (the repository root), so a dev server can derive its port.
+- Archiving removes the worktree, then deletes the branch only if it is merged into the project's `HEAD`. An unmerged branch stays, so its work can be recovered with git.
 
-Newjen's snapshot and landing commits skip git hooks (`--no-verify`). Declare their equivalent checks in `.newjen/checks.json` at the repository root.
+## Edit approvals
 
-```json
-[
-  ["cargo", "fmt", "--all", "--", "--check"],
-  ["cargo", "test", "--workspace"]
-]
-```
+An edit approval shows the proposed before-and-after diff using the current file. A missing original, an ambiguous replacement, a non-text file, or a provider request without a diff is shown as unavailable. Oversized edits can be allowed only once. File edits never gain a remembered permission. Approval rechecks the file before sending an allow decision; a changed file requires another review.
 
-Each entry is a program followed by its arguments. Commands run sequentially in the thread's working folder before landing. To use shell syntax, explicitly declare a shell command such as `["/bin/sh", "-c", "npm test && npm run lint"]`.
-
-Landing reads the file as committed at the project's `HEAD`, never from the agent's files, so an agent cannot change the checks it must pass. Commit changes to it before they apply. A missing file means there are no declared checks. Newjen does not discover hooks automatically. A failed command blocks landing and preserves the work. Commands must finish without interactive input.
-
-## Review edit approvals
-
-An edit approval shows the proposed before-and-after diff using the current file. A missing original, an ambiguous replacement, a non-text file, or a provider request without a diff is shown as unavailable. Oversized edits can be allowed only once. File edits never gain a remembered permission.
-
-Approval rechecks the file before sending an allow decision. A changed file requires another review.
-
-The dock has its own optional denial field. **Deny** and Escape send that note. An empty note uses the standard denial message. The conversation's half-written composer text stays separate.
-
-## Provider integration
-
-The landing backend and the edit-preview types (`edits::EditProposal`) are provider-neutral. Each provider connects to them through its own adapter:
-
-- **Edit previews.** The Claude adapter builds the proposal from the Write/Edit/MultiEdit/NotebookEdit tool input. The Codex adapter builds one git-style patch from the `changes` of a file-change approval; a request without them is shown as unavailable. Both are allow-once only.
-- **Denial notes.** Claude receives the note as the denial's `message`. A Codex decision carries no text, so the note stays in the composer with a notice; send it as a message if the agent should read it.
-- **Landing instructions.** There is one fixed instruction text, which tells the agent that Newjen manages version control and not to commit, stage, branch or otherwise write git metadata. It is sent as Claude's `--append-system-prompt` or Codex's `developerInstructions`. Neither provider ever receives the other's arguments.
+The dock has its own optional denial field. **Deny** and Escape send that note. Claude receives it as the denial's `message`. A Codex decision carries no text, so the note stays in the composer with a notice.
 
 ## Older threads
 
-A database migration (version 6) marks threads that worked in Rift copies, and project-folder threads with work recorded in jj, as resolved. Their Rift copies stay on disk and Newjen no longer removes them; remove one yourself with `rift remove <path>`. Old Rift-copy threads cannot be continued.
+Database migration 6 marks threads that worked in Rift copies, and project-folder threads with work recorded in jj, as resolved; they stay read-only. Their Rift copies stay on disk; remove one yourself with `rift remove <path>`.

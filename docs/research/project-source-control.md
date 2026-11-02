@@ -1,6 +1,6 @@
 # Project source control and native tool settings
 
-> **Note (2026-11-02):** Newjen switched to git worktrees and git landing, and no longer uses Rift or jj. The jj and Rift decisions in this memo are historical. See [how landing works now](../landing.md).
+> **Note (2026-11-02):** Newjen switched to git worktrees and git landing, and no longer uses Rift or jj. The jj and Rift decisions in this memo are historical. See [how git works now](../git.md).
 
 Research date 2026-10-31. This is a design memo, not an application implementation.
 

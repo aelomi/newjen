@@ -36,7 +36,7 @@ crates/
           #   agent.rs: the provider-neutral events, approvals and agent config the app sees.
           #   providers/: detection (`detect.rs`), the Claude adapter (stream-json) and the Codex adapter (app-server JSON-RPC).
           #   session.rs, thread.rs, transcript.rs: one process per thread, its lifecycle and the rendered transcript.
-          #   worktree.rs: git worktrees. landing.rs: git snapshots, review and landing. changes.rs, edits.rs: per-file change counts and edit previews.
+          #   worktree.rs: git worktrees. vcs.rs: checkpoints, diffs and git actions. commit_message.rs: AI commit messages through the user's CLI. changes.rs, edits.rs: per-file change counts and edit previews.
           #   store.rs: SQLite. instance.rs: the single-instance lock and local launch handoff. env.rs: the login shell's PATH.
   app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
           #   src/project_view.rs: the window, its loaded projects, the Dock badge, notifications and the quit gate.
@@ -46,17 +46,17 @@ crates/
           #   src/theme.rs: the sidebar width, the card inset and radius, and the material tokens. src/ui/: approval card, tool card, thin Kit helpers and style wrappers (`card`, `glass_title_bar`, `card_title_bar`).
           #   src/assets.rs: extra Kit icons. THIRD-PARTY-NOTICES.md: embedded Lucide icon licenses.
 design/   # newjen.pen: pen.dev mocks of every UI state. Mock UI changes here first.
-docs/     # PLAN.md, landing.md (how review and landing work) and research memos.
+docs/     # PLAN.md, git.md (checkpoints, changes and the git button) and research memos.
 ```
 
 ## Build order
 
 Build one vertical slice first, and don't start wrappers for later steps before it works end to end.
 
-1. `cargo run` opens a window. You type a prompt, Claude replies over stream-json, and the reply renders in the chat. Approve and deny work. One thread; no worktrees, no landing. **Done (2026-10-27).**
+1. `cargo run` opens a window. You type a prompt, Claude replies over stream-json, and the reply renders in the chat. Approve and deny work. One thread; no worktrees, no git actions. **Done (2026-10-27).**
 2. Thread list, SQLite persistence, resume. **Done (2026-10-31).**
 3. Git worktrees, chosen per thread (the default stays the project folder). **Done (2026-10-31, rebuilt on git worktrees 2026-11-02).** The slice first used Rift copies.
-4. Git snapshots, diff view (GPUI Kit `diff`), and landing: one mode, where Newjen commits (see the plan and [`docs/landing.md`](docs/landing.md)). **Done (2026-10-31, rebuilt on git 2026-11-02).** The slice first used jj and two landing modes.
+4. Checkpoints, diff view (GPUI Kit `diff`) and git actions; agents commit themselves (see the plan and [`docs/git.md`](docs/git.md)). **Done (2026-10-31, rebuilt on git 2026-11-02).** The slice first used jj and two landing modes, then briefly a model where only Newjen committed.
 5. Parallel threads, a "Needs you" group in the thread list (⌘J jumps to it), Dock badge and notifications, a terminal panel (on `alacritty_terminal`), and a quit prompt. **Done (2026-10-31).**
 6. Providers: Claude and Codex side by side, with a model, effort and speed picker and usage-limit pauses. **Done (2026-10-31)**, part of the MVP.
 
@@ -85,25 +85,16 @@ Checked against claude 2.1.310. `crates/core/tests/fixtures/` holds sanitized re
 - **Environment:** when Newjen runs inside a Claude Code terminal, nested-session variables (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID` and others) leak into the child. `crates/core/src/session.rs` strips them and keeps the user's own config variables.
 - **Tests:** record real sessions as fixture files and replay them in `core` tests.
 
-### Git worktrees and landing
+### Git
 
-Rift copies and jj were used until 2026-11-02, to get the build right on the common git-worktree model first. `docs/PLAN.md` has the history. `crates/core/tests/worktree.rs` and `crates/core/tests/landing.rs` need only git.
+Rift copies and jj were used until 2026-11-02; `docs/PLAN.md` has the history. [`docs/git.md`](docs/git.md) describes the behaviour. `crates/core/tests/vcs.rs` and `crates/core/tests/worktree.rs` need only git.
 
-- **A worktree** is made when the first message is sent: `git worktree add -b newjen/<id8>-<6 random lowercase letters or digits> <path> HEAD`, in the repository around the project. It starts at the commit the project has checked out. Uncommitted and gitignored files (`node_modules`, `target/`) are not in it, so each worktree builds its own dependencies.
-- **It needs a git repository with at least one commit**, and a project in a subfolder must be committed. Otherwise making the worktree fails with a message.
-- **Worktrees live beside the repository:** `<parent>/.newjen-worktrees/<repository folder name>/newjen-<id8>-<random>`.
-- **No hooks.** Rift's `postcreate` hooks are gone. The agent gets `NEWJEN_WORKTREE` (its branch) and `NEWJEN_SOURCE` (the repository root) in its environment, so a dev server can derive its port.
-- **Making a worktree stops on quit and on Cancel.** Cancel (⌘.) while the worktree is made stops git and removes the half-made worktree. The held message is saved before the job runs, so recovery after a crash restores it to the composer without sending it.
-- **Archiving a worktree thread** runs `git worktree remove --force`, then `git worktree prune`, then `git branch -d`. The branch goes only if it is merged into the project's `HEAD`. An unmerged branch stays, so its work can be recovered with git (`git branch -D` deletes it).
-- **Newjen commits** (the one landing mode). The agent is told not to commit, stage or branch, and Newjen snapshots after each turn.
-  - **In a worktree**, each snapshot is a git commit on the thread's branch: `git add --all`, then `git commit --no-verify`, with signing off and the stand-in identity `Newjen <newjen@localhost>` if the user has none. Review shows the branch's diff since the worktree's base.
-  - **Land** merges the reviewed commit into the project's current branch with `git merge --no-ff --no-verify`, titled `Land newjen/<…>: <thread title>`. It refuses while a merge is in progress and when `git merge-tree --write-tree` predicts conflicts. If the merge itself fails, for example because the project's own uncommitted changes touch the same files, Newjen runs `git merge --abort` and reports, leaving the project's files unchanged. Work already merged lands as a no-op. There is no rebase.
-  - **In the project folder**, Newjen never commits to the user's branch until Land. The thread's base and snapshots are commits built from a separate index file (`.git/newjen/<thread id>.index`) and kept under `refs/newjen/<thread id>`, so the project's own index, staged changes and branch are untouched. Uncommitted work present before the thread started is part of the base, so review shows only the thread's changes. Snapshots cover only the project folder and skip embedded git repositories. Opening the review snapshots first, so hand edits are reviewed and landed.
-  - **Land** in the project folder commits only the thread's files on the current branch (`git add`, then `git commit --only -- <those files>`). It refuses if any of them also had other uncommitted changes from before the thread, because git cannot separate them. Commit by hand, or choose Keep files and close. **Discard** restores the thread's files to the base and deletes files it added. Both then delete the ref and the index file.
-- **Git hooks do not run for Newjen's commits** (`--no-verify`). Declare hook-equivalent checks in `.newjen/checks.json`; landing runs them first, reading the file as committed at the project's `HEAD` so an agent can't change them.
-- **Review and landing need a git repository.**
-- **Old data.** Database migration 6 marks threads that worked in Rift copies, and project-folder threads with jj-recorded work, as resolved. Their Rift copies stay on disk and Newjen no longer removes them (remove one yourself with `rift remove <path>`). Old Rift-copy threads cannot be continued.
-- **Hooks get the login shell's PATH.** An app started from Finder has a minimal `PATH`; `Tools::with_env` passes `env::resolved_path()` to landing checks.
+- **Agents do version control themselves.** Newjen sends no git instructions. Its own checkpoints are private commits under `refs/newjen/<thread id>/<n>`, built in a separate index (`GIT_INDEX_FILE`) on top of `HEAD`, scoped to the thread's folder with a pathspec, skipping embedded repositories; they never touch the user's index, `HEAD` or branches (`crates/core/src/vcs.rs`). This is the same technique as T3 Code's checkpoints.
+- **The git button** (commit, push, `gh pr create`, merge a worktree branch) runs only on a user's click. The commit message comes from the user's own `claude -p --model haiku --tools ""` (`crates/core/src/commit_message.rs`), also only on a click.
+- **Worktrees:** `git worktree add -b newjen/<id8>-<6 random lowercase letters or digits> <path> HEAD` in `<parent>/.newjen-worktrees/<repository folder name>/`. Cancel (⌘.) while it is made stops git and removes the half-made worktree; the held message is saved first, so crash recovery restores it unsent. Archiving runs `git worktree remove --force`, `git worktree prune`, then `git branch -d`.
+- **Merging a worktree** uses `git merge-tree --write-tree` as a preflight and aborts a failed `git merge --no-ff`.
+- **Hooks get the login shell's PATH.** An app started from Finder has a minimal `PATH`; `Tools::with_env` passes `env::resolved_path()` to git.
+- **Old data.** Migration 6 marks Rift- and jj-era threads resolved (read-only) and keeps Rift-era drafts' messages.
 
 ## Subscription safety
 
@@ -144,7 +135,7 @@ Bump Rust by editing `rust-toolchain.toml` in its own commit.
 ```sh
 rustup toolchain install
 cargo run -p app [-- <project dir>]   # launch the app; without a folder it shows the project chooser
-cargo test --workspace --locked       # all tests; no network or login needed (worktree and landing tests need only git)
+cargo test --workspace --locked       # all tests; no network or login needed (worktree and git tests need only git)
 cargo test -p newjen-core -- --ignored   # live tests against the real claude and codex CLIs (use your logins)
 cargo build --release                 # optimized build
 cargo fmt --all -- --check
