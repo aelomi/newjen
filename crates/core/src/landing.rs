@@ -1,16 +1,3 @@
-//! Reviewing and landing a thread's work with git. No UI.
-//!
-//! **In a worktree** the thread has its own branch. After each turn Newjen commits everything
-//! the agent changed there ([`snapshot`]). Review shows the branch since the worktree's base,
-//! and [`land_worktree`] merges it into the project's current branch.
-//!
-//! **In the project folder** Newjen never commits to the project's branch until you land. The
-//! thread's base and its snapshots are commits built from a separate index file and kept under
-//! `refs/newjen/<thread id>`, so the project's own index, staged changes and branch are left
-//! alone. Uncommitted work that was there before the thread started is in the base, so review
-//! shows only the thread's changes. [`land_project`] commits the thread's files on the current
-//! branch; [`discard_project`] puts them back as they were.
-
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,7 +12,6 @@ pub const MAX_PATCH_BYTES: usize = 100_000;
 const MAX_OUTPUT_BYTES: usize = 1_000_000;
 const CHECKS_FILE: &str = ".newjen/checks.json";
 
-/// What the agent is told about version control in a thread Newjen can review.
 pub fn instructions() -> &'static str {
     "Newjen manages version control for this thread. Do not commit, stage, stash, rebase, merge, create branches or tags, or otherwise write git metadata. Make file changes only. Newjen snapshots the folder after each turn."
 }
@@ -38,12 +24,10 @@ pub struct Review {
     pub truncated: bool,
 }
 
-/// Whether work in `cwd` can be reviewed and landed: it is inside a git repository.
 pub fn available(cwd: &Path) -> bool {
     cwd.ancestors().any(|path| path.join(".git").exists())
 }
 
-/// The commit the thread's work is reviewed up to: the last snapshot.
 pub fn head(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<String> {
     match project_ref(tools, cwd, thread_id)? {
         Some(snapshot) => Ok(snapshot),
@@ -125,7 +109,6 @@ pub fn review(tools: &Tools, cwd: &Path, thread_id: &str, base: &str) -> Result<
 }
 
 /// Per-file counts of everything the thread changed since `base`, up to the last snapshot.
-/// The diff is counted as it streams, so a large one costs no memory.
 pub fn changed_files(
     tools: &Tools,
     cwd: &Path,
@@ -169,7 +152,6 @@ pub fn changed_files(
     Ok(counted?)
 }
 
-/// Merges a worktree thread's reviewed work into the project's current branch.
 pub fn land_worktree(
     tools: &Tools,
     worktree: &Worktree,
@@ -301,7 +283,6 @@ pub fn land_project(
     release(tools, cwd, thread_id)
 }
 
-/// Returns a project-folder thread's files to how they were at its base.
 pub fn discard_project(
     tools: &Tools,
     cwd: &Path,
@@ -389,7 +370,6 @@ fn ensure_review(tools: &Tools, cwd: &Path, thread_id: &str, reviewed: &Review) 
     Ok(())
 }
 
-/// The files changed between two commits, with git's status letter (`A`, `M`, `D`, `T`).
 fn changed_paths(
     tools: &Tools,
     root: &Path,
@@ -409,8 +389,6 @@ fn changed_paths(
     Ok(changed)
 }
 
-/// The tree of every file in the folder that git does not ignore, staged into `index` on top of
-/// `parent`. The project's own index is not touched.
 fn snapshot_tree(tools: &Tools, cwd: &Path, index: &Path, parent: &str) -> Result<String> {
     let root = root(tools, cwd)?;
     if !index.exists() {
@@ -461,12 +439,10 @@ fn commit(tools: &Tools, cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-/// The empty tree, the base of a repository with no commits yet.
 fn empty_tree(tools: &Tools, cwd: &Path) -> Result<String> {
     git(tools, cwd, &["hash-object", "-t", "tree", "--stdin"])
 }
 
-/// The snapshot a project-folder thread recorded, if it has one.
 fn project_ref(tools: &Tools, cwd: &Path, thread_id: &str) -> Result<Option<String>> {
     let name = reference(thread_id)?;
     let mut command = git_command(tools, cwd);
@@ -524,7 +500,6 @@ fn ensure_ancestor(tools: &Tools, cwd: &Path, base: &str, head: &str) -> Result<
     Ok(())
 }
 
-/// Runs the checks the project committed, so an agent cannot change them in its own files.
 fn run_checks(tools: &Tools, trusted_project: &Path, workdir: &Path) -> Result<()> {
     let committed = format!("HEAD:{CHECKS_FILE}");
     if !succeeds(
@@ -588,8 +563,6 @@ fn revision(tools: &Tools, cwd: &Path, name: &str) -> Result<String> {
     Ok(value)
 }
 
-/// Whether a git command that answers with its exit code said yes. Fails only if git could not
-/// run or reported an error (exit codes other than 0 and 1).
 fn succeeds(tools: &Tools, cwd: &Path, args: &[&str]) -> Result<bool> {
     let mut command = git_command(tools, cwd);
     command

@@ -1,17 +1,3 @@
-//! Git worktrees: a thread's own checkout of the project on its own branch, so agents that work
-//! at the same time never touch each other's files. No UI.
-//!
-//! **Making one** ([`create`]): in the git repository around the project, `git worktree add -b
-//! newjen/<name> <path> HEAD`. The thread's work starts on the commit the project had checked
-//! out, the worktree's [`Worktree::base`]. Uncommitted and gitignored files in the project are
-//! not in the worktree. Worktrees live beside the repository, in
-//! `.newjen-worktrees/<repository>/<name>`. A step that fails after the worktree exists removes
-//! it again.
-//!
-//! **Removing one** ([`remove`]): `git worktree remove --force`, then the branch is deleted only
-//! if it is merged into the project's `HEAD`. An unmerged branch stays, so its work can still be
-//! recovered with git.
-
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fmt;
@@ -24,28 +10,21 @@ use std::time::{Duration, Instant};
 use crate::env::find_program;
 use crate::session::for_each_line;
 
-/// The folder beside the repository that holds its worktrees.
 const FOLDER: &str = ".newjen-worktrees";
 
-/// The prefix of every thread branch.
 pub const BRANCH_PREFIX: &str = "newjen/";
 
-/// How many of the last stderr lines an error keeps.
 const KEPT_LINES: usize = 20;
 
-/// After a tool exits, how long to wait for the last lines it printed.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The `git` program, and extra environment for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tools {
     pub git: PathBuf,
-    /// Mostly for tests: their own `HOME` gives git its own configuration.
     pub env: Vec<(String, String)>,
 }
 
 impl Tools {
-    /// The installed `git` ([`find_git`]).
     pub fn find() -> Tools {
         Tools {
             git: find_git(),
@@ -53,39 +32,28 @@ impl Tools {
         }
     }
 
-    /// The same tools with these variables set for them. An app started from Finder has a
-    /// minimal `PATH`, so landing checks get the login shell's
-    /// ([`crate::env::resolved_path`]) this way.
     pub fn with_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Tools {
         self.env.extend(env);
         self
     }
 }
 
-/// Finds `git`, overridden by `$NEWJEN_GIT`.
 pub fn find_git() -> PathBuf {
     find_program("NEWJEN_GIT", "git", &[])
 }
 
-/// A thread's worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
-    /// The worktree's root folder.
     pub path: PathBuf,
     /// Where the thread works: the project's place inside the worktree (`path` for a project
     /// at the repository root, `path/<subfolder>` for one below it).
     pub workdir: PathBuf,
-    /// The repository it was made from.
     pub source: PathBuf,
-    /// The thread's branch, `newjen/<name>`. Empty for a Rift copy made by an older Newjen.
     pub branch: String,
-    /// The commit the thread's work starts on. Empty for a Rift copy made by an older Newjen.
     pub base: String,
 }
 
 impl Worktree {
-    /// What a worktree thread's agent gets in its environment, so the commands it runs (a dev
-    /// server, say) can tell worktrees apart, e.g. to pick a port.
     pub fn env(&self) -> Vec<(String, String)> {
         vec![
             ("NEWJEN_WORKTREE".to_string(), self.branch.clone()),
@@ -102,7 +70,6 @@ impl Worktree {
     }
 }
 
-/// The branch for the worktree named `name`.
 pub fn branch_name(name: &str) -> String {
     format!(
         "{BRANCH_PREFIX}{}",
@@ -110,12 +77,11 @@ pub fn branch_name(name: &str) -> String {
     )
 }
 
-/// Why a worktree could not be made or removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyError {
-    /// Something is already at the worktree's path, perhaps left by an earlier try that could
-    /// not clean up.
-    Exists { path: PathBuf },
+    Exists {
+        path: PathBuf,
+    },
     /// A step failed. `detail` is the tool's own message, `output` the last lines it printed.
     Failed {
         command: String,
@@ -146,7 +112,6 @@ pub enum Progress {
     Line(String),
 }
 
-/// Where the worktree named `name` for the project at `project_dir` goes.
 pub fn destination(project_dir: &Path, name: &str) -> Result<PathBuf, CopyError> {
     let project = std::fs::canonicalize(project_dir).map_err(|error| {
         failure(
@@ -173,14 +138,11 @@ pub fn check_destination(path: &Path) -> Result<(), CopyError> {
     Ok(())
 }
 
-/// Whether the project at `project_dir` can have worktrees: it is inside a git repository.
 pub fn available(project_dir: &Path) -> bool {
     std::fs::canonicalize(project_dir)
         .is_ok_and(|project| project_root(&project).join(".git").exists())
 }
 
-/// Removes a worktree whose message was never sent: the folder, its registration and its
-/// branch. Nothing to do if it is already gone, so it can run again after a crash.
 pub fn remove_pending(tools: &Tools, project: &Path, path: &Path) -> Result<(), CopyError> {
     check_copy_path(project, path)?;
     let name = path
@@ -306,9 +268,6 @@ pub(crate) fn create_controlled(
     Ok(worktree)
 }
 
-/// Removes the worktree at `path` on `branch` (see the module docs). Nothing to do if it is
-/// already gone, so it can run again after a crash. A Rift copy from an older Newjen (no
-/// branch) is left on disk.
 pub fn remove(tools: &Tools, project: &Path, path: &Path, branch: &str) -> Result<(), CopyError> {
     if branch.is_empty() {
         return Ok(());
@@ -322,7 +281,6 @@ pub fn remove(tools: &Tools, project: &Path, path: &Path, branch: &str) -> Resul
     }
     remove_folder(tools, project, path)?;
     if branch_exists(tools, project, branch) {
-        // `-d` refuses an unmerged branch, which keeps its work recoverable.
         let _ = run(tools, &git_args(&["branch", "-d", branch]), project, |_| {});
     }
     Ok(())
@@ -428,8 +386,6 @@ fn check_directory(path: &Path, parent: &Path) -> Result<(), CopyError> {
     }
 }
 
-/// The repository root around `project` (canonical): the nearest folder with a `.git` in it,
-/// else `project` itself.
 pub fn project_root(project: &Path) -> PathBuf {
     project
         .ancestors()
@@ -441,8 +397,6 @@ fn git_args<'a>(args: &[&'a str]) -> Vec<&'a OsStr> {
     args.iter().copied().map(OsStr::new).collect()
 }
 
-/// `error`, after removing the half-made worktree at `path`. If that fails too, the error
-/// says so.
 fn remove_after(tools: &Tools, project: &Path, path: &Path, error: CopyError) -> CopyError {
     let removed = remove_pending(tools, project, path);
     match (error, removed) {
@@ -518,14 +472,11 @@ fn stop_group(pid: u32) {
     }
 }
 
-/// One line a tool printed.
 enum Printed {
     Out(String),
     Err(String),
 }
 
-/// Runs git with `args` in `cwd` and returns its stdout, trimmed. Each stderr line goes
-/// to `on_line` as it arrives. Fails with the tool's last stderr line if it exits non-zero.
 fn run(
     tools: &Tools,
     args: &[&OsStr],

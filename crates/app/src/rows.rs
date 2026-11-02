@@ -417,8 +417,6 @@ pub fn footer_for(model: Option<String>, items: &[Item], ix: usize) -> TurnFoote
     }
 }
 
-/// The card shown while a worktree is made: the project, a track to the worktree, the steps
-/// it goes through, and the latest line git printed.
 pub struct CopyCard<'a> {
     pub project: &'a str,
     pub took: &'a str,
@@ -615,8 +613,6 @@ pub fn copy_card(card: CopyCard, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// Which of Base (0), Branch (1) and Checkout (2) is under way. git reports no step names, so
-/// Checkout is inferred from the first line it prints.
 fn copy_stage(snapshotting: bool, printed: bool) -> usize {
     if snapshotting {
         0

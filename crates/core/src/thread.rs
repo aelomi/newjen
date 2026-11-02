@@ -23,13 +23,6 @@
 //! a message only while its turn runs; a Stop pressed in that window ends the turn at once
 //! instead (see [`Thread::stop`]).
 //!
-//! **Where it works.** In the project folder, or in a worktree of its own. A draft chooses
-//! ([`Thread::set_works_in`]). A draft that wants a copy holds its first message while the copy
-//! is made: [`Thread::send`] hands back a [`CopyJob`] for the app to run off the UI thread, and
-//! [`Thread::finish_copy`] then moves the thread into the copy and sends the message, once.
-//! The copy is the thread's folder from then on, because Claude ties `--resume` to the folder.
-//! Archiving the thread hands back a [`Removal`] that deletes the copy.
-//!
 //! **Saving.** A thread is a *draft* until its first message is sent; drafts have no thread row.
 //! A pending copy's message and destination are durable before its job runs.
 //! After that, the row and the changed transcript rows are saved at checkpoints only (a
@@ -159,7 +152,6 @@ pub struct Thread {
 enum Stage {
     /// Nothing sent yet.
     Draft,
-    /// The first message waits while the thread's worktree is made.
     Preparing(Preparing),
     /// A message waits while the project folder's base is recorded.
     PreparingProject(PreparingProject),
@@ -180,7 +172,6 @@ enum SnapshotState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Place {
     ProjectFolder,
-    /// A worktree of its own, made when the first message is sent. Drafts only.
     NewCopy,
     Copy(worktree::Worktree),
 }
@@ -192,7 +183,6 @@ pub enum WorksIn {
     Worktree,
 }
 
-/// A first message held while the thread's worktree is made (see [`Thread::send`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preparing {
     message: String,
@@ -215,12 +205,10 @@ impl Preparing {
         &self.message
     }
 
-    /// When the user sent it, for "Making a worktree · 3s".
     pub fn started_at(&self) -> Instant {
         self.started_at
     }
 
-    /// The last line git printed (see [`Thread::note_copy_progress`]).
     pub fn last_line(&self) -> Option<&str> {
         self.last_line.as_deref()
     }
@@ -249,7 +237,6 @@ pub struct PreparingProject {
 /// What the app shows while a thread's first message waits (see [`Thread::preparing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waiting<'a> {
-    /// The thread's worktree is being made.
     Copy(&'a Preparing),
     /// The project folder's base is being recorded.
     Project(&'a PreparingProject),
@@ -264,7 +251,6 @@ impl Waiting<'_> {
         }
     }
 
-    /// When the user sent it, for "Making a worktree · 3s".
     pub fn started_at(&self) -> Instant {
         match self {
             Waiting::Copy(preparing) => preparing.started_at,
@@ -272,7 +258,6 @@ impl Waiting<'_> {
         }
     }
 
-    /// The last line git printed; nothing for project preparation.
     pub fn last_line(&self) -> Option<&str> {
         match self {
             Waiting::Copy(preparing) => preparing.last_line(),
@@ -350,8 +335,6 @@ impl SnapshotJob {
     }
 }
 
-/// Makes a thread's worktree ([`worktree::create`]). It can take seconds, so the app runs it on a
-/// background thread.
 #[must_use = "run it, then pass the result to `Thread::finish_copy`"]
 pub struct CopyJob {
     project_dir: PathBuf,
@@ -413,8 +396,6 @@ pub struct NotSent {
     pub copy_to_remove: Option<Box<worktree::Worktree>>,
 }
 
-/// Removes an archived thread's worktree, once its `claude` has stopped, and records that it
-/// is gone. It can take seconds, so the app runs it on a background thread.
 #[must_use = "run it off the UI thread, or the copy stays until the next launch"]
 pub struct Removal {
     thread_id: String,
@@ -817,7 +798,6 @@ impl Thread {
         matches!(self.stage, Stage::Draft)
     }
 
-    /// The project folder, or a worktree of its own.
     pub fn works_in(&self) -> WorksIn {
         match self.place {
             Place::ProjectFolder => WorksIn::ProjectFolder,
@@ -825,7 +805,6 @@ impl Thread {
         }
     }
 
-    /// The thread's worktree, once it is made.
     pub fn copy(&self) -> Option<&worktree::Worktree> {
         match &self.place {
             Place::Copy(copy) => Some(copy),
@@ -844,8 +823,6 @@ impl Thread {
         }
     }
 
-    /// True while this thread's own worktree or project base is being recorded. Making a
-    /// worktree reads only committed history, so a busy project-folder thread never blocks one.
     pub fn blocks_copy_creation(&self) -> bool {
         matches!(self.stage, Stage::Preparing(_) | Stage::PreparingProject(_))
     }
@@ -916,8 +893,6 @@ impl Thread {
         let mut config = self.base_config.clone();
         config.bind(&self.session_id, self.session_started, &rules);
         config.cwd = self.cwd.clone();
-        // Only where Newjen snapshots the work: a plain folder or an old Rift copy never is, so
-        // the agent must not be told it is.
         if landing::available(&self.cwd) && !self.copy().is_some_and(worktree::Worktree::is_legacy)
         {
             config.instructions = Some(landing::instructions().to_string());
@@ -1061,7 +1036,6 @@ impl Thread {
         self.save();
     }
 
-    /// Chooses where a draft works. Only a draft whose worktree is not made yet can change.
     pub fn set_works_in(&mut self, works_in: WorksIn) -> Result<()> {
         if !self.is_draft() || self.copy().is_some() {
             bail!("only a new thread can choose where it works");
@@ -1206,9 +1180,6 @@ impl Thread {
         })
     }
 
-    /// [`Thread::stop`] while the copy is made: git is stopped as quitting
-    /// stops them, and the half-made copy is removed. The held message is never sent; it comes
-    /// back through [`Thread::finish_copy`] with [`CopyError::Cancelled`].
     fn cancel_copy(&mut self) {
         let Stage::Preparing(preparing) = &mut self.stage else {
             return;
@@ -1261,8 +1232,6 @@ impl Thread {
         };
         let message = preparing.message;
         let (made, copy_to_remove) = match made {
-            // git finished just as the user cancelled; the copy goes the way a half-made one
-            // does, without being used.
             Ok(copy) if preparing.cancelled => (Err(CopyError::Cancelled), Some(Box::new(copy))),
             made => (made, None),
         };

@@ -1,6 +1,3 @@
-//! Makes and removes real git worktrees with the installed `git`, in temp folders. Each test has
-//! its own `HOME` and ignores the machine's git configuration.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,14 +21,12 @@ fn lab() -> Lab {
 }
 
 impl Lab {
-    /// An empty folder `name` (canonical) inside the temp folder.
     fn folder(&self, name: &str) -> PathBuf {
         let path = self.dir.path().join(name);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::canonicalize(path).unwrap()
     }
 
-    /// The git repository `parent/project` with one commit, "base", holding `base.txt`.
     fn repo(&self) -> PathBuf {
         let repo = self.folder("parent/project");
         self.git(&repo, &["init", "--quiet", "-b", "main"]);
@@ -86,7 +81,6 @@ impl Lab {
         self.git(repo, &["worktree", "list", "--porcelain"])
     }
 
-    /// Commits `file` with `text` on `wt`'s branch, so the branch is ahead of the project.
     fn commit_in(&self, wt: &Worktree, file: &str, text: &str) {
         self.git(&wt.path, &["config", "user.name", "Test"]);
         self.git(&wt.path, &["config", "user.email", "test@example.com"]);

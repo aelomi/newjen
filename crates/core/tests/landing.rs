@@ -1,6 +1,3 @@
-//! Reviews and lands work with the installed `git`, in temp folders. Each test has its own
-//! `HOME` and ignores the machine's git configuration.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,8 +26,6 @@ fn lab() -> Lab {
 }
 
 impl Lab {
-    /// The git repository `parent/project` with one commit holding `base.txt`, `other.txt` and
-    /// `deleted.txt`, and a local identity.
     fn repo(&self) -> PathBuf {
         let repo = self.init();
         self.git(&repo, &["config", "user.name", "Test"]);
@@ -39,7 +34,6 @@ impl Lab {
         repo
     }
 
-    /// The same repository with no identity anywhere, as on a fresh Mac.
     fn repo_without_identity(&self) -> PathBuf {
         let repo = self.init();
         self.first_commit(
@@ -119,7 +113,6 @@ impl Lab {
         self.git(repo, &["diff", "--cached", "--name-status"])
     }
 
-    /// The files a commit changed, sorted.
     fn files_of(&self, repo: &Path, revision: &str) -> Vec<String> {
         let text = self.git(repo, &["show", "--name-only", "--format=", revision]);
         let mut files: Vec<String> = text.lines().map(str::to_string).collect();
@@ -157,7 +150,6 @@ impl Lab {
         landing::snapshot(&self.tools, cwd, "Update work", THREAD).unwrap();
     }
 
-    /// Prepares the project folder as a thread's base.
     fn prepare(&self, repo: &Path) -> String {
         landing::prepare_project(&self.tools, repo, THREAD).unwrap()
     }
@@ -166,7 +158,6 @@ impl Lab {
         landing::review(&self.tools, cwd, THREAD, base).unwrap()
     }
 
-    /// A worktree thread's reviewed work, after it changed `file`.
     fn worktree_review(&self, wt: &Worktree, file: &str, text: &str) -> Review {
         write(&wt.workdir, file, text);
         self.snap(&wt.workdir);
@@ -295,8 +286,6 @@ fn discarding_in_a_repository_without_a_commit_yet_removes_the_threads_files() {
     assert!(!repo.join("agent.txt").exists());
     assert_eq!(read(&repo, "owner.txt"), "owner file\n");
 }
-
-// ---------- project folder ----------
 
 #[test]
 fn prepare_records_a_base_without_touching_the_users_index_branch_or_files() {
@@ -840,8 +829,6 @@ fn snapshots_of_two_threads_are_kept_apart() {
     assert_eq!(landing::head(&lab.tools, &repo, OTHER).unwrap(), second);
 }
 
-// ---------- worktree ----------
-
 #[test]
 fn a_worktree_snapshot_commits_on_the_branch_only_when_something_changed() {
     let lab = lab();
@@ -1105,8 +1092,6 @@ fn landing_leaves_a_legacy_rift_copy_to_the_user() {
     assert!(!repo.join("agent.txt").exists());
 }
 
-// ---------- landing checks ----------
-
 fn checks(lab: &Lab, repo: &Path, json: &str) {
     write(repo, ".newjen/checks.json", json);
     lab.commit_all(repo, "landing checks");
@@ -1225,8 +1210,6 @@ fn a_checks_file_that_is_not_a_list_of_commands_blocks_landing() {
     assert!(error.contains("checks.json"), "{error}");
     assert_eq!(lab.head(&repo), head);
 }
-
-// ---------- no git identity ----------
 
 const STAND_IN: &str = "Newjen <newjen@localhost>";
 

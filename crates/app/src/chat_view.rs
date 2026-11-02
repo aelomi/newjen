@@ -83,8 +83,6 @@ const TICK: Duration = Duration::from_secs(1);
 /// and "4m ago" moves on.
 const MINUTE_TICKS: u64 = 60;
 
-/// While a worktree is made, a hook line redraws the window at most this often. The clock
-/// redraws it every second anyway.
 const LINE_REDRAW: Duration = Duration::from_millis(100);
 const COPY_CANCELLING: &str = "Cancelling…";
 const COPY_OUTPUT_LINES: usize = 8;
@@ -125,8 +123,6 @@ impl Notice {
     }
 }
 
-/// What one row of the message list shows: the transcript's items, then, while the thread's
-/// worktree is made, the message waiting for it and the row that says so, then the notice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Entry {
     Item(usize),
@@ -257,8 +253,6 @@ pub struct ChatView {
     review_panel: Option<review::ReviewPanel>,
     review_loading: bool,
     changes: changes::ChangesCard,
-    /// The root has the keyboard while the thread on screen waits for its worktree: the
-    /// composer is disabled until then.
     making_copy_shown: bool,
     /// How the thread on screen's items become rows: its turns' tool calls fold into work
     /// blocks (see `rows::Plan`).
@@ -858,7 +852,6 @@ impl ChatView {
         self.enter(window, cx);
     }
 
-    /// A thread in a worktree asks first: archiving it deletes the copy with Claude's work.
     fn ask_to_archive(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.index_of(thread_id, cx) else {
             return;
@@ -1309,8 +1302,6 @@ impl ChatView {
     }
 
     /// Checked before `Thread::send`, which would hold the message and rename the thread.
-    /// Why `thread` cannot send yet, if it can't: a draft that wants a worktree needs a git
-    /// repository.
     fn copy_hold(&self, thread: &Entity<Thread>, cx: &App) -> Option<Notice> {
         let thread = thread.read(cx);
         let wants_copy =
@@ -1527,8 +1518,6 @@ impl ChatView {
         cx.notify();
     }
 
-    /// ⌘. or the stop button: deny-and-stop a pending approval, otherwise stop the turn. While
-    /// a worktree is made, it cancels that instead and the message comes back.
     fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = self.thread().clone();
         let (pending, busy) = {
@@ -2484,7 +2473,6 @@ impl ChatView {
             .into_any_element()
     }
 
-    /// Local | worktree. The help is in each segment's tooltip, not on screen.
     fn render_works_in(
         &self,
         works_in: WorksIn,
@@ -3003,7 +2991,6 @@ fn spawn_notice(
     Notice::error(&title, detail)
 }
 
-/// git's own message is the last line it printed, so it is not shown twice.
 fn copy_failed(error: &CopyError, home: Option<&Path>) -> Notice {
     let (detail, output) = match error {
         CopyError::Cancelled => (error.to_string(), Vec::new()),
@@ -3034,7 +3021,6 @@ fn copy_failed(error: &CopyError, home: Option<&Path>) -> Notice {
     }
 }
 
-/// Why the project at `project` can't have worktrees, if it can't.
 fn worktree_unavailable(project: &Path) -> Option<Notice> {
     (!worktree::available(project)).then(|| {
         Notice::held(
@@ -3061,9 +3047,6 @@ fn archive_question(
     )
 }
 
-/// Whether two project roots (`worktree::project_root`) share a repository: the same root, or
-/// one inside the other where at least one is a git repository. Plain folders that merely
-/// nest are not one repository: nothing snapshots them together.
 fn same_repository(a: &Path, b: &Path) -> bool {
     let is_repo = |root: &Path| root.join(".git").exists();
     inbox::overlaps(a, b) && (is_repo(a) || is_repo(b))

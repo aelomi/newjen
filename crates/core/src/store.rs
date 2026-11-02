@@ -135,9 +135,6 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE threads ADD COLUMN review_base TEXT;
      ALTER TABLE threads ADD COLUMN landing_resolved INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE threads ADD COLUMN snapshot_needed INTEGER NOT NULL DEFAULT 0;",
-    // Version 6: git worktrees replace Rift copies, and git replaces jj. A worktree's row keeps
-    // its branch in `branch`; a Rift copy's row has none. Work recorded with jj can no longer be
-    // reviewed here, so those threads count as resolved. There is one landing mode now.
     "ALTER TABLE copies ADD COLUMN branch TEXT;
      UPDATE threads SET landing_resolved = 1
          WHERE review_base IS NOT NULL OR id IN (SELECT thread_id FROM copies);
@@ -208,8 +205,6 @@ pub struct ThreadRow {
     pub updated_at: i64,
     /// When the thread was archived (hidden). `None` for a visible thread.
     pub archived_at: Option<i64>,
-    /// The thread's worktree, if it works in one (the `copies` table). Saved with the
-    /// thread's first row and never changed after.
     pub copy: Option<Worktree>,
     pub review_base: Option<String>,
     pub landing_resolved: bool,
@@ -689,8 +684,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The worktrees of archived threads that are not removed yet, with their threads' ids.
-    /// Removing them at startup finishes what an earlier run could not (see `Removal`).
     pub fn copies_to_remove(&self) -> Result<Vec<(String, Worktree)>> {
         let read = self.reader();
         let mut statement = read.prepare(
@@ -705,7 +698,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The id of the thread whose worktree is at `path` and not removed yet, archived or not.
     pub fn copy_owner(&self, path: &Path) -> Result<Option<String>> {
         Ok(self
             .reader()
@@ -881,7 +873,6 @@ impl Store {
         });
     }
 
-    /// Records that the thread's worktree was removed.
     pub fn mark_copy_removed(&self, thread_id: &str, at: i64) {
         self.queue(Write::CopyRemoved {
             thread_id: thread_id.to_string(),
@@ -992,8 +983,6 @@ fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
     })
 }
 
-/// The worktree in the five columns from `at` (path, workdir, source, branch, base), if any. A
-/// Rift copy from an older Newjen has no branch, and its base is cleared.
 fn saved_copy(row: &Row<'_>, at: usize) -> rusqlite::Result<Option<Worktree>> {
     let Some(path) = row.get::<_, Option<String>>(at)? else {
         return Ok(None);
