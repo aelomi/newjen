@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 cask "newjen" do
-  version "0.1.0-alpha.1"
-  sha256 "ed93c2165e42d3edefcb6d21d61c76a7c71d29a85e1a20a1c9b76e45dbf35b4b"
+  version "0.1.0-alpha.2"
+  sha256 "e7127e75168c3a97e64aad24d9337ef7c62dea1a2e627e8660ec43676f0ef166"
 
   url "https://github.com/aelomi/newjen/releases/download/v#{version}/Newjen-#{version}-arm64.zip"
   name "Newjen"
