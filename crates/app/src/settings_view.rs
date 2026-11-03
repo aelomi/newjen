@@ -8,11 +8,11 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_kit::base::Selectable as _;
 use gpui_kit::base::TypographyTokens;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use newjen_core::appearance::{
     Accent, Appearance, ChatWidth, CodeSize, DiffColors, Font, Glass, Mode, TextSize,
@@ -68,7 +68,6 @@ pub fn render(input: &Input, cx: &App) -> AnyElement {
                     look.mode,
                     setter(input, |look, mode| look.mode = mode),
                     None,
-                    cx,
                 ),
                 cx,
             ),
@@ -99,7 +98,6 @@ pub fn render(input: &Input, cx: &App) -> AnyElement {
                 look.glass,
                 setter(input, |look, glass| look.glass = glass),
                 None,
-                cx,
             ),
             cx,
         )],
@@ -180,7 +178,6 @@ pub fn render(input: &Input, cx: &App) -> AnyElement {
                     look.chat_width,
                     setter(input, |look, width| look.chat_width = width),
                     None,
-                    cx,
                 ),
                 cx,
             ),
@@ -194,7 +191,6 @@ pub fn render(input: &Input, cx: &App) -> AnyElement {
                     look.diff_colors,
                     setter(input, |look, colors| look.diff_colors = colors),
                     Some(diff_dots),
-                    cx,
                 ),
                 cx,
             ),
@@ -312,38 +308,27 @@ fn segmented<T: Copy + PartialEq + 'static>(
     selected: T,
     set: impl Fn(T, &mut Window, &mut App) + Clone + 'static,
     adorn: Option<fn(T) -> AnyElement>,
-    cx: &App,
 ) -> AnyElement {
-    let material = material(cx);
-    h_flex()
-        .id(id)
-        .gap_0p5()
-        .p_0p5()
-        .rounded_lg()
-        .bg(material.glass_selected)
+    let chosen = options
+        .iter()
+        .position(|option| *option == selected)
+        .unwrap_or(0);
+    TabBar::new(id)
+        .segmented()
+        .small()
+        .selected_index(chosen)
         .children(options.iter().copied().map(move |option| {
-            let set = set.clone();
             let name = label(option);
-            Button::new(SharedString::from(format!("{id}-{name}")))
-                .ghost()
-                .small()
-                .selected(option == selected)
-                .when(option == selected, |button| {
-                    button
-                        .bg(material.card)
-                        .border_1()
-                        .border_color(material.card_stroke)
-                })
+            Tab::new()
+                .label(name)
                 .debug_selector(move || format!("{id}-{name}"))
-                .child(
-                    h_flex()
-                        .gap_1p5()
-                        .items_center()
-                        .children(adorn.map(|adorn| adorn(option)))
-                        .child(name),
-                )
-                .on_click(move |_, window, cx| set(option, window, cx))
+                .when_some(adorn, |tab, adorn| tab.prefix(adorn(option)))
         }))
+        .on_click(move |index, window, cx| {
+            if let Some(option) = options.get(*index) {
+                set(*option, window, cx);
+            }
+        })
         .into_any_element()
 }
 
@@ -387,6 +372,7 @@ fn accents(
                 .border_2()
                 .border_color(if on { ring } else { gpui::transparent_black() })
                 .cursor_pointer()
+                .active(|swatch| swatch.opacity(0.85))
                 .tooltip(move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(accent.label()).build(window, cx)
                 })
