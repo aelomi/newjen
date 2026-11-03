@@ -13,6 +13,7 @@ mod keys;
 mod project_view;
 mod reply;
 mod rows;
+mod settings_view;
 mod sidebar;
 mod terminal;
 mod theme;
@@ -37,8 +38,8 @@ use newjen_core::{Project, Store, orphans, store, usage};
 use crate::assets::AppAssets;
 use crate::keys::{
     AboutNewjen, CheckForUpdates, CloseWindow, Hide, HideOthers, JumpToNeedsYou, JumpToThread,
-    Minimize, NewThread, NextThread, OpenProject, OpenRecentProject, PreviousThread, Quit,
-    ReleaseNotesOnGithub, ShowProjects, ToggleSidebar, ToggleTerminal, WhatsNewInNewjen,
+    Minimize, NewThread, NextThread, OpenProject, OpenRecentProject, OpenSettings, PreviousThread,
+    Quit, ReleaseNotesOnGithub, ShowProjects, ToggleSidebar, ToggleTerminal, WhatsNewInNewjen,
 };
 use crate::project_view::ProjectView;
 use gpui_kit::component::ActiveTheme as _;
@@ -246,6 +247,8 @@ fn update_menus(recent: &[Project], cx: &mut App) {
         Menu::new("Newjen").items([
             MenuItem::action("About Newjen", AboutNewjen),
             MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::separator(),
+            MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
             MenuItem::action("Hide Newjen", Hide),
             MenuItem::action("Hide Others", HideOthers),

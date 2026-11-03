@@ -34,6 +34,7 @@ actions!(
         CheckForUpdates,
         WhatsNewInNewjen,
         ReleaseNotesOnGithub,
+        OpenSettings,
     ]
 );
 
@@ -78,6 +79,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new("cmd-j", JumpToNeedsYou, Some(CONTEXT)),
         KeyBinding::new("cmd-`", ToggleTerminal, Some(CONTEXT)),
+        KeyBinding::new("cmd-,", OpenSettings, Some(CONTEXT)),
     ]);
     cx.bind_keys(
         JUMP_KEYS
@@ -139,8 +141,8 @@ pub fn approval_key(event: &KeyDownEvent) -> Option<ApprovalKey> {
 pub enum KeyRoute {
     /// Esc while the thread drawer is open: close it.
     CloseDrawer,
-    /// Esc in the Usage view: back to the thread.
-    LeaveUsage,
+    /// Esc in the Usage or Settings view: back to the thread.
+    LeavePane,
     /// ⌘↵ or Esc while an approval waits: answer it.
     Answer(ApprovalIntent),
     /// ⌘↵ or Esc held down while an approval waits: ours, but it answers nothing.
@@ -149,7 +151,7 @@ pub enum KeyRoute {
     Pass,
 }
 
-/// Where a key press goes. Esc first closes the thread drawer, then leaves the Usage view;
+/// Where a key press goes. Esc first closes the thread drawer, then leaves the Usage or Settings view;
 /// otherwise ⌘↵ and Esc answer a pending approval. None of this happens while a popover or
 /// menu holds the keyboard (the "N allowed" list, a row's "Archive thread"): there Esc closes
 /// that popover or menu, and ⌘↵ must not allow something the user is not looking at.
@@ -157,7 +159,7 @@ pub fn key_route(
     event: &KeyDownEvent,
     drawer_open: bool,
     overlay_focused: bool,
-    usage_open: bool,
+    pane_open: bool,
     approval_pending: bool,
 ) -> KeyRoute {
     if overlay_focused {
@@ -166,8 +168,8 @@ pub fn key_route(
     if drawer_open && event.keystroke.key == "escape" {
         return KeyRoute::CloseDrawer;
     }
-    if usage_open && approval_key(event) == Some(ApprovalKey::Answer(ApprovalIntent::Deny)) {
-        return KeyRoute::LeaveUsage;
+    if pane_open && approval_key(event) == Some(ApprovalKey::Answer(ApprovalIntent::Deny)) {
+        return KeyRoute::LeavePane;
     }
     if !approval_pending {
         return KeyRoute::Pass;
@@ -282,10 +284,10 @@ mod tests {
     }
 
     #[test]
-    fn esc_leaves_the_usage_view_unless_something_else_owns_it() {
+    fn esc_leaves_the_usage_or_settings_view_unless_something_else_owns_it() {
         let route =
             |key, held, drawer, overlay| key_route(&press(key, held), drawer, overlay, true, false);
-        assert_eq!(route("escape", false, false, false), KeyRoute::LeaveUsage);
+        assert_eq!(route("escape", false, false, false), KeyRoute::LeavePane);
         assert_eq!(route("escape", false, false, true), KeyRoute::Pass);
         assert_eq!(route("escape", false, true, false), KeyRoute::CloseDrawer);
         assert_eq!(route("escape", true, false, false), KeyRoute::Pass);

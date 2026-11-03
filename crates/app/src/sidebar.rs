@@ -13,7 +13,7 @@ use gpui::{
     AnyElement, App, ElementId, FontWeight, IntoElement, MouseButton, ParentElement, Pixels,
     SharedString, Styled, Window, div, prelude::*, px,
 };
-use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::base::{Selectable as _, h_flex, v_flex};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -620,21 +620,25 @@ pub fn section_header(group: SidebarGroup, count: usize, cx: &App) -> AnyElement
 }
 
 /// The row at the foot of the list that opens the Usage view: a gauge, "Usage" and the meter
-/// of the fullest window.
+/// of the fullest window, with the gear that opens Settings at its right end.
 pub fn usage_row(
     selected: bool,
     meter: Option<AnyElement>,
     on_press: OnPress,
+    (settings_open, on_settings): (bool, OnPress),
     cx: &App,
 ) -> AnyElement {
     let muted = crate::theme::material(cx).glass_muted;
-    div()
+    h_flex()
         .id("usage-row")
         .flex_none()
+        .items_center()
+        .gap_1()
         .pb_2()
         .child(
             ListItem::new("usage-row-item")
-                .w_full()
+                .flex_1()
+                .min_w_0()
                 .px_2p5()
                 .py_1p5()
                 .rounded_lg()
@@ -655,6 +659,12 @@ pub fn usage_row(
                         .child(div().flex_1().text_color(muted).child("Usage"))
                         .children(meter),
                 ),
+        )
+        .child(
+            ui::icon_button("settings-button", IconName::Settings, "Settings", cx)
+                .selected(settings_open)
+                .debug_selector(|| "settings-button".to_string())
+                .on_click(move |_, window, cx| on_settings(window, cx)),
         )
         .into_any_element()
 }

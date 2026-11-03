@@ -168,9 +168,14 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
         .into_any_element()
 }
 
-/// The bar above the Usage view: its name and what it shows, with the button that brings the
-/// thread list back while it is out of sight.
-pub fn usage_header(show_list: Option<(OnPress, sidebar::ListBadge)>, cx: &mut App) -> AnyElement {
+/// The bar above the Usage or Settings view: its name and what it shows, with the button that
+/// brings the thread list back while it is out of sight.
+pub fn pane_header(
+    title: &'static str,
+    subtitle: &'static str,
+    show_list: Option<(OnPress, sidebar::ListBadge)>,
+    cx: &mut App,
+) -> AnyElement {
     let lights_over_bar = show_list.is_some();
     let muted = cx.theme().colors.muted_foreground;
     ui::card_title_bar(cx)
@@ -189,13 +194,8 @@ pub fn usage_header(show_list: Option<(OnPress, sidebar::ListBadge)>, cx: &mut A
                 .flex_1()
                 .gap_2()
                 .items_baseline()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Usage"))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(muted)
-                        .child("From each CLI's own reports"),
-                ),
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(div().text_sm().text_color(muted).child(subtitle)),
         )
         .into_any_element()
 }

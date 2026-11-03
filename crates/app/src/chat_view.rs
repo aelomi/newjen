@@ -20,6 +20,7 @@ mod lifecycle;
 mod limits;
 mod picker;
 mod review;
+mod settings;
 mod usage;
 
 use std::path::{Path, PathBuf};
@@ -71,6 +72,7 @@ use gpui_kit::component::message_scroller::MessageScrollerState;
 enum Pane {
     Thread,
     Usage,
+    Settings,
 }
 
 /// The answered approval card kept on screen while it fades (`ui::EXIT_FADE`).
@@ -918,7 +920,7 @@ impl ChatView {
             let field = self.ensure_field(window, cx);
             let handle = field.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
-        } else if self.pane == Pane::Usage {
+        } else if self.pane != Pane::Thread {
             self.focus_panel(window, cx);
         }
         let entries = self.sidebar_entries(cx);
@@ -1110,6 +1112,7 @@ impl ChatView {
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_jump_to_needs_you))
             .on_action(cx.listener(Self::on_toggle_terminal))
+            .on_action(cx.listener(Self::on_open_settings))
             .children(list)
             .into_any_element()
     }
@@ -1714,7 +1717,7 @@ impl ChatView {
             event,
             self.drawer_open,
             overlay_focused(window),
-            self.pane == Pane::Usage,
+            self.pane != Pane::Thread,
             pending,
         )
     }
@@ -1765,12 +1768,24 @@ impl ChatView {
                 cx.stop_propagation();
                 self.run_primary_action(window, cx);
             }
-            KeyRoute::LeaveUsage => {
+            KeyRoute::LeavePane => {
                 cx.stop_propagation();
                 self.show(self.active, window, cx);
             }
             KeyRoute::CloseDrawer | KeyRoute::Pass => {}
         }
+    }
+
+    fn on_open_settings(
+        &mut self,
+        _: &keys::OpenSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.quit_saving {
+            return;
+        }
+        self.toggle_settings(window, cx);
     }
 
     fn on_stop(&mut self, _: &Stop, window: &mut Window, cx: &mut Context<Self>) {
@@ -1880,7 +1895,7 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.quit_saving || self.pane == Pane::Usage {
+        if self.quit_saving || self.pane != Pane::Thread {
             return;
         }
         self.toggle_terminal(window, cx);
@@ -2916,6 +2931,7 @@ impl Render for ChatView {
         let (main, changes) = match self.pane {
             Pane::Thread => self.render_thread_card(placement, width, main_width, window, cx),
             Pane::Usage => (self.render_usage_card(placement, cx), None),
+            Pane::Settings => (self.render_settings_card(placement, cx), None),
         };
 
         // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
@@ -2943,6 +2959,7 @@ impl Render for ChatView {
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_jump_to_needs_you))
             .on_action(cx.listener(Self::on_toggle_terminal))
+            .on_action(cx.listener(Self::on_open_settings))
             .flex()
             .text_color(fg)
             .font_family(font)

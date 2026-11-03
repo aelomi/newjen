@@ -168,6 +168,19 @@ pub fn install(appearance: Appearance, cx: &mut App) {
     reload(cx.window_appearance(), cx);
 }
 
+/// Makes `appearance` the look, on every window. The caller saves it.
+pub fn set_appearance(appearance: Appearance, window: Option<&mut Window>, cx: &mut App) {
+    cx.set_global(Look(appearance));
+    let system = match &window {
+        Some(window) => window.appearance(),
+        None => cx.window_appearance(),
+    };
+    reload(system, cx);
+    if let Some(window) = window {
+        window.set_background_appearance(window_background(cx));
+    }
+}
+
 /// The system switched between light and dark.
 pub fn follow_system_appearance(window: &mut Window, cx: &mut App) {
     reload(window.appearance(), cx);

@@ -2303,6 +2303,58 @@ async fn the_sidebar_groups_threads_and_its_usage_row_opens_the_usage_view(
 }
 
 #[gpui::test]
+async fn cmd_comma_opens_settings_where_a_click_changes_the_look_and_esc_leaves(
+    cx: &mut TestAppContext,
+) {
+    use newjen_core::appearance::{Accent, Appearance, ChatWidth};
+
+    let (chat, path, cx) = setup(cx, "settings", false);
+    cx.simulate_input("keep this draft");
+    assert!(cx.debug_bounds("settings-view").is_none());
+    cx.simulate_keystrokes("cmd-,");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("settings-view").is_some());
+    cx.update(|_, cx| assert_eq!(*theme::appearance(cx), Appearance::default()));
+
+    click(cx, "accent-Blue");
+    cx.run_until_parked();
+    click(cx, "chat-width-Wide");
+    cx.run_until_parked();
+    let chosen = Appearance {
+        accent: Accent::Blue,
+        chat_width: ChatWidth::Wide,
+        ..Appearance::default()
+    };
+    cx.update(|_, cx| assert_eq!(*theme::appearance(cx), chosen));
+    let store = cx.update(|_, cx| chat.read(cx).store.clone());
+    assert!(store.flush(Duration::from_secs(5)));
+    assert_eq!(
+        store.appearance().unwrap(),
+        chosen,
+        "kept for the next launch"
+    );
+
+    click(cx, "reset-appearance");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(*theme::appearance(cx), Appearance::default()));
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("settings-view").is_none());
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).composer_text(0, cx)),
+        "keep this draft"
+    );
+    cx.simulate_keystrokes("cmd-,");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("settings-view").is_some());
+    click(cx, "settings-button");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("settings-view").is_none());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
 async fn esc_in_the_usage_view_returns_to_the_thread_and_its_composer(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "usage-esc", false);
     cx.simulate_input("keep this draft");

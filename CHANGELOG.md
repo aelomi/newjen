@@ -4,6 +4,12 @@ What changed in each Newjen release, in plain English. Newjen shows the section 
 
 Every user-visible change adds a line under `## Unreleased`, in one of four groups: New features, Improvements, Fixes, Misc. A release renames `Unreleased` to the version and date.
 
+## Unreleased
+
+### New features
+
+- Settings opens with ⌘, from the Newjen menu or the gear beside Usage. Its Appearance page sets light or dark, the accent color, how much glass shows through, the interface and code fonts and sizes, how wide the chat is, and blue and orange for added and removed lines. Each choice applies at once and is kept.
+
 ## 0.1.0-alpha.2 · 3 November 2026
 
 ### New features
