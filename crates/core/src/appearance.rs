@@ -1,21 +1,31 @@
 //! How the user wants Newjen to look: a plain value the app applies and the store keeps.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 
-/// Every choice in Settings > Appearance. A field missing from the stored text takes its default,
-/// so a version that adds a field still reads what an older one saved.
+/// Every choice in Settings > Appearance. A field missing or unreadable in the stored text takes
+/// its default and the others keep their value, so a choice a newer version added does not reset
+/// the whole look after a downgrade.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
+    #[serde(deserialize_with = "or_default")]
     pub mode: Mode,
+    #[serde(deserialize_with = "or_default")]
     pub accent: Accent,
+    #[serde(deserialize_with = "or_default")]
     pub glass: Glass,
+    #[serde(deserialize_with = "or_default")]
     pub interface_font: Font,
+    #[serde(deserialize_with = "or_default")]
     pub interface_size: TextSize,
+    #[serde(deserialize_with = "or_default")]
     /// `Font::System` here means the mono font GPUI Kit ships.
     pub code_font: Font,
+    #[serde(deserialize_with = "or_default")]
     pub code_size: CodeSize,
+    #[serde(deserialize_with = "or_default")]
     pub chat_width: ChatWidth,
+    #[serde(deserialize_with = "or_default")]
     pub diff_colors: DiffColors,
 }
 
@@ -29,6 +39,13 @@ impl Appearance {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("appearance holds only plain values")
     }
+}
+
+fn or_default<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(
+    deserializer: D,
+) -> Result<T, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,6 +334,16 @@ mod tests {
         ] {
             assert_eq!(Appearance::parse(text), Appearance::default(), "{text}");
         }
+    }
+
+    #[test]
+    fn an_unknown_choice_resets_only_its_own_field() {
+        let parsed =
+            Appearance::parse(r#"{"accent":"teal","mode":"dark","chat_width":"wide","glass":9}"#);
+        assert_eq!(parsed.accent, Accent::default());
+        assert_eq!(parsed.glass, Glass::default());
+        assert_eq!(parsed.mode, Mode::Dark);
+        assert_eq!(parsed.chat_width, ChatWidth::Wide);
     }
 
     #[test]

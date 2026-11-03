@@ -337,10 +337,7 @@ fn dot(color: Hsla) -> gpui::Div {
 }
 
 fn diff_dots(colors: DiffColors) -> AnyElement {
-    let (added, removed): (Hsla, Hsla) = match colors {
-        DiffColors::GreenRed => (gpui::rgb(0x22c55e).into(), gpui::rgb(0xef4444).into()),
-        DiffColors::BlueOrange => (gpui::rgb(0x3b82f6).into(), gpui::rgb(0xf97316).into()),
-    };
+    let (added, removed) = theme::diff_swatches(colors);
     h_flex()
         .gap_0p5()
         .child(dot(added))
@@ -404,8 +401,10 @@ fn font_menu(
     installed: &'static [String],
     set: impl Fn(Font, &mut Window, &mut App) + Clone + 'static,
 ) -> AnyElement {
+    let missing = |name: &String| !installed.contains(name);
     let shown: SharedString = match current {
         Font::System => menu.system.clone(),
+        Font::Named(name) if missing(name) => format!("{name} (not installed)").into(),
         Font::Named(name) => name.clone().into(),
     };
     let mut names: Vec<String> = menu
@@ -417,6 +416,7 @@ fn font_menu(
         .collect();
     if let Font::Named(name) = current
         && !names.contains(name)
+        && !missing(name)
     {
         names.push(name.clone());
     }

@@ -244,13 +244,21 @@ fn apply_accent(theme: &mut Theme, accent: Accent) {
     theme.caret = base;
 }
 
+/// The added and removed colors each choice shows, for the Settings swatches and the theme.
+pub fn diff_swatches(colors: DiffColors) -> (Hsla, Hsla) {
+    match colors {
+        DiffColors::GreenRed => (rgb(0x22c55e).into(), rgb(0xef4444).into()),
+        DiffColors::BlueOrange => (rgb(0x3b82f6).into(), rgb(0xf97316).into()),
+    }
+}
+
 /// Green and red leave Kit's own. Blue and orange take their place everywhere Kit and the app
 /// say added and removed, so counts, diff lines and status marks change together.
 fn apply_diff_colors(theme: &mut Theme, colors: DiffColors) {
-    let (added, removed) = match colors {
-        DiffColors::GreenRed => return,
-        DiffColors::BlueOrange => (rgb(0x3b82f6).into(), rgb(0xf97316).into()),
-    };
+    if colors == DiffColors::GreenRed {
+        return;
+    }
+    let (added, removed) = diff_swatches(colors);
     theme.success = added;
     theme.success_hover = lighter(added, 0.05);
     theme.success_active = lighter(added, -0.06);

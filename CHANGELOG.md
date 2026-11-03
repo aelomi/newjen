@@ -10,6 +10,10 @@ Every user-visible change adds a line under `## Unreleased`, in one of four grou
 
 - Settings opens with ⌘, from the Newjen menu or the gear beside Usage. Its Appearance page sets light or dark, the accent color, how much glass shows through, the interface and code fonts and sizes, how wide the chat is, and blue and orange for added and removed lines. Each choice applies at once and is kept.
 
+### Improvements
+
+- Text is smaller and calmer: a 14 pt base instead of 16, quieter secondary lines in the thread list, your messages in a soft gray bubble instead of a white one, and a lighter composer border.
+
 ## 0.1.0-alpha.2 · 3 November 2026
 
 ### New features
