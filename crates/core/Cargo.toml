@@ -24,7 +24,9 @@ doc = false
 anyhow.workspace = true
 async-channel.workspace = true
 libc.workspace = true
+ring.workspace = true
 rusqlite.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
@@ -32,6 +34,13 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# Release tooling: makes the update signing key pair and signs and checks release zips.
+[[bin]]
+name = "newjen-sign"
+path = "src/bin/newjen-sign.rs"
+test = false
+doc = false
 
 [[bin]]
 name = "newjen-fake-codex"

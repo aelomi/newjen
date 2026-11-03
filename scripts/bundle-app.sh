@@ -15,6 +15,7 @@ if [[ ! $version =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+
     exit 1
 fi
 bundle_version=${BASH_REMATCH[1]}
+export NEWJEN_RELEASE_VERSION=$version
 export MACOSX_DEPLOYMENT_TARGET=11.0
 target=aarch64-apple-darwin
 binary="target/$target/release/newjen"
@@ -47,6 +48,7 @@ for points in 16 32 128 256 512; do
 done
 iconutil -c icns "$stage/Newjen.iconset" -o "$app/Contents/Resources/Newjen.icns"
 cp crates/app/THIRD-PARTY-NOTICES.md "$app/Contents/Resources/"
+cp CHANGELOG.md "$app/Contents/Resources/"
 printf 'APPL????' > "$app/Contents/PkgInfo"
 codesign --force --deep -s - "$app"
 codesign --verify --deep --strict "$app"

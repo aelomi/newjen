@@ -56,9 +56,12 @@ impl ChatView {
                 .iter()
                 .map(|slot| slot.thread.read(cx).status())
                 .collect();
-            let attention = sidebar::hidden_needs_you(&statuses, self.active);
+            let badge = sidebar::ListBadge {
+                attention: sidebar::hidden_needs_you(&statuses, self.active),
+                update: self.update_ready(cx),
+            };
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
-            (toggle, attention)
+            (toggle, badge)
         });
         let header = title_bar::usage_header(show_list, cx);
         let snapshot = self.usage_snapshot.clone().unwrap_or_default();

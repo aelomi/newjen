@@ -35,7 +35,7 @@ pub use code::CodeBlock;
 pub use copy::CopyButton;
 pub use message::{ErrorNotice, Pending, assistant, user, user_pending};
 pub use motion::Chevron;
-pub use popover::popover_surface;
+pub use popover::{popover_surface, solid_popover_surface};
 pub use provider::{provider_color, provider_icon};
 pub use ring::ring;
 pub use step::{

@@ -39,6 +39,7 @@ fn newjen_home_holds_a_freshly_created_database() {
     assert_eq!(
         tables,
         [
+            "app_state",
             "copies",
             "copy_cleanup",
             "grants",

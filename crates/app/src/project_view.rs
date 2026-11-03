@@ -1,4 +1,5 @@
 use gpui_kit::component::{WindowExt as _, dialog::DialogEntrance};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,14 +11,20 @@ use gpui_kit::base::v_flex;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
+use newjen_core::update::UpdateError;
 use newjen_core::worktree::Tools;
 use newjen_core::{Project, SessionConfig, Store, Thread, thread};
 
 use crate::attention::{NativeAttention, NativeQuitGuard};
 use crate::chat_view::{Attention, ChatView, QuitBlockers, Startup};
 use crate::format::{relative_time, tilde};
-use crate::keys::{OpenProject, OpenRecentProject, ShowProjects};
+use crate::keys::{
+    AboutNewjen, CheckForUpdates, OpenProject, OpenRecentProject, ReleaseNotesOnGithub,
+    ShowProjects, WhatsNewInNewjen,
+};
 use crate::ui;
+use crate::update::{self, UpdateModel};
+use crate::update_view::{self, Sheets, UpdateIntent};
 
 /// How often the attention adapter delivers the notifications it holds (see
 /// `NativeAttention::poll`).
@@ -27,6 +34,15 @@ struct OpenedProject {
     project: Project,
     chat: Entity<ChatView>,
     _attention: Subscription,
+}
+
+/// Why the quit question is asked: Quit Newjen, or Restart to update (which asks the same
+/// question and ends in the installer).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QuitIntent {
+    #[default]
+    Quit,
+    Restart,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,7 +67,7 @@ pub struct ProjectView {
     active: Option<usize>,
     recent: Vec<Project>,
     opening: Option<PathBuf>,
-    pending: Option<PathBuf>,
+    pending: VecDeque<PathBuf>,
     picking: bool,
     problem: Option<String>,
     save_problem_seen: bool,
@@ -61,6 +77,7 @@ pub struct ProjectView {
     attention: Option<NativeAttention>,
     quit_guard: Option<NativeQuitGuard>,
     quit_phase: QuitPhase,
+    quit_intent: QuitIntent,
     quit_attempt: u64,
     quit_save: Option<thread::QuitSave>,
     quit_observation: Option<newjen_core::store::SaveObservation>,
@@ -89,6 +106,8 @@ pub struct ProjectView {
     _focus: [Subscription; 2],
     _search: Subscription,
     _attention_tasks: Vec<Task<()>>,
+    update: Option<Entity<UpdateModel>>,
+    _update: Option<Subscription>,
 }
 
 impl ProjectView {
@@ -141,6 +160,7 @@ impl ProjectView {
                 _ => {}
             },
         );
+        let update = update::handle(cx);
         let mut view = Self {
             store,
             home,
@@ -149,7 +169,7 @@ impl ProjectView {
             active: None,
             recent,
             opening: None,
-            pending: None,
+            pending: VecDeque::new(),
             picking: false,
             problem,
             save_problem_seen: false,
@@ -158,6 +178,7 @@ impl ProjectView {
             attention: None,
             quit_guard: None,
             quit_phase: QuitPhase::Running,
+            quit_intent: QuitIntent::Quit,
             quit_attempt: 0,
             quit_save: None,
             quit_observation: None,
@@ -182,6 +203,13 @@ impl ProjectView {
             stand_in: None,
             _errors: listener,
             _attention_tasks: Vec::new(),
+            _update: update.as_ref().map(|model| {
+                cx.observe_in(model, window, |view, model, window, cx| {
+                    view.announce_install_failure(&model, window, cx);
+                    cx.notify();
+                })
+            }),
+            update,
             _search: search,
             _focus: [
                 cx.on_focus_lost(window, |view, window, cx| {
@@ -219,7 +247,9 @@ impl ProjectView {
             return;
         }
         if self.opening.is_some() {
-            self.pending = Some(path);
+            if !self.pending.contains(&path) {
+                self.pending.push_back(path);
+            }
             return;
         }
         self.opening = Some(path.clone());
@@ -291,7 +321,15 @@ impl ProjectView {
                                 let chat = cx.new(|cx| ChatView::new(*startup, window, cx));
                                 let shell = cx.weak_entity();
                                 let opener = cx.weak_entity();
+                                let updating = cx.weak_entity();
                                 chat.update(cx, |chat, _| {
+                                    chat.set_update_actions(std::rc::Rc::new(
+                                        move |intent, window, cx| {
+                                            let _ = updating.update(cx, |view, cx| {
+                                                view.update_intent(intent, window, cx);
+                                            });
+                                        },
+                                    ));
                                     chat.set_project_chooser(std::rc::Rc::new(
                                         move |window, cx| {
                                             let _ = shell.update(cx, |view, cx| {
@@ -340,7 +378,7 @@ impl ProjectView {
                     }
                     Err(error) => view.problem = Some(format!("Couldn't open project: {error:#}")),
                 }
-                if let Some(pending) = view.pending.take() {
+                if let Some(pending) = view.pending.pop_front() {
                     view.open_project(pending, window, cx);
                 }
                 cx.notify();
@@ -386,6 +424,139 @@ impl ProjectView {
             self.projects[active]
                 .chat
                 .update(cx, |chat, cx| chat.take_focus(window, cx));
+        }
+    }
+
+    fn can_open_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.quit_phase == QuitPhase::Running && !window.has_active_dialog(cx)
+    }
+
+    fn sheets(&self, cx: &mut Context<Self>) -> Option<Sheets> {
+        Some(Sheets {
+            model: self.update.clone()?,
+            shell: cx.weak_entity(),
+        })
+    }
+
+    /// Newjen › Check for Updates…: the sheet opens and a check starts at once.
+    fn check_for_updates(
+        &mut self,
+        _: &CheckForUpdates,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sheets) = self.sheets(cx) else {
+            return;
+        };
+        if !self.can_open_sheet(window, cx) {
+            return;
+        }
+        sheets.model.update(cx, |model, cx| model.check_now(cx));
+        window.open_dialog(cx, move |dialog, _, cx| {
+            update_view::check_sheet(dialog, &sheets, true, cx)
+        });
+    }
+
+    /// The sidebar card's link: the same sheet again.
+    fn open_install_failure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sheets) = self.sheets(cx) else {
+            return;
+        };
+        let Some(failure) = sheets.model.read(cx).install_failure().cloned() else {
+            return;
+        };
+        if !self.can_open_sheet(window, cx) {
+            return;
+        }
+        window.open_dialog(cx, move |dialog, _, cx| {
+            update_view::install_failed_sheet(dialog, &sheets, &failure, true, cx)
+        });
+    }
+
+    /// Tells the user once that the last install didn't finish, with ways to update anyway.
+    fn announce_install_failure(
+        &mut self,
+        model: &Entity<UpdateModel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_open_sheet(window, cx) {
+            return;
+        }
+        let Some(failure) = model.update(cx, |model, _| model.take_failure_notice()) else {
+            return;
+        };
+        let Some(sheets) = self.sheets(cx) else {
+            return;
+        };
+        window.open_dialog(cx, move |dialog, _, cx| {
+            update_view::install_failed_sheet(dialog, &sheets, &failure, true, cx)
+        });
+    }
+
+    fn whats_new(&mut self, _: &WhatsNewInNewjen, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_whats_new(UpdateIntent::WhatsNew, window, cx);
+    }
+
+    fn open_whats_new(
+        &mut self,
+        intent: UpdateIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sheets) = self.sheets(cx) else {
+            return;
+        };
+        if !self.can_open_sheet(window, cx) {
+            return;
+        }
+        let (news, mark_seen) = {
+            let model = sheets.model.read(cx);
+            match intent {
+                UpdateIntent::IncomingNotes => (model.incoming_sheet(), false),
+                _ => (model.whats_new_sheet(), true),
+            }
+        };
+        window.open_dialog(cx, move |dialog, _, cx| {
+            update_view::whats_new_sheet(dialog, &sheets, news.clone(), mark_seen, true, cx)
+        });
+    }
+
+    fn about(&mut self, _: &AboutNewjen, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_open_sheet(window, cx) {
+            return;
+        }
+        let current = self
+            .update
+            .as_ref()
+            .and_then(|model| model.read(cx).current_version().cloned())
+            .or_else(newjen_core::update::running_version);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            update_view::about_sheet(dialog, current.as_ref(), true, cx)
+        });
+    }
+
+    fn release_notes_on_github(
+        &mut self,
+        _: &ReleaseNotesOnGithub,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let url = self.update.as_ref().map_or_else(
+            || format!("{}/releases", newjen_core::update::DEFAULT_REPOSITORY),
+            |model| model.read(cx).releases_page(),
+        );
+        cx.open_url(&url);
+    }
+
+    /// What a click on the sidebar's pill or card asks for.
+    fn update_intent(&mut self, intent: UpdateIntent, window: &mut Window, cx: &mut Context<Self>) {
+        match intent {
+            UpdateIntent::Restart => self.request_restart(window, cx),
+            UpdateIntent::WhatsNew | UpdateIntent::IncomingNotes => {
+                self.open_whats_new(intent, window, cx)
+            }
+            UpdateIntent::InstallFailure => self.open_install_failure(window, cx),
         }
     }
 
@@ -480,6 +651,9 @@ impl ProjectView {
         if self.quit_phase == QuitPhase::Stopping {
             return Ok(());
         }
+        if let Some(model) = &self.update {
+            model.update(cx, |model, _| model.shutdown());
+        }
         for old in std::mem::take(&mut self.settling) {
             let _ = old.wait_blocking();
         }
@@ -488,7 +662,11 @@ impl ProjectView {
             .iter()
             .flat_map(|project| project.chat.update(cx, |chat, cx| chat.begin_quit(cx)))
             .collect();
-        thread::finish_quit(&self.store, quitting)
+        let finished = thread::finish_quit(&self.store, quitting);
+        if let Err(error) = self.install_update(cx) {
+            eprintln!("newjen: could not start the update installer: {error}");
+        }
+        finished
     }
 
     // -----------------------------------------------------------------------------------------
@@ -634,15 +812,33 @@ impl ProjectView {
     /// A second ⌘Q while the question is up answers yes.
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.quit_phase == QuitPhase::Confirming {
+            self.quit_intent = QuitIntent::Quit;
             self.confirm_quit(window, cx);
             return;
         }
         self.ask_to_quit(window, cx);
     }
 
+    /// "Restart to update": the quit question with a different title and buttons, and the
+    /// installer at its end. With nothing to lose it goes straight through the quit path.
+    pub fn request_restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .update
+            .as_ref()
+            .is_none_or(|model| model.read(cx).ready().is_none())
+        {
+            return;
+        }
+        self.ask(QuitIntent::Restart, window, cx);
+    }
+
     /// ⌘W, the window's close button and macOS asking the app to quit: the same question as
     /// ⌘Q, but while it is up they only bring it forward. Only the Quit shortcut answers yes.
     pub fn ask_to_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask(QuitIntent::Quit, window, cx);
+    }
+
+    fn ask(&mut self, intent: QuitIntent, window: &mut Window, cx: &mut Context<Self>) {
         if self.quit_phase != QuitPhase::Running {
             if self.quit_dialog || self.confirm_dialog {
                 window.activate_window();
@@ -650,6 +846,14 @@ impl ProjectView {
             }
             return;
         }
+        self.quit_intent = intent;
+        let restart_version = match intent {
+            QuitIntent::Restart => self
+                .update
+                .as_ref()
+                .and_then(|model| model.read(cx).ready().map(|staged| staged.version.clone())),
+            QuitIntent::Quit => None,
+        };
         let blockers = self.quit_blockers(cx);
         let unsent = self
             .projects
@@ -669,11 +873,27 @@ impl ProjectView {
         if unsent {
             notes.push("Unsent composer text will be discarded.".to_string());
         }
-        let message = if threads.is_empty() {
-            "Quitting stops what is still running."
-        } else {
-            "These stop mid-task. Their work so far is kept."
+        let (title, message) = match (&restart_version, threads.is_empty()) {
+            (Some(version), true) => (
+                "Restart to update?",
+                format!("Newjen {version} is ready. Restarting now stops what is still running."),
+            ),
+            (Some(version), false) => (
+                "Restart to update?",
+                format!(
+                    "Newjen {version} is ready. Restarting now stops these mid-task. Their work so far is kept."
+                ),
+            ),
+            (None, true) => (
+                "Quit Newjen?",
+                "Quitting stops what is still running.".into(),
+            ),
+            (None, false) => (
+                "Quit Newjen?",
+                "These stop mid-task. Their work so far is kept.".into(),
+            ),
         };
+        let restarting = restart_version.is_some();
         let view = cx.entity().downgrade();
         window.activate_window();
         cx.activate(true);
@@ -689,7 +909,11 @@ impl ProjectView {
                     gpui_kit::base::h_flex()
                         .gap_2()
                         .items_center()
-                        .child("Keep working")
+                        .child(if restarting {
+                            "Install when I quit"
+                        } else {
+                            "Keep working"
+                        })
                         .child(ui::key_caps("escape", cx)),
                 )
                 .on_click(move |_, window, cx| {
@@ -705,8 +929,8 @@ impl ProjectView {
                     gpui_kit::base::h_flex()
                         .gap_2()
                         .items_center()
-                        .child("Quit")
-                        .child(ui::key_caps("cmd-q", cx)),
+                        .child(if restarting { "Restart now" } else { "Quit" })
+                        .when(!restarting, |row| row.child(ui::key_caps("cmd-q", cx))),
                 )
                 .on_click(move |_, window, cx| {
                     let _ = quit.update(cx, |view, cx| view.confirm_quit(window, cx));
@@ -764,12 +988,12 @@ impl ProjectView {
                 .title(
                     div()
                         .debug_selector(|| "quit-confirm-title".into())
-                        .child("Quit Newjen?"),
+                        .child(title),
                 )
                 .child(
                     v_flex()
                         .gap_3()
-                        .child(div().text_color(muted).child(message))
+                        .child(div().text_color(muted).child(message.clone()))
                         .children(list)
                         .children(
                             notes
@@ -814,6 +1038,7 @@ impl ProjectView {
         }
         self.close_confirm(window, cx);
         self.quit_phase = QuitPhase::Running;
+        self.quit_intent = QuitIntent::Quit;
         if let Some(active) = self.active {
             self.projects[active]
                 .chat
@@ -984,6 +1209,7 @@ impl ProjectView {
         }
         self.quit_attempt += 1;
         self.quit_phase = QuitPhase::Running;
+        self.quit_intent = QuitIntent::Quit;
         if let Some(save) = self.quit_save.take() {
             self.settling.push(save);
         }
@@ -1004,6 +1230,15 @@ impl ProjectView {
     }
 
     fn commit_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.install_update(cx) {
+            eprintln!("newjen: could not start the update installer: {error}");
+            if self.quit_intent == QuitIntent::Restart {
+                self.problem = Some(format!("Couldn't restart to update: {error}"));
+                let attempt = self.quit_attempt;
+                self.keep_open(attempt, window, cx);
+                return;
+            }
+        }
         self.quit_phase = QuitPhase::Stopping;
         if self.quit_dialog {
             window.close_dialog(cx);
@@ -1011,6 +1246,33 @@ impl ProjectView {
         }
         self.allow_quit();
         cx.quit();
+    }
+
+    /// Hands a ready update to the installer, which waits for this process to exit. It is the
+    /// last thing before exit, so a quit that fails earlier installs nothing. Restart relaunches
+    /// the new version; any other quit only leaves it installed.
+    fn install_update(&mut self, cx: &mut Context<Self>) -> Result<(), UpdateError> {
+        let relaunch = self.quit_intent == QuitIntent::Restart;
+        let projects = self.open_project_paths();
+        match &self.update {
+            Some(model) => model.update(cx, |model, _| model.install(relaunch, &projects)),
+            None => Ok(()),
+        }
+    }
+
+    /// The loaded projects' folders with the one on screen last, so a relaunch that opens them
+    /// in order ends with it shown.
+    fn open_project_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .map(|slot| slot.project.path.clone())
+            .collect();
+        if let Some(active) = self.active.filter(|active| *active < paths.len()) {
+            let shown = paths.remove(active);
+            paths.push(shown);
+        }
+        paths
     }
 
     fn allow_quit(&self) {
@@ -1242,6 +1504,10 @@ impl Render for ProjectView {
             .on_action(cx.listener(Self::pick_project))
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::open_recent))
+            .on_action(cx.listener(Self::check_for_updates))
+            .on_action(cx.listener(Self::whats_new))
+            .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(Self::release_notes_on_github))
             .text_color(cx.theme().foreground)
             .child(div().flex_1().min_h_0().child(body))
             .when_some(
@@ -1663,6 +1929,356 @@ mod tests {
         finish(&shell, path, cx);
     }
 
+    use crate::keys::{
+        AboutNewjen as AboutAction, CheckForUpdates as CheckAction,
+        ReleaseNotesOnGithub as ReleaseNotesAction, WhatsNewInNewjen as WhatsNewAction,
+    };
+    use crate::update::UpdateHandle;
+    use crate::update::scripted::{Scripted, staged};
+    use newjen_core::changelog::WhatsNew;
+    use newjen_core::update::UpdateState;
+
+    fn update_setup<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        runs: Vec<Vec<UpdateState>>,
+        news: Option<WhatsNew>,
+    ) -> (
+        Entity<ProjectView>,
+        PathBuf,
+        &'a mut VisualTestContext,
+        Entity<UpdateModel>,
+        std::sync::Arc<Scripted>,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::keys::bind(cx);
+        });
+        cx.executor().allow_parking();
+        let source = Scripted::new(runs, Duration::ZERO);
+        let dynamic: std::sync::Arc<dyn crate::update::UpdateSource> = source.clone();
+        let mut model = UpdateModel::new(Ok(dynamic), Some("0.1.0-alpha.2".parse().unwrap()), None);
+        if let Some(news) = news {
+            model = model.with_whats_new(news);
+        }
+        let model = cx.new(|_| model);
+        cx.update(|cx| cx.set_global(UpdateHandle(model.clone())));
+        let (shell, path, cx) = setup(cx, name);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        (shell, path, cx, model, source)
+    }
+
+    fn some_news(skipped: usize) -> WhatsNew {
+        let changelog = newjen_core::changelog::Changelog::parse(
+            "## 0.1.0-alpha.2 · 3 November 2026\n\n### New features\n\n- One `code` note\n\n### Fixes\n\n- Two\n",
+        );
+        WhatsNew {
+            notes: changelog.releases()[0].clone(),
+            skipped: (0..skipped)
+                .map(|n| format!("0.1.0-alpha.{}", 1 + n).parse().unwrap())
+                .collect(),
+        }
+    }
+
+    fn ready() -> UpdateState {
+        UpdateState::Ready(staged("0.1.0-alpha.3"))
+    }
+
+    fn model_state(model: &Entity<UpdateModel>, cx: &mut VisualTestContext) -> UpdateState {
+        cx.update(|_, cx| model.read(cx).state().clone())
+    }
+
+    #[gpui::test]
+    async fn the_menu_actions_open_their_sheets_and_a_check_walks_to_up_to_date(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx, model, _) = update_setup(
+            cx,
+            "update-sheet",
+            vec![vec![UpdateState::UpToDate { checked_at: 1 }]],
+            None,
+        );
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| {
+                view.check_for_updates(&CheckAction, window, cx)
+            })
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.debug_bounds("update-title").is_some());
+        assert_eq!(model_state(&model, cx), UpdateState::Checking);
+        assert!(cx.debug_bounds("update-left").is_some(), "Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            model_state(&model, cx),
+            UpdateState::UpToDate { checked_at: 1 }
+        );
+        assert!(cx.debug_bounds("update-right").is_some(), "OK");
+        assert!(cx.debug_bounds("update-left").is_none());
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+
+        cx.dispatch_action(CheckAction);
+        assert!(
+            cx.debug_bounds("update-title").is_some(),
+            "the menu action opens the sheet"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.dispatch_action(AboutAction);
+        assert!(cx.debug_bounds("about-title").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.dispatch_action(WhatsNewAction);
+        assert!(cx.debug_bounds("whats-new-title").is_some());
+        assert!(cx.debug_bounds("whats-new-skipped").is_none());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.dispatch_action(ReleaseNotesAction);
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn cancelling_a_check_closes_the_sheet_and_leaves_no_result_behind(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx, model, _) = update_setup(
+            cx,
+            "update-cancel",
+            vec![vec![UpdateState::UpToDate { checked_at: 1 }]],
+            None,
+        );
+        cx.dispatch_action(CheckAction);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_ne!(model_state(&model, cx), ready());
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn the_pill_shows_only_for_a_ready_update_and_the_updated_card_yields_to_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx, model, _) =
+            update_setup(cx, "update-pill", vec![vec![ready()]], Some(some_news(0)));
+        let project = path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        open(&shell, project, cx).await;
+        assert!(cx.debug_bounds("updated-card").is_some());
+        assert!(cx.debug_bounds("update-pill").is_none());
+        cx.update(|_, cx| model.update(cx, |model, cx| model.check_now(cx)));
+        cx.run_until_parked();
+        assert_eq!(model_state(&model, cx), ready());
+        assert!(cx.debug_bounds("update-pill").is_some());
+        assert!(
+            cx.debug_bounds("updated-card").is_none(),
+            "the card waits while the pill shows"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "nothing opens a sheet by itself"
+        );
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn dismissing_the_updated_card_puts_it_away(cx: &mut TestAppContext) {
+        let (shell, path, cx, model, _) =
+            update_setup(cx, "update-card", vec![], Some(some_news(0)));
+        let project = path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        open(&shell, project, cx).await;
+        click(cx, "updated-card-dismiss");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("updated-card").is_none());
+        assert!(cx.update(|_, cx| model.read(cx).card().is_none()));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn whats_new_names_the_updates_you_skipped_and_done_marks_the_notes_seen(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx, model, _) =
+            update_setup(cx, "update-skipped", vec![], Some(some_news(2)));
+        let project = path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        open(&shell, project, cx).await;
+        click(cx, "updated-card-open");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("whats-new-title").is_some());
+        assert!(cx.debug_bounds("whats-new-skipped").is_some());
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|_, cx| model.read(cx).card().is_none()));
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn a_quiet_check_that_fails_says_nothing(cx: &mut TestAppContext) {
+        let (shell, path, cx, model, source) = update_setup(
+            cx,
+            "update-quiet",
+            vec![vec![UpdateState::Failed(
+                newjen_core::update::UpdateError::Offline,
+            )]],
+            None,
+        );
+        cx.update(|_, cx| model.update(cx, |model, cx| model.start(cx)));
+        cx.executor()
+            .advance_clock(newjen_core::update::FIRST_CHECK);
+        cx.run_until_parked();
+        assert_eq!(*source.runs_started.lock().unwrap(), 1);
+        assert!(matches!(model_state(&model, cx), UpdateState::Failed(_)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(shell.read_with(cx, |view, _| view.problem.is_none()));
+        finish(&shell, path, cx);
+    }
+
+    #[gpui::test]
+    async fn restart_with_work_running_asks_and_install_when_i_quit_keeps_the_update(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx, model, source) =
+            update_setup(cx, "update-restart", vec![vec![ready()]], None);
+        let project = path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        open(&shell, project, cx).await;
+        cx.update(|_, cx| model.update(cx, |model, cx| model.check_now(cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-`");
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_restart(window, cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("quit-confirm-title").is_some());
+        assert!(cx.debug_bounds("kbd:esc").is_some(), "Esc reads \"esc\"");
+        assert!(cx.debug_bounds("kbd:escape").is_none(), "not the ⎋ glyph");
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Confirming
+        );
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_intent),
+            QuitIntent::Restart
+        );
+        click(cx, "quit-keep-working");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Running
+        );
+        assert_eq!(model_state(&model, cx), ready(), "the update stays ready");
+        assert!(source.installs().is_empty());
+        let opened = cx.update(|_, cx| shell.read(cx).open_project_paths());
+        cx.update(|_, cx| shell.update(cx, |view, cx| view.quit(cx)))
+            .unwrap();
+        assert_eq!(
+            source.installs(),
+            vec![("0.1.0-alpha.3".parse().unwrap(), false, opened)],
+            "a later plain quit installs without relaunching"
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[gpui::test]
+    async fn restart_with_nothing_running_goes_straight_through_the_quit_path(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx, model, source) =
+            update_setup(cx, "update-straight", vec![vec![ready()]], None);
+        let project = path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        open(&shell, project, cx).await;
+        cx.update(|_, cx| model.update(cx, |model, cx| model.check_now(cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_restart(window, cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_eq!(
+            cx.update(|_, cx| shell.read(cx).quit_phase),
+            QuitPhase::Saving
+        );
+        let opened = cx.update(|_, cx| shell.read(cx).open_project_paths());
+        assert_eq!(opened.len(), 1);
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.commit_quit(window, cx)));
+        assert_eq!(
+            source.installs(),
+            vec![("0.1.0-alpha.3".parse().unwrap(), true, opened)],
+            "restart relaunches the new version on the project that was open"
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[gpui::test]
+    async fn the_ready_sheets_later_button_says_esc_not_a_glyph(cx: &mut TestAppContext) {
+        let (shell, path, cx, _, _) =
+            update_setup(cx, "update-esc-hint", vec![vec![ready()]], None);
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| {
+                view.check_for_updates(&CheckAction, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-left").is_some(), "Later");
+        assert!(cx.debug_bounds("kbd:esc").is_some());
+        assert!(cx.debug_bounds("kbd:escape").is_none());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[gpui::test]
+    async fn a_relaunch_reopens_every_open_project_with_the_shown_one_last(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, path, cx, model, source) =
+            update_setup(cx, "update-relaunch-projects", vec![vec![ready()]], None);
+        let (first, second) = (path.join("first"), path.join("second"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        open(&shell, first.clone(), cx).await;
+        open(&shell, second, cx).await;
+        open(&shell, first, cx).await;
+        cx.update(|_, cx| model.update(cx, |model, cx| model.check_now(cx)));
+        cx.run_until_parked();
+        let paths = cx.update(|_, cx| shell.read(cx).open_project_paths());
+        assert_eq!(paths.len(), 2);
+        assert!(paths[1].ends_with("first"), "{paths:?}");
+        assert!(paths[0].ends_with("second"), "{paths:?}");
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.request_restart(window, cx)));
+        cx.update(|window, cx| shell.update(cx, |view, cx| view.commit_quit(window, cx)));
+        assert_eq!(source.installs().len(), 1);
+        assert_eq!(source.installs()[0].2, paths);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[gpui::test]
+    async fn projects_opened_in_a_burst_all_open_in_order(cx: &mut TestAppContext) {
+        let (shell, path, cx) = setup(cx, "burst");
+        let names = ["a", "b", "c"];
+        for name in names {
+            std::fs::create_dir_all(path.join(name)).unwrap();
+        }
+        cx.update(|window, cx| {
+            shell.update(cx, |view, cx| {
+                for name in names {
+                    view.open_project(path.join(name), window, cx);
+                }
+            })
+        });
+        cx.condition(&shell, |view, _| {
+            view.opening.is_none() && view.pending.is_empty() && view.projects.len() == 3
+        })
+        .await;
+        let opened = cx.update(|_, cx| shell.read(cx).open_project_paths());
+        assert!(
+            opened[2].ends_with("c"),
+            "the last one is shown: {opened:?}"
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[gpui::test]
     async fn quitting_asks_once_for_work_in_any_loaded_project(cx: &mut TestAppContext) {
         let (shell, path, cx) = setup(cx, "quit-gate");
@@ -1757,7 +2373,7 @@ mod tests {
             })
         });
         cx.condition(&shell, |view, _| {
-            view.opening.is_none() && view.pending.is_none()
+            view.opening.is_none() && view.pending.is_empty()
         })
         .await;
         assert_eq!(

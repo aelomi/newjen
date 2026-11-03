@@ -33,6 +33,7 @@ use crate::thread_usage::TurnUsageRow;
 use crate::transcript::Status;
 use crate::worktree::Worktree;
 
+mod app_state;
 mod usage;
 pub use usage::{DailyTokens, ThreadWindowUsage, local_utc_offset_seconds};
 
@@ -177,6 +178,11 @@ const MIGRATIONS: &[&str] = &[
     // Version 8: the account a provider's plan report was read for, so a report restored at
     // launch is still dropped when the CLI is signed in to someone else.
     "ALTER TABLE provider_usage ADD COLUMN account TEXT;",
+    // Version 9: small app-wide values, such as the last version whose release notes were shown.
+    "CREATE TABLE app_state (
+         key TEXT PRIMARY KEY,
+         value TEXT NOT NULL
+     );",
 ];
 
 /// The `user_version` of a database at the current schema.
@@ -378,6 +384,11 @@ enum Write {
     RememberAgent {
         project_id: i64,
         config: String,
+    },
+    /// Sets one value in `app_state`.
+    AppState {
+        key: &'static str,
+        value: String,
     },
     Limit {
         thread_id: String,
@@ -1164,6 +1175,7 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
         // Not redone: the copy is removed again at the next launch, which finds nothing to do
         // and records it then.
         Write::RememberAgent { .. }
+        | Write::AppState { .. }
         | Write::Limit { .. }
         | Write::ProviderUsage { .. }
         | Write::UpsertProject { .. }
@@ -1185,6 +1197,13 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
     match write {
         Write::RememberAgent { project_id, config } => {
             connection.execute("INSERT INTO project_agent_choices (project_id, config) VALUES (?1, ?2) ON CONFLICT(project_id) DO UPDATE SET config=excluded.config", params![project_id, config])?;
+        }
+        Write::AppState { key, value } => {
+            connection.execute(
+                "INSERT INTO app_state (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
         }
         Write::Limit { thread_id, report } => {
             connection.execute("INSERT INTO thread_limits (thread_id, report) VALUES (?1, ?2) ON CONFLICT(thread_id) DO UPDATE SET report=excluded.report", params![thread_id, report])?;

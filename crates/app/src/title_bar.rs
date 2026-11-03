@@ -62,7 +62,7 @@ pub struct Bar {
     pub copy: bool,
     /// Set while the thread list is out of sight: the button that shows it, and whether
     /// another thread waits for an approval (an amber dot on the button).
-    pub show_list: Option<(OnPress, bool)>,
+    pub show_list: Option<(OnPress, sidebar::ListBadge)>,
     /// The thread's "Allow in this thread" rules.
     pub grants: Vec<GrantView>,
     pub grants_detail: &'static str,
@@ -129,8 +129,8 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
         .flex_none()
         .flex()
         .items_center()
-        .when_some(bar.show_list, |left, (on_press, attention)| {
-            left.child(show_list_button(on_press, attention, cx))
+        .when_some(bar.show_list, |left, (on_press, badge)| {
+            left.child(show_list_button(on_press, badge, cx))
         });
     let middle = h_flex()
         .flex_1()
@@ -170,7 +170,7 @@ pub fn render(bar: Bar, grants: Grants, _window: &mut Window, cx: &mut App) -> A
 
 /// The bar above the Usage view: its name and what it shows, with the button that brings the
 /// thread list back while it is out of sight.
-pub fn usage_header(show_list: Option<(OnPress, bool)>, cx: &mut App) -> AnyElement {
+pub fn usage_header(show_list: Option<(OnPress, sidebar::ListBadge)>, cx: &mut App) -> AnyElement {
     let lights_over_bar = show_list.is_some();
     let muted = cx.theme().colors.muted_foreground;
     ui::card_title_bar(cx)
@@ -180,8 +180,8 @@ pub fn usage_header(show_list: Option<(OnPress, bool)>, cx: &mut App) -> AnyElem
                 .flex_none()
                 .flex()
                 .items_center()
-                .when_some(show_list, |left, (on_press, attention)| {
-                    left.child(show_list_button(on_press, attention, cx))
+                .when_some(show_list, |left, (on_press, badge)| {
+                    left.child(show_list_button(on_press, badge, cx))
                 }),
         )
         .child(
@@ -269,27 +269,39 @@ fn changes_button(toggle: ChangesToggle, cx: &App) -> AnyElement {
     .into_any_element()
 }
 
-/// The panel-left button, with an amber dot while a hidden thread needs an approval.
-fn show_list_button(on_press: OnPress, attention: bool, cx: &App) -> AnyElement {
+/// The panel-left button, with an amber dot while a hidden thread needs an approval and a blue
+/// one while an update waits.
+fn show_list_button(on_press: OnPress, badge: sidebar::ListBadge, cx: &App) -> AnyElement {
     let colors = &cx.theme().colors;
+    let dot = if badge.attention {
+        Some(colors.warning)
+    } else {
+        badge.update.then_some(colors.info)
+    };
+    let tooltip = if badge.update {
+        "Show sidebar · Update ready"
+    } else {
+        "Show sidebar"
+    };
     div()
         .relative()
         .occlude()
         .child(sidebar::toggle_button(
             "sidebar-show",
-            "Show sidebar",
+            tooltip,
             on_press,
             cx,
         ))
-        .when(attention, |button| {
+        .when_some(dot, |button, dot| {
             button.child(
                 div()
+                    .debug_selector(|| "sidebar-dot".to_string())
                     .absolute()
                     .top(px(3.0))
                     .right(px(3.0))
                     .size(px(7.0))
                     .rounded_full()
-                    .bg(colors.warning)
+                    .bg(dot)
                     .border_1()
                     .border_color(colors.background),
             )
@@ -479,7 +491,7 @@ mod tests {
                     .into(),
                 path: "~/work/verify-project".into(),
                 copy: true,
-                show_list: Some((Rc::new(|_, _| {}), false)),
+                show_list: Some((Rc::new(|_, _| {}), sidebar::ListBadge::default())),
                 grants: vec![],
                 grants_detail: "Claude runs these without asking, until you revoke them.",
                 background_tasks: 0,

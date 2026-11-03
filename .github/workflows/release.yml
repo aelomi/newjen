@@ -53,6 +53,14 @@ jobs:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
 
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          scripts/release-notes.sh --check "$VERSION"
+          scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/release-notes.md"
+          printf '\nApple Silicon only. Ad-hoc signed, without Developer ID signing or notarization. The Homebrew cask removes quarantine on install. See the README for installation instructions.\n' >> "$RUNNER_TEMP/release-notes.md"
+
       - name: Rust toolchain
         run: |
           test "$(uname -m)" = arm64
@@ -83,6 +91,17 @@ jobs:
           scripts/bundle-app.sh "$VERSION"
           (cd dist && shasum -a 256 "$ASSET" > "$ASSET.sha256")
 
+      - name: Sign
+        env:
+          NEWJEN_SIGNING_KEY: ${{ secrets.NEWJEN_SIGNING_KEY }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          if [[ -z "$NEWJEN_SIGNING_KEY" ]]; then
+            echo "::error::The NEWJEN_SIGNING_KEY secret is missing. Run newjen-sign keygen, store the private key as that repository secret, and put the public key in crates/core/src/update/signature.rs."
+            exit 1
+          fi
+          cargo run --release --locked -p newjen-core --bin newjen-sign -- sign "dist/$ASSET"
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -95,10 +114,11 @@ jobs:
           if [[ "$PRERELEASE" == true ]]; then
             flags=(--prerelease --latest=false)
           fi
-          gh release create "$RELEASE_TAG" "dist/$ASSET" "dist/$ASSET.sha256" \
-            --verify-tag --title "Newjen $VERSION" --generate-notes \
-            --notes "Apple Silicon only. Ad-hoc signed, without Developer ID signing or notarization. The Homebrew cask removes quarantine on install. See the README for installation instructions." \
+          gh release create "$RELEASE_TAG" --draft \
+            --verify-tag --title "Newjen $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" \
             "${flags[@]}"
+          gh release upload "$RELEASE_TAG" "dist/$ASSET" "dist/$ASSET.sha256" "dist/$ASSET.sig" --clobber
+          gh release edit "$RELEASE_TAG" --draft=false "${flags[@]}"
 
       - name: Check out master for cask update
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

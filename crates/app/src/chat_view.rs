@@ -60,6 +60,8 @@ use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
 use crate::ui;
 use crate::ui::DOCK_METRICS;
 use crate::ui::MessageList;
+use crate::update::{self, UpdateModel};
+use crate::update_view::{self, UpdateIntent};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::TITLE_BAR_HEIGHT;
 use gpui_kit::component::message_scroller::MessageScrollerState;
@@ -296,7 +298,14 @@ pub struct ChatView {
     /// Taking focus back when its element leaves the window, and closing the grants popover
     /// when focus leaves it.
     _focus: [Subscription; 2],
+    /// The app's update model, if it has one: the pill and the card in the list read it.
+    update: Option<Entity<UpdateModel>>,
+    update_actions: Option<OnUpdate>,
+    _update: Option<Subscription>,
 }
+
+/// What a click on the update pill or card asks the window for.
+pub type OnUpdate = Rc<dyn Fn(UpdateIntent, &mut Window, &mut App)>;
 
 impl ChatView {
     pub fn new(startup: Startup, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -315,6 +324,7 @@ impl ChatView {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| project.path.display().to_string());
         let tasks = vec![clock(cx)];
+        let update = update::handle(cx);
         let grants_focus = cx.focus_handle();
         let focus = [
             cx.on_focus_lost(window, |view, window, cx| view.reclaim_focus(window, cx)),
@@ -369,6 +379,11 @@ impl ChatView {
             keys_ready_at: None,
             _tasks: tasks,
             _focus: focus,
+            _update: update
+                .as_ref()
+                .map(|model| cx.observe(model, |_, _, cx| cx.notify())),
+            update,
+            update_actions: None,
         };
         for thread in threads {
             let at = view.slots.len();
@@ -497,6 +512,76 @@ impl ChatView {
 
     pub fn set_thread_opener(&mut self, opener: OnOpenThread) {
         self.thread_opener = Some(opener);
+    }
+
+    pub fn set_update_actions(&mut self, actions: OnUpdate) {
+        self.update_actions = Some(actions);
+    }
+
+    /// Whether an update is downloaded and checked and waits for a restart.
+    fn update_ready(&self, cx: &App) -> bool {
+        self.update
+            .as_ref()
+            .is_some_and(|model| model.read(cx).ready().is_some())
+    }
+
+    /// The pill when an update is ready, else the card for an install that did not finish, else
+    /// the card that offers the notes of the update just installed. The pill wins and the cards
+    /// wait.
+    fn render_update_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let model = self.update.clone()?;
+        let intent = |cx: &Context<Self>, intent: UpdateIntent| {
+            self.press(cx, move |view, window, cx| {
+                if let Some(actions) = view.update_actions.clone() {
+                    actions(intent, window, cx);
+                }
+            })
+        };
+        let (ready, failure, card) = {
+            let model = model.read(cx);
+            (
+                model.ready().map(|staged| {
+                    (
+                        staged.version.clone(),
+                        model.current_version().cloned(),
+                        model.ready_notes().cloned(),
+                    )
+                }),
+                model.install_failure().cloned(),
+                model.card().map(|news| news.notes.label.clone()),
+            )
+        };
+        if let Some((version, current, notes)) = ready {
+            return Some(update_view::update_pill(
+                &version,
+                current.as_ref(),
+                notes.as_ref(),
+                intent(cx, UpdateIntent::Restart),
+                intent(cx, UpdateIntent::IncomingNotes),
+                cx,
+            ));
+        }
+        if let Some(failure) = failure {
+            let dismiss = self.press(cx, move |_, _, cx| {
+                model.update(cx, |model, cx| model.dismiss_failure(cx));
+            });
+            return Some(update_view::install_failed_card(
+                &failure,
+                intent(cx, UpdateIntent::InstallFailure),
+                dismiss,
+                cx,
+            ));
+        }
+        let label = card?;
+        let dismiss = self.press(cx, move |_, _, cx| {
+            model.update(cx, |model, cx| model.dismiss_card(cx));
+        });
+        Some(update_view::updated_card(
+            label,
+            intent(cx, UpdateIntent::WhatsNew),
+            dismiss,
+            cx,
+        ))
     }
 
     pub fn set_attention_note(&mut self, note: Option<&'static str>, cx: &mut Context<Self>) {
@@ -2046,9 +2131,12 @@ impl ChatView {
                 .iter()
                 .map(|slot| slot.thread.read(cx).status())
                 .collect();
-            let attention = sidebar::hidden_needs_you(&statuses, self.active);
+            let badge = sidebar::ListBadge {
+                attention: sidebar::hidden_needs_you(&statuses, self.active),
+                update: self.update_ready(cx),
+            };
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
-            (toggle, attention)
+            (toggle, badge)
         });
         let entity = self.thread().clone();
         let bar = {
@@ -2679,6 +2767,7 @@ impl ChatView {
         ]
         .into_iter()
         .chain(note)
+        .chain(self.render_update_row(cx))
         .chain([self.render_usage_row(cx)])
         .collect()
     }

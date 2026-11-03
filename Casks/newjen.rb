@@ -9,6 +9,8 @@ cask "newjen" do
   desc "Native agent development environment"
   homepage "https://github.com/aelomi/newjen"
 
+  auto_updates true
+
   depends_on arch: :arm64
   depends_on macos: :big_sur
 

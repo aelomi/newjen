@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xml:lang="en-US">
+  <id>tag:github.com,2008:https://github.com/aelomi/newjen/releases</id>
+  <link type="text/html" rel="alternate" href="https://github.com/aelomi/newjen/releases"/>
+  <link type="application/atom+xml" rel="self" href="https://github.com/aelomi/newjen/releases.atom"/>
+  <title>Release notes from newjen</title>
+  <updated>2026-11-03T08:00:00Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Repository/1441414554/v0.1.0-rc.1</id>
+    <updated>2026-11-03T08:00:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/aelomi/newjen/releases/tag/v0.1.0-rc.1"/>
+    <title>Newjen 0.1.0-rc.1</title>
+    <content type="html">&lt;p&gt;Synthetic entry for tests.&lt;/p&gt;</content>
+    <author>
+      <name>github-actions[bot]</name>
+    </author>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1441414554/nightly</id>
+    <updated>2026-11-02T20:00:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/aelomi/newjen/releases/tag/nightly"/>
+    <title>Nightly</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1441414554/v0.1.0-beta.1</id>
+    <updated>2026-11-02T09:00:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/aelomi/newjen/releases/tag/v0.1.0-beta.1"/>
+    <title>Newjen 0.1.0-beta.1</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1441414554/v0.1.0-alpha.10</id>
+    <updated>2026-11-02T08:00:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/aelomi/newjen/releases/tag/v0.1.0-alpha.10"/>
+    <title>Newjen 0.1.0-alpha.10</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1441414554/v1.2</id>
+    <updated>2026-11-02T07:00:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/aelomi/newjen/releases/tag/v1.2"/>
+    <title>Not semver</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1441414554/v0.1.0-alpha.1</id>
+    <updated>2026-11-01T09:17:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/aelomi/newjen/releases/tag/v0.1.0-alpha.1"/>
+    <title>Newjen 0.1.0-alpha.1</title>
+    <content type="html">&lt;p&gt;Apple Silicon only. Ad-hoc signed, without Developer ID signing or notarization. The Homebrew cask removes quarantine on install. See the README for installation instructions.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Full Changelog&lt;/strong&gt;: &lt;a href=&quot;https://github.com/aelomi/newjen/commits/v0.1.0-alpha.1&quot;&gt;https://github.com/aelomi/newjen/commits/v0.1.0-alpha.1&lt;/a&gt;&lt;/p&gt;</content>
+    <author>
+      <name>github-actions[bot]</name>
+    </author>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/in/15368?s=60&amp;v=4"/>
+  </entry>
+</feed>

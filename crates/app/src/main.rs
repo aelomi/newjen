@@ -18,6 +18,8 @@ mod terminal;
 mod theme;
 mod title_bar;
 mod ui;
+mod update;
+mod update_view;
 mod usage_view;
 
 use std::path::{Path, PathBuf};
@@ -34,23 +36,39 @@ use newjen_core::{Project, Store, orphans, store, usage};
 
 use crate::assets::AppAssets;
 use crate::keys::{
-    CloseWindow, Hide, HideOthers, JumpToNeedsYou, JumpToThread, Minimize, NewThread, NextThread,
-    OpenProject, OpenRecentProject, PreviousThread, Quit, ShowProjects, ToggleSidebar,
-    ToggleTerminal,
+    AboutNewjen, CheckForUpdates, CloseWindow, Hide, HideOthers, JumpToNeedsYou, JumpToThread,
+    Minimize, NewThread, NextThread, OpenProject, OpenRecentProject, PreviousThread, Quit,
+    ReleaseNotesOnGithub, ShowProjects, ToggleSidebar, ToggleTerminal, WhatsNewInNewjen,
 };
 use crate::project_view::ProjectView;
 use gpui_kit::component::ActiveTheme as _;
 
 fn main() {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let project = project_dir().map(std::path::absolute).transpose();
-    let request = match &project {
-        Ok(Some(path)) => LaunchRequest::OpenProject(path.clone()),
-        _ => LaunchRequest::Activate,
+    let projects: std::io::Result<Vec<PathBuf>> = launch_projects()
+        .into_iter()
+        .map(std::path::absolute)
+        .collect();
+    let (project, more) = match &projects {
+        Ok(projects) => match projects.split_first() {
+            Some((first, rest)) => (Some(first.clone()), rest.to_vec()),
+            None => (None, Vec::new()),
+        },
+        Err(_) => (None, Vec::new()),
     };
-    let acquired = project.map_err(anyhow::Error::from).and_then(|_| {
+    let request = match &project {
+        Some(path) => LaunchRequest::OpenProject(path.clone()),
+        None => LaunchRequest::Activate,
+    };
+    let acquired = projects.map_err(anyhow::Error::from).and_then(|_| {
         let folder = store::default_dir()?;
-        Instance::start(&folder, &request)
+        let started = Instance::start(&folder, &request)?;
+        if matches!(started, Startup::Forwarded) {
+            for path in &more {
+                Instance::start(&folder, &LaunchRequest::OpenProject(path.clone()))?;
+            }
+        }
+        Ok(started)
     });
     let (instance, startup) = match acquired {
         Ok(Startup::Forwarded) => return,
@@ -94,6 +112,7 @@ fn main() {
         }
     });
     let ipc_launches = launches.clone();
+    let queued_launches = launches.clone();
     application.on_reopen(move |_| send_launch(&launches, LaunchRequest::Activate));
     let running_instance = instance.clone();
     application.run(move |cx: &mut App| {
@@ -109,15 +128,21 @@ fn main() {
         install_menus(cx);
 
         let opened = match startup {
-            Ok(store) => open_window(
-                store,
-                home,
-                project,
-                received,
-                ipc_launches,
-                running_instance.unwrap(),
-                cx,
-            ),
+            Ok(store) => {
+                update::install(&store, cx);
+                for path in more {
+                    send_launch(&queued_launches, LaunchRequest::OpenProject(path));
+                }
+                open_window(
+                    store,
+                    home,
+                    project,
+                    received,
+                    ipc_launches,
+                    running_instance.unwrap(),
+                    cx,
+                )
+            }
             Err(problem) => show_startup_problem(&problem, cx),
         };
         if let Err(error) = opened {
@@ -212,6 +237,9 @@ fn install_menus(cx: &mut App) {
 fn update_menus(recent: &[Project], cx: &mut App) {
     cx.set_menus([
         Menu::new("Newjen").items([
+            MenuItem::action("About Newjen", AboutNewjen),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::separator(),
             MenuItem::action("Hide Newjen", Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::separator(),
@@ -259,15 +287,29 @@ fn update_menus(recent: &[Project], cx: &mut App) {
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Close", CloseWindow),
         ]),
+        Menu::new("Help").items([
+            MenuItem::action("What's New in Newjen", WhatsNewInNewjen),
+            MenuItem::action("Release Notes on GitHub", ReleaseNotesOnGithub),
+        ]),
     ]);
 }
 
-fn project_dir() -> Option<PathBuf> {
-    std::env::args_os().nth(1).map(PathBuf::from).or_else(|| {
-        std::env::var_os("NEWJEN_PROJECT")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    })
+/// The folders to open: every argument (an update relaunches with the projects that were
+/// open, the one to show last), else `NEWJEN_PROJECT`. macOS's `-psn_` argument is no folder.
+fn launch_projects() -> Vec<PathBuf> {
+    let from_arguments: Vec<PathBuf> = std::env::args_os()
+        .skip(1)
+        .filter(|argument| !argument.as_encoded_bytes().starts_with(b"-psn_"))
+        .map(PathBuf::from)
+        .collect();
+    if !from_arguments.is_empty() {
+        return from_arguments;
+    }
+    std::env::var_os("NEWJEN_PROJECT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .into_iter()
+        .collect()
 }
 
 /// The project must be an existing folder, since Claude runs inside it.

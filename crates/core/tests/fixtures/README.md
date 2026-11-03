@@ -40,3 +40,10 @@ Real recordings of the Claude Code CLI's stream-json protocol, used by the `core
 
 **Never commit real account data or personal paths.** When you record new fixtures, sanitize
 them first and grep for your user name, email and home folder before committing.
+
+## Update feed
+
+- **`update/releases.atom`**: the real `releases.atom` entry for `v0.1.0-alpha.1` (fetched from
+  github.com on 2026-11-03, nothing secret in it) plus synthetic entries for the update tests: a
+  higher prerelease, a double-digit `alpha.10`, and two tags that are not `v<semver>` (`nightly`,
+  `v1.2`), which the parser must skip.

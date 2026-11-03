@@ -38,6 +38,7 @@ crates/
           #   session.rs, thread.rs, transcript.rs: one process per thread, its lifecycle and the rendered transcript.
           #   worktree.rs: git worktrees. vcs.rs: checkpoints, diffs and git actions. commit_message.rs: AI commit messages through the user's CLI. changes.rs, edits.rs: per-file change counts and edit previews.
           #   thread_usage.rs: context fill and tokens per model for one thread. usage.rs: each CLI's plan windows, pace and billing.
+          #   update.rs (+ update/): in-app updates. The releases Atom feed, curl downloads, Ed25519 signature check, staging, and the detached install script. changelog.rs: the bundled CHANGELOG.md, What's New and the last version seen.
           #   store.rs: SQLite. instance.rs: the single-instance lock and local launch handoff. env.rs: the login shell's PATH.
   app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
           #   src/project_view.rs: the window, its loaded projects, the Dock badge, notifications and the quit gate.
@@ -109,6 +110,7 @@ Users run Newjen on their own Claude and ChatGPT subscriptions. **Never do anyth
 - **Respect usage limits.** Every turn starts from a user action. Never auto-retry, auto-resume at a limit reset, or auto-continue a turn. Stop on a rejected rate limit and show when it resets.
 - **Say which account pays.** Show the account and plan from the CLI's own report (`claude auth status --json`, Codex `account/read`), and warn when `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` will bill the API instead.
 - **Codex runs with `approvalPolicy: untrusted` and a read-only sandbox**, so every write and every non-trivial command asks, as Claude's `--permission-mode default` does. Newjen's own instructions to a thread go through each CLI's official seam: `--append-system-prompt` for Claude, `developerInstructions` on `thread/start` for Codex.
+- **Updates never touch the CLIs or credentials, and never start a turn.** The updater fetches only Newjen's own releases from github.com and installs nothing whose Ed25519 signature fails.
 - **No "Claude Code" in Newjen's name or UI labels.** Prose such as the README may say it "runs Claude Code".
 
 ## GPUI and GPUI Kit: don't guess APIs
@@ -176,7 +178,7 @@ gh pr create --base master
 
 The repository doubles as the Homebrew tap. The cask lives in `Casks/newjen.rb`.
 The release workflow uses the built-in `GITHUB_TOKEN` with `contents: write` for releases and cask updates.
-No separate tap repository or token secret is needed. Repository rules must allow Actions to push a cask update to `master`.
+No separate tap repository or tap token is needed; the only repository secret is `NEWJEN_SIGNING_KEY` (see In-app updates). Repository rules must allow Actions to push a cask update to `master`.
 
 Use tags such as `v0.1.0-alpha.1`, `v0.1.0-beta.1`, `v0.1.0-rc.1`, or `v0.1.0`.
 Version numbers have three numeric components without leading zeroes.
@@ -194,7 +196,7 @@ For a release, that file comes from the selected tag.
 
 The workflow runs the same build, test, format, and Clippy gates as CI.
 It calls `scripts/bundle-app.sh <version>` to build an ad-hoc-signed app without Developer ID signing or notarization.
-It publishes `Newjen-<version>-arm64.zip` and `Newjen-<version>-arm64.zip.sha256` through `gh release create`.
+It signs the zip with `newjen-sign`, then publishes `Newjen-<version>-arm64.zip`, its `.sha256` and its `.sig` through `gh release create`, with the version's `CHANGELOG.md` section as the release notes.
 It then checks out `master`, updates only the cask's version and SHA-256, and commits that file with a bot identity.
 If a push fails, it fetches `master`, rebases, and retries once. Conflicts or another rejected push fail with recovery instructions.
 
@@ -208,3 +210,20 @@ Check the release and cask before announcing it. The cask tracks whichever versi
 Do not reuse a published tag or replace its assets. Publish a new version to correct a release.
 If only the cask update fails, copy the version and checksum from the published asset into `Casks/newjen.rb` and commit that change.
 Do not rerun publication for an existing release.
+
+### Changelog
+
+Every user-visible change adds a line under `## Unreleased` in `CHANGELOG.md`, in one of four groups: `### New features`, `### Improvements`, `### Fixes` or `### Misc`. Write it in plain English for a user, one `- ` bullet per change. A bullet may wrap onto the next line and may use `inline code`.
+Releasing renames `## Unreleased` to `## <version> · <date>`, such as `## 0.1.0-alpha.2 · 12 November 2026`, and puts a new empty `## Unreleased` above it. Do this in the release commit, before tagging, and check it with `scripts/release-notes.sh --check <version>` (a pre-tag check: it fails when the version has no dated section with notes or `## Unreleased` still has bullets). The release workflow runs the same check, and CI fails when `CHANGELOG.md` is missing or does not parse.
+`CHANGELOG.md` is compiled into the app, so Newjen shows What's New offline after an update. The same section becomes the GitHub release notes (`scripts/release-notes.sh <version>`). The workflow creates the release as a draft, uploads the zip, `.sha256` and `.sig`, and only then publishes it, so the feed never lists a release without its assets.
+
+### In-app updates
+
+Newjen updates itself. Every hour (and 15 seconds after launch) it reads `https://github.com/aelomi/newjen/releases.atom`, never the GitHub API, which rate-limits. For a newer `v<semver>` tag (prereleases only for a copy that itself runs a prerelease) it downloads `Newjen-<version>-arm64.zip` and `Newjen-<version>-arm64.zip.sig` from the release with the system `curl`, checks the signature, unpacks the zip beside the installed app, and swaps it in after Newjen quits. The swap script writes `.Newjen-update-result` beside the app before it relaunches; the next launch reports a failed install once (with the Homebrew command and the releases page), and the quiet hourly check leaves that version alone until the feed offers a newer one. A relaunch after Restart reopens the projects that were open.
+`NEWJEN_UPDATE_FEED` replaces the repository URL, such as `file:///tmp/fake-releases` for a local end-to-end test with a bundle made by `scripts/bundle-app.sh`. Builds that did not come from that script have no release version and do not update.
+
+Releases are signed with an Ed25519 key. The public key is `UPDATE_PUBLIC_KEY` in `crates/core/src/update/signature.rs`; the private key is the `NEWJEN_SIGNING_KEY` repository secret, and the release workflow fails without it.
+
+- **Make the key pair once:** `cargo run --release -p newjen-core --bin newjen-sign -- keygen`. It prints the private key once. Store it as the secret and in a password manager, never in the repository, then paste the printed array over `UPDATE_PUBLIC_KEY`. Until you do, every update is refused.
+- **Sign by hand:** `NEWJEN_SIGNING_KEY=<hex> cargo run --release -p newjen-core --bin newjen-sign -- sign <zip>` writes `<zip>.sig`. `newjen-sign verify <zip> <public key hex>` checks one.
+- **Never lose or swap the key without a bridge release.** An installed app only accepts the key it was built with. To rotate, ship a release that contains the new key but is signed with the old one (`sign --allow-other-key`), then sign later releases with the new one.

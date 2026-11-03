@@ -25,6 +25,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Changelog
+        run: |
+          test -f CHANGELOG.md
+          cargo test -p newjen-core --test changelog --locked
+
       - name: Format
         run: cargo fmt --all -- --check
 

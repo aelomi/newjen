@@ -33,7 +33,17 @@ fn surface_shadow(ring: Hsla, strength: f32) -> Vec<BoxShadow> {
 /// The shadow ramps with the cube of the fade, as Kit's own dropdowns do, so it never shows
 /// through the glass while that is still see-through.
 pub fn popover_surface(id: &'static str, body: Div, pointer: bool, cx: &App) -> AnyElement {
-    let surface = body.relative().popover_style(cx);
+    surface(id, body.relative().popover_style(cx), pointer, cx)
+}
+
+/// [`popover_surface`] on the card's solid fill. A popover that opens over the sidebar needs
+/// it: the sidebar's own text is right behind, and the near-opaque glass lets it show.
+pub fn solid_popover_surface(id: &'static str, body: Div, pointer: bool, cx: &App) -> AnyElement {
+    let fill = crate::theme::material(cx).card;
+    surface(id, body.relative().popover_style(cx).bg(fill), pointer, cx)
+}
+
+fn surface(id: &'static str, surface: Div, pointer: bool, cx: &App) -> AnyElement {
     if !pointer {
         return surface.into_any_element();
     }

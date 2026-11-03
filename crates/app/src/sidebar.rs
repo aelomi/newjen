@@ -414,6 +414,14 @@ pub fn is_empty_list(drafts: &[bool]) -> bool {
     drafts.len() <= 1 && drafts.iter().all(|draft| *draft)
 }
 
+/// What the panel-left button's dot says while the list is out of sight. Amber, for a thread
+/// that needs you, wins over blue, for an update that is ready to install.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListBadge {
+    pub attention: bool,
+    pub update: bool,
+}
+
 /// Whether the title bar's panel-left button gets an amber dot: the list is out of sight and
 /// a thread other than the one on screen waits for an approval (screen 11).
 pub fn hidden_needs_you(statuses: &[Status], active: usize) -> bool {

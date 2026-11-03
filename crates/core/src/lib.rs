@@ -11,12 +11,15 @@
 //! - [`orphans`]: cleans up `claude` processes left behind by a crash.
 //! - [`worktree`]: makes and removes the git worktrees threads can work in.
 //! - [`usage`]: the latest plan and usage-window report each CLI gave.
+//! - [`update`]: finds, downloads, verifies and installs new releases.
+//! - [`changelog`]: the release notes bundled into the app.
 //!
 //! This crate must never depend on GPUI or GPUI Kit, so the UI layer could be replaced and
 //! the core can be tested headlessly.
 
 pub mod agent;
 mod approval_text;
+pub mod changelog;
 pub mod changes;
 pub mod commit_message;
 pub mod edits;
@@ -32,6 +35,7 @@ pub mod store;
 pub mod thread;
 pub mod thread_usage;
 pub mod transcript;
+pub mod update;
 pub mod usage;
 pub mod vcs;
 pub mod worktree;

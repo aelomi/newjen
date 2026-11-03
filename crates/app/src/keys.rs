@@ -30,6 +30,10 @@ actions!(
         ToggleSidebar,
         JumpToNeedsYou,
         ToggleTerminal,
+        AboutNewjen,
+        CheckForUpdates,
+        WhatsNewInNewjen,
+        ReleaseNotesOnGithub,
     ]
 );
 

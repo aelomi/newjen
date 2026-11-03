@@ -27,7 +27,14 @@ gpui_kit::assets::icon_assets!(
         Layers,
         Sparkles,
         Sparkle,
-        SquarePen
+        SquarePen,
+        CircleArrowUp,
+        WifiOff,
+        FolderLock,
+        FolderInput,
+        ShieldAlert,
+        RotateCcwClock,
+        ArrowUpRight
     ]
 );
 gpui_kit::assets::icon_assets!(ApprovalIcons, [Trash, FilePen, Terminal, Plug]);
@@ -101,6 +108,13 @@ mod tests {
             IconName::SquareCheck,
             IconName::SquarePen,
             IconName::TriangleAlert,
+            IconName::CircleArrowUp,
+            IconName::WifiOff,
+            IconName::FolderLock,
+            IconName::FolderInput,
+            IconName::ShieldAlert,
+            IconName::RotateCcwClock,
+            IconName::ArrowUpRight,
         ] {
             let path = icon.path();
             let bytes = assets.load(&path).unwrap().unwrap();

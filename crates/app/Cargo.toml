@@ -27,6 +27,7 @@ gpui.workspace = true
 gpui-kit.workspace = true
 gpui_platform.workspace = true
 newjen-core.workspace = true
+semver.workspace = true
 serde_json.workspace = true
 url = "=2.5.8"
 
