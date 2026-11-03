@@ -8,6 +8,10 @@ pub const SIDEBAR: Pixels = px(255.);
 /// The gap between the window's top, right and bottom edges and the floating card.
 pub const CARD_INSET: Pixels = px(8.);
 pub const CARD_RADIUS: Pixels = px(10.);
+/// The window's rem, and so the size of unstyled text. Kit's own default is 16, which reads
+/// about 15% larger than the mocks and than T3 Code.
+pub const INTERFACE_SIZE: Pixels = px(14.);
+pub const CODE_SIZE: Pixels = px(12.);
 
 /// How opaque menus, popovers and tooltips are. GPUI blurs only what is behind the window, not
 /// the card's own text behind a popover, so anything much more see-through is illegible over
@@ -56,7 +60,7 @@ impl Material {
                 glass_tint,
                 glass_hover: hsla(0., 0., 1., 0.05),
                 glass_selected: hsla(0., 0., 1., 0.09),
-                glass_muted: shade(0xd4d4d4, 1.0),
+                glass_muted: shade(0xa3a3a3, 1.0),
                 card: shade(0x111114, 1.0),
                 card_stroke: hsla(0., 0., 1., 0.07),
                 popover_glass,
@@ -139,6 +143,8 @@ pub fn apply(cx: &mut App) {
         theme.popover = material.popover_glass;
         theme.list_active = material.glass_selected;
         theme.list_hover = material.glass_hover;
+        theme.font_size = INTERFACE_SIZE;
+        theme.mono_font_size = CODE_SIZE;
     });
     // Set on the token alone: `Theme::update` would copy it back onto the `background` color.
     Theme::global_mut(cx).tokens.background = material.glass_tint.into();
@@ -187,7 +193,7 @@ mod tests {
         let light = Material::resolve(false, false);
         assert_eq!(dark.glass_tint, Hsla::from(rgb(0x0e0e12)).opacity(0.82));
         assert_eq!(light.glass_tint, Hsla::from(rgb(0xf4f4f7)).opacity(0.82));
-        assert_eq!(dark.glass_muted, Hsla::from(rgb(0xd4d4d4)));
+        assert_eq!(dark.glass_muted, Hsla::from(rgb(0xa3a3a3)));
         assert_eq!(light.glass_muted, Hsla::from(rgb(0x525252)));
         assert_eq!(dark.card, Hsla::from(rgb(0x111114)));
         assert_eq!(light.card, Hsla::from(rgb(0xffffff)));
@@ -226,6 +232,8 @@ mod tests {
             assert_eq!(cx.theme().colors.background, material(cx).card);
             assert_eq!(cx.theme().tokens.background.color, material(cx).glass_tint);
             assert_eq!(cx.theme().popover, material(cx).popover_glass);
+            assert_eq!(cx.theme().font_size, INTERFACE_SIZE);
+            assert_eq!(cx.theme().mono_font_size, CODE_SIZE);
 
             cx.set_global(ReduceTransparency(true));
             apply(cx);
@@ -237,6 +245,8 @@ mod tests {
             Theme::change(WindowAppearance::Light, None, cx);
             assert_ne!(cx.theme().tokens.background.color, material(cx).glass_tint);
             apply(cx);
+            assert_eq!(cx.theme().font_size, INTERFACE_SIZE);
+            assert_eq!(cx.theme().mono_font_size, CODE_SIZE);
             assert_eq!(cx.theme().colors.background, material(cx).card);
             assert_eq!(cx.theme().tokens.background.color, material(cx).glass_tint);
             assert_eq!(cx.theme().list_hover, hsla(0., 0., 0., 0.05));

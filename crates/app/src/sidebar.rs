@@ -612,7 +612,7 @@ pub fn section_header(group: SidebarGroup, count: usize, cx: &App) -> AnyElement
         .px_2p5()
         .pt_3()
         .pb_1()
-        .text_xs()
+        .text_sm()
         .text_color(crate::theme::material(cx).glass_muted)
         .child(group_label(group))
         .child(div().opacity(0.7).child(count_label(count)))
@@ -735,7 +735,7 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
         .children(row.time.map(|time| {
             div()
                 .flex_none()
-                .text_xs()
+                .text_sm()
                 .text_color(material.glass_muted)
                 .child(time)
         }));

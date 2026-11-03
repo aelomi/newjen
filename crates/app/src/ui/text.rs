@@ -1,11 +1,13 @@
 use gpui::{
-    AnyElement, App, Div, Half as _, InteractiveElement as _, IntoElement as _, Keystroke,
-    ParentElement as _, SharedString, Styled, div, relative,
+    AnyElement, App, Div, FontWeight, Half as _, InteractiveElement as _, IntoElement as _,
+    Keystroke, ParentElement as _, SharedString, Styled, div, relative, rems,
 };
 use gpui_kit::component::{ActiveTheme as _, kbd::Kbd, label::Label};
 
 pub fn title(text: impl Into<SharedString>, _: &App) -> Label {
-    Label::new(text).text_xl()
+    Label::new(text)
+        .text_size(rems(1.6))
+        .font_weight(FontWeight::SEMIBOLD)
 }
 
 pub fn caption(text: impl Into<SharedString>, cx: &App) -> Label {
