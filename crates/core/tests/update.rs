@@ -589,13 +589,13 @@ fn relaunch_without_projects_passes_no_arguments() {
 
 /// A program inside the installed bundle that stays alive, like a second Newjen would.
 fn peer_in_the_bundle(staged: &StagedUpdate, seconds: &str) -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
     let program = staged.target.app().join("Contents/MacOS/peer");
-    fs::copy("/bin/sleep", &program).unwrap();
-    run(
-        "/usr/bin/codesign",
-        &["--force", "-s", "-", program.to_str().unwrap()],
-    );
-    Command::new(&program).arg(seconds).spawn().unwrap()
+    Command::new("/bin/sleep")
+        .arg0(&program)
+        .arg(seconds)
+        .spawn()
+        .unwrap()
 }
 
 #[test]
