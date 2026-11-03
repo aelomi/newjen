@@ -1,28 +1,28 @@
+use std::sync::OnceLock;
+
 use gpui::{
-    App, BoxShadow, Global, Hsla, Pixels, Window, WindowBackgroundAppearance, hsla, point, px, rgb,
+    App, BoxShadow, Global, Hsla, Pixels, SharedString, Window, WindowAppearance,
+    WindowBackgroundAppearance, hsla, point, px, rgb,
 };
+use gpui_kit::base::TypographyTokens;
 use gpui_kit::component::{ActiveTheme as _, Theme};
+use newjen_core::appearance::{Accent, Appearance, DiffColors, Font, Glass, Mode};
 use objc2_app_kit::NSWorkspace;
 
 pub const SIDEBAR: Pixels = px(255.);
 /// The gap between the window's top, right and bottom edges and the floating card.
 pub const CARD_INSET: Pixels = px(8.);
 pub const CARD_RADIUS: Pixels = px(10.);
-/// The window's rem, and so the size of unstyled text. Kit's own default is 16, which reads
-/// about 15% larger than the mocks and than T3 Code.
-pub const INTERFACE_SIZE: Pixels = px(14.);
-pub const CODE_SIZE: Pixels = px(12.);
-
 /// How opaque menus, popovers and tooltips are. GPUI blurs only what is behind the window, not
 /// the card's own text behind a popover, so anything much more see-through is illegible over
 /// text. This keeps a hint of the glass.
 const POPOVER_ALPHA: f32 = 0.97;
 
-/// The window's materials, chosen by light or dark mode and by Reduce Transparency.
+/// The window's materials, chosen by light or dark mode and by how much glass the user wants.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
     dark: bool,
-    /// Over the blurred window, behind everything. Opaque under Reduce Transparency.
+    /// Over the blurred window, behind everything. Opaque for `Glass::Solid`.
     pub glass_tint: Hsla,
     pub glass_hover: Hsla,
     pub glass_selected: Hsla,
@@ -31,28 +31,27 @@ pub struct Material {
     /// The solid floating panel: the chat, and the recent projects.
     pub card: Hsla,
     pub card_stroke: Hsla,
-    /// Menus, popovers and tooltips: nearly opaque (see `POPOVER_ALPHA`), fully so under Reduce
-    /// Transparency.
+    /// Menus, popovers and tooltips: nearly opaque (see `POPOVER_ALPHA`), fully so for
+    /// `Glass::Solid`.
     pub popover_glass: Hsla,
 }
 
 impl Material {
-    /// Under Reduce Transparency the tint and the popover lose their alpha.
-    pub fn resolve(dark: bool, reduce_transparency: bool) -> Self {
+    pub fn resolve(dark: bool, glass: Glass) -> Self {
         let shade = |hex: u32, alpha: f32| {
             let mut color = Hsla::from(rgb(hex));
             color.a = alpha;
             color
         };
-        let (tint, popover) = if dark {
-            (shade(0x0e0e12, 0.82), shade(0x1b1b21, POPOVER_ALPHA))
-        } else {
-            (shade(0xf4f4f7, 0.82), shade(0xfbfbfd, POPOVER_ALPHA))
+        let (tint_alpha, popover_alpha) = match glass {
+            Glass::Clear => (0.6, POPOVER_ALPHA),
+            Glass::Frosted => (0.82, POPOVER_ALPHA),
+            Glass::Solid => (1.0, 1.0),
         };
-        let (glass_tint, popover_glass) = if reduce_transparency {
-            (Hsla { a: 1.0, ..tint }, Hsla { a: 1.0, ..popover })
+        let (glass_tint, popover_glass) = if dark {
+            (shade(0x0e0e12, tint_alpha), shade(0x1b1b21, popover_alpha))
         } else {
-            (tint, popover)
+            (shade(0xf4f4f7, tint_alpha), shade(0xfbfbfd, popover_alpha))
         };
         if dark {
             Self {
@@ -110,41 +109,186 @@ fn system_reduce_transparency() -> bool {
     NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency()
 }
 
-pub fn material(cx: &App) -> Material {
-    Material::resolve(cx.theme().is_dark(), reduced(cx))
-}
+/// The user's look. Everything visual derives from this one value in `apply`.
+struct Look(Appearance);
 
-/// What the main window is made of: blurred glass, or opaque under Reduce Transparency.
-pub fn window_background(cx: &App) -> WindowBackgroundAppearance {
-    if reduced(cx) {
-        WindowBackgroundAppearance::Opaque
-    } else {
-        WindowBackgroundAppearance::Blurred
+impl Global for Look {}
+
+pub fn appearance(cx: &App) -> &Appearance {
+    static DEFAULT: OnceLock<Appearance> = OnceLock::new();
+    match cx.try_global::<Look>() {
+        Some(look) => &look.0,
+        None => DEFAULT.get_or_init(Appearance::default),
     }
 }
 
-/// Reads the system setting once and applies the materials. Call it after the first
-/// `Theme::change`, before the window opens.
-pub fn install(cx: &mut App) {
+/// The glass the window is really made of: Reduce Transparency overrides the choice.
+fn glass(cx: &App) -> Glass {
+    if reduced(cx) {
+        Glass::Solid
+    } else {
+        appearance(cx).glass
+    }
+}
+
+pub fn material(cx: &App) -> Material {
+    Material::resolve(cx.theme().is_dark(), glass(cx))
+}
+
+/// What the main window is made of: blurred glass, or opaque for solid.
+pub fn window_background(cx: &App) -> WindowBackgroundAppearance {
+    match glass(cx) {
+        Glass::Solid => WindowBackgroundAppearance::Opaque,
+        Glass::Clear | Glass::Frosted => WindowBackgroundAppearance::Blurred,
+    }
+}
+
+/// The conversation column's widest size, or `None` when the user lets it fill the card.
+pub fn column_width(cx: &App) -> Option<Pixels> {
+    appearance(cx)
+        .chat_width
+        .max_points()
+        .map(|points| px(f32::from(points)))
+}
+
+/// The one place that decides between light and dark: `Mode::System` follows the system.
+fn window_appearance(mode: Mode, system: WindowAppearance) -> WindowAppearance {
+    match mode {
+        Mode::System => system,
+        Mode::Light => WindowAppearance::Light,
+        Mode::Dark => WindowAppearance::Dark,
+    }
+}
+
+/// Reads the system's Reduce Transparency setting and the saved look once and applies them.
+/// Call it after `gpui_kit::init`, before the window opens.
+pub fn install(appearance: Appearance, cx: &mut App) {
     cx.set_global(ReduceTransparency(system_reduce_transparency()));
+    cx.set_global(Look(appearance));
+    reload(cx.window_appearance(), cx);
+}
+
+/// The system switched between light and dark.
+pub fn follow_system_appearance(window: &mut Window, cx: &mut App) {
+    reload(window.appearance(), cx);
+}
+
+/// `Theme::change` loads Kit's own colors again, which is also what puts back the ones an
+/// earlier accent or diff palette replaced. `apply` then lays the look on top.
+fn reload(system: WindowAppearance, cx: &mut App) {
+    let mode = window_appearance(appearance(cx).mode, system);
+    Theme::change(mode, None, cx);
     apply(cx);
 }
 
-/// Puts the materials onto Kit's theme. `Theme::change` resets the theme, so call this after
-/// every one.
+/// The accent's swatch, and its color for buttons, focus rings and selection.
+pub fn accent_swatch(accent: Accent) -> Hsla {
+    rgb(match accent {
+        Accent::Graphite => 0x8e8e93,
+        Accent::Blue => 0x3b82f6,
+        Accent::Indigo => 0x6366f1,
+        Accent::Violet => 0x8b5cf6,
+        Accent::Pink => 0xec4899,
+        Accent::Orange => 0xf97316,
+        Accent::Green => 0x22c55e,
+    })
+    .into()
+}
+
+fn lighter(color: Hsla, by: f32) -> Hsla {
+    Hsla {
+        l: (color.l + by).clamp(0., 1.),
+        ..color
+    }
+}
+
+/// Graphite is Kit's own look, so it replaces nothing.
+fn apply_accent(theme: &mut Theme, accent: Accent) {
+    if accent == Accent::Graphite {
+        return;
+    }
+    let base = accent_swatch(accent);
+    let (hover, active) = (lighter(base, 0.05), lighter(base, -0.06));
+    let white = hsla(0., 0., 1., 1.);
+    theme.primary = base;
+    theme.primary_hover = hover;
+    theme.primary_active = active;
+    theme.primary_foreground = white;
+    theme.button_primary = base;
+    theme.button_primary_hover = hover;
+    theme.button_primary_active = active;
+    theme.button_primary_foreground = white;
+    theme.sidebar_primary = base;
+    theme.sidebar_primary_foreground = white;
+    theme.ring = base;
+    theme.selection = base.opacity(0.3);
+    theme.link = base;
+    theme.link_hover = hover;
+    theme.link_active = active;
+    theme.switch = base;
+    theme.slider_bar = base;
+    theme.progress_bar = base;
+    theme.caret = base;
+}
+
+/// Green and red leave Kit's own. Blue and orange take their place everywhere Kit and the app
+/// say added and removed, so counts, diff lines and status marks change together.
+fn apply_diff_colors(theme: &mut Theme, colors: DiffColors) {
+    let (added, removed) = match colors {
+        DiffColors::GreenRed => return,
+        DiffColors::BlueOrange => (rgb(0x3b82f6).into(), rgb(0xf97316).into()),
+    };
+    theme.success = added;
+    theme.success_hover = lighter(added, 0.05);
+    theme.success_active = lighter(added, -0.06);
+    theme.danger = removed;
+    theme.danger_hover = lighter(removed, 0.05);
+    theme.danger_active = lighter(removed, -0.06);
+}
+
+/// The families the machine has, listed once: it costs about 100ms.
+pub fn installed_fonts(cx: &App) -> &'static [String] {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES.get_or_init(|| cx.text_system().all_font_names())
+}
+
+/// GPUI panics laying out text in a family the machine lacks, so a family the user chose is
+/// applied only when it is installed.
+fn usable_family(
+    font: &Font,
+    installed: impl FnOnce() -> &'static [String],
+) -> Option<SharedString> {
+    let name = font.family()?;
+    installed()
+        .iter()
+        .any(|family| family == name)
+        .then(|| name.to_string().into())
+}
+
+/// Puts the materials and the look onto Kit's theme. `Theme::change` resets the theme, so call
+/// this after every one.
 ///
 /// Kit's `background` color becomes the card fill, so everything inside the card shares one
 /// solid. The window root paints the `background` token, so the glass tint takes that token's
 /// place. Dialogs and the drawer also paint it and set the card fill themselves.
 pub fn apply(cx: &mut App) {
     let material = material(cx);
+    let look = appearance(cx).clone();
+    let sans = usable_family(&look.interface_font, || installed_fonts(cx));
+    let mono = usable_family(&look.code_font, || installed_fonts(cx));
     Theme::update(cx, |theme| {
         theme.background = material.card;
         theme.popover = material.popover_glass;
         theme.list_active = material.glass_selected;
         theme.list_hover = material.glass_hover;
-        theme.font_size = INTERFACE_SIZE;
-        theme.mono_font_size = CODE_SIZE;
+        // The default sans is the virtual system font, which Kit resolves to a real family
+        // whenever this field changes; the default mono is Kit's own pick.
+        theme.font_family = sans.unwrap_or_else(|| ".SystemUIFont".into());
+        theme.mono_font_family = mono.unwrap_or_else(|| TypographyTokens::default().mono);
+        theme.font_size = px(f32::from(look.interface_size.points()));
+        theme.mono_font_size = px(f32::from(look.code_size.points()));
+        apply_accent(theme, look.accent);
+        apply_diff_colors(theme, look.diff_colors);
     });
     // Set on the token alone: `Theme::update` would copy it back onto the `background` color.
     Theme::global_mut(cx).tokens.background = material.glass_tint.into();
@@ -170,6 +314,13 @@ fn set_reduced(now: bool, window: &mut Window, cx: &mut App) {
 mod tests {
     use super::*;
     use gpui::{TestAppContext, WindowAppearance};
+    use newjen_core::appearance::{CodeSize, TextSize};
+
+    fn set_look(look: Appearance, system: WindowAppearance, cx: &mut App) {
+        cx.set_global(ReduceTransparency(false));
+        cx.set_global(Look(look));
+        reload(system, cx);
+    }
 
     #[gpui::test]
     fn default_kit_theme_follows_system_appearance(cx: &mut TestAppContext) {
@@ -189,8 +340,8 @@ mod tests {
 
     #[test]
     fn materials_follow_light_and_dark() {
-        let dark = Material::resolve(true, false);
-        let light = Material::resolve(false, false);
+        let dark = Material::resolve(true, Glass::Frosted);
+        let light = Material::resolve(false, Glass::Frosted);
         assert_eq!(dark.glass_tint, Hsla::from(rgb(0x0e0e12)).opacity(0.82));
         assert_eq!(light.glass_tint, Hsla::from(rgb(0xf4f4f7)).opacity(0.82));
         assert_eq!(dark.glass_muted, Hsla::from(rgb(0xa3a3a3)));
@@ -204,22 +355,40 @@ mod tests {
     }
 
     #[test]
-    fn reduce_transparency_makes_the_glass_opaque() {
+    fn glass_sets_how_much_of_the_desktop_shows_through() {
         for dark in [true, false] {
-            let glass = Material::resolve(dark, false);
-            let opaque = Material::resolve(dark, true);
-            assert!(glass.glass_tint.a < 1.0 && glass.popover_glass.a < 1.0);
+            let clear = Material::resolve(dark, Glass::Clear);
+            let frosted = Material::resolve(dark, Glass::Frosted);
+            let solid = Material::resolve(dark, Glass::Solid);
+            assert_eq!(clear.glass_tint.a, 0.6);
+            assert_eq!(frosted.glass_tint.a, 0.82);
+            assert_eq!(solid.glass_tint.a, 1.0);
+            assert!(clear.popover_glass.a < 1.0 && frosted.popover_glass.a < 1.0);
+            assert_eq!(solid.popover_glass.a, 1.0);
+            assert_ne!(solid.glass_tint, solid.card);
+            assert_eq!(solid.card, frosted.card);
             assert_eq!(
-                opaque.glass_tint,
+                solid.glass_tint,
                 Hsla {
                     a: 1.0,
-                    ..glass.glass_tint
+                    ..frosted.glass_tint
                 }
             );
-            assert_eq!(opaque.popover_glass.a, 1.0);
-            assert_ne!(opaque.glass_tint, opaque.card);
-            assert_eq!(opaque.card, glass.card);
         }
+    }
+
+    #[test]
+    fn a_family_is_used_only_when_it_is_installed() {
+        static INSTALLED: [String; 0] = [];
+        let named = Font::Named("Menlo".into());
+        assert_eq!(usable_family(&Font::System, || &INSTALLED), None);
+        assert_eq!(usable_family(&named, || &INSTALLED), None);
+        let installed: &'static [String] = Box::leak(Box::new(["Menlo".to_string()]));
+        assert_eq!(usable_family(&named, || installed), Some("Menlo".into()));
+        assert_eq!(
+            usable_family(&Font::Named("Comic Neue".into()), || installed),
+            None
+        );
     }
 
     #[gpui::test]
@@ -232,8 +401,8 @@ mod tests {
             assert_eq!(cx.theme().colors.background, material(cx).card);
             assert_eq!(cx.theme().tokens.background.color, material(cx).glass_tint);
             assert_eq!(cx.theme().popover, material(cx).popover_glass);
-            assert_eq!(cx.theme().font_size, INTERFACE_SIZE);
-            assert_eq!(cx.theme().mono_font_size, CODE_SIZE);
+            assert_eq!(cx.theme().font_size, px(14.));
+            assert_eq!(cx.theme().mono_font_size, px(12.));
 
             cx.set_global(ReduceTransparency(true));
             apply(cx);
@@ -245,11 +414,168 @@ mod tests {
             Theme::change(WindowAppearance::Light, None, cx);
             assert_ne!(cx.theme().tokens.background.color, material(cx).glass_tint);
             apply(cx);
-            assert_eq!(cx.theme().font_size, INTERFACE_SIZE);
-            assert_eq!(cx.theme().mono_font_size, CODE_SIZE);
+            assert_eq!(cx.theme().font_size, px(14.));
+            assert_eq!(cx.theme().mono_font_size, px(12.));
             assert_eq!(cx.theme().colors.background, material(cx).card);
             assert_eq!(cx.theme().tokens.background.color, material(cx).glass_tint);
             assert_eq!(cx.theme().list_hover, hsla(0., 0., 0., 0.05));
+        });
+    }
+
+    #[gpui::test]
+    fn a_chosen_mode_holds_when_the_system_switches(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for (mode, system, dark) in [
+                (Mode::System, WindowAppearance::Dark, true),
+                (Mode::System, WindowAppearance::Light, false),
+                (Mode::Light, WindowAppearance::Dark, false),
+                (Mode::Dark, WindowAppearance::Light, true),
+            ] {
+                let look = Appearance {
+                    mode,
+                    ..Appearance::default()
+                };
+                set_look(look, system, cx);
+                assert_eq!(cx.theme().is_dark(), dark, "{mode:?} on {system:?}");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn every_accent_colors_buttons_rings_and_selection_and_graphite_puts_kit_back(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            Theme::change(WindowAppearance::Dark, None, cx);
+            let kit = (cx.theme().primary, cx.theme().ring, cx.theme().selection);
+            for &accent in Accent::ALL {
+                let look = Appearance {
+                    accent,
+                    ..Appearance::default()
+                };
+                set_look(look.clone(), WindowAppearance::Dark, cx);
+                let theme = cx.theme();
+                if accent == Accent::Graphite {
+                    assert_eq!((theme.primary, theme.ring, theme.selection), kit);
+                    continue;
+                }
+                let base = accent_swatch(accent);
+                assert_eq!(theme.primary, base, "{accent:?}");
+                assert_eq!(theme.tokens.button_primary.color, base);
+                assert_eq!(theme.ring, base);
+                assert_eq!(theme.link, base);
+                assert_eq!(theme.caret, base);
+                assert_eq!(theme.selection, base.opacity(0.3));
+                assert_ne!(theme.primary_hover, base);
+
+                set_look(look, WindowAppearance::Light, cx);
+                assert_eq!(cx.theme().primary, base, "{accent:?} in light");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn blue_and_orange_replace_added_and_removed_and_green_red_puts_kit_back(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            Theme::change(WindowAppearance::Dark, None, cx);
+            let kit = (cx.theme().success, cx.theme().danger);
+            let look = Appearance {
+                diff_colors: DiffColors::BlueOrange,
+                ..Appearance::default()
+            };
+            set_look(look, WindowAppearance::Dark, cx);
+            let (added, removed) = (cx.theme().success, cx.theme().danger);
+            assert_eq!(added, Hsla::from(rgb(0x3b82f6)));
+            assert_eq!(removed, Hsla::from(rgb(0xf97316)));
+            assert_ne!(cx.theme().success_hover, added);
+            assert_ne!(cx.theme().danger_active, removed);
+
+            Theme::change(WindowAppearance::Light, None, cx);
+            apply(cx);
+            assert_eq!(cx.theme().success, added);
+
+            set_look(Appearance::default(), WindowAppearance::Dark, cx);
+            assert_eq!((cx.theme().success, cx.theme().danger), kit);
+        });
+    }
+
+    #[gpui::test]
+    fn glass_reaches_the_window_and_reduce_transparency_wins(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for (glass, alpha, background) in [
+                (Glass::Clear, 0.6, WindowBackgroundAppearance::Blurred),
+                (Glass::Frosted, 0.82, WindowBackgroundAppearance::Blurred),
+                (Glass::Solid, 1.0, WindowBackgroundAppearance::Opaque),
+            ] {
+                let look = Appearance {
+                    glass,
+                    ..Appearance::default()
+                };
+                set_look(look, WindowAppearance::Dark, cx);
+                assert_eq!(cx.theme().tokens.background.color.a, alpha);
+                assert_eq!(window_background(cx), background);
+            }
+            set_look(
+                Appearance {
+                    glass: Glass::Clear,
+                    ..Appearance::default()
+                },
+                WindowAppearance::Dark,
+                cx,
+            );
+            cx.set_global(ReduceTransparency(true));
+            apply(cx);
+            assert_eq!(cx.theme().tokens.background.color.a, 1.0);
+            assert_eq!(window_background(cx), WindowBackgroundAppearance::Opaque);
+        });
+    }
+
+    #[gpui::test]
+    fn sizes_reach_the_theme_and_a_missing_family_falls_back(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            set_look(Appearance::default(), WindowAppearance::Dark, cx);
+            let (sans, mono) = (
+                cx.theme().font_family.clone(),
+                cx.theme().mono_font_family.clone(),
+            );
+            let look = Appearance {
+                interface_size: TextSize::new(16),
+                code_size: CodeSize::new(10),
+                interface_font: Font::Named("No Such Family 7".into()),
+                code_font: Font::Named("No Such Mono 7".into()),
+                ..Appearance::default()
+            };
+            set_look(look, WindowAppearance::Dark, cx);
+            assert_eq!(cx.theme().font_size, px(16.));
+            assert_eq!(cx.theme().mono_font_size, px(10.));
+            assert_eq!(cx.theme().font_family, sans);
+            assert_eq!(cx.theme().mono_font_family, mono);
+        });
+    }
+
+    #[gpui::test]
+    fn the_chat_column_follows_the_chat_width(cx: &mut TestAppContext) {
+        use newjen_core::appearance::ChatWidth;
+        cx.update(|cx| {
+            assert_eq!(column_width(cx), Some(px(720.)));
+            for (width, expected) in [
+                (ChatWidth::Wide, Some(px(900.))),
+                (ChatWidth::Full, None),
+                (ChatWidth::Comfortable, Some(px(720.))),
+            ] {
+                cx.set_global(Look(Appearance {
+                    chat_width: width,
+                    ..Appearance::default()
+                }));
+                assert_eq!(column_width(cx), expected);
+            }
         });
     }
 }

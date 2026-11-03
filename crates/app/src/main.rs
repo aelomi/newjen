@@ -117,10 +117,17 @@ fn main() {
     let running_instance = instance.clone();
     application.run(move |cx: &mut App| {
         gpui_kit::init(cx);
-        // Match the system's light/dark mode from the first frame (no flash).
-        gpui_kit::component::Theme::change(cx.window_appearance(), None, cx);
-        // The window's glass materials sit on Kit's theme; Reduce Transparency is read here too.
-        theme::install(cx);
+        // The saved look, applied before the window opens so the first frame is right (no
+        // flash). A problem reading it, or no store at all, gives the defaults. Reduce
+        // Transparency is read here too.
+        let look = match &startup {
+            Ok(store) => store.appearance().unwrap_or_else(|error| {
+                eprintln!("newjen: could not read the appearance: {error:#}");
+                Default::default()
+            }),
+            Err(_) => Default::default(),
+        };
+        theme::install(look, cx);
         // And its Reduce Motion setting; the chat view's clock keeps it in step.
         gpui_kit::base::apply_system_reduce_motion(cx);
 
@@ -400,12 +407,9 @@ fn open_window(
         ..Default::default()
     };
     let (window_handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
-        // Follow the system when it switches between light and dark.
+        // Follow the system when it switches between light and dark, unless the mode is chosen.
         window
-            .observe_window_appearance(|window, cx| {
-                gpui_kit::component::Theme::change(window.appearance(), Some(window), cx);
-                theme::apply(cx);
-            })
+            .observe_window_appearance(theme::follow_system_appearance)
             .detach();
         let view = cx.new(|cx| ProjectView::new(store, home, project, window, cx));
         // The Dock badge, notifications and the native quit hook, once for the app's life.

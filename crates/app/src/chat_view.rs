@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Pixels, Render, ScrollHandle, SharedString, Styled, Subscription,
-    Task, Window, WindowControlArea, div, font, prelude::*, px,
+    MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Task,
+    Window, WindowControlArea, div, font, prelude::*, px,
 };
 use gpui_kit::base::input::{InputAccessibility, TextareaState};
 use gpui_kit::base::{h_flex, v_flex};
@@ -55,7 +55,7 @@ use crate::reply;
 use crate::rows::{self, OnRestart};
 use crate::sidebar::{self, OnPress, Placement, RowFacts};
 use crate::terminal::TerminalPanel;
-use crate::theme::{CARD_INSET, CARD_RADIUS, SIDEBAR};
+use crate::theme::{self, CARD_INSET, CARD_RADIUS, SIDEBAR};
 use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
 use crate::ui;
 use crate::ui::DOCK_METRICS;
@@ -72,9 +72,6 @@ enum Pane {
     Thread,
     Usage,
 }
-
-/// The conversation column is capped at this width and centered, as in the mocks.
-const COLUMN_WIDTH: Pixels = px(720.0);
 
 /// The answered approval card kept on screen while it fades (`ui::EXIT_FADE`).
 struct DockGhost {
@@ -2112,7 +2109,13 @@ impl ChatView {
             .when(notice_row, |row| {
                 row.debug_selector(|| "chat-notice".to_string())
             })
-            .child(div().w_full().max_w(COLUMN_WIDTH).py_2().child(row))
+            .child(
+                div()
+                    .w_full()
+                    .when_some(theme::column_width(cx), |column, width| column.max_w(width))
+                    .py_2()
+                    .child(row),
+            )
             .into_any_element()
     }
 
@@ -2233,7 +2236,7 @@ impl ChatView {
             ))
             .when(no_agent, |column| {
                 column.child(
-                    div().max_w(COLUMN_WIDTH).text_center().child(
+                    div().when_some(theme::column_width(cx), |notice, width| notice.max_w(width)).text_center().child(
                         ui::caption(
                             "Newjen drives the Claude or Codex CLI installed and signed in on this Mac with your own account. Install one, then Refresh.",
                             cx,
@@ -2359,7 +2362,8 @@ impl ChatView {
             .unwrap_or(f32::from(font_size) * 0.6)
             .max(1.0);
         let viewport = window.viewport_size();
-        let dock_width = (main_width - m.page_padding * 2.).min(f32::from(COLUMN_WIDTH));
+        let room = main_width - m.page_padding * 2.;
+        let dock_width = theme::column_width(cx).map_or(room, |width| room.min(f32::from(width)));
         // One column spare: real wrapping is a little less tidy than the estimate.
         let cols = ((dock_width - m.detail_inset()) / char_width).max(0.0) as usize;
         let cols = cols.saturating_sub(1);
@@ -3019,7 +3023,7 @@ impl ChatView {
         let column = v_flex()
             .relative()
             .w_full()
-            .max_w(COLUMN_WIDTH)
+            .when_some(theme::column_width(cx), |column, width| column.max_w(width))
             .gap(px(DOCK_METRICS.scope_gap))
             .children(problem)
             .children(limit_notice)
