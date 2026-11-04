@@ -481,8 +481,23 @@ struct Number {
     mix: Tween<f32>,
 }
 
+/// How many times slower debug builds run the motion, from `NEWJEN_MOTION_SLOW`: 5 shows every
+/// step at a fifth of its speed, to look at it or to record it. Release builds ignore it.
+fn slowdown() -> f32 {
+    if !cfg!(debug_assertions) {
+        return 1.;
+    }
+    std::env::var("NEWJEN_MOTION_SLOW")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|factor| factor.is_finite() && *factor > 1.)
+        .unwrap_or(1.)
+}
+
 #[derive(Default)]
 pub struct Motion {
+    slow: Option<f32>,
+    epoch: Option<Instant>,
     started: bool,
     snap: bool,
     live: Vec<Key>,
@@ -537,7 +552,18 @@ impl Motion {
             .count()
     }
 
+    /// The time the motion runs on: `now`, stretched by [`slowdown`] from the first call on.
+    fn dilate(&mut self, now: Instant) -> Instant {
+        let slow = *self.slow.get_or_insert_with(slowdown);
+        if slow <= 1. {
+            return now;
+        }
+        let epoch = *self.epoch.get_or_insert(now);
+        epoch + now.saturating_duration_since(epoch).div_f32(slow)
+    }
+
     pub fn step(&mut self, now: Instant, sight: Sight, reduce: bool) -> Frame {
+        let now = self.dilate(now);
         let animate = self.started && !std::mem::take(&mut self.snap);
         self.started = true;
         if !animate {
@@ -1286,5 +1312,21 @@ mod tests {
         assert!((lowered - seen).abs() < 1e-4);
         let later = motion.step(at(now, 120), sight(false), false).raised.panel;
         assert!(later < lowered);
+    }
+
+    #[test]
+    fn a_slowdown_stretches_the_time_the_motion_runs_on() {
+        let start = Instant::now();
+        let mut motion = Motion {
+            slow: Some(5.),
+            ..Motion::default()
+        };
+        assert_eq!(motion.dilate(start), start);
+        assert_eq!(motion.dilate(at(start, 500)), at(start, 100));
+        let mut normal = Motion {
+            slow: Some(1.),
+            ..Motion::default()
+        };
+        assert_eq!(normal.dilate(at(start, 500)), at(start, 500));
     }
 }
