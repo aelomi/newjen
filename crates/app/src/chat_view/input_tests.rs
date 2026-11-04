@@ -2911,6 +2911,38 @@ async fn a_hidden_list_runs_no_motion_and_shows_where_it_is_when_it_returns(
 }
 
 #[gpui::test]
+async fn the_list_follows_the_interface_text_size(cx: &mut TestAppContext) {
+    use newjen_core::appearance::{Appearance, TextSize};
+    let (chat, path, cx) = setup(cx, "text-size", false);
+    add_idle_thread(&chat, cx, "a row", true, Default::default());
+    let_motion_finish(&chat, cx);
+    let mut heights = Vec::new();
+    for points in [14u8, 16, 12] {
+        cx.update(|window, cx| {
+            theme::set_appearance(
+                Appearance {
+                    interface_size: TextSize::new(points),
+                    ..Appearance::default()
+                },
+                Some(window),
+                cx,
+            )
+        });
+        cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+        cx.run_until_parked();
+        heights.push(cx.debug_bounds("thread-row").unwrap().size.height);
+    }
+    let grown = heights[1] - heights[0];
+    let shrunk = heights[0] - heights[2];
+    let step = px(sidebar::ROW_HEIGHT * (2. / sidebar::BASE_TEXT));
+    assert!(
+        (grown - step).abs() <= px(1.) && (shrunk - step).abs() <= px(1.),
+        "a row grows and shrinks by {step:?} for two points, to the pixel: {heights:?}"
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
 async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "settle-motion", true);
     let id = add_idle_thread(&chat, cx, "first thread", true, Default::default());

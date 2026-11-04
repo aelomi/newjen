@@ -13,14 +13,14 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 
-use super::{Counted, Edge, Key, Look, OnOpen, OnPress, faint, muted, number, pulse, slot};
+use super::{Counted, Edge, Key, Look, OnOpen, OnPress, faint, muted, number, pulse, scaled, slot};
 use crate::ui::{self, IconName};
 
 /// Rows the tray shows before a quiet "+N more".
 pub const TRAY_ROWS: usize = 3;
 
 /// The height of a tray row and of the Snoozed and Settled rows.
-pub const ROW: Pixels = px(30.);
+pub const ROW: f32 = 30.;
 
 /// The room under the last dock row.
 const FOOT: Pixels = px(4.);
@@ -29,13 +29,13 @@ const FOOT: Pixels = px(4.);
 const LIFT: Pixels = px(4.);
 
 /// The height of the In flight header.
-pub const TRAY_HEADER: Pixels = px(30.);
+pub const TRAY_HEADER: f32 = 30.;
 
 /// The height of the rule above the Snoozed and Settled rows, with its margins.
-pub const SEP: Pixels = px(13.);
+pub const SEP: f32 = 13.;
 
 /// A panel row.
-const PANEL_ROW: Pixels = px(32.);
+const PANEL_ROW: f32 = 32.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SheetKind {
@@ -214,13 +214,13 @@ fn tray_header(count: Counted, cx: &App) -> AnyElement {
         )
     };
     h_flex()
-        .h(TRAY_HEADER)
+        .h(scaled(TRAY_HEADER, cx))
         .items_center()
         .gap_2()
         .px_2()
         .pt_2()
         .pb_1()
-        .text_size(px(11.))
+        .text_size(scaled(11., cx))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(faint(cx))
         .child("In flight")
@@ -258,7 +258,7 @@ fn tray_row(row: &TrayRow, dim: f32, cx: &App) -> AnyElement {
         .id((ElementId::from("tray-row"), row.id.clone()))
         .debug_selector(|| "tray-row".to_string())
         .flex_none()
-        .h(ROW)
+        .h(scaled(ROW, cx))
         .flex()
         .items_center()
         .gap(px(7.))
@@ -275,13 +275,13 @@ fn tray_row(row: &TrayRow, dim: f32, cx: &App) -> AnyElement {
         .child(
             ui::ellipsis(row.title.clone())
                 .flex_1()
-                .text_size(px(12.5))
+                .text_size(scaled(12.5, cx))
                 .text_color(cx.theme().sidebar_foreground.opacity(0.86)),
         )
         .child(
             div()
                 .flex_none()
-                .text_size(px(11.5))
+                .text_size(scaled(11.5, cx))
                 .text_color(faint(cx))
                 .child(row.clock.label().to_string()),
         )
@@ -312,14 +312,14 @@ fn disclosure(
         .id((ElementId::from("disclosure"), SharedString::from(label)))
         .debug_selector(|| format!("disclosure-{}", label.to_lowercase()))
         .flex_none()
-        .h(ROW)
+        .h(scaled(ROW, cx))
         .flex()
         .items_center()
         .gap_1p5()
         .px_2()
         .rounded(px(6.))
         .cursor_pointer()
-        .text_size(px(12.5))
+        .text_size(scaled(12.5, cx))
         .text_color(color)
         .when(is_open, |row| row.bg(material.glass_selected))
         .when(!is_open, |row| {
@@ -343,7 +343,7 @@ fn disclosure(
         .child(div().flex_1())
         .child(
             div()
-                .text_size(px(11.5))
+                .text_size(scaled(11.5, cx))
                 .text_color(faint(cx))
                 .child(number(count, Edge::Right)),
         )
@@ -374,12 +374,14 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
         SheetKind::Settled => 1.,
     };
     let record = bounds.clone();
+    let scale = super::scale(cx);
     let mut root = v_flex().id("dock").relative().flex_none().pt_0p5().pb(FOOT);
     if let Some(flight) = flight {
         root = root.child(slot(
             &Key::Flight,
             flight.look,
             tray_header(flight.count, cx),
+            scale,
         ));
     }
     for item in &tray {
@@ -387,6 +389,7 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
             &Key::Tray(item.row.id.clone()),
             item.look,
             tray_row(&item.row, dim, cx),
+            scale,
         ));
     }
     if let Some(more) = more_label(tray_total) {
@@ -395,13 +398,13 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
                 .px_2p5()
                 .pt_1()
                 .pb_0p5()
-                .text_size(px(11.5))
+                .text_size(scaled(11.5, cx))
                 .text_color(faint(cx))
                 .child(more),
         );
     }
     if let Some(look) = sep {
-        root = root.child(slot(&Key::Sep, look, separator(cx)));
+        root = root.child(slot(&Key::Sep, look, separator(cx), scale));
     }
     for (kind, fold) in [(SheetKind::Snoozed, snoozed), (SheetKind::Settled, settled)] {
         if let Some(fold) = fold {
@@ -409,6 +412,7 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
                 &Key::Disclosure(kind),
                 fold.look,
                 disclosure(kind, fold.count, open, dim, &on_open, cx),
+                scale,
             ));
         }
     }
@@ -418,7 +422,7 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
             .inset_0(),
     );
     if let Some(panel) = panel {
-        let bottom = FOOT + ROW * rows_below(panel.kind) + LIFT;
+        let bottom = FOOT + scaled(ROW, cx) * rows_below(panel.kind) + LIFT;
         root = root.child(sheet(panel, bottom, bounds, window, cx));
     }
     Some(root.into_any_element())
@@ -461,7 +465,7 @@ fn sheet(
                 div()
                     .px_2()
                     .py_3()
-                    .text_size(px(12.5))
+                    .text_size(scaled(12.5, cx))
                     .text_color(faint(cx))
                     .child("No matches"),
             )
@@ -573,7 +577,7 @@ fn filter_bar(panel: &Panel, cx: &App) -> AnyElement {
                 .debug_selector(|| "sheet-bulk".to_string())
                 .flex_none()
                 .px_1()
-                .text_size(px(11.5))
+                .text_size(scaled(11.5, cx))
                 .text_color(muted(cx))
                 .when(enabled, |label| {
                     label
@@ -601,7 +605,7 @@ fn confirm_bar(confirm: Confirm, panel: &Panel, cx: &App) -> AnyElement {
             .items_center()
             .rounded(px(6.))
             .cursor_pointer()
-            .text_size(px(11.5))
+            .text_size(scaled(11.5, cx))
             .child(label)
     };
     h_flex()
@@ -616,8 +620,8 @@ fn confirm_bar(confirm: Confirm, panel: &Panel, cx: &App) -> AnyElement {
                 .flex_1()
                 .min_w_0()
                 .pl_0p5()
-                .text_size(px(11.5))
-                .line_height(px(15.))
+                .text_size(scaled(11.5, cx))
+                .line_height(scaled(15., cx))
                 .text_color(muted(cx))
                 .child(archive_question(confirm)),
         )
@@ -642,7 +646,7 @@ fn group_block(group: &PanelGroup, cx: &App) -> AnyElement {
                 .px_2()
                 .pt(px(9.))
                 .pb(px(3.))
-                .text_size(px(10.5))
+                .text_size(scaled(10.5, cx))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(faint(cx))
                 .child(group.label.to_uppercase()),
@@ -658,7 +662,7 @@ fn panel_row(row: &PanelRow, cx: &App) -> AnyElement {
         .id(id)
         .debug_selector(|| "sheet-row".to_string())
         .flex_none()
-        .h(PANEL_ROW)
+        .h(scaled(PANEL_ROW, cx))
         .flex()
         .items_center()
         .gap(px(9.))
@@ -679,13 +683,13 @@ fn panel_row(row: &PanelRow, cx: &App) -> AnyElement {
         .child(
             ui::ellipsis(row.title.clone())
                 .flex_1()
-                .text_size(px(12.5))
+                .text_size(scaled(12.5, cx))
                 .text_color(cx.theme().sidebar_foreground.opacity(0.86)),
         )
         .child(
             div()
                 .flex_none()
-                .text_size(px(11.5))
+                .text_size(scaled(11.5, cx))
                 .text_color(faint(cx))
                 .child(row.when.clone()),
         )

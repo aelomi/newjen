@@ -3300,6 +3300,7 @@ impl ChatView {
             .slots
             .get(self.active)
             .map(|slot| slot.thread.read(cx).id().to_string());
+        let scale = sidebar::scale(cx);
         let mut elements = Vec::new();
         for item in frame.lane(sidebar::Lane::List) {
             let content = match &item.key {
@@ -3331,7 +3332,10 @@ impl ChatView {
                     };
                     sidebar::section_header(*section, count, needs, cx)
                 }
-                sidebar::Key::Gap => div().flex_none().h(sidebar::READ_GAP).into_any_element(),
+                sidebar::Key::Gap => div()
+                    .flex_none()
+                    .h(sidebar::scaled(sidebar::READ_GAP, cx))
+                    .into_any_element(),
                 sidebar::Key::Row(_, id) => {
                     let live = (!item.ghost).then(|| self.index_of(id, cx)).flatten();
                     match live {
@@ -3363,7 +3367,7 @@ impl ChatView {
             {
                 self.list_scroll.scroll_to_item(elements.len());
             }
-            elements.push(sidebar::slot(&item.key, item.look, content));
+            elements.push(sidebar::slot(&item.key, item.look, content, scale));
         }
         self.reveal_active.set(false);
         elements

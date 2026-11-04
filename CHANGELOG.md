@@ -23,6 +23,7 @@ Every user-visible change adds a line under `## Unreleased`, in one of four grou
 - Tooltips, menus and popovers are fully opaque, so the text behind them no longer shows through.
 - Rows in the thread list move with some ease. A working thread folds into the In flight tray when you switch away, a finished one lands in the Queue, a read one drops out of it, and a settled or snoozed one slides away. The gap closes after the row fades, and the counts crossfade. The Snoozed and Settled panels rise from their row while everything behind them dims. Reduce Motion keeps the fades and drops the movement.
 - Text is smaller and calmer: a 14 pt base instead of 16, quieter secondary lines in the thread list, your messages in a soft gray bubble instead of a white one, and a lighter composer border.
+- The thread list, the In flight tray and the Snoozed and Settled panels follow the interface text size from Settings, rows and all.
 
 ## 0.1.0-alpha.2 · 3 November 2026
 

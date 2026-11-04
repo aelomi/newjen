@@ -38,7 +38,7 @@ const LOWER: Duration = ms(160);
 const DIM: Duration = ms(220);
 
 /// The height of a section header.
-pub const HEADER_HEIGHT: Pixels = px(35.);
+pub const HEADER_HEIGHT: f32 = 35.;
 
 /// Where a thread shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,16 +104,18 @@ impl Key {
         }
     }
 
-    /// The height the element has when it is fully there.
-    pub fn natural(&self) -> Pixels {
-        match self {
+    /// The height the element has when it is fully there, at `scale` times the mock's text
+    /// size (`sidebar::scale`).
+    pub fn natural(&self, scale: f32) -> Pixels {
+        let at_base = match self {
             Self::Header(_) => HEADER_HEIGHT,
             Self::Gap => READ_GAP,
             Self::Row(..) => ROW_HEIGHT,
             Self::Flight => dock::TRAY_HEADER,
             Self::Tray(_) | Self::Disclosure(_) => dock::ROW,
             Self::Sep => dock::SEP,
-        }
+        };
+        px(at_base * scale)
     }
 
     /// The zone and thread of a key that is a thread's row.
@@ -802,10 +804,10 @@ impl Motion {
     }
 }
 
-/// An element in its place in the list, drawn as far along as `look` says. The box has an id of
-/// its own, so a row that leaves in one zone and arrives in another is two elements, each with
-/// its own state.
-pub fn slot(key: &Key, look: Look, content: AnyElement) -> AnyElement {
+/// An element in its place in the list, drawn as far along as `look` says, with its natural
+/// height at `scale` (`sidebar::scale`). The box has an id of its own, so a row that leaves in
+/// one zone and arrives in another is two elements, each with its own state.
+pub fn slot(key: &Key, look: Look, content: AnyElement, scale: f32) -> AnyElement {
     let slot = div().id(key.element_id()).flex_none();
     if look.is_steady() {
         return slot.child(content).into_any_element();
@@ -821,7 +823,7 @@ pub fn slot(key: &Key, look: Look, content: AnyElement) -> AnyElement {
         content
     };
     let slot = if look.size < 1. {
-        slot.h(key.natural() * look.size).overflow_hidden()
+        slot.h(key.natural(scale) * look.size).overflow_hidden()
     } else {
         slot
     };

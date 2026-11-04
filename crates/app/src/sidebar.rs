@@ -63,6 +63,21 @@ pub const ALL_CLEAR: &str = "All clear";
 /// How far the game sits above the foot of the list, which is the top of the dock.
 pub const GAME_LIFT: Pixels = px(30.);
 
+/// The interface text size the sidebar's mocks were drawn at, in points. Text sizes and the
+/// heights that hold them are given at this base and follow the Appearance page's text size
+/// from there.
+pub const BASE_TEXT: f32 = 14.;
+
+/// How much larger or smaller than the mock the interface text is.
+pub fn scale(cx: &App) -> f32 {
+    f32::from(cx.theme().font_size) / BASE_TEXT
+}
+
+/// `at_base` pixels at the mock's text size, scaled to the one in use.
+pub fn scaled(at_base: f32, cx: &App) -> Pixels {
+    px(at_base * scale(cx))
+}
+
 /// Secondary text on the glass: a row's detail line.
 pub fn muted(cx: &App) -> gpui::Hsla {
     crate::theme::material(cx).glass_muted.opacity(0.62)
@@ -252,7 +267,7 @@ pub enum Entry {
 }
 
 /// The room between the Queue and the read list.
-pub const READ_GAP: Pixels = px(14.);
+pub const READ_GAP: f32 = 14.;
 
 /// Where each thread shows, as indexes into the view's thread order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -780,13 +795,13 @@ pub fn section_header(section: Section, count: Counted, needs: Counted, cx: &App
     h_flex()
         .debug_selector(|| "section-header".to_string())
         .flex_none()
-        .h(HEADER_HEIGHT)
+        .h(scaled(HEADER_HEIGHT, cx))
         .items_center()
         .gap_2()
         .px_2()
         .pt_3()
         .pb(px(5.))
-        .text_size(px(11.))
+        .text_size(scaled(11., cx))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(material.glass_muted)
         .child(label)
@@ -850,7 +865,7 @@ impl Row {
 }
 
 /// The height of a thread row.
-pub const ROW_HEIGHT: Pixels = px(48.);
+pub const ROW_HEIGHT: f32 = 48.;
 
 /// What a row can do beyond opening: the buttons that show on hover and the right-click menu.
 pub struct RowActions {
@@ -1012,7 +1027,7 @@ pub fn thread_row(
         .items_center()
         .gap_1()
         .min_w_0()
-        .text_size(px(12.))
+        .text_size(scaled(12., cx))
         .text_color(detail_color)
         .children(row.in_copy.then(|| {
             ui::icon(
@@ -1029,13 +1044,13 @@ pub fn thread_row(
         .child(
             ui::ellipsis(row.title)
                 .flex_1()
-                .text_size(px(13.))
+                .text_size(scaled(13., cx))
                 .when(row.strong, |title| title.font_weight(FontWeight::SEMIBOLD)),
         )
         .children(row.time.map(|time| {
             div()
                 .flex_none()
-                .text_size(px(11.5))
+                .text_size(scaled(11.5, cx))
                 .text_color(material.glass_muted)
                 .child(time)
         }));
@@ -1044,7 +1059,7 @@ pub fn thread_row(
         .map(|actions| hover_actions(&row.id, actions, group.clone(), cx));
     let item = ListItem::new((ElementId::from("thread-row"), row.id))
         .w_full()
-        .h(ROW_HEIGHT)
+        .h(scaled(ROW_HEIGHT, cx))
         .px(px(8.))
         .py(px(7.))
         .rounded(px(7.))
@@ -1132,6 +1147,21 @@ mod tests {
             background_tasks: 0,
             updated_at: NOW - 4 * 60 * 1000,
         }
+    }
+
+    #[gpui::test]
+    fn sizes_follow_the_interface_text_size(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for points in [12., 14., 16.] {
+                gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(points));
+                assert_eq!(scaled(BASE_TEXT, cx), px(points));
+                assert_eq!(
+                    scaled(ROW_HEIGHT, cx),
+                    px(ROW_HEIGHT * (points / BASE_TEXT))
+                );
+            }
+        });
     }
 
     #[test]
