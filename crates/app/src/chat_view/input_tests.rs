@@ -558,6 +558,7 @@ async fn reply_copy_and_chrome_clicks_preserve_keyboard_behavior(cx: &mut TestAp
     cx.simulate_keystrokes("cmd-b cmd-n");
     assert!(focused(cx));
     assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
+    let_motion_finish(&chat, cx);
     // The first thread is still finishing in the tray, or already in the list.
     let first = if cx.debug_bounds("tray-row").is_some() {
         "tray-row"
@@ -2311,6 +2312,7 @@ async fn the_sidebar_lists_threads_and_its_usage_row_opens_the_usage_view(cx: &m
             ]
         );
     });
+    let_motion_finish(&chat, cx);
     assert!(cx.debug_bounds("thread-row").is_some());
     // The usage row opens the Usage view in place of the thread, and a thread row returns.
     assert!(cx.debug_bounds("usage-view").is_none());
@@ -2392,7 +2394,7 @@ async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) 
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
     cx.simulate_keystrokes("cmd-n");
-    cx.run_until_parked();
+    let_motion_finish(&chat, cx);
     let ghosts = |cx: &mut VisualTestContext| {
         cx.update(|_, cx| {
             chat.read(cx)

@@ -2859,11 +2859,31 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let now = Instant::now();
-        let tray = layout
-            .in_flight
-            .iter()
-            .filter_map(|ix| self.tray_row(*ix, now, cx))
-            .collect();
+        let frame = self.frame.borrow();
+        let mut tray = Vec::new();
+        for item in frame.lane(sidebar::Lane::Dock) {
+            let sidebar::Key::Tray(id) = &item.key else {
+                continue;
+            };
+            let live = (!item.ghost).then(|| self.index_of(id, cx)).flatten();
+            let row = match live.and_then(|ix| self.tray_row(ix, now, cx)) {
+                Some(row) => {
+                    self.motion.borrow_mut().remember_tray(&row);
+                    row
+                }
+                None => {
+                    let Some(mut row) = self.motion.borrow().tray(id).cloned() else {
+                        continue;
+                    };
+                    row.on_press = Rc::new(|_, _| {});
+                    row
+                }
+            };
+            tray.push(sidebar::TrayItem {
+                row,
+                look: item.look,
+            });
+        }
         let on_open = {
             let view = cx.weak_entity();
             Rc::new(move |kind, window: &mut Window, cx: &mut App| {
@@ -2874,7 +2894,6 @@ impl ChatView {
             .sheet
             .as_ref()
             .map(|sheet| self.sheet_panel(sheet, layout, window, cx));
-        let frame = self.frame.borrow();
         let fold = |kind: sidebar::SheetKind, counter: sidebar::Counter| {
             frame
                 .item(&sidebar::Key::Disclosure(kind))
@@ -2885,7 +2904,15 @@ impl ChatView {
         };
         sidebar::dock(
             sidebar::Dock {
+                flight: frame
+                    .item(&sidebar::Key::Flight)
+                    .map(|item| sidebar::Flight {
+                        count: frame.counted(sidebar::Counter::Flight),
+                        look: item.look,
+                    }),
                 tray,
+                tray_total: layout.in_flight.len(),
+                sep: frame.item(&sidebar::Key::Sep).map(|item| item.look),
                 snoozed: fold(sidebar::SheetKind::Snoozed, sidebar::Counter::Snoozed),
                 settled: fold(sidebar::SheetKind::Settled, sidebar::Counter::Settled),
                 open: self.sheet.as_ref().map(|sheet| sheet.kind),
@@ -3139,6 +3166,15 @@ impl ChatView {
                 }
             }
         }
+        if !layout.in_flight.is_empty() {
+            sight.keys.push(sidebar::Key::Flight);
+            sight
+                .counts
+                .push((sidebar::Counter::Flight, layout.in_flight.len()));
+            for ix in layout.in_flight.iter().take(sidebar::TRAY_ROWS) {
+                sight.keys.push(sidebar::Key::Tray(ids[*ix].clone()));
+            }
+        }
         sight.zones = ids
             .iter()
             .enumerate()
@@ -3201,7 +3237,9 @@ impl ChatView {
                     let live = (!item.ghost).then(|| self.index_of(id, cx)).flatten();
                     match live {
                         Some(ix) => {
-                            let Some((row, element)) = self.render_thread_row(ix, now, cx) else {
+                            let Some((row, element)) =
+                                self.render_thread_row(ix, now, item.look.mark, cx)
+                            else {
                                 continue;
                             };
                             motion.remember_row(&row);
@@ -3211,11 +3249,14 @@ impl ChatView {
                             let Some(row) = motion.row(id).cloned() else {
                                 continue;
                             };
-                            sidebar::thread_row(row, None, Rc::new(|_, _| {}), cx)
+                            sidebar::thread_row(row, None, Rc::new(|_, _| {}), 1., cx)
                         }
                     }
                 }
-                sidebar::Key::Disclosure(_) => continue,
+                sidebar::Key::Flight
+                | sidebar::Key::Tray(_)
+                | sidebar::Key::Sep
+                | sidebar::Key::Disclosure(_) => continue,
             };
             if !item.ghost
                 && matches!(&item.key, sidebar::Key::Row(_, id) if active.as_deref() == Some(id.as_ref()))
@@ -3233,6 +3274,7 @@ impl ChatView {
         &self,
         ix: usize,
         now: Instant,
+        grown: f32,
         cx: &mut Context<Self>,
     ) -> Option<(sidebar::Row, AnyElement)> {
         let now_ms = now_ms();
@@ -3266,7 +3308,7 @@ impl ChatView {
             view.show_thread(&shown, window, cx)
         });
         let actions = (!draft_row).then(|| self.row_actions(&id, pinned, cx));
-        let element = sidebar::thread_row(row.clone(), actions, on_press, cx);
+        let element = sidebar::thread_row(row.clone(), actions, on_press, grown, cx);
         Some((row, element))
     }
 

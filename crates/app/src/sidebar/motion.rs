@@ -20,7 +20,7 @@ use gpui::{
 };
 use newjen_core::steps::Placement as ThreadPlacement;
 
-use super::dock::{self, SheetKind};
+use super::dock::{self, SheetKind, TrayRow};
 use super::{READ_GAP, ROW_HEIGHT, Row, Section};
 use crate::ui::Tween;
 
@@ -81,6 +81,12 @@ pub enum Key {
     /// A thread's row in one of the list's zones. A move changes the zone, so it is a leave and
     /// an arrival.
     Row(Zone, SharedString),
+    /// The In flight header.
+    Flight,
+    /// A thread's row in the In flight tray.
+    Tray(SharedString),
+    /// The rule between the tray and the Snoozed and Settled rows.
+    Sep,
     Disclosure(SheetKind),
 }
 
@@ -88,7 +94,7 @@ impl Key {
     pub fn lane(&self) -> Lane {
         match self {
             Self::Header(_) | Self::Gap | Self::Row(..) => Lane::List,
-            Self::Disclosure(_) => Lane::Dock,
+            Self::Flight | Self::Tray(_) | Self::Sep | Self::Disclosure(_) => Lane::Dock,
         }
     }
 
@@ -98,14 +104,25 @@ impl Key {
             Self::Header(_) => HEADER_HEIGHT,
             Self::Gap => READ_GAP,
             Self::Row(..) => ROW_HEIGHT,
-            Self::Disclosure(_) => dock::ROW,
+            Self::Flight => dock::TRAY_HEADER,
+            Self::Tray(_) | Self::Disclosure(_) => dock::ROW,
+            Self::Sep => dock::SEP,
+        }
+    }
+
+    /// The zone and thread of a key that is a thread's row.
+    fn origin(&self) -> Option<(Zone, &SharedString)> {
+        match self {
+            Self::Row(zone, id) => Some((*zone, id)),
+            Self::Tray(id) => Some((Zone::Tray, id)),
+            Self::Header(_) | Self::Gap | Self::Flight | Self::Sep | Self::Disclosure(_) => None,
         }
     }
 
     fn thread(&self) -> Option<&SharedString> {
         match self {
-            Self::Row(_, id) => Some(id),
-            Self::Header(_) | Self::Gap | Self::Disclosure(_) => None,
+            Self::Row(_, id) | Self::Tray(id) => Some(id),
+            Self::Header(_) | Self::Gap | Self::Flight | Self::Sep | Self::Disclosure(_) => None,
         }
     }
 
@@ -114,6 +131,9 @@ impl Key {
             Self::Header(section) => format!("slot-header-{section:?}"),
             Self::Gap => "slot-gap".to_string(),
             Self::Row(zone, id) => format!("slot-row-{zone:?}-{id}"),
+            Self::Flight => "slot-flight".to_string(),
+            Self::Tray(id) => format!("slot-tray-{id}"),
+            Self::Sep => "slot-sep".to_string(),
             Self::Disclosure(kind) => format!("slot-disclosure-{kind:?}"),
         };
         ElementId::from(SharedString::from(name))
@@ -126,6 +146,7 @@ pub enum Counter {
     Pinned,
     Queue,
     Need,
+    Flight,
     Snoozed,
     Settled,
 }
@@ -160,15 +181,72 @@ struct Recipe {
     size: Duration,
     /// Where the row sits when it is hidden, in pixels right and down from where it rests.
     shift: (f32, f32),
+    /// How long the row's status mark takes to grow from 85% to its size.
+    pop: Option<Duration>,
 }
 
-/// Settling or snoozing a row: it fades and slides 8px right, then the gap closes.
-const LEAVE: Recipe = Recipe {
+/// Switching away from a working thread: the row fades and sinks 6px, then the gap closes.
+const FOLD_OUT: Recipe = Recipe {
     wait: ms(0),
     fade: ms(140),
     size_wait: ms(140),
     size: ms(180),
+    shift: (0., 6.),
+    pop: None,
+};
+
+/// Settling or snoozing a row: it fades and slides 8px right, then the gap closes.
+const LEAVE: Recipe = Recipe {
     shift: (8., 0.),
+    ..FOLD_OUT
+};
+
+/// A row that moves to another place in the list fades where it was, then the gap closes.
+const MOVE_OUT: Recipe = Recipe {
+    shift: (0., 0.),
+    ..FOLD_OUT
+};
+
+/// A tray row whose thread landed: it fades quickly, then the gap closes.
+const LAND_OUT: Recipe = Recipe {
+    fade: ms(120),
+    size_wait: ms(120),
+    ..MOVE_OUT
+};
+
+/// A thread arriving in the tray: the row opens room and fades in a moment after the fold begins.
+const FOLD_IN: Recipe = Recipe {
+    wait: ms(60),
+    fade: ms(160),
+    size_wait: ms(0),
+    size: ms(180),
+    shift: (0., 0.),
+    pop: None,
+};
+
+/// A thread arriving in the list after its tray row faded: room opens, and the row fades in from
+/// 4px above while its mark grows.
+const LAND_IN: Recipe = Recipe {
+    wait: ms(120),
+    fade: ms(200),
+    size_wait: ms(0),
+    size: ms(180),
+    shift: (0., -4.),
+    pop: Some(ms(160)),
+};
+
+/// A row arriving from another place in the list waits for the gap it left to start closing.
+const MOVE_IN: Recipe = Recipe {
+    wait: ms(140),
+    pop: None,
+    ..LAND_IN
+};
+
+/// A snoozed or settled thread coming back needs no gap to wait for.
+const WAKE_IN: Recipe = Recipe {
+    wait: ms(0),
+    pop: None,
+    ..LAND_IN
 };
 
 /// A section header, the gap above the read list and a dock row grow and fade together.
@@ -178,28 +256,44 @@ const BLOCK: Recipe = Recipe {
     size_wait: ms(0),
     size: ms(180),
     shift: (0., 0.),
+    pop: None,
 };
 
 /// What a leaving row does, given where it goes. `None` when it just disappears.
 fn exit_recipe(from: Zone, to: Option<Zone>) -> Option<Recipe> {
-    match (from.in_list(), to) {
-        (true, Some(Zone::Settled | Zone::Snoozed)) => Some(LEAVE),
+    match (from, to) {
+        (Zone::Tray, _) => Some(LAND_OUT),
+        (Zone::Draft, None) => None,
+        (_, Some(Zone::Settled | Zone::Snoozed)) => Some(LEAVE),
+        (_, Some(Zone::Tray)) => Some(FOLD_OUT),
+        _ => Some(MOVE_OUT),
+    }
+}
+
+/// What an arriving row does, given where it came from. `None` when it just appears: a thread
+/// seen for the first time has nowhere to have come from.
+fn enter_recipe(from: Option<Zone>, to: Zone) -> Option<Recipe> {
+    match (from?, to) {
+        (Zone::Tray, to) if to.in_list() => Some(LAND_IN),
+        (from, Zone::Tray) if from.in_list() => Some(FOLD_IN),
+        (from, to) if from.in_list() && to.in_list() => Some(Recipe {
+            pop: LAND_IN.pop.filter(|_| to == Zone::Queue),
+            ..MOVE_IN
+        }),
+        (Zone::Settled | Zone::Snoozed, to) if to.in_list() => Some(WAKE_IN),
         _ => None,
     }
 }
 
-/// What an arriving row does, given where it came from. `None` when it just appears.
-fn enter_recipe(_from: Option<Zone>, _to: Zone) -> Option<Recipe> {
-    None
-}
-
-/// One key's progress: its opacity and its height fade on their own clocks.
+/// One key's progress: its opacity, its height and its mark fade on their own clocks.
 #[derive(Clone, Copy, Debug)]
 struct Block {
     fade: Tween<f32>,
     fade_len: Duration,
     size: Tween<f32>,
     size_len: Duration,
+    pop: Tween<f32>,
+    pop_len: Duration,
     shift: (f32, f32),
     leaving: bool,
 }
@@ -211,6 +305,8 @@ impl Block {
             fade_len: BLOCK.fade,
             size: Tween::at(1., now),
             size_len: BLOCK.size,
+            pop: Tween::at(1., now),
+            pop_len: ms(1),
             shift: (0., 0.),
             leaving: false,
         }
@@ -246,10 +342,17 @@ impl Block {
         self.size_len = recipe.size;
         self.shift = recipe.shift;
         self.leaving = false;
+        if let Some(pop) = recipe.pop {
+            self.pop = Tween::at(0., now);
+            self.pop.aim_at(1., begin, now, pop, true);
+            self.pop_len = pop;
+        }
     }
 
     fn done(&self, now: Instant) -> bool {
-        self.fade.settled(now, self.fade_len) && self.size.settled(now, self.size_len)
+        self.fade.settled(now, self.fade_len)
+            && self.size.settled(now, self.size_len)
+            && self.pop.settled(now, self.pop_len)
     }
 
     fn look(&self, now: Instant, reduce: bool) -> Look {
@@ -265,6 +368,7 @@ impl Block {
             size: self.size.value(now, self.size_len),
             dx,
             dy,
+            mark: self.pop.value(now, self.pop_len),
         }
     }
 }
@@ -277,6 +381,8 @@ pub struct Look {
     pub size: f32,
     pub dx: f32,
     pub dy: f32,
+    /// How far the row's status mark has grown from 85% of its size to all of it.
+    pub mark: f32,
 }
 
 impl Look {
@@ -285,6 +391,7 @@ impl Look {
         size: 1.,
         dx: 0.,
         dy: 0.,
+        mark: 1.,
     };
 
     pub fn is_steady(&self) -> bool {
@@ -362,6 +469,7 @@ pub struct Motion {
     /// A row that left for Snoozed or Settled, and when it gets there: the dock counts it then.
     arrivals: Vec<(Zone, Instant)>,
     rows: HashMap<SharedString, Row>,
+    trays: HashMap<SharedString, TrayRow>,
     headers: HashMap<Section, (usize, usize)>,
 }
 
@@ -378,6 +486,14 @@ impl Motion {
 
     pub fn row(&self, id: &str) -> Option<&Row> {
         self.rows.get(id)
+    }
+
+    pub fn remember_tray(&mut self, row: &TrayRow) {
+        self.trays.insert(row.id.clone(), row.clone());
+    }
+
+    pub fn tray(&self, id: &str) -> Option<&TrayRow> {
+        self.trays.get(id)
     }
 
     pub fn remember_header(&mut self, section: Section, count: usize, needs: usize) {
@@ -415,15 +531,22 @@ impl Motion {
         if animate {
             self.note_arrivals(&keys, &zones, now);
         }
-        for (kind, zone, counter, real) in [
+        let folds: Vec<(SheetKind, Counter, usize)> = [
             (SheetKind::Snoozed, Zone::Snoozed, Counter::Snoozed, snoozed),
             (SheetKind::Settled, Zone::Settled, Counter::Settled, settled),
-        ] {
-            let shown = real.saturating_sub(self.pending(zone, now));
-            if shown > 0 {
-                keys.push(Key::Disclosure(kind));
-                counts.push((counter, shown));
-            }
+        ]
+        .into_iter()
+        .map(|(kind, zone, counter, real)| {
+            (kind, counter, real.saturating_sub(self.pending(zone, now)))
+        })
+        .filter(|(_, _, shown)| *shown > 0)
+        .collect();
+        if keys.contains(&Key::Flight) && !folds.is_empty() {
+            keys.push(Key::Sep);
+        }
+        for (kind, counter, shown) in folds {
+            keys.push(Key::Disclosure(kind));
+            counts.push((counter, shown));
         }
         if animate {
             self.diff(&keys, &zones, now);
@@ -437,9 +560,11 @@ impl Motion {
     fn note_arrivals(&mut self, keys: &[Key], zones: &HashMap<SharedString, Zone>, now: Instant) {
         let kept: HashSet<&Key> = keys.iter().collect();
         for key in self.live.iter().filter(|key| !kept.contains(key)) {
-            let Key::Row(from, id) = key else { continue };
+            let Some((from, id)) = key.origin() else {
+                continue;
+            };
             let to = zones.get(id).copied();
-            let Some(recipe) = exit_recipe(*from, to) else {
+            let Some(recipe) = exit_recipe(from, to) else {
                 continue;
             };
             if let Some(to @ (Zone::Settled | Zone::Snoozed)) = to {
@@ -454,9 +579,9 @@ impl Motion {
         let was: HashSet<Key> = self.live.iter().cloned().collect();
 
         for key in self.live.clone().iter().filter(|key| !kept.contains(key)) {
-            let recipe = match key {
-                Key::Row(from, id) => exit_recipe(*from, zones.get(id).copied()),
-                Key::Header(_) | Key::Gap | Key::Disclosure(_) => Some(BLOCK),
+            let recipe = match key.origin() {
+                Some((from, id)) => exit_recipe(from, zones.get(id).copied()),
+                None => Some(BLOCK),
             };
             match recipe {
                 Some(recipe) => self
@@ -472,8 +597,8 @@ impl Motion {
 
         let mut rows: Vec<(&Key, Option<Recipe>)> = Vec::new();
         for key in keys.iter().filter(|key| !was.contains(key)) {
-            if let Key::Row(zone, id) = key {
-                rows.push((key, enter_recipe(self.zones.get(id).copied(), *zone)));
+            if let Some((zone, id)) = key.origin() {
+                rows.push((key, enter_recipe(self.zones.get(id).copied(), zone)));
             }
         }
         let row_wait = rows
@@ -486,9 +611,9 @@ impl Motion {
         }
         for key in keys.iter().filter(|key| !was.contains(key)) {
             let wait = match key {
-                Key::Header(_) | Key::Gap => row_wait,
-                Key::Disclosure(_) => Duration::ZERO,
-                Key::Row(..) => continue,
+                Key::Header(_) | Key::Gap | Key::Flight => row_wait,
+                Key::Sep | Key::Disclosure(_) => Duration::ZERO,
+                Key::Row(..) | Key::Tray(_) => continue,
             };
             self.arrive(key, Some(Recipe { wait, ..BLOCK }), now);
         }
@@ -582,6 +707,7 @@ impl Motion {
             .filter_map(Key::thread)
             .collect();
         self.rows.retain(|id, _| referenced.contains(id));
+        self.trays.retain(|id, _| referenced.contains(id));
         let busy = !self.blocks.is_empty()
             || self.numbers.values().any(|number| number.was.is_some())
             || !self.arrivals.is_empty();
@@ -868,5 +994,187 @@ mod tests {
         assert_eq!(motion.row("b").unwrap().title, "Title");
         motion.step(at(now, 400), sight(&["a"], &["b"]), false);
         assert!(motion.row("b").is_none());
+    }
+
+    fn placed(keys: Vec<Key>, zones: &[(&str, Zone)]) -> Sight {
+        Sight {
+            keys,
+            zones: zones.iter().map(|(name, zone)| (id(name), *zone)).collect(),
+            ..Sight::default()
+        }
+    }
+
+    fn tray(name: &str) -> Key {
+        Key::Tray(id(name))
+    }
+
+    #[test]
+    fn switching_away_from_a_working_thread_folds_its_row_into_the_tray() {
+        let start = Instant::now();
+        let before = || {
+            placed(
+                vec![read("w"), read("x")],
+                &[("w", Zone::Read), ("x", Zone::Read)],
+            )
+        };
+        let after = || {
+            let mut sight = placed(
+                vec![read("x"), Key::Flight, tray("w")],
+                &[("w", Zone::Tray), ("x", Zone::Read)],
+            );
+            sight.counts = vec![(Counter::Flight, 1)];
+            sight
+        };
+        let mut motion = Motion::default();
+        motion.step(start, before(), false);
+
+        let now = at(start, 1000);
+        let frame = motion.step(now, after(), false);
+        assert!(frame.item(&read("w")).unwrap().ghost);
+        assert_eq!(keys(&frame, Lane::Dock), vec![Key::Flight, tray("w")]);
+        assert_eq!(look(&frame, &tray("w")).opacity, 0.);
+
+        let frame = motion.step(at(now, 70), after(), false);
+        let sinking = look(&frame, &read("w"));
+        assert!(sinking.dy > 0. && sinking.dy < 6. && sinking.opacity < 1.);
+        let arriving = look(&frame, &tray("w"));
+        assert!(arriving.opacity > 0. && arriving.size > 0.);
+        assert!(look(&frame, &Key::Flight).opacity > 0.);
+
+        let frame = motion.step(at(now, 400), after(), false);
+        assert_eq!(keys(&frame, Lane::List), vec![read("x")]);
+        assert_eq!(look(&frame, &tray("w")), Look::STEADY);
+        assert!(!frame.busy);
+    }
+
+    #[test]
+    fn a_landing_fades_the_tray_row_then_opens_room_for_the_row_in_the_queue() {
+        let start = Instant::now();
+        let queue = Key::Row(Zone::Queue, id("w"));
+        let header = Key::Header(Section::Queue);
+        let before = || {
+            let mut sight = placed(vec![Key::Flight, tray("w")], &[("w", Zone::Tray)]);
+            sight.keys = vec![Key::Flight, tray("w")];
+            sight
+        };
+        let after = || placed(vec![header.clone(), queue.clone()], &[("w", Zone::Queue)]);
+        let mut motion = Motion::default();
+        motion.step(start, before(), false);
+
+        let now = at(start, 1000);
+        let frame = motion.step(now, after(), false);
+        assert_eq!(look(&frame, &queue).opacity, 0.);
+        assert_eq!(look(&frame, &queue).size, 0.);
+        assert!(frame.item(&tray("w")).unwrap().ghost);
+        assert!(frame.item(&Key::Flight).unwrap().ghost);
+
+        let frame = motion.step(at(now, 100), after(), false);
+        assert_eq!(
+            look(&frame, &queue).size,
+            0.,
+            "it waits for the tray row to fade"
+        );
+        assert_eq!(look(&frame, &header).size, 0.);
+        assert!(look(&frame, &tray("w")).opacity < 1.);
+
+        let frame = motion.step(at(now, 200), after(), false);
+        let growing = look(&frame, &queue);
+        assert!(growing.size > 0. && growing.opacity > 0. && growing.opacity < 1.);
+        assert!(growing.dy < 0. && growing.dy > -4.);
+        assert!(growing.mark > 0. && growing.mark < 1.);
+        assert_eq!(look(&frame, &tray("w")).opacity, 0.);
+        assert!(look(&frame, &header).size > 0.);
+
+        let frame = motion.step(at(now, 500), after(), false);
+        assert_eq!(look(&frame, &queue), Look::STEADY);
+        assert!(frame.item(&tray("w")).is_none());
+        assert!(!frame.busy);
+    }
+
+    #[test]
+    fn reading_a_row_in_the_queue_moves_it_to_the_read_list_after_its_gap_starts_to_close() {
+        let start = Instant::now();
+        let queue = Key::Row(Zone::Queue, id("q"));
+        let mut motion = Motion::default();
+        motion.step(
+            start,
+            placed(vec![queue.clone()], &[("q", Zone::Queue)]),
+            false,
+        );
+        let now = at(start, 1000);
+        let after = || placed(vec![read("q")], &[("q", Zone::Read)]);
+        let frame = motion.step(now, after(), false);
+        assert!(frame.item(&queue).unwrap().ghost);
+        assert_eq!(look(&frame, &read("q")).size, 0.);
+
+        let frame = motion.step(at(now, 100), after(), false);
+        assert_eq!(look(&frame, &read("q")).size, 0.);
+        assert!(look(&frame, &queue).opacity < 1.);
+        assert_eq!(look(&frame, &queue).dx, 0.);
+
+        let frame = motion.step(at(now, 200), after(), false);
+        let arriving = look(&frame, &read("q"));
+        assert!(arriving.size > 0. && arriving.mark == 1.);
+    }
+
+    #[test]
+    fn a_thread_seen_for_the_first_time_appears_at_once() {
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        motion.step(start, placed(vec![read("a")], &[("a", Zone::Read)]), false);
+        let frame = motion.step(
+            at(start, 50),
+            placed(
+                vec![Key::Row(Zone::Draft, id("d")), read("a")],
+                &[("a", Zone::Read), ("d", Zone::Draft)],
+            ),
+            false,
+        );
+        assert!(frame.items.iter().all(|item| item.look.is_steady()));
+        assert!(!frame.busy);
+    }
+
+    #[test]
+    fn the_rule_shows_with_the_tray_and_the_rows_under_it() {
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let mut sight = placed(vec![Key::Flight, tray("w")], &[("w", Zone::Tray)]);
+        sight.settled = 2;
+        let frame = motion.step(start, sight, false);
+        assert_eq!(
+            keys(&frame, Lane::Dock),
+            vec![
+                Key::Flight,
+                tray("w"),
+                Key::Sep,
+                Key::Disclosure(SheetKind::Settled)
+            ]
+        );
+        let mut sight = placed(vec![], &[("w", Zone::Read)]);
+        sight.settled = 2;
+        let frame = motion.step(at(start, 10), sight, false);
+        assert_eq!(
+            frame.lane(Lane::Dock).filter(|item| !item.ghost).count(),
+            1,
+            "the rule leaves with the tray"
+        );
+    }
+
+    #[test]
+    fn a_snoozed_thread_that_wakes_fades_in_with_no_wait() {
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let mut asleep = placed(vec![], &[("s", Zone::Snoozed)]);
+        asleep.snoozed = 1;
+        motion.step(start, asleep, false);
+        let now = at(start, 1000);
+        let frame = motion.step(now, placed(vec![read("s")], &[("s", Zone::Read)]), false);
+        assert_eq!(look(&frame, &read("s")).size, 0.);
+        let frame = motion.step(
+            at(now, 100),
+            placed(vec![read("s")], &[("s", Zone::Read)]),
+            false,
+        );
+        assert!(look(&frame, &read("s")).size > 0.);
     }
 }

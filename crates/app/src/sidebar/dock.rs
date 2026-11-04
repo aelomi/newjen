@@ -13,9 +13,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 
-use super::{
-    Counted, Edge, Key, Look, OnOpen, OnPress, count_label, faint, muted, number, pulse, slot,
-};
+use super::{Counted, Edge, Key, Look, OnOpen, OnPress, faint, muted, number, pulse, slot};
 use crate::ui::{self, IconName};
 
 /// Rows the tray shows before a quiet "+N more".
@@ -29,6 +27,12 @@ const FOOT: Pixels = px(4.);
 
 /// The gap between a panel and the row that opened it.
 const LIFT: Pixels = px(4.);
+
+/// The height of the In flight header.
+pub const TRAY_HEADER: Pixels = px(30.);
+
+/// The height of the rule above the Snoozed and Settled rows, with its margins.
+pub const SEP: Pixels = px(13.);
 
 /// A panel row.
 const PANEL_ROW: Pixels = px(32.);
@@ -76,6 +80,7 @@ impl Clock {
     }
 }
 
+#[derive(Clone)]
 pub struct TrayRow {
     pub id: SharedString,
     pub title: SharedString,
@@ -91,9 +96,27 @@ pub struct Fold {
     pub look: Look,
 }
 
+/// A tray row, and how far it has grown or faded.
+pub struct TrayItem {
+    pub row: TrayRow,
+    pub look: Look,
+}
+
+/// The In flight header while it shows.
+#[derive(Clone, Copy)]
+pub struct Flight {
+    pub count: Counted,
+    pub look: Look,
+}
+
 pub struct Dock {
-    /// Every thread in flight; the tray shows the first [`TRAY_ROWS`].
-    pub tray: Vec<TrayRow>,
+    pub flight: Option<Flight>,
+    /// The tray's rows, the first [`TRAY_ROWS`] of the threads in flight, leaving ones too.
+    pub tray: Vec<TrayItem>,
+    /// Every thread in flight.
+    pub tray_total: usize,
+    /// The rule above the Snoozed and Settled rows, while it shows.
+    pub sep: Option<Look>,
     pub snoozed: Option<Fold>,
     pub settled: Option<Fold>,
     pub open: Option<SheetKind>,
@@ -150,7 +173,7 @@ fn separator(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn tray_header(count: usize, cx: &App) -> AnyElement {
+fn tray_header(count: Counted, cx: &App) -> AnyElement {
     let blue = cx.theme().colors.info;
     let dot = |phase: f32| {
         pulse(
@@ -161,6 +184,7 @@ fn tray_header(count: usize, cx: &App) -> AnyElement {
         )
     };
     h_flex()
+        .h(TRAY_HEADER)
         .items_center()
         .gap_2()
         .px_2()
@@ -170,7 +194,7 @@ fn tray_header(count: usize, cx: &App) -> AnyElement {
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(faint(cx))
         .child("In flight")
-        .child(count_label(count))
+        .child(number(count, Edge::Left))
         .child(div().flex_1())
         .child(
             h_flex()
@@ -297,7 +321,10 @@ fn disclosure(
 /// open, everything but the row that opened it dims to half.
 pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
     let Dock {
+        flight,
         tray,
+        tray_total,
+        sep,
         snoozed,
         settled,
         open,
@@ -305,7 +332,7 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
         panel,
         bounds,
     } = dock;
-    if tray.is_empty() && snoozed.is_none() && settled.is_none() {
+    if flight.is_none() && tray.is_empty() && snoozed.is_none() && settled.is_none() {
         return None;
     }
     let dimmed = open.is_some();
@@ -315,27 +342,33 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
     };
     let record = bounds.clone();
     let mut root = v_flex().id("dock").relative().flex_none().pt_0p5().pb(FOOT);
-    if !tray.is_empty() {
-        root = root.child(tray_header(tray.len(), cx));
-        root = root.children(
-            tray.iter()
-                .take(TRAY_ROWS)
-                .map(|row| tray_row(row, dimmed, cx)),
+    if let Some(flight) = flight {
+        root = root.child(slot(
+            &Key::Flight,
+            flight.look,
+            tray_header(flight.count, cx),
+        ));
+    }
+    for item in &tray {
+        root = root.child(slot(
+            &Key::Tray(item.row.id.clone()),
+            item.look,
+            tray_row(&item.row, dimmed, cx),
+        ));
+    }
+    if let Some(more) = more_label(tray_total) {
+        root = root.child(
+            div()
+                .px_2p5()
+                .pt_1()
+                .pb_0p5()
+                .text_size(px(11.5))
+                .text_color(faint(cx))
+                .child(more),
         );
-        if let Some(more) = more_label(tray.len()) {
-            root = root.child(
-                div()
-                    .px_2p5()
-                    .pt_1()
-                    .pb_0p5()
-                    .text_size(px(11.5))
-                    .text_color(faint(cx))
-                    .child(more),
-            );
-        }
-        if snoozed.is_some() || settled.is_some() {
-            root = root.child(separator(cx));
-        }
+    }
+    if let Some(look) = sep {
+        root = root.child(slot(&Key::Sep, look, separator(cx)));
     }
     for (kind, fold) in [(SheetKind::Snoozed, snoozed), (SheetKind::Settled, settled)] {
         if let Some(fold) = fold {

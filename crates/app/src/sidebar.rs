@@ -9,7 +9,10 @@
 mod dock;
 mod motion;
 
-pub use dock::{Clock, Dock, Fold, Panel, PanelGroup, PanelRow, SheetKind, TrayRow, dock};
+pub use dock::{
+    Clock, Dock, Flight, Fold, Panel, PanelGroup, PanelRow, SheetKind, TRAY_ROWS, TrayItem,
+    TrayRow, dock,
+};
 pub use motion::{
     Counted, Counter, Frame, HEADER_HEIGHT, Key, Lane, Look, Motion, Sight, Zone, slot,
 };
@@ -877,11 +880,19 @@ fn hover_actions(
 
 /// The status dot before a title: 8px, in the thread's color. Working pulses; with Reduce
 /// Motion it holds still.
-pub fn status_dot(dot: Dot, id: impl Into<ElementId>, cx: &App) -> AnyElement {
+///
+/// `grown` (0 to 1) is how far a mark that has just arrived has come: it fades in and grows from
+/// 85% of its size. With Reduce Motion it only fades.
+pub fn status_dot(dot: Dot, id: impl Into<ElementId>, grown: f32, cx: &App) -> AnyElement {
     let colors = &cx.theme().colors;
     let muted = crate::theme::material(cx).glass_muted;
-    let mark = div().flex_none().size(px(8.)).rounded_full();
-    match dot {
+    let size = if cx.reduce_motion() {
+        8.
+    } else {
+        8. * (0.85 + 0.15 * grown)
+    };
+    let mark = div().flex_none().size(px(size)).rounded_full();
+    let dot = match dot {
         Dot::None => mark.into_any_element(),
         Dot::Approval => mark.bg(colors.warning).into_any_element(),
         Dot::Failed => mark.bg(colors.danger).into_any_element(),
@@ -891,7 +902,16 @@ pub fn status_dot(dot: Dot, id: impl Into<ElementId>, cx: &App) -> AnyElement {
             .border_color(muted.opacity(0.7))
             .into_any_element(),
         Dot::Working => pulse(mark.bg(colors.info), id, 0., cx),
-    }
+    };
+    div()
+        .flex_none()
+        .size(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .opacity(grown)
+        .child(dot)
+        .into_any_element()
 }
 
 const PULSE: Duration = Duration::from_millis(1200);
@@ -921,6 +941,7 @@ pub fn thread_row(
     row: Row,
     actions: Option<RowActions>,
     on_press: OnPress,
+    grown: f32,
     cx: &App,
 ) -> AnyElement {
     let colors = &cx.theme().colors;
@@ -995,7 +1016,7 @@ pub fn thread_row(
                         .flex()
                         .items_center()
                         .pl(px(3.))
-                        .child(status_dot(row.dot, dot_id, cx)),
+                        .child(status_dot(row.dot, dot_id, grown, cx)),
                 )
                 .child(v_flex().flex_1().min_w_0().child(title).child(line)),
         )
