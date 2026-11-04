@@ -1980,6 +1980,361 @@ mod art {
     }
 }
 
+use art::{Fx, Hud, Prim, Pt, Shape};
+use gpui::{
+    AnyElement, Bounds, Context, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement as _, PathBuilder, Pixels, Render, Rgba, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, canvas, div, fill, point,
+    px, size,
+};
+use model::{HEIGHT, Phase, Runner, WIDTH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+const FADE_IN: f32 = 0.2;
+const FADE_OUT: f32 = 0.14;
+const HINT_FADE: f32 = 0.15;
+const LONGEST_FRAME: f32 = 0.033;
+const GOLD: u32 = 0xfcd34d;
+
+fn approach(value: f32, target: f32, step: f32) -> f32 {
+    if value < target {
+        (value + step).min(target)
+    } else {
+        (value - step).max(target)
+    }
+}
+
+fn hint_for(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Idle | Phase::Running => "Cultivating · click to play",
+        Phase::Paused => "Paused · click to resume",
+        Phase::Crashed => "Qi deviation · click to retry",
+    }
+}
+
+fn is_jump_key(keystroke: &Keystroke) -> bool {
+    !keystroke.modifiers.modified() && matches!(keystroke.key.as_str(), "space" | "up")
+}
+
+pub struct FoxGame {
+    runner: Runner,
+    fx: Fx,
+    title: SharedString,
+    shown: bool,
+    fade: f32,
+    hint: &'static str,
+    hint_alpha: f32,
+    focus: FocusHandle,
+    frame: Option<Instant>,
+    _subscriptions: [Subscription; 2],
+}
+
+impl FoxGame {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0x5EED, |since| since.as_nanos() as u64);
+        let focus = cx.focus_handle();
+        let subscriptions = [
+            cx.on_focus_out(&focus, window, |game, _, _, cx| game.pause(cx)),
+            cx.observe_window_activation(window, |game, window, cx| {
+                if !window.is_window_active() {
+                    game.pause(cx);
+                }
+            }),
+        ];
+        Self {
+            runner: Runner::new(seed),
+            fx: Fx::new(seed),
+            title: SharedString::default(),
+            shown: false,
+            fade: 0.0,
+            hint: hint_for(Phase::Idle),
+            hint_alpha: 1.0,
+            focus,
+            frame: None,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    pub fn set_title(&mut self, title: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let title = title.into();
+        if self.title != title {
+            self.title = title;
+            cx.notify();
+        }
+    }
+
+    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if self.shown == shown {
+            return;
+        }
+        self.shown = shown;
+        if !shown {
+            self.runner.pause();
+            self.runner.release();
+            self.fx.set_hover(false);
+        }
+        cx.notify();
+    }
+
+    fn pause(&mut self, cx: &mut Context<Self>) {
+        if self.runner.phase() == Phase::Running {
+            self.runner.release();
+            self.runner.pause();
+            cx.notify();
+        }
+    }
+
+    fn advance(&mut self, dt: f32, reduce_motion: bool) {
+        self.fx.set_reduce_motion(reduce_motion);
+        self.runner.step(dt);
+        self.fx.step(dt, &self.runner);
+        let phase = self.runner.phase();
+        let fade_span = if self.shown { FADE_IN } else { FADE_OUT };
+        self.fade = approach(self.fade, self.shown as u8 as f32, dt / fade_span);
+        self.hint_alpha = approach(self.hint_alpha, self.hint_target(), dt / HINT_FADE);
+        if phase != Phase::Running {
+            self.hint = hint_for(phase);
+        }
+        if !self.shown && self.fade <= 0.0 && phase != Phase::Idle {
+            self.runner.rest();
+            self.hint = hint_for(Phase::Idle);
+        }
+    }
+
+    fn hint_target(&self) -> f32 {
+        if self.runner.phase() == Phase::Running {
+            0.0
+        } else {
+            1.0
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.fx.busy(&self.runner)
+            || self.fade != self.shown as u8 as f32
+            || self.hint_alpha != self.hint_target()
+    }
+
+    fn on_mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.shown {
+            return;
+        }
+        self.focus.focus(window, cx);
+        self.runner.press();
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.runner.release();
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.shown || !is_jump_key(&event.keystroke) {
+            return;
+        }
+        cx.stop_propagation();
+        if !event.is_held {
+            self.runner.press();
+            cx.notify();
+        }
+    }
+
+    fn on_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        if is_jump_key(&event.keystroke) {
+            self.runner.release();
+        }
+    }
+
+    fn on_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        self.fx.set_hover(*hovered && self.shown);
+        cx.notify();
+    }
+}
+
+fn rgba(color: art::Color) -> Rgba {
+    Rgba {
+        r: f32::from(color.r) / 255.0,
+        g: f32::from(color.g) / 255.0,
+        b: f32::from(color.b) / 255.0,
+        a: color.a.clamp(0.0, 1.0),
+    }
+}
+
+fn paint_scene(prims: &[Prim], bounds: Bounds<Pixels>, window: &mut Window) {
+    let at = |p: Pt| bounds.origin + point(px(p.x), px(p.y));
+    let dot = |window: &mut Window, p: Pt, radius: f32, color: Rgba| {
+        let square = Bounds::centered_at(at(p), size(px(radius * 2.0), px(radius * 2.0)));
+        window.paint_quad(fill(square, color).corner_radii(px(radius)));
+    };
+    for prim in prims {
+        let color = rgba(prim.color);
+        match &prim.shape {
+            Shape::Fill(points) => {
+                let mut builder = PathBuilder::fill();
+                for (i, p) in points.iter().enumerate() {
+                    if i == 0 {
+                        builder.move_to(at(*p));
+                    } else {
+                        builder.line_to(at(*p));
+                    }
+                }
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            }
+            Shape::Line {
+                pts,
+                width,
+                closed,
+                round,
+            } => {
+                let mut builder = PathBuilder::stroke(px(*width));
+                for (i, p) in pts.iter().enumerate() {
+                    if i == 0 {
+                        builder.move_to(at(*p));
+                    } else {
+                        builder.line_to(at(*p));
+                    }
+                }
+                if *closed {
+                    builder.close();
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+                if *round {
+                    for p in [pts.first(), pts.last()].into_iter().flatten() {
+                        dot(window, *p, width / 2.0, color);
+                    }
+                }
+            }
+            Shape::Dot { at: centre, radius } => dot(window, *centre, *radius, color),
+            Shape::Rect {
+                at: corner,
+                width,
+                height,
+            } => window.paint_quad(fill(
+                Bounds::new(at(*corner), size(px(*width), px(*height))),
+                color,
+            )),
+        }
+    }
+}
+
+fn hud_element(hud: Hud, muted: Hsla) -> AnyElement {
+    let lines = div()
+        .absolute()
+        .top(px(2.))
+        .right(px(2.))
+        .flex()
+        .flex_col()
+        .items_end()
+        .text_size(px(10.5))
+        .line_height(px(12.))
+        .font_weight(FontWeight::MEDIUM);
+    match hud {
+        Hud::Blank => div().into_any_element(),
+        Hud::Best(best) => lines
+            .text_color(muted.opacity(0.4))
+            .child(format!("Best {best:04}"))
+            .into_any_element(),
+        Hud::Run { score, realm, glow } => {
+            let gold: Hsla = gpui::rgb(GOLD).into();
+            lines
+                .child(
+                    div()
+                        .text_color(muted.opacity(0.62))
+                        .child(format!("{score:04}")),
+                )
+                .child(
+                    div()
+                        .mt(px(1.))
+                        .text_size(px(10.))
+                        .text_color(gold.opacity(0.75 * glow))
+                        .child(realm),
+                )
+                .into_any_element()
+        }
+    }
+}
+
+impl Render for FoxGame {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
+        let dt = self.frame.map_or(0.0, |last| {
+            now.duration_since(last).as_secs_f32().min(LONGEST_FRAME)
+        });
+        self.frame = Some(now);
+        self.advance(dt, cx.reduce_motion());
+        if self.busy() {
+            window.request_animation_frame();
+        } else {
+            self.frame = None;
+        }
+        if !self.shown && self.fade <= 0.0 {
+            return div().into_any_element();
+        }
+        let muted = crate::theme::material(cx).glass_muted;
+        let prims = art::scene(&self.runner, &self.fx);
+        let playfield = div()
+            .id("fox-playfield")
+            .debug_selector(|| "fox-playfield".into())
+            .relative()
+            .w(px(WIDTH))
+            .h(px(HEIGHT))
+            .overflow_hidden()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, (), window, _| paint_scene(&prims, bounds, window),
+                )
+                .size_full(),
+            )
+            .child(hud_element(art::hud(&self.runner, &self.fx), muted));
+        div()
+            .id("fox-game")
+            .debug_selector(|| "fox-game".into())
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .on_hover(cx.listener(Self::on_hover))
+            .flex()
+            .flex_col()
+            .items_center()
+            .w_full()
+            .opacity(self.fade)
+            .child(
+                div()
+                    .h(px(17.))
+                    .line_height(px(17.))
+                    .text_size(px(12.5))
+                    .text_color(muted.opacity(0.62))
+                    .child(self.title.clone()),
+            )
+            .child(
+                div()
+                    .mt(px(3.))
+                    .mb(px(6.))
+                    .h(px(15.))
+                    .line_height(px(15.))
+                    .text_size(px(11.))
+                    .text_color(muted.opacity(0.42 * self.hint_alpha))
+                    .child(self.hint),
+            )
+            .child(playfield)
+            .into_any_element()
+    }
+}
+
 #[cfg(test)]
 mod play {
     use super::model::{FOX_X, Runner};
@@ -2017,5 +2372,239 @@ mod play {
         if runner.vy() < 120.0 {
             runner.release();
         }
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+    use gpui::{AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext, point};
+
+    struct Sidebar {
+        game: Entity<FoxGame>,
+    }
+
+    impl Render for Sidebar {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(255.)).child(self.game.clone())
+        }
+    }
+
+    fn game(cx: &mut TestAppContext) -> (Entity<FoxGame>, &mut VisualTestContext) {
+        cx.update(gpui_kit::init);
+        let (sidebar, cx) = cx.add_window_view(|window, cx| Sidebar {
+            game: cx.new(|cx| FoxGame::new(window, cx)),
+        });
+        let game = sidebar.read_with(cx, |sidebar, _| sidebar.game.clone());
+        (game, cx)
+    }
+
+    fn settle(game: &Entity<FoxGame>, cx: &mut VisualTestContext) {
+        game.update(cx, |game, cx| {
+            game.advance(5.0, false);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn shown(cx: &mut TestAppContext) -> (Entity<FoxGame>, &mut VisualTestContext) {
+        let (game, cx) = game(cx);
+        cx.update(|window, _| window.activate_window());
+        game.update(cx, |game, cx| game.set_shown(true, cx));
+        settle(&game, cx);
+        cx.simulate_mouse_move(point(px(900.), px(600.)), None, Modifiers::none());
+        settle(&game, cx);
+        (game, cx)
+    }
+
+    fn phase(game: &Entity<FoxGame>, cx: &mut VisualTestContext) -> Phase {
+        game.read_with(cx, |game, _| game.runner.phase())
+    }
+
+    fn focus(game: &Entity<FoxGame>, cx: &mut VisualTestContext) {
+        let handle = game.read_with(cx, |game, _| game.focus.clone());
+        cx.update(|window, cx| handle.focus(window, cx));
+    }
+
+    fn click_playfield(cx: &mut VisualTestContext) {
+        let playfield = cx.debug_bounds("fox-playfield").expect("the game is drawn");
+        cx.simulate_click(playfield.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn run_clear(game: &Entity<FoxGame>, cx: &mut VisualTestContext, frames: usize) {
+        for _ in 0..frames {
+            game.update(cx, |game, _| {
+                game.advance(1.0 / 60.0, false);
+                game.runner.clear_obstacles();
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn a_new_game_is_hidden_and_draws_nothing(cx: &mut TestAppContext) {
+        let (game, cx) = game(cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("fox-playfield").is_none());
+        assert!(!game.read_with(cx, |game, _| game.busy()));
+    }
+
+    #[gpui::test]
+    fn showing_the_game_draws_a_239_by_112_playfield_and_never_starts_it(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        let bounds = cx.debug_bounds("fox-playfield").expect("drawn");
+        assert_eq!(bounds.size, size(px(239.), px(112.)));
+        game.update(cx, |game, _| game.advance(30.0, false));
+        assert_eq!(phase(&game, cx), Phase::Idle);
+    }
+
+    #[gpui::test]
+    fn a_click_focuses_the_game_and_starts_the_run(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        click_playfield(cx);
+        assert_eq!(phase(&game, cx), Phase::Running);
+        let focused = game.read_with(cx, |game, _| game.focus.clone());
+        assert!(cx.update(|window, _| focused.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn space_and_up_jump_only_while_the_game_has_focus(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        cx.simulate_keystrokes("space up");
+        assert_eq!(phase(&game, cx), Phase::Idle, "no focus, no jump");
+        focus(&game, cx);
+        cx.simulate_keystrokes("cmd-space");
+        assert_eq!(phase(&game, cx), Phase::Idle, "a shortcut is not a jump");
+        cx.simulate_keystrokes("space");
+        assert_eq!(phase(&game, cx), Phase::Running);
+        assert!(game.read_with(cx, |game, _| game.runner.airborne()));
+    }
+
+    #[gpui::test]
+    fn up_starts_a_run_too(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        focus(&game, cx);
+        cx.simulate_keystrokes("up");
+        assert_eq!(phase(&game, cx), Phase::Running);
+    }
+
+    #[gpui::test]
+    fn losing_focus_or_the_window_pauses_and_a_click_resumes(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        click_playfield(cx);
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
+        assert_eq!(phase(&game, cx), Phase::Paused);
+        click_playfield(cx);
+        assert_eq!(phase(&game, cx), Phase::Running);
+        cx.deactivate_window();
+        assert_eq!(phase(&game, cx), Phase::Paused);
+        game.update(cx, |game, _| game.advance(5.0, false));
+        assert_eq!(phase(&game, cx), Phase::Paused, "never resumes by itself");
+    }
+
+    #[gpui::test]
+    fn the_hint_follows_the_phase(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        let hint = |game: &Entity<FoxGame>, cx: &mut VisualTestContext| {
+            game.read_with(cx, |game, _| game.hint)
+        };
+        assert_eq!(hint(&game, cx), "Cultivating · click to play");
+        click_playfield(cx);
+        game.update(cx, |game, _| game.advance(1.0 / 60.0, false));
+        assert!(game.read_with(cx, |game, _| game.hint_alpha) < 1.0);
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
+        game.update(cx, |game, _| game.advance(1.0 / 60.0, false));
+        assert_eq!(hint(&game, cx), "Paused · click to resume");
+        click_playfield(cx);
+        for _ in 0..600 {
+            game.update(cx, |game, _| game.advance(1.0 / 60.0, false));
+        }
+        assert_eq!(phase(&game, cx), Phase::Crashed);
+        assert_eq!(hint(&game, cx), "Qi deviation · click to retry");
+        assert_eq!(game.read_with(cx, |game, _| game.hint_alpha), 1.0);
+    }
+
+    #[gpui::test]
+    fn the_title_is_the_callers(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        game.update(cx, |game, cx| game.set_title("All clear", cx));
+        cx.run_until_parked();
+        assert_eq!(
+            game.read_with(cx, |game, _| game.title.clone()),
+            "All clear"
+        );
+    }
+
+    #[gpui::test]
+    fn hover_wakes_the_idle_fire_only_while_the_pointer_is_over_it(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        assert!(!game.read_with(cx, |game, _| game.busy()), "idle is still");
+        let inside = cx.debug_bounds("fox-playfield").unwrap().center();
+        cx.simulate_mouse_move(inside, None, Modifiers::none());
+        cx.run_until_parked();
+        assert!(game.read_with(cx, |game, _| game.busy()), "hover wakes it");
+        cx.simulate_mouse_move(point(px(-20.), px(-20.)), None, Modifiers::none());
+        cx.run_until_parked();
+        game.update(cx, |game, _| game.advance(5.0, false));
+        assert!(!game.read_with(cx, |game, _| game.busy()), "calm again");
+    }
+
+    #[gpui::test]
+    fn an_idle_game_asks_for_no_frames_and_a_running_one_does(cx: &mut TestAppContext) {
+        let (_game, cx) = shown(cx);
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|window, cx| window.simulate_next_frame(cx)),
+            0,
+            "drawn once and left alone"
+        );
+        click_playfield(cx);
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.simulate_next_frame(cx)) > 0);
+    }
+
+    #[gpui::test]
+    fn hiding_freezes_a_run_and_resets_it_to_idle_after_the_fade(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        click_playfield(cx);
+        run_clear(&game, cx, 200);
+        let score = game.read_with(cx, |game, _| game.runner.score());
+        assert!(score > 20);
+        game.update(cx, |game, cx| game.set_shown(false, cx));
+        assert_eq!(phase(&game, cx), Phase::Paused);
+        game.update(cx, |game, _| game.advance(0.05, false));
+        assert_eq!(game.read_with(cx, |game, _| game.runner.score()), score);
+        game.update(cx, |game, _| game.advance(1.0, false));
+        assert_eq!(phase(&game, cx), Phase::Idle);
+        assert_eq!(game.read_with(cx, |game, _| game.runner.best()), score);
+        game.update(cx, |game, cx| game.set_shown(true, cx));
+        game.update(cx, |game, _| game.advance(30.0, false));
+        assert_eq!(phase(&game, cx), Phase::Idle, "showing never starts a run");
+    }
+
+    #[gpui::test]
+    fn showing_a_paused_run_again_keeps_it_paused(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        click_playfield(cx);
+        game.update(cx, |game, cx| game.set_shown(false, cx));
+        game.update(cx, |game, cx| game.set_shown(true, cx));
+        game.update(cx, |game, _| game.advance(30.0, false));
+        assert_eq!(phase(&game, cx), Phase::Paused);
+    }
+
+    #[gpui::test]
+    fn reduce_motion_keeps_the_game_playable(cx: &mut TestAppContext) {
+        let (game, cx) = shown(cx);
+        cx.update(|window, cx| {
+            cx.set_reduce_motion(true);
+            window.refresh();
+        });
+        click_playfield(cx);
+        assert_eq!(phase(&game, cx), Phase::Running);
+        run_clear(&game, cx, 120);
+        assert!(game.read_with(cx, |game, _| game.runner.distance()) > 100.0);
     }
 }
