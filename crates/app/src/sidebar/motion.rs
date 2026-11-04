@@ -31,6 +31,12 @@ const fn ms(millis: u64) -> Duration {
 /// How long a count takes to crossfade into its new value.
 const COUNT: Duration = ms(120);
 
+/// A panel grows up from its row over this long, everything behind it dims as long, and it
+/// lowers a little quicker.
+const RISE: Duration = ms(220);
+const LOWER: Duration = ms(160);
+const DIM: Duration = ms(220);
+
 /// The height of a section header.
 pub const HEADER_HEIGHT: Pixels = px(35.);
 
@@ -409,10 +415,20 @@ pub struct Item {
     pub ghost: bool,
 }
 
+/// How far the Snoozed or Settled panel has come, and how far everything behind it has dimmed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Raised {
+    /// 0 when it is closed, 1 when it is all the way up.
+    pub panel: f32,
+    /// 0 for no dimming, 1 for the full dimming.
+    pub dim: f32,
+}
+
 /// What a render draws.
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     pub items: Vec<Item>,
+    pub raised: Raised,
     counts: HashMap<Counter, Counted>,
     last: HashMap<Counter, usize>,
     /// Something is still moving: ask for another frame.
@@ -448,6 +464,15 @@ pub struct Sight {
     pub counts: Vec<(Counter, usize)>,
     pub snoozed: usize,
     pub settled: usize,
+    /// A Snoozed or Settled panel is open.
+    pub panel_open: bool,
+}
+
+struct Lift {
+    open: bool,
+    panel: Tween<f32>,
+    panel_len: Duration,
+    dim: Tween<f32>,
 }
 
 struct Number {
@@ -468,6 +493,7 @@ pub struct Motion {
     last: HashMap<Counter, usize>,
     /// A row that left for Snoozed or Settled, and when it gets there: the dock counts it then.
     arrivals: Vec<(Zone, Instant)>,
+    lift: Option<Lift>,
     rows: HashMap<SharedString, Row>,
     trays: HashMap<SharedString, TrayRow>,
     headers: HashMap<Section, (usize, usize)>,
@@ -527,6 +553,7 @@ impl Motion {
             mut counts,
             snoozed,
             settled,
+            panel_open,
         } = sight;
         if animate {
             self.note_arrivals(&keys, &zones, now);
@@ -554,7 +581,35 @@ impl Motion {
         self.live = keys;
         self.zones = zones;
         let counted = self.count(counts, now);
-        self.frame(counted, now, reduce)
+        let raised = self.raise(panel_open, now);
+        let mut frame = self.frame(counted, now, reduce);
+        frame.busy |= raised.1;
+        frame.raised = raised.0;
+        frame
+    }
+
+    /// Eases the panel up or down and the dimming in or out, from wherever they are now.
+    fn raise(&mut self, open: bool, now: Instant) -> (Raised, bool) {
+        let level = if open { 1. } else { 0. };
+        let long_ago = now.checked_sub(ms(1000)).unwrap_or(now);
+        let lift = self.lift.get_or_insert_with(|| Lift {
+            open,
+            panel: Tween::at(level, long_ago),
+            panel_len: RISE,
+            dim: Tween::at(level, long_ago),
+        });
+        if lift.open != open {
+            lift.panel.aim(level, now, lift.panel_len, true);
+            lift.panel_len = if open { RISE } else { LOWER };
+            lift.dim.aim(level, now, DIM, true);
+            lift.open = open;
+        }
+        let raised = Raised {
+            panel: lift.panel.value(now, lift.panel_len),
+            dim: lift.dim.value(now, DIM),
+        };
+        let busy = !lift.panel.settled(now, lift.panel_len) || !lift.dim.settled(now, DIM);
+        (raised, busy)
     }
 
     fn note_arrivals(&mut self, keys: &[Key], zones: &HashMap<SharedString, Zone>, now: Instant) {
@@ -713,6 +768,7 @@ impl Motion {
             || !self.arrivals.is_empty();
         Frame {
             items,
+            raised: Raised::default(),
             counts,
             last: self.last.clone(),
             busy,
@@ -777,6 +833,7 @@ mod tests {
             counts: Vec::new(),
             snoozed: 0,
             settled: settled.len(),
+            panel_open: false,
         }
     }
 
@@ -1176,5 +1233,58 @@ mod tests {
             false,
         );
         assert!(look(&frame, &read("s")).size > 0.);
+    }
+
+    #[test]
+    fn the_panel_rises_in_220ms_and_lowers_in_160_while_everything_behind_dims_in_220_both_ways() {
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let closed = || placed(vec![], &[]);
+        let open = || Sight {
+            panel_open: true,
+            ..closed()
+        };
+        let frame = motion.step(start, closed(), false);
+        assert_eq!(frame.raised, Raised::default());
+        assert!(!frame.busy);
+
+        let now = at(start, 1000);
+        let frame = motion.step(now, open(), false);
+        assert_eq!(frame.raised, Raised::default());
+        assert!(frame.busy);
+        let frame = motion.step(at(now, 100), open(), false);
+        assert!(frame.raised.panel > 0. && frame.raised.panel < 1.);
+        assert!(frame.raised.dim > 0. && frame.raised.dim < 1.);
+        let frame = motion.step(at(now, 220), open(), false);
+        assert_eq!(frame.raised, Raised { panel: 1., dim: 1. });
+        assert!(!frame.busy);
+
+        let now = at(now, 1000);
+        motion.step(now, closed(), false);
+        let frame = motion.step(at(now, 160), closed(), false);
+        assert_eq!(frame.raised.panel, 0.);
+        assert!(frame.raised.dim > 0., "the dimming takes 220ms");
+        assert!(frame.busy);
+        let frame = motion.step(at(now, 220), closed(), false);
+        assert_eq!(frame.raised, Raised::default());
+        assert!(!frame.busy);
+    }
+
+    #[test]
+    fn closing_a_panel_half_way_up_lowers_it_from_there() {
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let sight = |panel_open| Sight {
+            panel_open,
+            ..Sight::default()
+        };
+        motion.step(start, sight(false), false);
+        let now = at(start, 1000);
+        motion.step(now, sight(true), false);
+        let seen = motion.step(at(now, 80), sight(true), false).raised.panel;
+        let lowered = motion.step(at(now, 80), sight(false), false).raised.panel;
+        assert!((lowered - seen).abs() < 1e-4);
+        let later = motion.step(at(now, 120), sight(false), false).raised.panel;
+        assert!(later < lowered);
     }
 }

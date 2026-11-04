@@ -2429,6 +2429,49 @@ async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+async fn the_settled_panel_rises_and_lowers_instead_of_appearing_and_vanishing(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "panel-motion", true);
+    cx.simulate_input("park me");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
+    cx.run_until_parked();
+    let_motion_finish(&chat, cx);
+    let lift = |cx: &mut VisualTestContext| cx.update(|_, cx| chat.read(cx).frame.borrow().raised);
+
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    assert_eq!(lift(cx), Default::default());
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+    let rising = lift(cx);
+    assert!(rising.panel > 0. && rising.panel < 1. && rising.dim > 0.);
+    let_motion_finish(&chat, cx);
+    let up = lift(cx);
+    assert_eq!((up.panel, up.dim), (1., 1.));
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("sheet").is_some(),
+        "the panel stays while it lowers"
+    );
+    cx.executor().advance_clock(Duration::from_millis(80));
+    cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+    let lowering = lift(cx);
+    assert!(lowering.panel > 0. && lowering.panel < 1.);
+    let_motion_finish(&chat, cx);
+    assert!(cx.debug_bounds("sheet").is_none());
+    assert_eq!(lift(cx), Default::default());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
 async fn esc_in_the_usage_view_returns_to_the_thread_and_its_composer(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "usage-esc", false);
     cx.simulate_input("keep this draft");

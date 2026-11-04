@@ -122,6 +122,8 @@ pub struct Dock {
     pub open: Option<SheetKind>,
     pub on_open: OnOpen,
     pub panel: Option<Panel>,
+    /// 0 to 1: how far everything but the row that opened the panel has dimmed.
+    pub dim: f32,
     /// Where the dock was drawn last, for telling a click on it from a click outside the panel.
     pub bounds: Rc<Cell<Bounds<Pixels>>>,
 }
@@ -149,6 +151,12 @@ pub struct Panel {
     pub on_confirm: OnPress,
     pub on_dismiss: OnPress,
     pub max_height: Pixels,
+    /// 0 to 1: how far up it has come. It stays drawn while it lowers.
+    pub lift: f32,
+    /// It can be clicked: it is open, not lowering.
+    pub live: bool,
+    /// How tall it is with all its rows, as of the last draw: the height it grows to.
+    pub measured: Rc<Cell<Pixels>>,
 }
 
 /// "+2 more", under the rows the tray shows.
@@ -206,7 +214,7 @@ fn tray_header(count: Counted, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn tray_row(row: &TrayRow, dimmed: bool, cx: &App) -> AnyElement {
+fn tray_row(row: &TrayRow, dim: f32, cx: &App) -> AnyElement {
     let material = crate::theme::material(cx);
     let blue = cx.theme().colors.info;
     let waiting = row.clock == Clock::Waiting;
@@ -238,7 +246,7 @@ fn tray_row(row: &TrayRow, dimmed: bool, cx: &App) -> AnyElement {
         .cursor_pointer()
         .when(row.selected, |row| row.bg(material.glass_selected))
         .hover(move |row| row.bg(material.glass_hover))
-        .when(dimmed, |row| row.opacity(0.5))
+        .when(dim > 0., |row| row.opacity(1. - 0.5 * dim))
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .on_click(move |_, window, cx| on_press(window, cx))
         .child(div().flex_none().pr(px(3.)).child(mark))
@@ -262,6 +270,7 @@ fn disclosure(
     kind: SheetKind,
     count: Counted,
     open: Option<SheetKind>,
+    dim: f32,
     on_open: &OnOpen,
     cx: &App,
 ) -> AnyElement {
@@ -294,7 +303,9 @@ fn disclosure(
         .when(!is_open, |row| {
             row.hover(move |row| row.bg(material.glass_hover))
         })
-        .when(open.is_some() && !is_open, |row| row.opacity(0.5))
+        .when(open.is_some() && !is_open && dim > 0., |row| {
+            row.opacity(1. - 0.5 * dim)
+        })
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .on_click(move |_, window, cx| on_open(kind, window, cx))
         .child(ui::icon(
@@ -330,12 +341,12 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
         open,
         on_open,
         panel,
+        dim,
         bounds,
     } = dock;
     if flight.is_none() && tray.is_empty() && snoozed.is_none() && settled.is_none() {
         return None;
     }
-    let dimmed = open.is_some();
     let rows_below = |kind: SheetKind| match kind {
         SheetKind::Snoozed => 1. + settled.map_or(0., |fold| fold.look.size),
         SheetKind::Settled => 1.,
@@ -353,7 +364,7 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
         root = root.child(slot(
             &Key::Tray(item.row.id.clone()),
             item.look,
-            tray_row(&item.row, dimmed, cx),
+            tray_row(&item.row, dim, cx),
         ));
     }
     if let Some(more) = more_label(tray_total) {
@@ -375,7 +386,7 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
             root = root.child(slot(
                 &Key::Disclosure(kind),
                 fold.look,
-                disclosure(kind, fold.count, open, &on_open, cx),
+                disclosure(kind, fold.count, open, dim, &on_open, cx),
             ));
         }
     }
@@ -433,22 +444,30 @@ fn sheet(
             )
         });
     let _ = window;
-    div()
+    let level = panel.lift;
+    let measured = panel.measured.clone();
+    let content = v_flex().relative().min_h_0().child(bar).child(body).child(
+        canvas(
+            |_, _, _| {},
+            move |area, _, _, _| measured.set(area.size.height),
+        )
+        .absolute()
+        .inset_0(),
+    );
+    let reduce = cx.reduce_motion();
+    let sheet = div()
         .id("sheet")
         .debug_selector(|| "sheet".to_string())
         .absolute()
         .left(px(-2.))
         .right(px(-2.))
         .bottom(bottom)
-        .max_h(panel.max_height)
-        .flex()
-        .flex_col()
         .rounded(px(12.))
         .overflow_hidden()
         .bg(fill)
         .shadow(vec![
             gpui::BoxShadow {
-                color: hsla(0., 0., 0., 0.5),
+                color: hsla(0., 0., 0., 0.5 * level),
                 offset: gpui::point(px(0.), px(-16.)),
                 blur_radius: px(40.),
                 spread_radius: px(0.),
@@ -468,15 +487,40 @@ fn sheet(
                 spread_radius: px(0.),
                 inset: true,
             },
-        ])
+        ]);
+    let sheet = if level < 1. && !reduce {
+        let known = panel.measured.get();
+        let natural = if known > px(0.) {
+            known
+        } else {
+            panel.max_height
+        };
+        sheet.h(natural * level).child(
+            content
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .max_h(panel.max_height),
+        )
+    } else {
+        sheet
+            .max_h(panel.max_height)
+            .flex()
+            .flex_col()
+            .when(level < 1., |sheet| sheet.opacity(level))
+            .child(content)
+    };
+    if !panel.live {
+        return sheet.into_any_element();
+    }
+    sheet
         .occlude()
         .on_mouse_down_out(move |event: &MouseDownEvent, window, cx| {
             if !dock.get().contains(&event.position) {
                 on_dismiss(window, cx);
             }
         })
-        .child(bar)
-        .child(body)
         .into_any_element()
 }
 

@@ -274,6 +274,9 @@ pub struct ChatView {
     frame: RefCell<sidebar::Frame>,
     hold: RefCell<Option<(String, ThreadPlacement)>>,
     sheet: Option<Sheet>,
+    /// The panel that was just closed, drawn while it lowers.
+    sheet_exit: Option<Sheet>,
+    sheet_height: Rc<Cell<Pixels>>,
     dock_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
     chip: Entity<ChipMenu>,
     /// What the main card shows: the thread on screen, or the Usage view.
@@ -383,6 +386,8 @@ impl ChatView {
             frame: RefCell::new(sidebar::Frame::default()),
             hold: RefCell::new(None),
             sheet: None,
+            sheet_exit: None,
+            sheet_height: Rc::new(Cell::new(px(0.))),
             dock_bounds: Rc::default(),
             chip: cx.new(|_| ChipMenu::new()),
             pane: Pane::Thread,
@@ -877,7 +882,7 @@ impl ChatView {
         self.review_panel = None;
         self.terminal_open = false;
         self.drawer_open = false;
-        self.sheet = None;
+        self.lower_sheet();
         self.pane = Pane::Thread;
         if target >= self.slots.len() {
             return;
@@ -2833,13 +2838,17 @@ impl ChatView {
             });
             sidebar::attention_note(note, on_dismiss, cx)
         });
-        let dimmed = self.sheet.is_some();
-        let list =
-            sidebar::list_panel(&self.list_scroll, rows).when(dimmed, |list| list.opacity(0.5));
+        let dim = self.frame.borrow().raised.dim;
+        let dimmed = dim > 0.;
+        let list = sidebar::list_panel(&self.list_scroll, rows)
+            .when(dimmed, |list| list.opacity(1. - 0.5 * dim));
         let dock = self.render_thread_dock(&layout, window, cx);
         let usage = self.render_usage_row(cx);
         let usage = if dimmed {
-            div().opacity(0.5).child(usage).into_any_element()
+            div()
+                .opacity(1. - 0.5 * dim)
+                .child(usage)
+                .into_any_element()
         } else {
             usage
         };
@@ -2893,6 +2902,7 @@ impl ChatView {
         let panel = self
             .sheet
             .as_ref()
+            .or(self.sheet_exit.as_ref())
             .map(|sheet| self.sheet_panel(sheet, layout, window, cx));
         let fold = |kind: sidebar::SheetKind, counter: sidebar::Counter| {
             frame
@@ -2915,9 +2925,14 @@ impl ChatView {
                 sep: frame.item(&sidebar::Key::Sep).map(|item| item.look),
                 snoozed: fold(sidebar::SheetKind::Snoozed, sidebar::Counter::Snoozed),
                 settled: fold(sidebar::SheetKind::Settled, sidebar::Counter::Settled),
-                open: self.sheet.as_ref().map(|sheet| sheet.kind),
+                open: self
+                    .sheet
+                    .as_ref()
+                    .or(self.sheet_exit.as_ref())
+                    .map(|sheet| sheet.kind),
                 on_open,
                 panel,
+                dim: frame.raised.dim,
                 bounds: self.dock_bounds.clone(),
             },
             window,
@@ -3071,6 +3086,9 @@ impl ChatView {
             on_confirm,
             on_dismiss,
             max_height: window.viewport_size().height * 0.55,
+            lift: self.frame.borrow().raised.panel,
+            live: self.sheet.is_some(),
+            measured: self.sheet_height.clone(),
         }
     }
 
@@ -3094,6 +3112,7 @@ impl ChatView {
         });
         let focus = Focusable::focus_handle(filter.read(cx), cx);
         window.focus(&focus, cx);
+        self.sheet_exit = None;
         self.sheet = Some(Sheet {
             kind,
             filter,
@@ -3103,10 +3122,18 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Takes the panel off the screen the way it leaves: it keeps drawing while it lowers.
+    fn lower_sheet(&mut self) {
+        if let Some(sheet) = self.sheet.take() {
+            self.sheet_exit = Some(sheet);
+        }
+    }
+
     fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sheet.take().is_none() {
+        if self.sheet.is_none() {
             return;
         }
+        self.lower_sheet();
         if self.composer_has_keys() {
             let field = self.ensure_field(window, cx);
             let handle = field.read(cx).focus_handle(cx);
@@ -3130,7 +3157,7 @@ impl ChatView {
 
     /// Compares what the list shows with the render before, and keeps the rows that are
     /// leaving on screen until they have faded.
-    fn step_motion(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn step_motion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let listed = self.listed(cx);
         let layout = sidebar::display_order(&listed);
         let ids: Vec<SharedString> = self
@@ -3182,6 +3209,7 @@ impl ChatView {
             .collect();
         sight.snoozed = layout.snoozed.len();
         sight.settled = layout.settled.len();
+        sight.panel_open = self.sheet.is_some();
         let now = cx.background_executor().now();
         let frame = self
             .motion
@@ -3189,6 +3217,9 @@ impl ChatView {
             .step(now, sight, cx.reduce_motion());
         if frame.busy {
             window.request_animation_frame();
+        }
+        if self.sheet.is_none() && frame.raised.panel <= 0. {
+            self.sheet_exit = None;
         }
         *self.frame.borrow_mut() = frame;
     }
