@@ -352,6 +352,32 @@ pub fn held(held: Placement, now: Placement) -> Placement {
     }
 }
 
+/// Where the thread on screen shows: its placement and the landing time its row sorts by. Both
+/// stay as they were when the thread was opened, so the row keeps its exact position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub placement: Placement,
+    pub landed_at: i64,
+}
+
+/// What the thread on screen shows after a render. `previous` is what it showed before, when it
+/// was on screen then too. A held place keeps its landing time even when the thread lands
+/// again. A place that moves, by the user's own move or because a thread opened from the tray
+/// landed, takes the thread's own landing time and so goes to the top.
+pub fn hold(previous: Option<Held>, now: Placement, landed_at: i64) -> Held {
+    match previous {
+        Some(at) if held(at.placement, now) == at.placement => at,
+        Some(at) => Held {
+            placement: held(at.placement, now),
+            landed_at,
+        },
+        None => Held {
+            placement: now,
+            landed_at,
+        },
+    }
+}
+
 /// ⌘J: the thread that needs you after `active` in the list's order, wrapping around. `order`
 /// is [`thread_order`], and `needs[ix]` says whether thread `ix` is in the "Needs you" group.
 /// `None` when nothing else needs you (the thread on screen needs no jump to itself).
@@ -1478,6 +1504,51 @@ mod tests {
             assert_eq!(held(was, Read), Read);
             assert_eq!(held(was, Queue), Queue);
         }
+    }
+
+    #[test]
+    fn a_held_row_keeps_its_landing_time_and_a_moved_one_takes_the_new_time() {
+        use Placement::*;
+        let opened = hold(None, Read, 100);
+        assert_eq!(
+            opened,
+            Held {
+                placement: Read,
+                landed_at: 100
+            }
+        );
+        assert_eq!(hold(Some(opened), Read, 900), opened);
+        assert_eq!(hold(Some(opened), Queue, 900), opened);
+        assert_eq!(hold(Some(opened), InFlight, 900), opened);
+        let queued = hold(None, Queue, 100);
+        assert_eq!(hold(Some(queued), Read, 900), queued);
+
+        let tray = hold(None, InFlight, 100);
+        assert_eq!(hold(Some(tray), InFlight, 900), tray);
+        assert_eq!(
+            hold(Some(tray), Read, 900),
+            Held {
+                placement: Queue,
+                landed_at: 900
+            }
+        );
+
+        assert_eq!(
+            hold(Some(opened), Pinned, 900),
+            Held {
+                placement: Pinned,
+                landed_at: 900
+            }
+        );
+        let pinned = hold(Some(opened), Pinned, 900);
+        assert_eq!(hold(Some(pinned), Pinned, 950), pinned);
+        assert_eq!(
+            hold(Some(pinned), Read, 960),
+            Held {
+                placement: Read,
+                landed_at: 960
+            }
+        );
     }
 
     #[test]

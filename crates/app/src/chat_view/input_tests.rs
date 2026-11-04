@@ -2625,6 +2625,63 @@ async fn archive_all_leaves_a_thread_that_left_settled_while_the_question_was_op
     finish(&chat, path, cx);
 }
 
+fn listed_ids(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        view.thread_order(cx)
+            .into_iter()
+            .map(|ix| view.slots[ix].thread.read(cx).id().to_string())
+            .collect()
+    })
+}
+
+fn read_list(landed_at: i64) -> newjen_core::store::ListState {
+    newjen_core::store::ListState {
+        landed_at,
+        ..Default::default()
+    }
+}
+
+#[gpui::test]
+async fn the_thread_on_screen_keeps_its_exact_place_when_it_lands_and_moves_when_left(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "hold-order", false);
+    let older = add_idle_thread(&chat, cx, "older", false, read_list(100));
+    let mid = add_idle_thread(&chat, cx, "mid", false, read_list(200));
+    let newest = add_idle_thread(&chat, cx, "newest", false, read_list(300));
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| view.show_thread(&mid, window, cx));
+    });
+    let_motion_finish(&chat, cx);
+    let expected = vec![newest.clone(), mid.clone(), older.clone()];
+    assert_eq!(listed_ids(&chat, cx), expected);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            let ix = view.index_of(&mid, cx).unwrap();
+            view.slots[ix].thread.update(cx, |thread, cx| {
+                thread.snooze(i64::MAX);
+                thread.wake(now_ms());
+                cx.notify();
+            });
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        listed_ids(&chat, cx),
+        expected,
+        "landing on screen does not move the row"
+    );
+
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| view.show_thread(&older, window, cx));
+    });
+    let_motion_finish(&chat, cx);
+    assert_eq!(listed_ids(&chat, cx), vec![mid, newest, older]);
+    finish(&chat, path, cx);
+}
+
 #[gpui::test]
 async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "settle-motion", true);

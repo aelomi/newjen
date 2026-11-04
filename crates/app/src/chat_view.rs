@@ -275,7 +275,7 @@ pub struct ChatView {
     motion: RefCell<sidebar::Motion>,
     /// What the list shows this render, with each ghost and how far along each element is.
     frame: RefCell<sidebar::Frame>,
-    hold: RefCell<Option<(String, Placement)>>,
+    hold: RefCell<Option<(String, sidebar::Held)>>,
     sheet: Option<Sheet>,
     /// The panel that was just closed, drawn while it lowers.
     sheet_exit: Option<Sheet>,
@@ -2776,27 +2776,30 @@ impl ChatView {
             .map(|(ix, slot)| {
                 let thread = slot.thread.read(cx);
                 let own = thread.placement(now);
-                let placement = if ix == self.active {
-                    self.hold_place(thread.id(), own)
-                } else {
-                    own
-                };
+                let mut list = thread.list_state();
+                let mut placement = own;
+                if ix == self.active {
+                    let held = self.hold_place(thread.id(), own, list.landed_at);
+                    placement = held.placement;
+                    list.landed_at = held.landed_at;
+                }
                 sidebar::Listed {
                     draft: thread.is_draft(),
                     placement,
                     waits: !thread.is_draft() && thread.waits_on_you(),
-                    list: thread.list_state(),
+                    list,
                 }
             })
             .collect()
     }
 
-    fn hold_place(&self, thread_id: &str, own: Placement) -> Placement {
+    fn hold_place(&self, thread_id: &str, own: Placement, landed_at: i64) -> sidebar::Held {
         let mut hold = self.hold.borrow_mut();
-        let shown = match hold.as_ref() {
-            Some((held_id, at)) if held_id == thread_id => sidebar::held(*at, own),
-            _ => own,
-        };
+        let previous = hold
+            .as_ref()
+            .filter(|(held_id, _)| held_id == thread_id)
+            .map(|(_, at)| *at);
+        let shown = sidebar::hold(previous, own, landed_at);
         *hold = Some((thread_id.to_string(), shown));
         shown
     }
