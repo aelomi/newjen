@@ -1,5 +1,34 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use super::*;
 use crate::usage_view::{self, Snapshot};
+use newjen_core::providers::Provider;
+
+thread_local! {
+    static TURN_USAGE: RefCell<HashMap<(Provider, i64), (Instant, bool)>> =
+        RefCell::new(HashMap::new());
+}
+
+const TURN_USAGE_FRESH: Duration = Duration::from_secs(10);
+
+/// Whether Newjen's turns used `provider` since `since` (Unix seconds). The footer asks on
+/// every redraw, so an answer is kept for a few seconds instead of reading the store each time.
+fn turn_usage_since(store: &Store, provider: Provider, since: i64) -> bool {
+    TURN_USAGE.with_borrow_mut(|cache| {
+        if let Some((read_at, used)) = cache.get(&(provider, since))
+            && read_at.elapsed() < TURN_USAGE_FRESH
+        {
+            return *used;
+        }
+        let used = store
+            .threads_with_usage_since(provider, since * 1000)
+            .is_ok_and(|threads| !threads.is_empty());
+        cache.retain(|_, (read_at, _)| read_at.elapsed() < TURN_USAGE_FRESH);
+        cache.insert((provider, since), (Instant::now(), used));
+        used
+    })
+}
 
 impl ChatView {
     /// Shows the Usage view in the main card. The thread that was on screen stops being "on
@@ -35,11 +64,28 @@ impl ChatView {
         changed
     }
 
+    /// The footer row: the settings gear and the usage ring, which shows the tightest limit among
+    /// the providers in use.
     pub(super) fn render_usage_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let now = now_ms() / 1000;
-        let meter = usage_view::footer_meter(now).map(|meter| usage_view::meter_view(meter, cx));
+        let usages = usage_view::board_usages();
+        let on_screen = self.thread().read(cx).agent_config().map(|a| a.provider);
+        let threads: Vec<_> = self
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let thread = slot.thread.read(cx);
+                Some((thread.agent_config()?.provider, thread.status()))
+            })
+            .collect();
+        let known = usage_view::providers_in_use(threads.iter().copied(), on_screen, &[]);
+        let with_turns = usage_view::providers_with_turns(&usages, now, |provider, since| {
+            known.contains(&provider) || turn_usage_since(&self.store, provider, since)
+        });
+        let in_use = usage_view::providers_in_use(threads, on_screen, &with_turns);
+        let gauge = usage_view::gauge(&usages, &in_use, now);
         let on_press = self.press(cx, |view, window, cx| view.show_usage(window, cx));
-        sidebar::usage_row(self.pane == Pane::Usage, meter, on_press, cx)
+        usage_view::footer(gauge.as_ref(), self.pane == Pane::Usage, on_press, cx)
     }
 
     pub(super) fn render_usage_card(
