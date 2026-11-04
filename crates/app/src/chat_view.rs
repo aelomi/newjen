@@ -273,6 +273,9 @@ pub struct ChatView {
     reveal_active: Cell<bool>,
     /// Rows that change place stay on screen while they leave (see `sidebar::Motion`).
     motion: RefCell<sidebar::Motion>,
+    /// The list was out of sight at the last render, so its motion did not run and the next
+    /// one starts from where the list is.
+    motion_asleep: bool,
     /// What the list shows this render, with each ghost and how far along each element is.
     frame: RefCell<sidebar::Frame>,
     hold: RefCell<Option<(String, sidebar::Held)>>,
@@ -387,6 +390,7 @@ impl ChatView {
             fox: cx.new(|cx| ui::FoxGame::new(window, cx)),
             reveal_active: Cell::new(false),
             motion: RefCell::new(sidebar::Motion::default()),
+            motion_asleep: false,
             frame: RefCell::new(sidebar::Frame::default()),
             hold: RefCell::new(None),
             sheet: None,
@@ -3195,7 +3199,14 @@ impl ChatView {
 
     /// Compares what the list shows with the render before, and keeps the rows that are
     /// leaving on screen until they have faded.
-    fn step_motion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn step_motion(&mut self, mode: SidebarMode, window: &mut Window, cx: &mut Context<Self>) {
+        if mode == SidebarMode::Hidden {
+            self.motion_asleep = true;
+            return;
+        }
+        if std::mem::take(&mut self.motion_asleep) {
+            self.motion.get_mut().snap();
+        }
         let listed = self.listed(cx);
         let layout = sidebar::display_order(&listed);
         let ids: Vec<SharedString> = self
@@ -3460,7 +3471,13 @@ impl ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.step_motion(window, cx);
+        let width = f32::from(window.viewport_size().width);
+        // The drawer only exists in narrow windows; widening the window docks the list.
+        if width >= sidebar::NARROW_WINDOW {
+            self.drawer_open = false;
+        }
+        let mode = sidebar::mode(width, self.sidebar_hidden, self.drawer_open);
+        self.step_motion(mode, window, cx);
         if self.terminal_open {
             if self.terminal_focused(window, cx) {
                 self.terminal_wanted = true;
@@ -3471,16 +3488,10 @@ impl Render for ChatView {
                 self.terminal_wanted = false;
             }
         }
-        let width = f32::from(window.viewport_size().width);
-        // The drawer only exists in narrow windows; widening the window docks the list.
-        if width >= sidebar::NARROW_WINDOW {
-            self.drawer_open = false;
-        }
         // Revoking the last rule takes the chip, and its popover, away.
         if self.thread().read(cx).grant_views().is_empty() {
             self.grants_open = false;
         }
-        let mode = sidebar::mode(width, self.sidebar_hidden, self.drawer_open);
         let sidebar_px = f32::from(SIDEBAR);
         // The drawer floats over the chat, so only the docked list takes width from it.
         let main_width = match mode {

@@ -2879,6 +2879,38 @@ async fn the_panel_names_the_filtered_count_and_the_copies_only_when_there_are_s
 }
 
 #[gpui::test]
+async fn a_hidden_list_runs_no_motion_and_shows_where_it_is_when_it_returns(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "hidden-motion", false);
+    add_idle_thread(&chat, cx, "before", true, Default::default());
+    let_motion_finish(&chat, cx);
+    let busy = |cx: &mut VisualTestContext| cx.update(|_, cx| chat.read(cx).frame.borrow().busy);
+    assert!(!busy(cx));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.sidebar_hidden = true;
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    add_idle_thread(&chat, cx, "while hidden", true, Default::default());
+    cx.run_until_parked();
+    assert!(!busy(cx), "nothing animates in a list nobody sees");
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.sidebar_hidden = false;
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    assert!(!busy(cx), "the list comes back as it is");
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
 async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "settle-motion", true);
     let id = add_idle_thread(&chat, cx, "first thread", true, Default::default());
