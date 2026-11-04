@@ -58,7 +58,7 @@ impl<T: Mix> Tween<T> {
     }
 
     pub fn settled(&self, now: Instant, length: Duration) -> bool {
-        self.progress(now, length) >= 1.0
+        self.from == self.to || self.progress(now, length) >= 1.0
     }
 
     /// Heads for `target` from wherever the value is now, or jumps there. A target it already
@@ -141,11 +141,25 @@ mod tests {
     }
 
     #[test]
-    fn a_move_that_may_not_animate_jumps() {
+    fn a_move_that_may_not_animate_jumps_and_is_settled_at_once() {
         let start = Instant::now();
         let mut arc = Tween::at(0.1_f32, start);
         arc.aim(0.9, start, ARC, false);
         assert_eq!(arc.value(start, ARC), 0.9);
+        assert!(arc.settled(start, ARC));
+        arc.aim_at(0.2, at(start, 500), start, ARC, false);
+        assert_eq!(arc.value(start, ARC), 0.2);
+        assert!(arc.settled(start, ARC));
+    }
+
+    #[test]
+    fn a_value_that_has_nowhere_to_go_is_settled() {
+        let start = Instant::now();
+        let arc = Tween::at(0.4_f32, start);
+        assert!(arc.settled(start, ARC));
+        let mut moving = Tween::at(0.4_f32, start);
+        moving.aim(0.8, start, ARC, true);
+        assert!(!moving.settled(start, ARC));
     }
 
     #[test]
