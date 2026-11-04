@@ -43,6 +43,9 @@ pub use step::{
 };
 pub use tool_card::{ToolBody, ToolCard};
 
+mod gauge;
+pub use gauge::{GaugeLabel, GaugeLook, UsageGauge};
+
 mod message_list;
 pub use message_list::MessageList;
 

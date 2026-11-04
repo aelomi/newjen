@@ -1060,8 +1060,6 @@ fn week_card(snapshot: &Snapshot, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-const RING: f32 = 16.0;
-const RING_WIDTH: f32 = 2.0;
 const ICON_BUTTON: f32 = 26.0;
 const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -1102,41 +1100,19 @@ pub fn footer(gauge: Option<&Gauge>, selected: bool, on_usage: OnPress, cx: &App
 fn cluster(gauge: Option<&Gauge>, selected: bool, on_usage: OnPress, cx: &App) -> AnyElement {
     let material = material(cx);
     let colors = cx.theme().colors;
-    let tone = gauge.map_or(Tone::Normal, |gauge| gauge.tone);
-    let ink = tone_ink(tone, cx);
+    let look = ui::GaugeLook {
+        fraction: gauge.map_or(0.0, |gauge| gauge.fraction),
+        tick: gauge.and_then(|gauge| gauge.pace),
+        ink: tone_ink(gauge.map_or(Tone::Normal, |gauge| gauge.tone), cx),
+        track: colors.foreground.opacity(0.12),
+        tick_ink: colors.foreground.opacity(0.55),
+    };
     let label = gauge.and_then(|gauge| {
-        gauge.label.as_ref().map(|text| {
-            h_flex()
-                .debug_selector(|| "usage-label".to_string())
-                .items_center()
-                .mr(px(6.))
-                .text_xs()
-                .text_color(match tone {
-                    Tone::Normal => material.glass_muted,
-                    _ => ink,
-                })
-                .child(
-                    ui::provider_icon(gauge.provider, cx)
-                        .size(px(12.))
-                        .mr(px(5.)),
-                )
-                .child(text.clone())
+        Some(ui::GaugeLabel {
+            provider: gauge.provider,
+            text: gauge.label.clone()?.into(),
         })
     });
-    let ring = ui::ring_with_tick(
-        gauge.map_or(0.0, |gauge| gauge.fraction),
-        px(RING),
-        px(RING_WIDTH),
-        px(1.),
-        ink,
-        colors.foreground.opacity(0.12),
-        gauge.and_then(|gauge| gauge.pace).map(|at| ui::Tick {
-            at,
-            color: colors.foreground.opacity(0.55),
-            width: px(1.2),
-            reach: px(1.7),
-        }),
-    );
     h_flex()
         .id("usage-row")
         .debug_selector(|| "usage-row".to_string())
@@ -1152,8 +1128,7 @@ fn cluster(gauge: Option<&Gauge>, selected: bool, on_usage: OnPress, cx: &App) -
             window.prevent_default()
         })
         .on_click(move |_, window, cx| on_usage(window, cx))
-        .children(label)
-        .child(ring)
+        .child(ui::UsageGauge::new("usage-gauge", look, label))
         .into_any_element()
 }
 
@@ -1465,6 +1440,83 @@ mod tests {
             opened: Rc::default(),
         });
         assert!(cx.debug_bounds("usage-label").is_none());
+    }
+
+    fn show(view: &gpui::Entity<Harness>, gauge: Option<Gauge>, cx: &mut gpui::VisualTestContext) {
+        cx.update(|_, cx| {
+            view.update(cx, |harness, cx| {
+                harness.gauge = gauge;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    fn label_width(cx: &mut gpui::VisualTestContext) -> Option<f32> {
+        cx.debug_bounds("usage-label")
+            .map(|bounds| f32::from(bounds.size.width))
+    }
+
+    fn pass(cx: &mut gpui::VisualTestContext, millis: u64) {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(millis));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+
+    fn near() -> Option<Gauge> {
+        gauge(
+            &[usage(vec![five_hours(1.0, 3_600, UsageStatus::Limited)])],
+            &BOTH,
+            NOW,
+        )
+    }
+
+    #[gpui::test]
+    fn the_label_slides_out_of_the_ring_and_back(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, _| Harness {
+            gauge: None,
+            opened: Rc::default(),
+        });
+        assert_eq!(label_width(cx), None);
+        show(&view, near(), cx);
+        let starting = label_width(cx).unwrap();
+        pass(cx, 100);
+        let sliding = label_width(cx).unwrap();
+        pass(cx, 300);
+        let full = label_width(cx).unwrap();
+        assert!(
+            starting < sliding && sliding < full,
+            "{starting} {sliding} {full}"
+        );
+        show(&view, None, cx);
+        pass(cx, 100);
+        assert!(label_width(cx).unwrap() < full);
+        pass(cx, 300);
+        assert_eq!(label_width(cx), None);
+    }
+
+    #[gpui::test]
+    fn with_reduce_motion_the_label_keeps_its_width_and_only_fades(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (view, cx) = cx.add_window_view(|_, _| Harness {
+            gauge: None,
+            opened: Rc::default(),
+        });
+        show(&view, near(), cx);
+        pass(cx, 100);
+        let full = label_width(cx).unwrap();
+        pass(cx, 300);
+        assert_eq!(label_width(cx), Some(full));
+        show(&view, None, cx);
+        pass(cx, 100);
+        assert_eq!(label_width(cx), Some(full));
+        pass(cx, 300);
+        assert_eq!(label_width(cx), None);
     }
 
     #[test]
