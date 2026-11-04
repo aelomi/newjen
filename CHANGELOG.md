@@ -4,6 +4,19 @@ What changed in each Newjen release, in plain English. Newjen shows the section 
 
 Every user-visible change adds a line under `## Unreleased`, in one of four groups: New features, Improvements, Fixes, Misc. A release renames `Unreleased` to the version and date.
 
+## Unreleased
+
+### New features
+
+- The thread list is an inbox. A Queue holds what waits on you, finished threads you have read sit below it, working threads tuck into an In flight tray, and Snoozed and Settled open as panels at the bottom.
+- Snooze a thread until later today, tomorrow or next Monday, settle it when you are done, or pin it to the top. Hover a row for Snooze and Settle, or right-click it.
+- Archive all in the Settled panel removes every settled thread after one confirmation.
+
+### Improvements
+
+- A thread stays where it is while you read it and moves to its new place when you switch away.
+- A thread that ended and was not opened yet waits in the Queue, and a thread held back by a usage limit shows as waiting in the In flight tray.
+
 ## 0.1.0-alpha.2 · 3 November 2026
 
 ### New features

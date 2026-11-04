@@ -22,7 +22,7 @@ mod picker;
 mod review;
 mod usage;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -37,7 +37,9 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::input::{InputEvent, InputState};
 use newjen_core::agent::NoteDelivery;
+use newjen_core::calendar::{self, SettledAge, WakeDay};
 use newjen_core::steps::Placement as ThreadPlacement;
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
@@ -206,6 +208,15 @@ struct Slot {
     _changes: Subscription,
 }
 
+/// The panel the Snoozed or Settled row opened.
+struct Sheet {
+    kind: sidebar::SheetKind,
+    filter: Entity<InputState>,
+    /// "Archive these threads?" is being asked, about these threads.
+    confirming: Option<Vec<String>>,
+    _filter: Subscription,
+}
+
 /// What `ChatView::new` starts from (see `main.rs`).
 pub struct Startup {
     pub store: Store,
@@ -256,6 +267,8 @@ pub struct ChatView {
     drawer_focus: FocusHandle,
     list_scroll: ScrollHandle,
     hold: RefCell<Option<(String, ThreadPlacement)>>,
+    sheet: Option<Sheet>,
+    dock_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
     chip: Entity<ChipMenu>,
     /// What the main card shows: the thread on screen, or the Usage view.
     pane: Pane,
@@ -360,6 +373,8 @@ impl ChatView {
             drawer_focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             hold: RefCell::new(None),
+            sheet: None,
+            dock_bounds: Rc::default(),
             chip: cx.new(|_| ChipMenu::new()),
             pane: Pane::Thread,
             usage_snapshot: None,
@@ -852,6 +867,7 @@ impl ChatView {
         self.review_panel = None;
         self.terminal_open = false;
         self.drawer_open = false;
+        self.sheet = None;
         self.pane = Pane::Thread;
         if target >= self.slots.len() {
             return;
@@ -1094,8 +1110,8 @@ impl ChatView {
         None
     }
 
-    fn render_drawer(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let list = self.render_list(cx);
+    fn render_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let list = self.render_list(window, cx);
         v_flex()
             .size_full()
             .key_context(keys::CONTEXT)
@@ -1136,6 +1152,17 @@ impl ChatView {
             return;
         }
         gpui_kit::base::apply_system_reduce_motion(cx);
+        let now = now_ms();
+        let mut woke = false;
+        for slot in &self.slots {
+            woke |= slot.thread.update(cx, |thread, cx| {
+                let woke = thread.wake_if_due(now);
+                if woke {
+                    cx.notify();
+                }
+                woke
+            });
+        }
         let minute = ticks.is_multiple_of(MINUTE_TICKS);
         if minute {
             let now = Instant::now();
@@ -1155,7 +1182,7 @@ impl ChatView {
         let refreshed = self.pane == Pane::Usage
             && ticks.is_multiple_of(USAGE_REFRESH_TICKS)
             && self.refresh_usage();
-        if minute || busy || limited || refreshed {
+        if minute || busy || limited || refreshed || woke {
             cx.notify();
         }
     }
@@ -1736,6 +1763,14 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         if self.quit_saving {
+            return;
+        }
+        if self.sheet.is_some()
+            && event.keystroke.key == "escape"
+            && !event.keystroke.modifiers.modified()
+        {
+            self.close_sheet(window, cx);
+            cx.stop_propagation();
             return;
         }
         if self.key_route(event, window, cx) == KeyRoute::CloseDrawer {
@@ -2763,16 +2798,10 @@ impl ChatView {
 
     /// The list's content: the project row, the threads by section (or, with none yet, a line
     /// saying so) and the usage row.
-    fn render_list(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_list(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let listed = self.listed(cx);
         let layout = sidebar::display_order(&listed);
         let mut rows = self.render_entries(&layout.entries, cx);
-        rows.extend(
-            layout
-                .in_flight
-                .iter()
-                .filter_map(|ix| self.render_thread_row(*ix, Instant::now(), cx)),
-        );
         if sidebar::is_empty_list(&listed) {
             rows.push(sidebar::empty_caption(
                 sidebar::empty_caption_text(&listed),
@@ -2794,15 +2823,263 @@ impl ChatView {
             });
             sidebar::attention_note(note, on_dismiss, cx)
         });
-        vec![
-            sidebar::project_bar(bar, cx),
-            sidebar::list_panel(&self.list_scroll, rows).into_any_element(),
-        ]
-        .into_iter()
-        .chain(note)
-        .chain(self.render_update_row(cx))
-        .chain([self.render_usage_row(cx)])
-        .collect()
+        let dimmed = self.sheet.is_some();
+        let list =
+            sidebar::list_panel(&self.list_scroll, rows).when(dimmed, |list| list.opacity(0.5));
+        let dock = self.render_thread_dock(&layout, window, cx);
+        let usage = self.render_usage_row(cx);
+        let usage = if dimmed {
+            div().opacity(0.5).child(usage).into_any_element()
+        } else {
+            usage
+        };
+        vec![sidebar::project_bar(bar, cx), list.into_any_element()]
+            .into_iter()
+            .chain(dock)
+            .chain(note)
+            .chain(self.render_update_row(cx))
+            .chain([usage])
+            .collect()
+    }
+
+    fn render_thread_dock(
+        &self,
+        layout: &sidebar::Layout,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let now = Instant::now();
+        let tray = layout
+            .in_flight
+            .iter()
+            .filter_map(|ix| self.tray_row(*ix, now, cx))
+            .collect();
+        let on_open = {
+            let view = cx.weak_entity();
+            Rc::new(move |kind, window: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |view, cx| view.toggle_sheet(kind, window, cx));
+            })
+        };
+        let panel = self
+            .sheet
+            .as_ref()
+            .map(|sheet| self.sheet_panel(sheet, layout, window, cx));
+        sidebar::dock(
+            sidebar::Dock {
+                tray,
+                snoozed: layout.snoozed.len(),
+                settled: layout.settled.len(),
+                open: self.sheet.as_ref().map(|sheet| sheet.kind),
+                on_open,
+                panel,
+                bounds: self.dock_bounds.clone(),
+            },
+            window,
+            cx,
+        )
+    }
+
+    fn tray_row(
+        &self,
+        ix: usize,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> Option<sidebar::TrayRow> {
+        let slot = self.slots.get(ix)?;
+        let (id, row) = {
+            let thread = slot.thread.read(cx);
+            let id = SharedString::from(thread.id().to_string());
+            let facts = row_facts(thread, now);
+            let clock = if thread.paused_until(now_ms() / 1000).is_some() {
+                sidebar::Clock::Waiting
+            } else {
+                facts.working_for.map_or(sidebar::Clock::Quiet, |since| {
+                    sidebar::Clock::Elapsed(elapsed(since.as_secs()))
+                })
+            };
+            let row = (
+                thread.title().to_string().into(),
+                clock,
+                ix == self.active && self.pane == Pane::Thread,
+            );
+            (id, row)
+        };
+        let shown = id.clone();
+        let on_press = self.press(cx, move |view, window, cx| {
+            view.show_thread(&shown, window, cx)
+        });
+        Some(sidebar::TrayRow {
+            id,
+            title: row.0,
+            clock: row.1,
+            selected: row.2,
+            on_press,
+        })
+    }
+
+    fn sheet_panel(
+        &self,
+        sheet: &Sheet,
+        layout: &sidebar::Layout,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> sidebar::Panel {
+        let now = now_ms();
+        let query = sheet.filter.read(cx).value().trim().to_lowercase();
+        let members = match sheet.kind {
+            sidebar::SheetKind::Snoozed => &layout.snoozed,
+            sidebar::SheetKind::Settled => &layout.settled,
+        };
+        let mut groups: Vec<(&'static str, Vec<sidebar::PanelRow>)> = Vec::new();
+        let mut shown = Vec::new();
+        for ix in members {
+            let Some(slot) = self.slots.get(*ix) else {
+                continue;
+            };
+            let (id, title, label, when) = {
+                let thread = slot.thread.read(cx);
+                if !query.is_empty() && !thread.title().to_lowercase().contains(&query) {
+                    continue;
+                }
+                let list = thread.list_state();
+                let (label, at) = match sheet.kind {
+                    sidebar::SheetKind::Snoozed => {
+                        let until = list.snoozed_until.unwrap_or(now);
+                        (
+                            WakeDay::of(until, now, &calendar::system_offset).label(),
+                            until,
+                        )
+                    }
+                    sidebar::SheetKind::Settled => {
+                        let at = list.settled_at.unwrap_or(now);
+                        (
+                            SettledAge::of(at, now, &calendar::system_offset).label(),
+                            at,
+                        )
+                    }
+                };
+                (
+                    thread.id().to_string(),
+                    SharedString::from(thread.title().to_string()),
+                    label,
+                    calendar::short_when(at, now, &calendar::system_offset),
+                )
+            };
+            shown.push(id.clone());
+            let open = id.clone();
+            let row = sidebar::PanelRow {
+                id: id.into(),
+                title,
+                when,
+                on_press: self.press(cx, move |view, window, cx| {
+                    view.show_thread(&open, window, cx)
+                }),
+            };
+            match groups.last_mut() {
+                Some((last, rows)) if *last == label => rows.push(row),
+                _ => groups.push((label, vec![row])),
+            }
+        }
+        let kind = sheet.kind;
+        let ids = shown.clone();
+        let on_bulk = self.press(cx, move |view, window, cx| match kind {
+            sidebar::SheetKind::Snoozed => {
+                view.wake_threads(&ids, cx);
+                view.close_sheet(window, cx);
+            }
+            sidebar::SheetKind::Settled => {
+                if let Some(sheet) = view.sheet.as_mut() {
+                    sheet.confirming = Some(ids.clone());
+                    cx.notify();
+                }
+            }
+        });
+        let on_cancel = self.press(cx, |view, _, cx| {
+            if let Some(sheet) = view.sheet.as_mut() {
+                sheet.confirming = None;
+                cx.notify();
+            }
+        });
+        let on_confirm = self.press(cx, |view, window, cx| {
+            let ids = view
+                .sheet
+                .as_mut()
+                .and_then(|sheet| sheet.confirming.take())
+                .unwrap_or_default();
+            view.close_sheet(window, cx);
+            for id in ids {
+                view.archive(&id, window, cx);
+            }
+        });
+        let on_dismiss = self.press(cx, |view, window, cx| view.close_sheet(window, cx));
+        sidebar::Panel {
+            kind,
+            filter: sheet.filter.clone(),
+            groups: groups
+                .into_iter()
+                .map(|(label, rows)| sidebar::PanelGroup { label, rows })
+                .collect(),
+            confirming: sheet.confirming.as_ref().map(Vec::len),
+            on_bulk,
+            on_cancel,
+            on_confirm,
+            on_dismiss,
+            max_height: window.viewport_size().height * 0.55,
+        }
+    }
+
+    /// Clicking the Snoozed or Settled row: opens its panel, or closes it when it is the one
+    /// open.
+    fn toggle_sheet(
+        &mut self,
+        kind: sidebar::SheetKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sheet.as_ref().is_some_and(|sheet| sheet.kind == kind) {
+            self.close_sheet(window, cx);
+            return;
+        }
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(kind.filter_hint()));
+        let subscription = cx.subscribe_in(&filter, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let focus = Focusable::focus_handle(filter.read(cx), cx);
+        window.focus(&focus, cx);
+        self.sheet = Some(Sheet {
+            kind,
+            filter,
+            confirming: None,
+            _filter: subscription,
+        });
+        cx.notify();
+    }
+
+    fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sheet.take().is_none() {
+            return;
+        }
+        if self.composer_has_keys() {
+            let field = self.ensure_field(window, cx);
+            let handle = field.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    fn wake_threads(&mut self, ids: &[String], cx: &mut Context<Self>) {
+        let now = now_ms();
+        for id in ids {
+            if let Some(ix) = self.index_of(id, cx) {
+                self.slots[ix].thread.update(cx, |thread, cx| {
+                    thread.wake(now);
+                    cx.notify();
+                });
+            }
+        }
+        cx.notify();
     }
 
     fn render_entries(
@@ -2835,7 +3112,7 @@ impl ChatView {
     ) -> Option<AnyElement> {
         let now_ms = now_ms();
         let slot = self.slots.get(ix)?;
-        let (id, row) = {
+        let (id, row, draft_row, pinned) = {
             let thread = slot.thread.read(cx);
             let id = SharedString::from(thread.id().to_string());
             let draft = thread.is_draft();
@@ -2857,16 +3134,81 @@ impl ChatView {
                 selected: ix == self.active && self.pane == Pane::Thread,
                 archivable: thread.preparing().is_none(),
             };
-            (id, row)
+            (id, row, draft, thread.list_state().pinned_at.is_some())
         };
         let shown = id.clone();
         let on_press = self.press(cx, move |view, window, cx| {
             view.show_thread(&shown, window, cx)
         });
-        let on_archive = self.press(cx, move |view, window, cx| {
-            view.ask_to_archive(&id, window, cx)
+        let actions = (!draft_row).then(|| self.row_actions(&id, pinned, cx));
+        Some(sidebar::thread_row(row, actions, on_press, cx))
+    }
+
+    fn row_actions(
+        &self,
+        id: &SharedString,
+        pinned: bool,
+        cx: &mut Context<Self>,
+    ) -> sidebar::RowActions {
+        let (pin, settle, archive) = (id.clone(), id.clone(), id.clone());
+        let snooze = id.clone();
+        let view = cx.weak_entity();
+        sidebar::RowActions {
+            pinned,
+            on_pin: self.press(cx, move |view, _, cx| view.toggle_pin(&pin, cx)),
+            on_snooze: Rc::new(move |until, _, cx| {
+                let _ = view.update(cx, |view, cx| view.snooze_thread(&snooze, until, cx));
+            }),
+            on_settle: self.press(cx, move |view, _, cx| view.settle_thread(&settle, cx)),
+            on_archive: self.press(cx, move |view, window, cx| {
+                view.ask_to_archive(&archive, window, cx)
+            }),
+        }
+    }
+
+    fn toggle_pin(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let now = now_ms();
+        self.slots[ix].thread.update(cx, |thread, cx| {
+            if thread.list_state().pinned_at.is_some() {
+                thread.unpin();
+            } else {
+                thread.pin(now);
+            }
+            cx.notify();
         });
-        Some(sidebar::thread_row(row, on_press, on_archive, cx))
+        cx.notify();
+    }
+
+    fn snooze_thread(
+        &mut self,
+        thread_id: &str,
+        until: calendar::SnoozeUntil,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let until = until.at(now_ms(), &calendar::system_offset);
+        self.slots[ix].thread.update(cx, |thread, cx| {
+            thread.snooze(until);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn settle_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let now = now_ms();
+        self.slots[ix].thread.update(cx, |thread, cx| {
+            thread.settle(now);
+            cx.notify();
+        });
+        cx.notify();
     }
 }
 
@@ -2901,7 +3243,7 @@ impl Render for ChatView {
         let docked = (placement == Placement::Docked).then(|| {
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
             let header = sidebar::header(toggle, window, cx);
-            let list = self.render_list(cx);
+            let list = self.render_list(window, cx);
             sidebar::column(header, list, cx)
         });
         use gpui_kit::component::{Placement as SheetPlacement, WindowExt as _};
@@ -3173,7 +3515,7 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
         failure,
         stopped_on_quit: matches!(transcript.items().last(), Some(Item::Stopped { .. })),
         background_tasks: thread.background_tasks().len(),
-        updated_at: thread.updated_at(),
+        updated_at: thread.list_state().landed_at,
     }
 }
 

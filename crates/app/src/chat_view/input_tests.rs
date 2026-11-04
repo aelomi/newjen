@@ -552,7 +552,13 @@ async fn reply_copy_and_chrome_clicks_preserve_keyboard_behavior(cx: &mut TestAp
     cx.simulate_keystrokes("cmd-b cmd-n");
     assert!(focused(cx));
     assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
-    click(cx, "thread-row");
+    // The first thread is still finishing in the tray, or already in the list.
+    let first = if cx.debug_bounds("tray-row").is_some() {
+        "tray-row"
+    } else {
+        "thread-row"
+    };
+    click(cx, first);
     assert!(focused(cx));
     assert!(!cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
     finish(&chat, path, cx);
@@ -1008,7 +1014,7 @@ fn archive_from_menu(cx: &mut VisualTestContext) {
             );
         }
     }
-    cx.simulate_keystrokes("down enter");
+    cx.simulate_keystrokes("down down down down enter");
 }
 
 #[gpui::test]
@@ -2308,6 +2314,66 @@ async fn the_sidebar_lists_threads_and_its_usage_row_opens_the_usage_view(cx: &m
     click(cx, "thread-row");
     cx.run_until_parked();
     assert!(cx.debug_bounds("usage-view").is_none());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_settled_thread_waits_in_a_panel_that_esc_closes_and_archive_all_asks_first(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "settled-panel", true);
+    cx.simulate_input("park me");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let layout = chat.read(cx).sidebar_layout(cx);
+        assert_eq!(layout.settled, vec![0]);
+        assert!(layout.entries.is_empty() && layout.in_flight.is_empty());
+    });
+    assert!(cx.debug_bounds("sheet").is_none());
+
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet").is_some());
+    assert!(cx.debug_bounds("sheet-row").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet").is_none());
+    assert!(
+        cx.update(|_, cx| chat
+            .read(cx)
+            .thread()
+            .read(cx)
+            .transcript()
+            .pending_approval()
+            .is_some()),
+        "Esc closed the panel and denied nothing"
+    );
+
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet-archive").is_some());
+    click(cx, "sheet-cancel");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet-archive").is_none());
+    assert!(cx.debug_bounds("sheet").is_some(), "cancel keeps the panel");
+    assert!(cx.debug_bounds("sheet-bulk").is_some());
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    click(cx, "sheet-archive");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet").is_none());
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert!(view.thread().read(cx).is_draft());
+        assert!(view.sidebar_layout(cx).settled.is_empty());
+    });
+    assert!(cx.debug_bounds("disclosure-settled").is_none());
     finish(&chat, path, cx);
 }
 

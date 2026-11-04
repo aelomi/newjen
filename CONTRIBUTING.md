@@ -39,11 +39,12 @@ crates/
           #   worktree.rs: git worktrees. vcs.rs: checkpoints, diffs and git actions. commit_message.rs: AI commit messages through the user's CLI. changes.rs, edits.rs: per-file change counts and edit previews.
           #   thread_usage.rs: context fill and tokens per model for one thread. usage.rs: each CLI's plan windows, pace and billing.
           #   update.rs (+ update/): in-app updates. The releases Atom feed, curl downloads, Ed25519 signature check, staging, and the detached install script. changelog.rs: the bundled CHANGELOG.md, What's New and the last version seen.
+          #   calendar.rs: local days for snoozes and the Snoozed and Settled panels.
           #   store.rs: SQLite. instance.rs: the single-instance lock and local launch handoff. env.rs: the login shell's PATH.
   app/    # package `app`, binary `newjen`. The GPUI and GPUI Kit shell. Renders core state and sends user intents to core.
           #   src/project_view.rs: the window, its loaded projects, the Dock badge, notifications and the quit gate.
           #   src/chat_view.rs (+ chat_view/): one project's threads, composer, approval dock, picker, review pane, terminal panel.
-          #   src/sidebar.rs: the thread list (grouped by what needs you) and the Usage row at its foot.
+          #   src/sidebar.rs (+ sidebar/dock.rs): the thread list (Pinned, a Queue of what waits on you, then the read list) with the In flight, Snoozed and Settled dock under it, and the Usage row at its foot.
           #   src/context_chip.rs: the composer's context chip and its "This thread" popover. src/usage_view.rs: the Usage view (plan windows with pace, threads in the current windows, a week of tokens).
           #   src/terminal.rs: the per-thread terminal panel. src/attention.rs: AppKit badge and notification adapters.
           #   src/theme.rs: the sidebar width, the card inset and radius, and the material tokens. src/ui/: approval card, tool card, thin Kit helpers and style wrappers (`card`, `glass_title_bar`, `card_title_bar`).
@@ -60,7 +61,7 @@ Build one vertical slice first, and don't start wrappers for later steps before 
 2. Thread list, SQLite persistence, resume. **Done (2026-10-31).**
 3. Git worktrees, chosen per thread (the default stays the project folder). **Done (2026-10-31, rebuilt on git worktrees 2026-11-02).** The slice first used Rift copies.
 4. Checkpoints, diff view (GPUI Kit `diff`) and git actions; agents commit themselves (see the plan and [`docs/git.md`](docs/git.md)). **Done (2026-10-31, rebuilt on git 2026-11-02).** The slice first used jj and two landing modes, then briefly a model where only Newjen committed.
-5. Parallel threads, a "Needs you" group in the thread list (⌘J jumps to it), Dock badge and notifications, a terminal panel (on `alacritty_terminal`), and a quit prompt. **Done (2026-10-31).**
+5. Parallel threads, a Queue in the thread list (⌘J jumps to what needs you), Dock badge and notifications, a terminal panel (on `alacritty_terminal`), and a quit prompt. **Done (2026-10-31).**
 6. Providers: Claude and Codex side by side, with a model, effort and speed picker and usage-limit pauses. **Done (2026-10-31)**, part of the MVP.
 
 ## Verified facts (tested on macOS)

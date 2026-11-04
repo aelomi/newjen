@@ -1,10 +1,14 @@
-//! The thread list on the left: the project switcher, threads grouped by what needs you, and
-//! the usage footer (see `design/newjen.pen` and the v3 mocks).
+//! The thread list on the left: the project switcher, Pinned and the Queue of what waits on you,
+//! the read list under them, a dock with In flight, Snoozed and Settled, and the usage footer.
 //!
-//! The decisions come first as plain functions, tested without a window: which group a row
-//! sits in and in what order, what a row says, where the list sits at each window width, which
+//! The decisions come first as plain functions, tested without a window: where each thread
+//! shows and in what order, what a row says, where the list sits at each window width, which
 //! thread ⌘J goes to. The elements that draw them come after; the chat view wires them to the
 //! threads.
+
+mod dock;
+
+pub use dock::{Clock, Dock, Panel, PanelGroup, PanelRow, SheetKind, TrayRow, dock};
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -18,6 +22,7 @@ use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMen
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, list::ListItem};
 use newjen_core::Status;
+use newjen_core::calendar::SnoozeUntil;
 use newjen_core::steps::Placement as ThreadPlacement;
 use newjen_core::store::ListState;
 use newjen_core::transcript::STOPPED_ON_QUIT;
@@ -51,8 +56,24 @@ pub const NOTHING_NEEDS_YOU: &str = "Nothing needs you";
 /// What the empty list says when nothing is in flight either.
 pub const ALL_CLEAR: &str = "All clear";
 
+/// Secondary text on the glass: a row's detail line.
+pub fn muted(cx: &App) -> gpui::Hsla {
+    crate::theme::material(cx).glass_muted.opacity(0.62)
+}
+
+/// The quietest text on the glass: headers, counts and times.
+pub fn faint(cx: &App) -> gpui::Hsla {
+    crate::theme::material(cx).glass_muted.opacity(0.42)
+}
+
 /// A click on a row or a button: the chat view's handler.
 pub type OnPress = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A choice of when a snoozed thread wakes: the chat view's handler.
+pub type OnSnooze = Rc<dyn Fn(SnoozeUntil, &mut Window, &mut App)>;
+
+/// A click on the Snoozed or Settled row: the chat view's handler.
+pub type OnOpen = Rc<dyn Fn(SheetKind, &mut Window, &mut App)>;
 
 // -------------------------------------------------------------------------------------------
 // Decisions
@@ -775,6 +796,79 @@ pub struct Row {
 /// The height of a thread row.
 pub const ROW_HEIGHT: Pixels = px(48.);
 
+/// What a row can do beyond opening: the buttons that show on hover and the right-click menu.
+pub struct RowActions {
+    pub pinned: bool,
+    pub on_pin: OnPress,
+    pub on_snooze: OnSnooze,
+    pub on_settle: OnPress,
+    pub on_archive: OnPress,
+}
+
+/// "Later today · in 3 hours": a snooze choice in a menu.
+pub fn snooze_label(until: SnoozeUntil) -> String {
+    format!("{} · {}", until.label(), until.hint())
+}
+
+fn snooze_menu(menu: PopupMenu, on_snooze: &OnSnooze) -> PopupMenu {
+    SnoozeUntil::ALL
+        .into_iter()
+        .fold(menu.min_w(MENU_WIDTH), |menu, until| {
+            let on_snooze = on_snooze.clone();
+            menu.item(
+                PopupMenuItem::new(snooze_label(until))
+                    .on_click(move |_, window, cx| on_snooze(until, window, cx)),
+            )
+        })
+}
+
+/// The Snooze and Settle buttons at the right of a row, which show while the pointer is on it.
+fn hover_actions(
+    id: &SharedString,
+    actions: &RowActions,
+    group: SharedString,
+    cx: &App,
+) -> AnyElement {
+    let fill = crate::theme::material(cx).popover_glass;
+    let on_snooze = actions.on_snooze.clone();
+    let on_settle = actions.on_settle.clone();
+    h_flex()
+        .absolute()
+        .right(px(6.))
+        .top(px(7.))
+        .gap(px(2.))
+        .pl(px(18.))
+        .rounded(px(6.))
+        .opacity(0.)
+        .group_hover(group, |actions| actions.opacity(1.))
+        .bg(gpui::linear_gradient(
+            90.,
+            gpui::linear_color_stop(fill.opacity(0.), 0.),
+            gpui::linear_color_stop(fill, 0.4),
+        ))
+        .child(
+            ui::icon_button(
+                (ElementId::from("snooze"), id.clone()),
+                IconName::Clock,
+                "Snooze",
+                cx,
+            )
+            .debug_selector(|| "row-snooze".to_string())
+            .dropdown_menu(move |menu, _, _| snooze_menu(menu, &on_snooze)),
+        )
+        .child(
+            ui::icon_button(
+                (ElementId::from("settle"), id.clone()),
+                IconName::Check,
+                "Settle",
+                cx,
+            )
+            .debug_selector(|| "row-settle".to_string())
+            .on_click(move |_, window, cx| on_settle(window, cx)),
+        )
+        .into_any_element()
+}
+
 /// The status dot before a title: 8px, in the thread's color. Working pulses; with Reduce
 /// Motion it holds still.
 pub fn status_dot(dot: Dot, id: impl Into<ElementId>, cx: &App) -> AnyElement {
@@ -815,8 +909,14 @@ pub fn pulse(element: gpui::Div, id: impl Into<ElementId>, phase: f32, cx: &App)
 }
 
 /// One thread: its status dot, its title (cut with "…") and time, and what it does now. A
-/// click shows it; a right click offers "Archive thread".
-pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) -> AnyElement {
+/// click shows it. On hover it offers Snooze and Settle, and a right click Pin, Snooze, Settle
+/// and Archive.
+pub fn thread_row(
+    row: Row,
+    actions: Option<RowActions>,
+    on_press: OnPress,
+    cx: &App,
+) -> AnyElement {
     let colors = &cx.theme().colors;
     let material = crate::theme::material(cx);
     let detail_color = if row.attention {
@@ -860,7 +960,11 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
                 .text_color(material.glass_muted)
                 .child(time)
         }));
-    ListItem::new((ElementId::from("thread-row"), row.id))
+    let group = SharedString::from(format!("thread-row-{}", row.id));
+    let hover = actions
+        .as_ref()
+        .map(|actions| hover_actions(&row.id, actions, group.clone(), cx));
+    let item = ListItem::new((ElementId::from("thread-row"), row.id))
         .w_full()
         .h(ROW_HEIGHT)
         .px(px(8.))
@@ -890,15 +994,42 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
                 .child(v_flex().flex_1().min_w_0().child(title).child(line)),
         )
         .debug_selector(|| "thread-row".to_string())
-        .context_menu(move |menu, _, _| {
-            let on_archive = on_archive.clone();
-            menu.min_w(MENU_WIDTH).item(
-                PopupMenuItem::new("Archive thread")
-                    .icon(IconName::Archive)
-                    .disabled(!archivable)
-                    .on_click(move |_, window, cx| on_archive(window, cx)),
-            )
-        })
+        .context_menu(move |menu, window, cx| {
+            let Some(actions) = &actions else {
+                return menu;
+            };
+            let (on_pin, on_settle, on_archive) = (
+                actions.on_pin.clone(),
+                actions.on_settle.clone(),
+                actions.on_archive.clone(),
+            );
+            let on_snooze = actions.on_snooze.clone();
+            menu.min_w(MENU_WIDTH)
+                .item(
+                    PopupMenuItem::new(if actions.pinned { "Unpin" } else { "Pin" })
+                        .on_click(move |_, window, cx| on_pin(window, cx)),
+                )
+                .submenu("Snooze", window, cx, move |menu, _, _| {
+                    snooze_menu(menu, &on_snooze)
+                })
+                .item(
+                    PopupMenuItem::new("Settle")
+                        .on_click(move |_, window, cx| on_settle(window, cx)),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Archive thread")
+                        .icon(IconName::Archive)
+                        .disabled(!archivable)
+                        .on_click(move |_, window, cx| on_archive(window, cx)),
+                )
+        });
+    div()
+        .relative()
+        .flex_none()
+        .group(group)
+        .child(item)
+        .children(hover)
         .into_any_element()
 }
 
