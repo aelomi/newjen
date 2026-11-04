@@ -402,6 +402,11 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
     Some(root.into_any_element())
 }
 
+/// The panel's fill: solid, so the rows behind it never show through.
+fn sheet_fill(dark: bool, card: Hsla) -> Hsla {
+    if dark { rgba(0x26262cff).into() } else { card }
+}
+
 fn sheet(
     panel: Panel,
     bottom: Pixels,
@@ -410,11 +415,7 @@ fn sheet(
     cx: &App,
 ) -> AnyElement {
     let dark = cx.theme().is_dark();
-    let fill = if dark {
-        rgba(0x26262cf8).into()
-    } else {
-        crate::theme::material(cx).card
-    };
+    let fill = sheet_fill(dark, crate::theme::material(cx).card);
     let edge: Hsla = if dark {
         hsla(0., 0., 1., 0.09)
     } else {
@@ -672,6 +673,12 @@ fn panel_row(row: &PanelRow, cx: &App) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_panel_is_opaque_in_both_appearances() {
+        assert_eq!(sheet_fill(true, hsla(0., 0., 1., 1.)).a, 1.);
+        assert_eq!(sheet_fill(false, hsla(0., 0., 1., 1.)).a, 1.);
+    }
 
     #[test]
     fn the_tray_shows_three_rows_and_counts_the_rest() {
