@@ -4,6 +4,28 @@ What changed in each Newjen release, in plain English. Newjen shows the section 
 
 Every user-visible change adds a line under `## Unreleased`, in one of four groups: New features, Improvements, Fixes, Misc. A release renames `Unreleased` to the version and date.
 
+## Unreleased
+
+### New features
+
+- The thread list is an inbox. A Queue holds what waits on you, finished threads you have read sit below it, working threads tuck into an In flight tray, and Snoozed and Settled open as panels at the bottom.
+- Snooze a thread until later today, tomorrow or next Monday, settle it when you are done, or pin it to the top. Hover a row for Snooze and Settle, or right-click it.
+- Archive all in the Settled panel removes every settled thread after one confirmation.
+- When the list is empty, a spirit fox runner game fills the space while you wait. Click it to play and press Space to jump. It steps aside when a thread lands.
+
+### Improvements
+
+- A thread stays where it is while you read it and moves to its new place when you switch away.
+- A thread that ended and was not opened yet waits in the Queue, and a thread held back by a usage limit shows as waiting in the In flight tray.
+- The Usage row at the foot of the sidebar is now a ring. It follows the tightest limit among the providers you are using. Near a limit it names the provider and when you will hit it, and at a limit it says when it resets. Click it to open Usage.
+- Claude and Codex show their own marks.
+- Tooltips, menus and popovers are fully opaque, so the text behind them no longer shows through.
+- Rows in the thread list move with some ease. A working thread folds into the In flight tray when you switch away, a finished one lands in the Queue, a read one drops out of it, and a settled or snoozed one slides away. The gap closes after the row fades, and the counts crossfade. The Snoozed and Settled panels rise from their row while everything behind them dims. Reduce Motion keeps the fades and drops the movement.
+
+### Misc
+
+- The sidebar has a settings gear, and the Newjen menu has Settings… (⌘,). They open nothing yet.
+
 ## 0.1.0-alpha.2 · 3 November 2026
 
 ### New features

@@ -24,6 +24,7 @@ pub fn icon(name: IconName, size: gpui_kit::component::Size, color: Hsla) -> Ico
 
 mod code;
 mod copy;
+mod fox;
 mod message;
 mod motion;
 mod popover;
@@ -33,15 +34,22 @@ mod step;
 mod tool_card;
 pub use code::CodeBlock;
 pub use copy::CopyButton;
+pub use fox::FoxGame;
 pub use message::{ErrorNotice, Pending, assistant, user, user_pending};
 pub use motion::Chevron;
 pub use popover::{popover_surface, solid_popover_surface};
 pub use provider::{provider_color, provider_icon};
-pub use ring::ring;
+pub use ring::{Tick, ring, ring_with_tick};
 pub use step::{
     Detail, Mark, Narration, Part, QuietMark, StepState, StepView, WorkBlockView, mark, step_mark,
 };
 pub use tool_card::{ToolBody, ToolCard};
+
+mod gauge;
+pub use gauge::{GaugeLabel, GaugeLook, UsageGauge};
+
+mod tween;
+pub use tween::Tween;
 
 mod message_list;
 pub use message_list::MessageList;

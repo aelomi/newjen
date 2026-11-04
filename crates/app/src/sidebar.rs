@@ -1,25 +1,37 @@
-//! The thread list on the left: the project switcher, threads grouped by what needs you, and
-//! the usage footer (see `design/newjen.pen` and the v3 mocks).
+//! The thread list on the left: the project switcher, Pinned and the Queue of what waits on you,
+//! the read list under them, a dock with In flight, Snoozed and Settled, and the usage footer.
 //!
-//! The decisions come first as plain functions, tested without a window: which group a row
-//! sits in and in what order, what a row says, where the list sits at each window width, which
+//! The decisions come first as plain functions, tested without a window: where each thread
+//! shows and in what order, what a row says, where the list sits at each window width, which
 //! thread ⌘J goes to. The elements that draw them come after; the chat view wires them to the
 //! threads.
+
+mod dock;
+mod motion;
+
+pub use dock::{
+    Clock, Confirm, Dock, Flight, Fold, Panel, PanelGroup, PanelRow, SheetKind, TRAY_ROWS,
+    TrayItem, TrayRow, dock,
+};
+pub use motion::{
+    Counted, Counter, Frame, HEADER_HEIGHT, Key, Lane, Look, Motion, Sight, Zone, slot,
+};
 
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, ElementId, FontWeight, IntoElement, MouseButton, ParentElement, Pixels,
-    SharedString, Styled, Window, div, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ElementId, FontWeight, IntoElement, MouseButton,
+    ParentElement, Pixels, SharedString, Styled, Window, div, prelude::*, px,
 };
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, list::ListItem};
+use gpui_kit::component::{ActiveTheme as _, list::ListItem};
 use newjen_core::Status;
-use newjen_core::steps::SidebarGroup;
+use newjen_core::calendar::SnoozeUntil;
+use newjen_core::steps::Placement;
+use newjen_core::store::ListState;
 use newjen_core::transcript::STOPPED_ON_QUIT;
 
 use crate::format::{elapsed, relative_time};
@@ -42,11 +54,33 @@ pub const NEEDS_APPROVAL: &str = "Needs approval";
 
 pub const MAKING_COPY_DETAIL: &str = "Creating a worktree…";
 
-/// What the list says when it has no thread yet (screen 12, "Empty").
-pub const EMPTY_LIST: &str = "No threads yet. Your first message starts one.";
+/// What the game's title says while threads work in the tray.
+pub const NOTHING_NEEDS_YOU: &str = "Nothing needs you";
+
+/// What the game's title says when nothing is in flight either.
+pub const ALL_CLEAR: &str = "All clear";
+
+/// How far the game sits above the foot of the list, which is the top of the dock.
+pub const GAME_LIFT: Pixels = px(30.);
+
+/// Secondary text on the glass: a row's detail line.
+pub fn muted(cx: &App) -> gpui::Hsla {
+    crate::theme::material(cx).glass_muted.opacity(0.62)
+}
+
+/// The quietest text on the glass: headers, counts and times.
+pub fn faint(cx: &App) -> gpui::Hsla {
+    crate::theme::material(cx).glass_muted.opacity(0.42)
+}
 
 /// A click on a row or a button: the chat view's handler.
 pub type OnPress = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A choice of when a snoozed thread wakes: the chat view's handler.
+pub type OnSnooze = Rc<dyn Fn(SnoozeUntil, &mut Window, &mut App)>;
+
+/// A click on the Snoozed or Settled row: the chat view's handler.
+pub type OnOpen = Rc<dyn Fn(SheetKind, &mut Window, &mut App)>;
 
 // -------------------------------------------------------------------------------------------
 // Decisions
@@ -175,22 +209,6 @@ pub fn row_look(facts: &RowFacts, now_ms: i64) -> RowLook {
     }
 }
 
-/// The groups, top to bottom.
-pub const GROUPS: [SidebarGroup; 3] = [
-    SidebarGroup::NeedsYou,
-    SidebarGroup::Working,
-    SidebarGroup::Done,
-];
-
-/// A section header's label.
-pub fn group_label(group: SidebarGroup) -> &'static str {
-    match group {
-        SidebarGroup::NeedsYou => "Needs you",
-        SidebarGroup::Working => "Working",
-        SidebarGroup::Done => "Done",
-    }
-}
-
 /// A count in a header: "7", or "99+" from 100 up.
 pub fn count_label(count: usize) -> String {
     if count > 99 {
@@ -200,57 +218,164 @@ pub fn count_label(count: usize) -> String {
     }
 }
 
-/// One line of the list: a section's header or a thread (its index in the view's thread order).
+/// What the list needs to know about each thread, in the view's thread order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Entry {
-    Header { group: SidebarGroup, count: usize },
-    Thread(usize),
+pub struct Listed {
+    pub draft: bool,
+    /// Where the thread shows: its own placement, or the one it is held in while on screen
+    /// (see [`held`]).
+    pub placement: Placement,
+    /// An approval or a question waits for an answer.
+    pub waits: bool,
+    pub list: ListState,
 }
 
-/// The list from the threads' `(draft, group)`, in the view's thread order: drafts first and
-/// without a header, then a header and its threads for each group that has any, in
-/// [`GROUPS`] order. A group keeps its threads in the view's order, so a thread that moves
-/// between groups slots in by age, not by when it changed.
-pub fn display_order(threads: &[(bool, SidebarGroup)]) -> Vec<Entry> {
+/// A section of the scrolling list that has a header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Section {
+    Pinned,
+    Queue,
+}
+
+/// One line of the scrolling list: a section's header, a thread (its index in the view's thread
+/// order), or the gap above the read list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// `needs` counts the rows that wait for an answer.
+    Header {
+        section: Section,
+        count: usize,
+        needs: usize,
+    },
+    Thread(usize),
+    Gap,
+}
+
+/// The room between the Queue and the read list.
+pub const READ_GAP: Pixels = px(14.);
+
+/// Where each thread shows, as indexes into the view's thread order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Layout {
+    /// The scrolling list: drafts, Pinned, Queue, then the read list.
+    pub entries: Vec<Entry>,
+    /// The In flight tray.
+    pub in_flight: Vec<usize>,
+    /// Snoozed, the one that wakes first on top.
+    pub snoozed: Vec<usize>,
+    /// Settled, the latest on top.
+    pub settled: Vec<usize>,
+}
+
+/// The layout from the threads, in the view's thread order. Drafts come first and have no
+/// header. Pinned keeps the order of the pins. The Queue and the read list put the thread that
+/// landed last on top, so a row only moves when something lands, never because its status
+/// changed. A section has a header only while it has rows, and the read list, which has no
+/// header, sits 14px under whatever is above it.
+pub fn display_order(threads: &[Listed]) -> Layout {
+    let members = |placement: Placement| -> Vec<usize> {
+        threads
+            .iter()
+            .enumerate()
+            .filter(|(_, thread)| !thread.draft && thread.placement == placement)
+            .map(|(ix, _)| ix)
+            .collect()
+    };
     let mut entries: Vec<Entry> = threads
         .iter()
         .enumerate()
-        .filter(|(_, (draft, _))| *draft)
+        .filter(|(_, thread)| thread.draft)
         .map(|(ix, _)| Entry::Thread(ix))
         .collect();
-    for group in GROUPS {
-        let members: Vec<usize> = threads
-            .iter()
-            .enumerate()
-            .filter(|(_, (draft, of))| !draft && *of == group)
-            .map(|(ix, _)| ix)
-            .collect();
-        if members.is_empty() {
+
+    let mut pinned = members(Placement::Pinned);
+    pinned.sort_by_key(|ix| threads[*ix].list.pinned_at);
+    let mut queue = members(Placement::Queue);
+    queue.sort_by_key(|ix| std::cmp::Reverse(threads[*ix].list.landed_at));
+    let mut read = members(Placement::Read);
+    read.sort_by_key(|ix| std::cmp::Reverse(threads[*ix].list.landed_at));
+
+    for (section, rows) in [(Section::Pinned, &pinned), (Section::Queue, &queue)] {
+        if rows.is_empty() {
             continue;
         }
         entries.push(Entry::Header {
-            group,
-            count: members.len(),
+            section,
+            count: rows.len(),
+            needs: rows.iter().filter(|ix| threads[**ix].waits).count(),
         });
-        entries.extend(members.into_iter().map(Entry::Thread));
+        entries.extend(rows.iter().copied().map(Entry::Thread));
     }
-    entries
+    if !read.is_empty() && !(pinned.is_empty() && queue.is_empty()) {
+        entries.push(Entry::Gap);
+    }
+    entries.extend(read.into_iter().map(Entry::Thread));
+
+    let mut snoozed = members(Placement::Snoozed);
+    snoozed.sort_by_key(|ix| threads[*ix].list.snoozed_until);
+    let mut settled = members(Placement::Settled);
+    settled.sort_by_key(|ix| std::cmp::Reverse(threads[*ix].list.settled_at));
+    Layout {
+        entries,
+        in_flight: members(Placement::InFlight),
+        snoozed,
+        settled,
+    }
 }
 
-/// The threads in the order the list shows them: what ⌘1 to ⌘9 and ⌘⇧[ ⌘⇧] count through.
-pub fn thread_order(entries: &[Entry]) -> Vec<usize> {
-    entries
+/// The threads in the order ⌘1 to ⌘9 and ⌘⇧[ ⌘⇧] count through: what the list shows from the
+/// top, then the In flight tray. Snoozed and Settled threads are not in it.
+pub fn thread_order(layout: &Layout) -> Vec<usize> {
+    layout
+        .entries
         .iter()
         .filter_map(|entry| match entry {
             Entry::Thread(ix) => Some(*ix),
-            Entry::Header { .. } => None,
+            Entry::Header { .. } | Entry::Gap => None,
         })
+        .chain(layout.in_flight.iter().copied())
         .collect()
 }
 
-/// Where thread `ix` sits among `entries` (headers count), to scroll to it.
-pub fn entry_of(entries: &[Entry], ix: usize) -> Option<usize> {
-    entries.iter().position(|entry| *entry == Entry::Thread(ix))
+/// Where the thread on screen shows. It stays in the Queue or the read list where it was when
+/// it was opened, whatever happens to it there, until the user switches away, so it never moves
+/// under them. The user's own moves (pin, snooze, settle) apply at once. A thread opened from
+/// the tray that lands while on screen moves to the top of the Queue.
+pub fn held(held: Placement, now: Placement) -> Placement {
+    use Placement::*;
+    match (held, now) {
+        (_, Pinned | Snoozed | Settled) => now,
+        (Queue | Read, _) => held,
+        (InFlight, InFlight) => InFlight,
+        (InFlight, _) => Queue,
+        (Pinned | Snoozed | Settled, _) => now,
+    }
+}
+
+/// Where the thread on screen shows: its placement and the landing time its row sorts by. Both
+/// stay as they were when the thread was opened, so the row keeps its exact position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub placement: Placement,
+    pub landed_at: i64,
+}
+
+/// What the thread on screen shows after a render. `previous` is what it showed before, when it
+/// was on screen then too. A held place keeps its landing time even when the thread lands
+/// again. A place that moves, by the user's own move or because a thread opened from the tray
+/// landed, takes the thread's own landing time and so goes to the top.
+pub fn hold(previous: Option<Held>, now: Placement, landed_at: i64) -> Held {
+    match previous {
+        Some(at) if held(at.placement, now) == at.placement => at,
+        Some(at) => Held {
+            placement: held(at.placement, now),
+            landed_at,
+        },
+        None => Held {
+            placement: now,
+            landed_at,
+        },
+    }
 }
 
 /// ⌘J: the thread that needs you after `active` in the list's order, wrapping around. `order`
@@ -289,53 +414,25 @@ pub fn compact_time(then_ms: i64, now_ms: i64) -> String {
     }
 }
 
-/// What the row's status icon shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mark {
-    /// An approval, a usage limit or a question waits for you.
-    Attention,
-    Failed,
-    Working,
-    Done,
-    Draft,
-}
-
-pub fn mark(group: SidebarGroup, look: &RowLook, draft: bool) -> Mark {
-    if draft {
-        return Mark::Draft;
-    }
-    match group {
-        SidebarGroup::NeedsYou | SidebarGroup::Done if look.dot == Dot::Failed => Mark::Failed,
-        SidebarGroup::NeedsYou => Mark::Attention,
-        SidebarGroup::Working => Mark::Working,
-        SidebarGroup::Done => Mark::Done,
-    }
-}
-
 /// The row's second line: what the thread is doing (core's activity line), else the row look's
 /// own words. A finished thread's look only says how long ago, which the row's time already
 /// does, so it says "Done".
-pub fn detail_line(
-    activity: Option<String>,
-    look: &RowLook,
-    group: SidebarGroup,
-    draft: bool,
-) -> String {
+pub fn detail_line(activity: Option<String>, look: &RowLook, draft: bool) -> String {
     if draft {
         return DRAFT_LINE.to_string();
     }
     if let Some(line) = activity.filter(|line| !line.trim().is_empty()) {
         return line;
     }
-    match (group, look.dot) {
-        (SidebarGroup::Done, Dot::None | Dot::Unread) => "Done".to_string(),
+    match look.dot {
+        Dot::None | Dot::Unread => "Done".to_string(),
         _ => look.detail.clone(),
     }
 }
 
-/// Where the thread list is.
+/// How the thread list is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Placement {
+pub enum SidebarMode {
     /// A column beside the chat.
     Docked,
     /// Floating over the chat from the left (narrow windows, after ⌘B).
@@ -344,19 +441,19 @@ pub enum Placement {
     Hidden,
 }
 
-/// Where the list is at `window_width`: docked in a wide window unless the user hid it,
+/// How the list is shown at `window_width`: docked in a wide window unless the user hid it,
 /// hidden in a narrow one unless the user opened the drawer.
-pub fn placement(window_width: f32, hidden_by_user: bool, drawer_open: bool) -> Placement {
+pub fn mode(window_width: f32, hidden_by_user: bool, drawer_open: bool) -> SidebarMode {
     if window_width >= NARROW_WINDOW {
         if hidden_by_user {
-            Placement::Hidden
+            SidebarMode::Hidden
         } else {
-            Placement::Docked
+            SidebarMode::Docked
         }
     } else if drawer_open {
-        Placement::Drawer
+        SidebarMode::Drawer
     } else {
-        Placement::Hidden
+        SidebarMode::Hidden
     }
 }
 
@@ -407,11 +504,29 @@ pub fn shifted(ix: usize, removed: usize) -> usize {
     if removed < ix { ix - 1 } else { ix }
 }
 
-/// Whether the list counts as empty: nothing in it but one draft, the thread on screen. Then
-/// it shows [`EMPTY_LIST`] under that draft's row. A draft kept beside saved threads is a row
-/// of its own.
-pub fn is_empty_list(drafts: &[bool]) -> bool {
-    drafts.len() <= 1 && drafts.iter().all(|draft| *draft)
+/// Whether the spirit fox game fills the list: no thread in Pinned, the Queue or the read
+/// list. Drafts do not count, so a lone "New thread" draft row still has the game below it, and
+/// neither do the In flight tray, Snoozed or Settled.
+pub fn shows_game(threads: &[Listed]) -> bool {
+    threads.iter().all(|thread| {
+        thread.draft
+            || matches!(
+                thread.placement,
+                Placement::InFlight | Placement::Snoozed | Placement::Settled
+            )
+    })
+}
+
+/// The game's title: that nothing needs you while a thread works in the tray, else all clear.
+pub fn game_title(threads: &[Listed]) -> &'static str {
+    if threads
+        .iter()
+        .any(|thread| !thread.draft && thread.placement == Placement::InFlight)
+    {
+        NOTHING_NEEDS_YOU
+    } else {
+        ALL_CLEAR
+    }
 }
 
 /// What the panel-left button's dot says while the list is out of sight. Amber, for a thread
@@ -592,79 +707,117 @@ pub fn column(header: AnyElement, list: Vec<AnyElement>, cx: &App) -> gpui::Div 
         .child(v_flex().flex_1().min_h_0().px_2().children(list))
 }
 
-/// "No threads yet. Your first message starts one."
-pub fn empty_caption(cx: &App) -> AnyElement {
+/// The scrolling list with the game anchored over its foot, just above the dock.
+pub fn list_area(list: impl IntoElement, game: impl IntoElement) -> gpui::Div {
     div()
-        .px_2p5()
-        .py_2()
-        .text_sm()
-        .text_color(crate::theme::material(cx).glass_muted)
-        .child(EMPTY_LIST)
-        .into_any_element()
-}
-
-/// "Needs you 2": a small muted label and its count.
-pub fn section_header(group: SidebarGroup, count: usize, cx: &App) -> AnyElement {
-    h_flex()
-        .flex_none()
-        .items_baseline()
-        .gap_1p5()
-        .px_2p5()
-        .pt_3()
-        .pb_1()
-        .text_xs()
-        .text_color(crate::theme::material(cx).glass_muted)
-        .child(group_label(group))
-        .child(div().opacity(0.7).child(count_label(count)))
-        .into_any_element()
-}
-
-/// The row at the foot of the list that opens the Usage view: a gauge, "Usage" and the meter
-/// of the fullest window.
-pub fn usage_row(
-    selected: bool,
-    meter: Option<AnyElement>,
-    on_press: OnPress,
-    cx: &App,
-) -> AnyElement {
-    let muted = crate::theme::material(cx).glass_muted;
-    div()
-        .id("usage-row")
-        .flex_none()
-        .pb_2()
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(list)
         .child(
-            ListItem::new("usage-row-item")
-                .w_full()
-                .px_2p5()
-                .py_1p5()
-                .rounded_lg()
-                .selected(selected)
-                .accessibility_label("Usage")
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .on_click(move |_, window, cx| on_press(window, cx))
-                .debug_selector(|| "usage-row".to_string())
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(ui::icon(
-                            IconName::Gauge,
-                            gpui_kit::component::Size::Small,
-                            muted,
-                        ))
-                        .child(div().flex_1().text_color(muted).child("Usage"))
-                        .children(meter),
-                ),
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(GAME_LIFT)
+                .child(game),
         )
+}
+
+/// Which edge the old value of a crossfading count lines up with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+}
+
+/// A count. While it changes, the old value fades out under the new one fading in.
+pub fn number(count: Counted, edge: Edge) -> AnyElement {
+    let Some(was) = count.was else {
+        return div().child(count_label(count.value)).into_any_element();
+    };
+    let old = div()
+        .absolute()
+        .top_0()
+        .opacity(1. - count.mix)
+        .child(count_label(was));
+    let old = match edge {
+        Edge::Left => old.left_0(),
+        Edge::Right => old.right_0(),
+    };
+    div()
+        .relative()
+        .child(div().opacity(count.mix).child(count_label(count.value)))
+        .child(old)
+        .into_any_element()
+}
+
+/// How much of the "need you" group shows: it fades in when the first row starts to wait and out
+/// when the last one is answered.
+fn need_group(needs: Counted) -> Option<(Counted, f32)> {
+    match (needs.value, needs.was) {
+        (0, Some(was)) if was > 0 => Some((Counted::steady(was), 1. - needs.mix)),
+        (0, _) => None,
+        (value, Some(0)) => Some((Counted::steady(value), needs.mix)),
+        _ => Some((needs, 1.)),
+    }
+}
+
+/// A section's header: a small muted label and its count. The Queue's also says how many rows
+/// wait for an answer, in amber, with the key that jumps to them.
+pub fn section_header(section: Section, count: Counted, needs: Counted, cx: &App) -> AnyElement {
+    let material = crate::theme::material(cx);
+    let warning = cx.theme().colors.warning;
+    let label = match section {
+        Section::Pinned => "Pinned",
+        Section::Queue => "Queue",
+    };
+    let need = (section == Section::Queue)
+        .then(|| need_group(needs))
+        .flatten();
+    h_flex()
+        .debug_selector(|| "section-header".to_string())
+        .flex_none()
+        .h(HEADER_HEIGHT)
+        .items_center()
+        .gap_2()
+        .px_2()
+        .pt_3()
+        .pb(px(5.))
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(material.glass_muted)
+        .child(label)
+        .child(number(count, Edge::Left))
+        .when_some(need, |header, (needs, opacity)| {
+            header.child(div().flex_1()).child(
+                h_flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_color(warning)
+                    .opacity(opacity)
+                    .child(div().size(px(6.)).rounded_full().bg(warning))
+                    .child(
+                        h_flex()
+                            .gap(px(3.))
+                            .child(number(needs, Edge::Left))
+                            .child("need you"),
+                    )
+                    .child(ui::key_caps("cmd-j", cx)),
+            )
+        })
         .into_any_element()
 }
 
 /// What one thread row shows.
+#[derive(Clone)]
 pub struct Row {
     /// The thread's id, which keys the row's state (its menu).
     pub id: SharedString,
     pub title: SharedString,
-    pub mark: Mark,
+    pub dot: Dot,
     pub detail: String,
     /// The second line in the warning color: something waits for you.
     pub attention: bool,
@@ -677,27 +830,171 @@ pub struct Row {
     /// The thread on screen.
     pub selected: bool,
     pub archivable: bool,
+    /// The row is the memory of one that left, drawn while it fades.
+    pub ghost: bool,
 }
 
-fn mark_icon(mark: Mark, cx: &App) -> AnyElement {
-    let colors = &cx.theme().colors;
-    let size = gpui_kit::component::Size::Small;
-    let muted = crate::theme::material(cx).glass_muted;
-    match mark {
-        Mark::Attention => ui::icon(IconName::CircleAlert, size, colors.warning).into_any_element(),
-        Mark::Failed => ui::icon(IconName::CircleAlert, size, colors.danger).into_any_element(),
-        Mark::Working => Spinner::new()
-            .with_size(size)
-            .color(colors.cyan)
-            .into_any_element(),
-        Mark::Done => ui::icon(IconName::CircleCheck, size, muted).into_any_element(),
-        Mark::Draft => ui::icon(IconName::SquarePen, size, muted).into_any_element(),
+impl Row {
+    /// What a row that has left is drawn as: not selected, and with a hover group of its own so
+    /// that the live row of the same thread, wherever it is now, is not hovered with it.
+    pub fn leaving(mut self) -> Row {
+        self.selected = false;
+        self.ghost = true;
+        self
+    }
+
+    fn hover_group(&self) -> SharedString {
+        let kind = if self.ghost { "ghost" } else { "live" };
+        SharedString::from(format!("thread-row-{kind}-{}", self.id))
     }
 }
 
-/// One thread: its status icon, its title (cut with "…") and time, and what it does now. A
-/// click shows it; a right click offers "Archive thread".
-pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) -> AnyElement {
+/// The height of a thread row.
+pub const ROW_HEIGHT: Pixels = px(48.);
+
+/// What a row can do beyond opening: the buttons that show on hover and the right-click menu.
+pub struct RowActions {
+    pub pinned: bool,
+    /// The thread can be put away: not while it works, waits on you or is being prepared.
+    pub settlable: bool,
+    pub on_pin: OnPress,
+    pub on_snooze: OnSnooze,
+    pub on_settle: OnPress,
+    pub on_archive: OnPress,
+}
+
+/// "Later today · in 3 hours": a snooze choice in a menu.
+pub fn snooze_label(until: SnoozeUntil) -> String {
+    format!("{} · {}", until.label(), until.hint())
+}
+
+fn snooze_menu(menu: PopupMenu, on_snooze: &OnSnooze) -> PopupMenu {
+    SnoozeUntil::ALL
+        .into_iter()
+        .fold(menu.min_w(MENU_WIDTH), |menu, until| {
+            let on_snooze = on_snooze.clone();
+            menu.item(
+                PopupMenuItem::new(snooze_label(until))
+                    .on_click(move |_, window, cx| on_snooze(until, window, cx)),
+            )
+        })
+}
+
+/// The Snooze and Settle buttons at the right of a row, which show while the pointer is on it.
+fn hover_actions(
+    id: &SharedString,
+    actions: &RowActions,
+    group: SharedString,
+    cx: &App,
+) -> AnyElement {
+    let fill = crate::theme::material(cx).popover;
+    let on_snooze = actions.on_snooze.clone();
+    let on_settle = actions.on_settle.clone();
+    h_flex()
+        .absolute()
+        .right(px(6.))
+        .top(px(7.))
+        .gap(px(2.))
+        .pl(px(18.))
+        .rounded(px(6.))
+        .opacity(0.)
+        .group_hover(group, |actions| actions.opacity(1.))
+        .bg(gpui::linear_gradient(
+            90.,
+            gpui::linear_color_stop(fill.opacity(0.), 0.),
+            gpui::linear_color_stop(fill, 0.4),
+        ))
+        .child(
+            ui::icon_button(
+                (ElementId::from("snooze"), id.clone()),
+                IconName::Clock,
+                "Snooze",
+                cx,
+            )
+            .debug_selector(|| "row-snooze".to_string())
+            .dropdown_menu(move |menu, _, _| snooze_menu(menu, &on_snooze)),
+        )
+        .when(actions.settlable, |actions| {
+            actions.child(
+                ui::icon_button(
+                    (ElementId::from("settle"), id.clone()),
+                    IconName::Check,
+                    "Settle",
+                    cx,
+                )
+                .debug_selector(|| "row-settle".to_string())
+                .on_click(move |_, window, cx| on_settle(window, cx)),
+            )
+        })
+        .into_any_element()
+}
+
+/// The status dot before a title: 8px, in the thread's color. Working pulses; with Reduce
+/// Motion it holds still.
+///
+/// `grown` (0 to 1) is how far a mark that has just arrived has come: it fades in and grows from
+/// 85% of its size. With Reduce Motion it only fades.
+pub fn status_dot(dot: Dot, id: impl Into<ElementId>, grown: f32, cx: &App) -> AnyElement {
+    let colors = &cx.theme().colors;
+    let muted = crate::theme::material(cx).glass_muted;
+    let size = if cx.reduce_motion() {
+        8.
+    } else {
+        8. * (0.85 + 0.15 * grown)
+    };
+    let mark = div().flex_none().size(px(size)).rounded_full();
+    let dot = match dot {
+        Dot::None => mark.into_any_element(),
+        Dot::Approval => mark.bg(colors.warning).into_any_element(),
+        Dot::Failed => mark.bg(colors.danger).into_any_element(),
+        Dot::Unread => mark.bg(cx.theme().sidebar_foreground).into_any_element(),
+        Dot::Stopped => mark
+            .border(px(1.5))
+            .border_color(muted.opacity(0.7))
+            .into_any_element(),
+        Dot::Working => pulse(mark.bg(colors.info), id, 0., cx),
+    };
+    div()
+        .flex_none()
+        .size(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .opacity(grown)
+        .child(dot)
+        .into_any_element()
+}
+
+const PULSE: Duration = Duration::from_millis(1200);
+
+/// A slow fade between full and 45% ink, `phase` (0 to 1) into the loop.
+pub fn pulse(element: gpui::Div, id: impl Into<ElementId>, phase: f32, cx: &App) -> AnyElement {
+    if cx.reduce_motion() {
+        return element.into_any_element();
+    }
+    element
+        .with_animation(
+            id,
+            Animation::new(PULSE).repeat(),
+            move |element, progress| {
+                let loop_at = (progress + phase).fract();
+                let wave = gpui::ease_in_out(1. - (2. * loop_at - 1.).abs());
+                element.opacity(1. - 0.55 * wave)
+            },
+        )
+        .into_any_element()
+}
+
+/// One thread: its status dot, its title (cut with "…") and time, and what it does now. A
+/// click shows it. On hover it offers Snooze and Settle, and a right click Pin, Snooze, Settle
+/// and Archive.
+pub fn thread_row(
+    row: Row,
+    actions: Option<RowActions>,
+    on_press: OnPress,
+    grown: f32,
+    cx: &App,
+) -> AnyElement {
     let colors = &cx.theme().colors;
     let material = crate::theme::material(cx);
     let detail_color = if row.attention {
@@ -706,14 +1003,16 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
         material.glass_muted
     };
     let archivable = row.archivable;
+    let group = row.hover_group();
     let label = format!("{}: {}", row.title, row.detail);
     let full_title = row.title.clone();
     let cut = full_title.chars().count() > TITLE_TOOLTIP_CHARS;
+    let dot_id = (ElementId::from("thread-dot"), row.id.clone());
     let line = h_flex()
         .items_center()
         .gap_1()
         .min_w_0()
-        .text_sm()
+        .text_size(px(12.))
         .text_color(detail_color)
         .children(row.in_copy.then(|| {
             ui::icon(
@@ -730,20 +1029,25 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
         .child(
             ui::ellipsis(row.title)
                 .flex_1()
+                .text_size(px(13.))
                 .when(row.strong, |title| title.font_weight(FontWeight::SEMIBOLD)),
         )
         .children(row.time.map(|time| {
             div()
                 .flex_none()
-                .text_xs()
+                .text_size(px(11.5))
                 .text_color(material.glass_muted)
                 .child(time)
         }));
-    ListItem::new((ElementId::from("thread-row"), row.id))
+    let hover = actions
+        .as_ref()
+        .map(|actions| hover_actions(&row.id, actions, group.clone(), cx));
+    let item = ListItem::new((ElementId::from("thread-row"), row.id))
         .w_full()
-        .px_2p5()
-        .py_1p5()
-        .rounded_lg()
+        .h(ROW_HEIGHT)
+        .px(px(8.))
+        .py(px(7.))
+        .rounded(px(7.))
         .selected(row.selected)
         .accessibility_label(label)
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
@@ -758,23 +1062,54 @@ pub fn thread_row(row: Row, on_press: OnPress, on_archive: OnPress, cx: &App) ->
                 .child(
                     div()
                         .flex_none()
-                        .h(px(22.))
+                        .w(px(16.))
+                        .h(px(18.))
                         .flex()
                         .items_center()
-                        .child(mark_icon(row.mark, cx)),
+                        .pl(px(3.))
+                        .child(status_dot(row.dot, dot_id, grown, cx)),
                 )
                 .child(v_flex().flex_1().min_w_0().child(title).child(line)),
         )
         .debug_selector(|| "thread-row".to_string())
-        .context_menu(move |menu, _, _| {
-            let on_archive = on_archive.clone();
-            menu.min_w(MENU_WIDTH).item(
-                PopupMenuItem::new("Archive thread")
-                    .icon(IconName::Archive)
-                    .disabled(!archivable)
-                    .on_click(move |_, window, cx| on_archive(window, cx)),
-            )
-        })
+        .context_menu(move |menu, window, cx| {
+            let Some(actions) = &actions else {
+                return menu;
+            };
+            let (on_pin, on_settle, on_archive) = (
+                actions.on_pin.clone(),
+                actions.on_settle.clone(),
+                actions.on_archive.clone(),
+            );
+            let on_snooze = actions.on_snooze.clone();
+            let settlable = actions.settlable;
+            menu.min_w(MENU_WIDTH)
+                .item(
+                    PopupMenuItem::new(if actions.pinned { "Unpin" } else { "Pin" })
+                        .on_click(move |_, window, cx| on_pin(window, cx)),
+                )
+                .submenu("Snooze", window, cx, move |menu, _, _| {
+                    snooze_menu(menu, &on_snooze)
+                })
+                .item(
+                    PopupMenuItem::new("Settle")
+                        .disabled(!settlable)
+                        .on_click(move |_, window, cx| on_settle(window, cx)),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Archive thread")
+                        .icon(IconName::Archive)
+                        .disabled(!archivable)
+                        .on_click(move |_, window, cx| on_archive(window, cx)),
+                )
+        });
+    div()
+        .relative()
+        .flex_none()
+        .group(group)
+        .child(item)
+        .children(hover)
         .into_any_element()
 }
 
@@ -948,15 +1283,15 @@ mod tests {
 
     #[test]
     fn the_list_hides_below_760_and_toggles_into_a_drawer() {
-        assert_eq!(placement(1200.0, false, false), Placement::Docked);
-        assert_eq!(placement(760.0, false, false), Placement::Docked);
-        assert_eq!(placement(1200.0, true, false), Placement::Hidden);
+        assert_eq!(mode(1200.0, false, false), SidebarMode::Docked);
+        assert_eq!(mode(760.0, false, false), SidebarMode::Docked);
+        assert_eq!(mode(1200.0, true, false), SidebarMode::Hidden);
         // Wide: the drawer never shows, even if it was left open in a narrow window.
-        assert_eq!(placement(1200.0, false, true), Placement::Docked);
-        assert_eq!(placement(759.0, false, false), Placement::Hidden);
-        assert_eq!(placement(640.0, false, true), Placement::Drawer);
+        assert_eq!(mode(1200.0, false, true), SidebarMode::Docked);
+        assert_eq!(mode(759.0, false, false), SidebarMode::Hidden);
+        assert_eq!(mode(640.0, false, true), SidebarMode::Drawer);
         // The user's choice for wide windows does not keep the drawer shut.
-        assert_eq!(placement(640.0, true, true), Placement::Drawer);
+        assert_eq!(mode(640.0, true, true), SidebarMode::Drawer);
 
         // ⌘B in a wide window hides or shows the column.
         assert_eq!(toggled(1200.0, false, false), (true, false));
@@ -999,13 +1334,35 @@ mod tests {
     }
 
     #[test]
-    fn only_a_lone_draft_counts_as_an_empty_list() {
-        assert!(is_empty_list(&[]));
-        assert!(is_empty_list(&[true]));
-        assert!(!is_empty_list(&[false]));
-        // A draft beside a saved thread, or two drafts, are rows of their own.
-        assert!(!is_empty_list(&[true, false]));
-        assert!(!is_empty_list(&[true, true]));
+    fn the_game_shows_until_a_thread_sits_in_the_list() {
+        use Placement::*;
+        assert!(shows_game(&[]));
+        assert!(shows_game(&[listed(true, Read)]));
+        assert!(shows_game(&[listed(true, Read), listed(true, Read)]));
+        assert!(!shows_game(&[listed(false, Read)]));
+        assert!(!shows_game(&[listed(false, Queue)]));
+        assert!(!shows_game(&[listed(false, Pinned)]));
+        assert!(!shows_game(&[listed(true, Read), listed(false, Read)]));
+        assert!(shows_game(&[
+            listed(true, Read),
+            listed(false, InFlight),
+            listed(false, Snoozed),
+            listed(false, Settled),
+        ]));
+    }
+
+    #[test]
+    fn the_games_title_says_whether_anything_is_in_flight() {
+        use Placement::*;
+        assert_eq!(game_title(&[listed(true, Read)]), ALL_CLEAR);
+        assert_eq!(
+            game_title(&[listed(true, Read), listed(false, Settled)]),
+            ALL_CLEAR
+        );
+        assert_eq!(
+            game_title(&[listed(true, Read), listed(false, InFlight)]),
+            NOTHING_NEEDS_YOU
+        );
     }
 
     #[test]
@@ -1017,57 +1374,219 @@ mod tests {
         assert!(!hidden_needs_you(&[Status::Working, Status::Failed], 0));
     }
 
-    use SidebarGroup::{Done, NeedsYou, Working};
+    fn listed(draft: bool, placement: Placement) -> Listed {
+        Listed {
+            draft,
+            placement,
+            waits: false,
+            list: ListState::default(),
+        }
+    }
+
+    fn landed(placement: Placement, landed_at: i64) -> Listed {
+        Listed {
+            list: ListState {
+                landed_at,
+                ..ListState::default()
+            },
+            ..listed(false, placement)
+        }
+    }
+
+    fn header(section: Section, count: usize, needs: usize) -> Entry {
+        Entry::Header {
+            section,
+            count,
+            needs,
+        }
+    }
 
     #[test]
-    fn the_list_goes_drafts_then_needs_you_working_done_without_empty_groups() {
-        // slot order is newest first: a draft, then threads in mixed groups.
+    fn the_list_goes_drafts_pinned_queue_then_the_read_list_newest_landing_first() {
+        use Placement::*;
         let threads = [
-            (false, Done),
-            (true, Done),
-            (false, Working),
-            (false, NeedsYou),
-            (false, Done),
-            (false, NeedsYou),
+            landed(Read, 10),
+            listed(true, Read),
+            landed(Read, 30),
+            Listed {
+                waits: true,
+                ..landed(Queue, 5)
+            },
+            landed(Queue, 40),
+            Listed {
+                list: ListState {
+                    pinned_at: Some(2),
+                    landed_at: 99,
+                    ..ListState::default()
+                },
+                ..listed(false, Pinned)
+            },
+            Listed {
+                list: ListState {
+                    pinned_at: Some(1),
+                    ..ListState::default()
+                },
+                ..listed(false, Pinned)
+            },
+            landed(InFlight, 50),
         ];
+        let layout = display_order(&threads);
         assert_eq!(
-            display_order(&threads),
+            layout.entries,
             vec![
                 Entry::Thread(1),
-                Entry::Header {
-                    group: NeedsYou,
-                    count: 2
-                },
-                Entry::Thread(3),
+                header(Section::Pinned, 2, 0),
+                Entry::Thread(6),
                 Entry::Thread(5),
-                Entry::Header {
-                    group: Working,
-                    count: 1
-                },
-                Entry::Thread(2),
-                Entry::Header {
-                    group: Done,
-                    count: 2
-                },
-                Entry::Thread(0),
+                header(Section::Queue, 2, 1),
                 Entry::Thread(4),
+                Entry::Thread(3),
+                Entry::Gap,
+                Entry::Thread(2),
+                Entry::Thread(0),
             ]
         );
-        let order = thread_order(&display_order(&threads));
-        assert_eq!(order, vec![1, 3, 5, 2, 0, 4]);
-        assert_eq!(entry_of(&display_order(&threads), 2), Some(5));
-        // A group with no thread has no header.
+        assert_eq!(layout.in_flight, vec![7]);
+        assert_eq!(thread_order(&layout), vec![1, 6, 5, 4, 3, 2, 0, 7]);
+    }
+
+    #[test]
+    fn a_header_shows_only_while_it_has_rows_and_the_read_list_has_none() {
+        use Placement::*;
+        assert!(display_order(&[]).entries.is_empty());
         assert_eq!(
-            display_order(&[(false, Working)]),
-            vec![
-                Entry::Header {
-                    group: Working,
-                    count: 1
-                },
-                Entry::Thread(0)
-            ]
+            display_order(&[landed(Read, 1), landed(Read, 2)]).entries,
+            vec![Entry::Thread(1), Entry::Thread(0)]
         );
-        assert!(display_order(&[]).is_empty());
+        assert_eq!(
+            display_order(&[landed(Queue, 1)]).entries,
+            vec![header(Section::Queue, 1, 0), Entry::Thread(0)]
+        );
+        assert_eq!(
+            display_order(&[listed(true, Read), landed(Read, 1)]).entries,
+            vec![Entry::Thread(0), Entry::Thread(1)]
+        );
+    }
+
+    #[test]
+    fn a_row_moves_only_when_something_lands() {
+        use Placement::*;
+        let before = [landed(Read, 10), landed(Read, 20)];
+        assert_eq!(display_order(&before).entries[0], Entry::Thread(1));
+        // The older thread lands again: it goes on top.
+        let after = [landed(Read, 30), landed(Read, 20)];
+        assert_eq!(display_order(&after).entries[0], Entry::Thread(0));
+    }
+
+    #[test]
+    fn parked_threads_wait_in_their_panels_by_date() {
+        use Placement::*;
+        let snoozed = |until| Listed {
+            list: ListState {
+                snoozed_until: Some(until),
+                ..ListState::default()
+            },
+            ..listed(false, Snoozed)
+        };
+        let settled = |at| Listed {
+            list: ListState {
+                settled_at: Some(at),
+                ..ListState::default()
+            },
+            ..listed(false, Settled)
+        };
+        let layout = display_order(&[snoozed(30), settled(1), snoozed(10), settled(5)]);
+        assert_eq!(layout.snoozed, vec![2, 0]);
+        assert_eq!(layout.settled, vec![3, 1]);
+        assert!(layout.entries.is_empty());
+        assert!(thread_order(&layout).is_empty());
+    }
+
+    #[test]
+    fn the_thread_on_screen_stays_where_it_was_opened() {
+        use Placement::*;
+        assert_eq!(held(Queue, Read), Queue);
+        assert_eq!(held(Read, Queue), Read);
+        assert_eq!(held(Read, InFlight), Read);
+        assert_eq!(held(Queue, InFlight), Queue);
+        assert_eq!(held(InFlight, InFlight), InFlight);
+        assert_eq!(held(InFlight, Read), Queue);
+        assert_eq!(held(InFlight, Queue), Queue);
+        for user_move in [Pinned, Snoozed, Settled] {
+            assert_eq!(held(Queue, user_move), user_move);
+            assert_eq!(held(Read, user_move), user_move);
+            assert_eq!(held(InFlight, user_move), user_move);
+        }
+        for was in [Pinned, Snoozed, Settled] {
+            assert_eq!(held(was, Read), Read);
+            assert_eq!(held(was, Queue), Queue);
+        }
+    }
+
+    #[test]
+    fn a_row_that_left_is_not_selected_and_shares_no_hover_group_with_the_live_row() {
+        let live = Row {
+            id: "t1".into(),
+            title: "Title".into(),
+            dot: Dot::None,
+            detail: "Done".to_string(),
+            attention: false,
+            time: None,
+            in_copy: false,
+            strong: false,
+            selected: true,
+            archivable: true,
+            ghost: false,
+        };
+        let ghost = live.clone().leaving();
+        assert!(live.selected && !ghost.selected);
+        assert_ne!(live.hover_group(), ghost.hover_group());
+        assert_eq!(ghost.id, live.id);
+    }
+
+    #[test]
+    fn a_held_row_keeps_its_landing_time_and_a_moved_one_takes_the_new_time() {
+        use Placement::*;
+        let opened = hold(None, Read, 100);
+        assert_eq!(
+            opened,
+            Held {
+                placement: Read,
+                landed_at: 100
+            }
+        );
+        assert_eq!(hold(Some(opened), Read, 900), opened);
+        assert_eq!(hold(Some(opened), Queue, 900), opened);
+        assert_eq!(hold(Some(opened), InFlight, 900), opened);
+        let queued = hold(None, Queue, 100);
+        assert_eq!(hold(Some(queued), Read, 900), queued);
+
+        let tray = hold(None, InFlight, 100);
+        assert_eq!(hold(Some(tray), InFlight, 900), tray);
+        assert_eq!(
+            hold(Some(tray), Read, 900),
+            Held {
+                placement: Queue,
+                landed_at: 900
+            }
+        );
+
+        assert_eq!(
+            hold(Some(opened), Pinned, 900),
+            Held {
+                placement: Pinned,
+                landed_at: 900
+            }
+        );
+        let pinned = hold(Some(opened), Pinned, 900);
+        assert_eq!(hold(Some(pinned), Pinned, 950), pinned);
+        assert_eq!(
+            hold(Some(pinned), Read, 960),
+            Held {
+                placement: Read,
+                landed_at: 960
+            }
+        );
     }
 
     #[test]
@@ -1117,36 +1636,15 @@ mod tests {
     fn the_second_line_prefers_the_activity_and_never_repeats_the_time() {
         let done = row_look(&facts(Status::Done), NOW);
         assert_eq!(
-            detail_line(Some("Answered".into()), &done, Done, false),
+            detail_line(Some("Answered".into()), &done, false),
             "Answered"
         );
-        assert_eq!(detail_line(None, &done, Done, false), "Done");
-        assert_eq!(detail_line(Some("  ".into()), &done, Done, false), "Done");
+        assert_eq!(detail_line(None, &done, false), "Done");
+        assert_eq!(detail_line(Some("  ".into()), &done, false), "Done");
         let mut waiting = facts(Status::Waiting);
         waiting.waiting_tool = Some("Bash".into());
         let look = row_look(&waiting, NOW);
-        assert_eq!(
-            detail_line(None, &look, NeedsYou, false),
-            "Needs approval · Bash"
-        );
-        assert_eq!(detail_line(None, &done, Done, true), "Draft");
-    }
-
-    #[test]
-    fn the_status_icon_follows_the_group() {
-        let failed = row_look(
-            &RowFacts {
-                failure: Some("x".into()),
-                ..facts(Status::Failed)
-            },
-            NOW,
-        );
-        let done = row_look(&facts(Status::Done), NOW);
-        assert_eq!(mark(NeedsYou, &failed, false), Mark::Failed);
-        assert_eq!(mark(Done, &failed, false), Mark::Failed);
-        assert_eq!(mark(NeedsYou, &done, false), Mark::Attention);
-        assert_eq!(mark(Working, &done, false), Mark::Working);
-        assert_eq!(mark(Done, &done, false), Mark::Done);
-        assert_eq!(mark(Done, &done, true), Mark::Draft);
+        assert_eq!(detail_line(None, &look, false), "Needs approval · Bash");
+        assert_eq!(detail_line(None, &done, true), "Draft");
     }
 }

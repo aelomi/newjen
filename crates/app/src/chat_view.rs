@@ -22,6 +22,7 @@ mod picker;
 mod review;
 mod usage;
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -36,8 +37,10 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::input::{InputEvent, InputState};
 use newjen_core::agent::NoteDelivery;
-use newjen_core::steps::SidebarGroup;
+use newjen_core::calendar::{self, SettledAge, WakeDay};
+use newjen_core::steps::Placement;
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
 use newjen_core::worktree::{self, CopyError, Tools};
@@ -53,7 +56,7 @@ use crate::keys::{
 };
 use crate::reply;
 use crate::rows::{self, OnRestart};
-use crate::sidebar::{self, OnPress, Placement, RowFacts};
+use crate::sidebar::{self, OnPress, RowFacts, SidebarMode};
 use crate::terminal::TerminalPanel;
 use crate::theme::{CARD_INSET, CARD_RADIUS, SIDEBAR};
 use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
@@ -205,6 +208,15 @@ struct Slot {
     _changes: Subscription,
 }
 
+/// The panel the Snoozed or Settled row opened.
+struct Sheet {
+    kind: sidebar::SheetKind,
+    filter: Entity<InputState>,
+    /// "Archive these threads?" is being asked, about these threads.
+    confirming: Option<Vec<String>>,
+    _filter: Subscription,
+}
+
 /// What `ChatView::new` starts from (see `main.rs`).
 pub struct Startup {
     pub store: Store,
@@ -254,6 +266,24 @@ pub struct ChatView {
     drawer_open: bool,
     drawer_focus: FocusHandle,
     list_scroll: ScrollHandle,
+    /// The spirit fox game under the list. It lives as long as the view and is only shown while
+    /// the list has no thread to read (see `sidebar::shows_game`).
+    fox: Entity<ui::FoxGame>,
+    /// The list scrolls to the thread on screen the next time it is drawn.
+    reveal_active: Cell<bool>,
+    /// Rows that change place stay on screen while they leave (see `sidebar::Motion`).
+    motion: RefCell<sidebar::Motion>,
+    /// The list was out of sight at the last render, so its motion did not run and the next
+    /// one starts from where the list is.
+    motion_asleep: bool,
+    /// What the list shows this render, with each ghost and how far along each element is.
+    frame: RefCell<sidebar::Frame>,
+    hold: RefCell<Option<(String, sidebar::Held)>>,
+    sheet: Option<Sheet>,
+    /// The panel that was just closed, drawn while it lowers.
+    sheet_exit: Option<Sheet>,
+    sheet_height: Rc<Cell<Pixels>>,
+    dock_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
     chip: Entity<ChipMenu>,
     /// What the main card shows: the thread on screen, or the Usage view.
     pane: Pane,
@@ -357,6 +387,16 @@ impl ChatView {
             drawer_open: false,
             drawer_focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
+            fox: cx.new(|cx| ui::FoxGame::new(window, cx)),
+            reveal_active: Cell::new(false),
+            motion: RefCell::new(sidebar::Motion::default()),
+            motion_asleep: false,
+            frame: RefCell::new(sidebar::Frame::default()),
+            hold: RefCell::new(None),
+            sheet: None,
+            sheet_exit: None,
+            sheet_height: Rc::new(Cell::new(px(0.))),
+            dock_bounds: Rc::default(),
             chip: cx.new(|_| ChipMenu::new()),
             pane: Pane::Thread,
             usage_snapshot: None,
@@ -486,6 +526,7 @@ impl ChatView {
 
     pub fn set_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = visible;
+        self.motion.get_mut().snap();
         if visible {
             self.enter(window, cx);
         } else {
@@ -849,6 +890,7 @@ impl ChatView {
         self.review_panel = None;
         self.terminal_open = false;
         self.drawer_open = false;
+        self.lower_sheet();
         self.pane = Pane::Thread;
         if target >= self.slots.len() {
             return;
@@ -902,6 +944,7 @@ impl ChatView {
         if !self.visible {
             return;
         }
+        self.listed(cx);
         self.sync_replies(self.active, cx);
         // No `notify` on the thread: this view redraws itself below. (It also runs while the
         // view is being built, when nothing can observe the thread yet.)
@@ -915,19 +958,8 @@ impl ChatView {
         self.dock_request = None;
         self.making_copy_shown = false;
         self.sync_field(window, cx);
-        if self.terminal_open && self.terminal_wanted {
-            self.focus_panel(window, cx);
-        } else if self.composer_has_keys() {
-            let field = self.ensure_field(window, cx);
-            let handle = field.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
-        } else if self.pane == Pane::Usage {
-            self.focus_panel(window, cx);
-        }
-        let entries = self.sidebar_entries(cx);
-        if let Some(at) = sidebar::entry_of(&entries, self.active) {
-            self.list_scroll.scroll_to_item(at);
-        }
+        self.focus_panel(window, cx);
+        self.reveal_active.set(true);
         cx.notify();
     }
 
@@ -1090,8 +1122,8 @@ impl ChatView {
         None
     }
 
-    fn render_drawer(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let list = self.render_list(cx);
+    fn render_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let list = self.render_list(window, cx);
         v_flex()
             .size_full()
             .key_context(keys::CONTEXT)
@@ -1132,6 +1164,17 @@ impl ChatView {
             return;
         }
         gpui_kit::base::apply_system_reduce_motion(cx);
+        let now = now_ms();
+        let mut woke = false;
+        for slot in &self.slots {
+            woke |= slot.thread.update(cx, |thread, cx| {
+                let woke = thread.wake_if_due(now);
+                if woke {
+                    cx.notify();
+                }
+                woke
+            });
+        }
         let minute = ticks.is_multiple_of(MINUTE_TICKS);
         if minute {
             let now = Instant::now();
@@ -1151,7 +1194,7 @@ impl ChatView {
         let refreshed = self.pane == Pane::Usage
             && ticks.is_multiple_of(USAGE_REFRESH_TICKS)
             && self.refresh_usage();
-        if minute || busy || limited || refreshed {
+        if minute || busy || limited || refreshed || woke {
             cx.notify();
         }
     }
@@ -1734,6 +1777,14 @@ impl ChatView {
         if self.quit_saving {
             return;
         }
+        if self.sheet.is_some()
+            && event.keystroke.key == "escape"
+            && !event.keystroke.modifiers.modified()
+        {
+            self.close_sheet(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.key_route(event, window, cx) == KeyRoute::CloseDrawer {
             self.drawer_open = false;
             cx.stop_propagation();
@@ -1812,6 +1863,7 @@ impl ChatView {
         }
         let order = self.thread_order(cx);
         if let Some(place) = sidebar::jump(jump.0, order.len()) {
+            self.motion.get_mut().snap();
             self.show(order[place], window, cx);
         }
     }
@@ -1823,6 +1875,7 @@ impl ChatView {
             return;
         };
         if let Some(place) = sidebar::step(at, order.len(), forward) {
+            self.motion.get_mut().snap();
             self.show(order[place], window, cx);
         }
     }
@@ -1841,6 +1894,7 @@ impl ChatView {
         let order = self.thread_order(cx);
         let needs = self.needs_you(cx);
         if let Some(target) = sidebar::next_needs_you(&order, self.active, &needs) {
+            self.motion.get_mut().snap();
             self.show(target, window, cx);
             return;
         }
@@ -2120,12 +2174,12 @@ impl ChatView {
     /// brings it back, with an amber dot if another thread waits for an approval.
     fn render_title_bar(
         &self,
-        placement: Placement,
+        mode: SidebarMode,
         window_width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let show_list = (placement != Placement::Docked).then(|| {
+        let show_list = (mode != SidebarMode::Docked).then(|| {
             let statuses: Vec<Status> = self
                 .slots
                 .iter()
@@ -2175,7 +2229,7 @@ impl ChatView {
             }
         };
         let bar = Bar {
-            changes: self.changes_toggle(placement, window_width, window, cx),
+            changes: self.changes_toggle(mode, window_width, window, cx),
             ..bar
         };
         // claude cannot forget a rule, so core stops it (now, or when the turn ends) and the
@@ -2707,45 +2761,66 @@ impl ChatView {
         )
     }
 
-    /// Each thread's `(draft, group)`, in the view's thread order.
-    fn sidebar_groups(&self, cx: &App) -> Vec<(bool, SidebarGroup)> {
-        let now = now_ms() / 1000;
+    /// Each thread's place in the list, in the view's thread order. The thread on screen shows
+    /// where it was when it was opened (see `sidebar::held`), so the first call after a thread
+    /// is opened records that place: call it before the thread is marked as seen.
+    fn listed(&self, cx: &App) -> Vec<sidebar::Listed> {
+        let now = now_ms();
         self.slots
             .iter()
-            .map(|slot| {
+            .enumerate()
+            .map(|(ix, slot)| {
                 let thread = slot.thread.read(cx);
-                (thread.is_draft(), thread.sidebar_group(now))
+                let own = thread.placement(now);
+                let mut list = thread.list_state();
+                let mut placement = own;
+                if ix == self.active {
+                    let held = self.hold_place(thread.id(), own, list.landed_at);
+                    placement = held.placement;
+                    list.landed_at = held.landed_at;
+                }
+                sidebar::Listed {
+                    draft: thread.is_draft(),
+                    placement,
+                    waits: !thread.is_draft() && thread.waits_on_you(),
+                    list,
+                }
             })
             .collect()
     }
 
-    fn sidebar_entries(&self, cx: &App) -> Vec<sidebar::Entry> {
-        sidebar::display_order(&self.sidebar_groups(cx))
+    fn hold_place(&self, thread_id: &str, own: Placement, landed_at: i64) -> sidebar::Held {
+        let mut hold = self.hold.borrow_mut();
+        let previous = hold
+            .as_ref()
+            .filter(|(held_id, _)| held_id == thread_id)
+            .map(|(_, at)| *at);
+        let shown = sidebar::hold(previous, own, landed_at);
+        *hold = Some((thread_id.to_string(), shown));
+        shown
+    }
+
+    fn sidebar_layout(&self, cx: &App) -> sidebar::Layout {
+        sidebar::display_order(&self.listed(cx))
     }
 
     /// The threads in the order the list shows them.
     fn thread_order(&self, cx: &App) -> Vec<usize> {
-        sidebar::thread_order(&self.sidebar_entries(cx))
+        sidebar::thread_order(&self.sidebar_layout(cx))
     }
 
-    /// Whether each thread is in the "Needs you" group.
+    /// Whether each thread has an approval or a question waiting.
     fn needs_you(&self, cx: &App) -> Vec<bool> {
-        self.sidebar_groups(cx)
-            .into_iter()
-            .map(|(_, group)| group == SidebarGroup::NeedsYou)
-            .collect()
+        self.listed(cx).iter().map(|thread| thread.waits).collect()
     }
 
-    /// The list's content: the project row, the threads by group (or, with none yet, a line
+    /// The list's content: the project row, the threads by section (or, with none yet, a line
     /// saying so) and the usage row.
-    fn render_list(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let groups = self.sidebar_groups(cx);
-        let drafts: Vec<bool> = groups.iter().map(|(draft, _)| *draft).collect();
-        let entries = sidebar::display_order(&groups);
-        let mut rows = self.render_entries(&entries, &groups, cx);
-        if sidebar::is_empty_list(&drafts) {
-            rows.push(sidebar::empty_caption(cx));
-        }
+    fn render_list(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let listed = self.listed(cx);
+        let layout = sidebar::display_order(&listed);
+        let rows = self.render_entries(&layout, cx);
+        self.sync_fox(&listed, window, cx);
         let bar = sidebar::ProjectBar {
             name: self.project_name.clone(),
             on_switch: self.project_chooser.clone(),
@@ -2761,84 +2836,648 @@ impl ChatView {
             });
             sidebar::attention_note(note, on_dismiss, cx)
         });
-        vec![
-            sidebar::project_bar(bar, cx),
-            sidebar::list_panel(&self.list_scroll, rows).into_any_element(),
-        ]
-        .into_iter()
-        .chain(note)
-        .chain(self.render_update_row(cx))
-        .chain([self.render_usage_row(cx)])
-        .collect()
-    }
-
-    fn render_entries(
-        &self,
-        entries: &[sidebar::Entry],
-        groups: &[(bool, SidebarGroup)],
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let now = Instant::now();
-        entries
-            .iter()
-            .filter_map(|entry| match *entry {
-                sidebar::Entry::Header { group, count } => {
-                    Some(sidebar::section_header(group, count, cx))
-                }
-                sidebar::Entry::Thread(ix) => {
-                    let group = groups.get(ix)?.1;
-                    self.render_thread_row(ix, group, now, cx)
-                }
-            })
+        let dim = self.frame.borrow().raised.dim;
+        let dimmed = dim > 0.;
+        let list = sidebar::list_area(
+            sidebar::list_panel(&self.list_scroll, rows),
+            self.fox.clone(),
+        )
+        .when(dimmed, |list| list.opacity(1. - 0.5 * dim));
+        let dock = self.render_thread_dock(&layout, window, cx);
+        let usage = self.render_usage_row(cx);
+        let usage = if dimmed {
+            div()
+                .opacity(1. - 0.5 * dim)
+                .child(usage)
+                .into_any_element()
+        } else {
+            usage
+        };
+        vec![sidebar::project_bar(bar, cx), list.into_any_element()]
+            .into_iter()
+            .chain(dock)
+            .chain(note)
+            .chain(self.render_update_row(cx))
+            .chain([usage])
             .collect()
     }
 
-    fn render_thread_row(
+    /// Shows the game while the list has nothing to read and hides it the moment a row lands. A
+    /// game that held the keyboard gives it back to the composer when it goes.
+    fn sync_fox(&self, listed: &[sidebar::Listed], window: &Window, cx: &mut Context<Self>) {
+        let shown = sidebar::shows_game(listed);
+        let title = sidebar::game_title(listed);
+        self.fox.update(cx, |fox, cx| {
+            fox.set_title(title, cx);
+            fox.set_shown(shown, cx);
+        });
+        if !shown && self.fox.focus_handle(cx).is_focused(window) {
+            cx.defer_in(window, |view, window, cx| view.focus_panel(window, cx));
+        }
+    }
+
+    fn render_thread_dock(
         &self,
-        ix: usize,
-        group: SidebarGroup,
-        now: Instant,
+        layout: &sidebar::Layout,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let now_ms = now_ms();
+        let now = Instant::now();
+        let frame = self.frame.borrow();
+        let mut tray = Vec::new();
+        for item in frame.lane(sidebar::Lane::Dock) {
+            let sidebar::Key::Tray(id) = &item.key else {
+                continue;
+            };
+            let live = (!item.ghost).then(|| self.index_of(id, cx)).flatten();
+            let row = match live.and_then(|ix| self.tray_row(ix, now, cx)) {
+                Some(row) => {
+                    self.motion.borrow_mut().remember_tray(&row);
+                    row
+                }
+                None => {
+                    let Some(mut row) = self.motion.borrow().tray(id).cloned() else {
+                        continue;
+                    };
+                    row.on_press = Rc::new(|_, _| {});
+                    row
+                }
+            };
+            tray.push(sidebar::TrayItem {
+                row,
+                look: item.look,
+            });
+        }
+        let on_open = {
+            let view = cx.weak_entity();
+            Rc::new(move |kind, window: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |view, cx| view.toggle_sheet(kind, window, cx));
+            })
+        };
+        let panel = self
+            .sheet
+            .as_ref()
+            .or(self.sheet_exit.as_ref())
+            .map(|sheet| self.sheet_panel(sheet, layout, window, cx));
+        let fold = |kind: sidebar::SheetKind, counter: sidebar::Counter| {
+            frame
+                .item(&sidebar::Key::Disclosure(kind))
+                .map(|item| sidebar::Fold {
+                    count: frame.counted(counter),
+                    look: item.look,
+                })
+        };
+        sidebar::dock(
+            sidebar::Dock {
+                flight: frame
+                    .item(&sidebar::Key::Flight)
+                    .map(|item| sidebar::Flight {
+                        count: frame.counted(sidebar::Counter::Flight),
+                        look: item.look,
+                    }),
+                tray,
+                tray_total: layout.in_flight.len(),
+                sep: frame.item(&sidebar::Key::Sep).map(|item| item.look),
+                snoozed: fold(sidebar::SheetKind::Snoozed, sidebar::Counter::Snoozed),
+                settled: fold(sidebar::SheetKind::Settled, sidebar::Counter::Settled),
+                open: self
+                    .sheet
+                    .as_ref()
+                    .or(self.sheet_exit.as_ref())
+                    .map(|sheet| sheet.kind),
+                on_open,
+                panel,
+                dim: frame.raised.dim,
+                bounds: self.dock_bounds.clone(),
+            },
+            window,
+            cx,
+        )
+    }
+
+    fn tray_row(
+        &self,
+        ix: usize,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> Option<sidebar::TrayRow> {
         let slot = self.slots.get(ix)?;
         let (id, row) = {
             let thread = slot.thread.read(cx);
             let id = SharedString::from(thread.id().to_string());
-            let draft = thread.is_draft();
-            let look = sidebar::row_look(&row_facts(thread, now), now_ms);
-            let row = sidebar::Row {
-                id: id.clone(),
-                title: thread.title().to_string().into(),
-                mark: sidebar::mark(group, &look, draft),
-                detail: sidebar::detail_line(
-                    thread.activity_line(now_ms / 1000),
-                    &look,
-                    group,
-                    draft,
-                ),
-                attention: group == SidebarGroup::NeedsYou,
-                time: (!draft).then(|| sidebar::compact_time(thread.updated_at(), now_ms)),
-                in_copy: look.copy,
-                strong: look.strong,
-                selected: ix == self.active && self.pane == Pane::Thread,
-                archivable: thread.preparing().is_none(),
+            let facts = row_facts(thread, now);
+            let clock = if thread.paused_until(now_ms() / 1000).is_some() {
+                sidebar::Clock::Waiting
+            } else {
+                facts.working_for.map_or(sidebar::Clock::Quiet, |since| {
+                    sidebar::Clock::Elapsed(elapsed(since.as_secs()))
+                })
             };
+            let row = (
+                thread.title().to_string().into(),
+                clock,
+                ix == self.active && self.pane == Pane::Thread,
+            );
             (id, row)
         };
         let shown = id.clone();
         let on_press = self.press(cx, move |view, window, cx| {
             view.show_thread(&shown, window, cx)
         });
-        let on_archive = self.press(cx, move |view, window, cx| {
-            view.ask_to_archive(&id, window, cx)
+        Some(sidebar::TrayRow {
+            id,
+            title: row.0,
+            clock: row.1,
+            selected: row.2,
+            on_press,
+        })
+    }
+
+    fn sheet_panel(
+        &self,
+        sheet: &Sheet,
+        layout: &sidebar::Layout,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> sidebar::Panel {
+        let now = now_ms();
+        let query = sheet.filter.read(cx).value().trim().to_lowercase();
+        let members = match sheet.kind {
+            sidebar::SheetKind::Snoozed => &layout.snoozed,
+            sidebar::SheetKind::Settled => &layout.settled,
+        };
+        let mut groups: Vec<(&'static str, Vec<sidebar::PanelRow>)> = Vec::new();
+        let mut shown = Vec::new();
+        for ix in members {
+            let Some(slot) = self.slots.get(*ix) else {
+                continue;
+            };
+            let (id, title, label, when) = {
+                let thread = slot.thread.read(cx);
+                if !query.is_empty() && !thread.title().to_lowercase().contains(&query) {
+                    continue;
+                }
+                let list = thread.list_state();
+                let (label, at) = match sheet.kind {
+                    sidebar::SheetKind::Snoozed => {
+                        let until = list.snoozed_until.unwrap_or(now);
+                        (
+                            WakeDay::of(until, now, &calendar::system_offset).label(),
+                            until,
+                        )
+                    }
+                    sidebar::SheetKind::Settled => {
+                        let at = list.settled_at.unwrap_or(now);
+                        (
+                            SettledAge::of(at, now, &calendar::system_offset).label(),
+                            at,
+                        )
+                    }
+                };
+                (
+                    thread.id().to_string(),
+                    SharedString::from(thread.title().to_string()),
+                    label,
+                    calendar::short_when(at, now, &calendar::system_offset),
+                )
+            };
+            shown.push(id.clone());
+            let open = id.clone();
+            let row = sidebar::PanelRow {
+                id: id.into(),
+                title,
+                when,
+                on_press: self.press(cx, move |view, window, cx| {
+                    view.show_thread(&open, window, cx)
+                }),
+            };
+            match groups.last_mut() {
+                Some((last, rows)) if *last == label => rows.push(row),
+                _ => groups.push((label, vec![row])),
+            }
+        }
+        let kind = sheet.kind;
+        let ids = shown.clone();
+        let on_bulk = self.press(cx, move |view, window, cx| match kind {
+            sidebar::SheetKind::Snoozed => {
+                view.wake_threads(&ids, cx);
+                view.close_sheet(window, cx);
+            }
+            sidebar::SheetKind::Settled => {
+                if let Some(sheet) = view.sheet.as_mut() {
+                    sheet.confirming = Some(ids.clone());
+                    cx.notify();
+                }
+            }
         });
-        Some(sidebar::thread_row(row, on_press, on_archive, cx))
+        let on_cancel = self.press(cx, |view, _, cx| {
+            if let Some(sheet) = view.sheet.as_mut() {
+                sheet.confirming = None;
+                cx.notify();
+            }
+        });
+        let on_confirm = self.press(cx, |view, window, cx| {
+            let asked = view
+                .sheet
+                .as_mut()
+                .and_then(|sheet| sheet.confirming.take())
+                .unwrap_or_default();
+            let ids = view.still_settled(&asked, cx);
+            view.close_sheet(window, cx);
+            for id in ids {
+                view.archive(&id, window, cx);
+            }
+        });
+        let on_dismiss = self.press(cx, |view, window, cx| view.close_sheet(window, cx));
+        sidebar::Panel {
+            kind,
+            filter: sheet.filter.clone(),
+            groups: groups
+                .into_iter()
+                .map(|(label, rows)| sidebar::PanelGroup { label, rows })
+                .collect(),
+            filtered: (!query.is_empty()).then_some(shown.len()),
+            confirming: sheet.confirming.as_ref().map(|asked| {
+                let ids = self.still_settled(asked, cx);
+                sidebar::Confirm {
+                    count: ids.len(),
+                    copies: self.any_copy(&ids, cx),
+                }
+            }),
+            on_bulk,
+            on_cancel,
+            on_confirm,
+            on_dismiss,
+            max_height: window.viewport_size().height * 0.55,
+            lift: self.frame.borrow().raised.panel,
+            live: self.sheet.is_some(),
+            measured: self.sheet_height.clone(),
+        }
+    }
+
+    /// Whether any of the threads works in a worktree of its own.
+    fn any_copy(&self, ids: &[String], cx: &App) -> bool {
+        ids.iter().any(|id| {
+            self.index_of(id, cx)
+                .is_some_and(|ix| self.slots[ix].thread.read(cx).copy().is_some())
+        })
+    }
+
+    /// The threads among `ids` that are still settled. A thread can leave Settled while a
+    /// question about it is open, say when an approval brings it back, and then it is not
+    /// archived.
+    fn still_settled(&self, ids: &[String], cx: &App) -> Vec<String> {
+        let now = now_ms();
+        ids.iter()
+            .filter(|id| {
+                self.index_of(id, cx).is_some_and(|ix| {
+                    self.slots[ix].thread.read(cx).placement(now) == Placement::Settled
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Clicking the Snoozed or Settled row: opens its panel, or closes it when it is the one
+    /// open.
+    fn toggle_sheet(
+        &mut self,
+        kind: sidebar::SheetKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sheet.as_ref().is_some_and(|sheet| sheet.kind == kind) {
+            self.close_sheet(window, cx);
+            return;
+        }
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(kind.filter_hint()));
+        let subscription = cx.subscribe_in(&filter, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let focus = Focusable::focus_handle(filter.read(cx), cx);
+        window.focus(&focus, cx);
+        self.sheet_exit = None;
+        self.sheet = Some(Sheet {
+            kind,
+            filter,
+            confirming: None,
+            _filter: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Takes the panel off the screen the way it leaves: it keeps drawing while it lowers.
+    fn lower_sheet(&mut self) {
+        if let Some(sheet) = self.sheet.take() {
+            self.sheet_exit = Some(sheet);
+        }
+    }
+
+    fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sheet.is_none() {
+            return;
+        }
+        self.lower_sheet();
+        self.focus_panel(window, cx);
+        cx.notify();
+    }
+
+    fn wake_threads(&mut self, ids: &[String], cx: &mut Context<Self>) {
+        let now = now_ms();
+        for id in ids {
+            if let Some(ix) = self.index_of(id, cx) {
+                self.slots[ix].thread.update(cx, |thread, cx| {
+                    thread.wake(now);
+                    cx.notify();
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Compares what the list shows with the render before, and keeps the rows that are
+    /// leaving on screen until they have faded.
+    fn step_motion(&mut self, mode: SidebarMode, window: &mut Window, cx: &mut Context<Self>) {
+        if mode == SidebarMode::Hidden {
+            self.motion_asleep = true;
+            return;
+        }
+        if std::mem::take(&mut self.motion_asleep) {
+            self.motion.get_mut().snap();
+        }
+        let listed = self.listed(cx);
+        let layout = sidebar::display_order(&listed);
+        let ids: Vec<SharedString> = self
+            .slots
+            .iter()
+            .map(|slot| SharedString::from(slot.thread.read(cx).id().to_string()))
+            .collect();
+        let zone = |ix: usize| sidebar::Zone::of(listed[ix].draft, listed[ix].placement);
+        let mut sight = sidebar::Sight::default();
+        for entry in &layout.entries {
+            match *entry {
+                sidebar::Entry::Header {
+                    section,
+                    count,
+                    needs,
+                } => {
+                    sight.keys.push(sidebar::Key::Header(section));
+                    match section {
+                        sidebar::Section::Pinned => {
+                            sight.counts.push((sidebar::Counter::Pinned, count));
+                        }
+                        sidebar::Section::Queue => {
+                            sight.counts.push((sidebar::Counter::Queue, count));
+                            sight.counts.push((sidebar::Counter::Need, needs));
+                        }
+                    }
+                }
+                sidebar::Entry::Gap => sight.keys.push(sidebar::Key::Gap),
+                sidebar::Entry::Thread(ix) => {
+                    sight
+                        .keys
+                        .push(sidebar::Key::Row(zone(ix), ids[ix].clone()));
+                }
+            }
+        }
+        if !layout.in_flight.is_empty() {
+            sight.keys.push(sidebar::Key::Flight);
+            sight
+                .counts
+                .push((sidebar::Counter::Flight, layout.in_flight.len()));
+            for ix in layout.in_flight.iter().take(sidebar::TRAY_ROWS) {
+                sight.keys.push(sidebar::Key::Tray(ids[*ix].clone()));
+            }
+        }
+        sight.zones = ids
+            .iter()
+            .enumerate()
+            .map(|(ix, id)| (id.clone(), zone(ix)))
+            .collect();
+        sight.snoozed = layout.snoozed.len();
+        sight.settled = layout.settled.len();
+        sight.panel_open = self.sheet.is_some();
+        let now = cx.background_executor().now();
+        let frame = self
+            .motion
+            .borrow_mut()
+            .step(now, sight, cx.reduce_motion());
+        if frame.busy {
+            window.request_animation_frame();
+        }
+        if self.sheet.is_none() && frame.raised.panel <= 0. {
+            self.sheet_exit = None;
+        }
+        *self.frame.borrow_mut() = frame;
+    }
+
+    fn render_entries(&self, layout: &sidebar::Layout, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let frame = self.frame.borrow();
+        let now = Instant::now();
+        let mut motion = self.motion.borrow_mut();
+        let active = self
+            .slots
+            .get(self.active)
+            .map(|slot| slot.thread.read(cx).id().to_string());
+        let mut elements = Vec::new();
+        for item in frame.lane(sidebar::Lane::List) {
+            let content = match &item.key {
+                sidebar::Key::Header(section) => {
+                    let live = layout.entries.iter().find_map(|entry| match *entry {
+                        sidebar::Entry::Header {
+                            section: found,
+                            count,
+                            needs,
+                        } if found == *section => Some((count, needs)),
+                        _ => None,
+                    });
+                    let (count, needs) = match live.filter(|_| !item.ghost) {
+                        Some((count, needs)) => {
+                            motion.remember_header(*section, count, needs);
+                            let shown = match section {
+                                sidebar::Section::Pinned => sidebar::Counter::Pinned,
+                                sidebar::Section::Queue => sidebar::Counter::Queue,
+                            };
+                            (frame.counted(shown), frame.counted(sidebar::Counter::Need))
+                        }
+                        None => {
+                            let (count, needs) = motion.header(*section);
+                            (
+                                sidebar::Counted::steady(count),
+                                sidebar::Counted::steady(needs),
+                            )
+                        }
+                    };
+                    sidebar::section_header(*section, count, needs, cx)
+                }
+                sidebar::Key::Gap => div().flex_none().h(sidebar::READ_GAP).into_any_element(),
+                sidebar::Key::Row(_, id) => {
+                    let live = (!item.ghost).then(|| self.index_of(id, cx)).flatten();
+                    match live {
+                        Some(ix) => {
+                            let Some((row, element)) =
+                                self.render_thread_row(ix, now, item.look.mark, cx)
+                            else {
+                                continue;
+                            };
+                            motion.remember_row(&row);
+                            element
+                        }
+                        None => {
+                            let Some(row) = motion.row(id).cloned() else {
+                                continue;
+                            };
+                            sidebar::thread_row(row.leaving(), None, Rc::new(|_, _| {}), 1., cx)
+                        }
+                    }
+                }
+                sidebar::Key::Flight
+                | sidebar::Key::Tray(_)
+                | sidebar::Key::Sep
+                | sidebar::Key::Disclosure(_) => continue,
+            };
+            if !item.ghost
+                && matches!(&item.key, sidebar::Key::Row(_, id) if active.as_deref() == Some(id.as_ref()))
+                && self.reveal_active.take()
+            {
+                self.list_scroll.scroll_to_item(elements.len());
+            }
+            elements.push(sidebar::slot(&item.key, item.look, content));
+        }
+        self.reveal_active.set(false);
+        elements
+    }
+
+    fn render_thread_row(
+        &self,
+        ix: usize,
+        now: Instant,
+        grown: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<(sidebar::Row, AnyElement)> {
+        let now_ms = now_ms();
+        let slot = self.slots.get(ix)?;
+        let (id, row, draft_row, pinned, settlable) = {
+            let thread = slot.thread.read(cx);
+            let id = SharedString::from(thread.id().to_string());
+            let draft = thread.is_draft();
+            let look = sidebar::row_look(&row_facts(thread, now), now_ms);
+            let dot = match look.dot {
+                sidebar::Dot::Failed if !look.strong => sidebar::Dot::None,
+                dot => dot,
+            };
+            let row = sidebar::Row {
+                id: id.clone(),
+                title: thread.title().to_string().into(),
+                dot,
+                detail: sidebar::detail_line(thread.activity_line(now_ms / 1000), &look, draft),
+                attention: thread.waits_on_you(),
+                time: (!draft)
+                    .then(|| sidebar::compact_time(thread.list_state().landed_at, now_ms)),
+                in_copy: look.copy,
+                strong: look.strong,
+                selected: ix == self.active && self.pane == Pane::Thread,
+                archivable: thread.preparing().is_none(),
+                ghost: false,
+            };
+            (
+                id,
+                row,
+                draft,
+                thread.list_state().pinned_at.is_some(),
+                thread.can_settle(),
+            )
+        };
+        let shown = id.clone();
+        let on_press = self.press(cx, move |view, window, cx| {
+            view.show_thread(&shown, window, cx)
+        });
+        let actions = (!draft_row).then(|| self.row_actions(&id, pinned, settlable, cx));
+        let element = sidebar::thread_row(row.clone(), actions, on_press, grown, cx);
+        Some((row, element))
+    }
+
+    fn row_actions(
+        &self,
+        id: &SharedString,
+        pinned: bool,
+        settlable: bool,
+        cx: &mut Context<Self>,
+    ) -> sidebar::RowActions {
+        let (pin, settle, archive) = (id.clone(), id.clone(), id.clone());
+        let snooze = id.clone();
+        let view = cx.weak_entity();
+        sidebar::RowActions {
+            pinned,
+            settlable,
+            on_pin: self.press(cx, move |view, _, cx| view.toggle_pin(&pin, cx)),
+            on_snooze: Rc::new(move |until, _, cx| {
+                let _ = view.update(cx, |view, cx| view.snooze_thread(&snooze, until, cx));
+            }),
+            on_settle: self.press(cx, move |view, _, cx| view.settle_thread(&settle, cx)),
+            on_archive: self.press(cx, move |view, window, cx| {
+                view.ask_to_archive(&archive, window, cx)
+            }),
+        }
+    }
+
+    fn toggle_pin(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let now = now_ms();
+        self.slots[ix].thread.update(cx, |thread, cx| {
+            if thread.list_state().pinned_at.is_some() {
+                thread.unpin();
+            } else {
+                thread.pin(now);
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn snooze_thread(
+        &mut self,
+        thread_id: &str,
+        until: calendar::SnoozeUntil,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let until = until.at(now_ms(), &calendar::system_offset);
+        self.slots[ix].thread.update(cx, |thread, cx| {
+            thread.snooze(until);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn settle_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(thread_id, cx) else {
+            return;
+        };
+        let now = now_ms();
+        self.slots[ix].thread.update(cx, |thread, cx| {
+            thread.settle(now);
+            cx.notify();
+        });
+        cx.notify();
     }
 }
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = f32::from(window.viewport_size().width);
+        // The drawer only exists in narrow windows; widening the window docks the list.
+        if width >= sidebar::NARROW_WINDOW {
+            self.drawer_open = false;
+        }
+        let mode = sidebar::mode(width, self.sidebar_hidden, self.drawer_open);
+        self.step_motion(mode, window, cx);
         if self.terminal_open {
             if self.terminal_focused(window, cx) {
                 self.terminal_wanted = true;
@@ -2849,30 +3488,24 @@ impl Render for ChatView {
                 self.terminal_wanted = false;
             }
         }
-        let width = f32::from(window.viewport_size().width);
-        // The drawer only exists in narrow windows; widening the window docks the list.
-        if width >= sidebar::NARROW_WINDOW {
-            self.drawer_open = false;
-        }
         // Revoking the last rule takes the chip, and its popover, away.
         if self.thread().read(cx).grant_views().is_empty() {
             self.grants_open = false;
         }
-        let placement = sidebar::placement(width, self.sidebar_hidden, self.drawer_open);
         let sidebar_px = f32::from(SIDEBAR);
         // The drawer floats over the chat, so only the docked list takes width from it.
-        let main_width = match placement {
-            Placement::Docked => width - sidebar_px,
-            Placement::Drawer | Placement::Hidden => width,
+        let main_width = match mode {
+            SidebarMode::Docked => width - sidebar_px,
+            SidebarMode::Drawer | SidebarMode::Hidden => width,
         };
-        let docked = (placement == Placement::Docked).then(|| {
+        let docked = (mode == SidebarMode::Docked).then(|| {
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
             let header = sidebar::header(toggle, window, cx);
-            let list = self.render_list(cx);
+            let list = self.render_list(window, cx);
             sidebar::column(header, list, cx)
         });
         use gpui_kit::component::{Placement as SheetPlacement, WindowExt as _};
-        if placement == Placement::Drawer && !window.has_active_sheet(cx) {
+        if mode == SidebarMode::Drawer && !window.has_active_sheet(cx) {
             let drawer_fill = crate::theme::material(cx).card;
             let view = cx.entity().downgrade();
             let closed = view.clone();
@@ -2899,7 +3532,7 @@ impl Render for ChatView {
                     focus.focus(window, cx);
                 }
             });
-        } else if placement != Placement::Drawer && window.has_active_sheet(cx) {
+        } else if mode != SidebarMode::Drawer && window.has_active_sheet(cx) {
             window.close_sheet(cx);
             self.focus_panel(window, cx);
         }
@@ -2908,10 +3541,10 @@ impl Render for ChatView {
             let theme = cx.theme();
             (theme.foreground, theme.font_family.clone())
         };
-        let floating = placement == Placement::Docked;
+        let floating = mode == SidebarMode::Docked;
         let (main, changes) = match self.pane {
-            Pane::Thread => self.render_thread_card(placement, width, main_width, window, cx),
-            Pane::Usage => (self.render_usage_card(placement, cx), None),
+            Pane::Thread => self.render_thread_card(mode, width, main_width, window, cx),
+            Pane::Usage => (self.render_usage_card(mode, cx), None),
         };
 
         // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
@@ -2977,14 +3610,14 @@ impl ChatView {
     /// terminal. The Changes card beside it, when there is one, comes back apart.
     fn render_thread_card(
         &mut self,
-        placement: Placement,
+        mode: SidebarMode,
         width: f32,
         main_width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (AnyElement, Option<AnyElement>) {
         self.sync_changes(window, cx);
-        let changes = self.render_changes_card(placement, width, window, cx);
+        let changes = self.render_changes_card(mode, width, window, cx);
         let main_width = main_width - changes.as_ref().map_or(0.0, |(_, taken)| *taken);
 
         let (thread_id, empty) = {
@@ -2997,7 +3630,7 @@ impl ChatView {
                     && thread.preparing().is_none(),
             )
         };
-        let title_bar = self.render_title_bar(placement, width, window, cx);
+        let title_bar = self.render_title_bar(mode, width, window, cx);
         let body = if self.review_panel.is_some() {
             self.render_review(cx)
         } else if empty {
@@ -3057,7 +3690,7 @@ impl ChatView {
         };
 
         let material = crate::theme::material(cx);
-        let floating = placement == Placement::Docked;
+        let floating = mode == SidebarMode::Docked;
         // Everything that belongs to one thread sits under an id made from the thread's id,
         // so per-element state (a tool card left open, the scroll position, a streaming reply)
         // can never carry over to another thread whose rows have the same numbers.
@@ -3140,7 +3773,7 @@ fn row_facts(thread: &Thread, now: Instant) -> RowFacts {
         failure,
         stopped_on_quit: matches!(transcript.items().last(), Some(Item::Stopped { .. })),
         background_tasks: thread.background_tasks().len(),
-        updated_at: thread.updated_at(),
+        updated_at: thread.list_state().landed_at,
     }
 }
 

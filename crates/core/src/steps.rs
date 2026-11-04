@@ -3,7 +3,7 @@
 //! - [`StepLabel`]: a short headline and an optional muted detail for each tool call.
 //! - [`WorkBlock`]: one turn's tool calls grouped, with a state and the time it took.
 //! - [`activity_line`]: what a thread is doing right now, for the thread list.
-//! - [`SidebarGroup`]: which group of the thread list a thread belongs to.
+//! - [`Placement`]: where in the thread list a thread belongs.
 //!
 //! All of it is computed from the items the transcript already holds, so nothing is saved and
 //! old threads gain it too. Labels only restate what the event says: a command with no
@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::agent::{ApprovalRequest, ToolDescriptor};
+use crate::store::ListState;
 use crate::thread::{Thread, Waiting};
 use crate::transcript::{Item, Status, ToolState, Transcript};
 
@@ -937,20 +938,29 @@ fn outcome(transcript: &Transcript) -> Option<String> {
     }
 }
 
-/// The group of the thread list a thread sits in.
+/// Where a thread sits in the thread list, from the top: Pinned, Queue, Read (the list with no
+/// header), then the dock below it: In flight, Snoozed and Settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidebarGroup {
-    /// An approval to answer, a usage limit that stopped it, or a failure not yet looked at.
-    NeedsYou,
-    /// A turn is running, a worktree is being made, or a background command runs.
-    Working,
-    /// Idle: nothing for the user to do.
-    Done,
+pub enum Placement {
+    /// Pinned by the user. It stays here whatever it does and keeps its status mark.
+    Pinned,
+    /// Waits on you: an approval or a question to answer, or a turn that ended and has not been
+    /// opened yet.
+    Queue,
+    /// Nothing to do: opened since it last landed, and not put away.
+    Read,
+    /// A turn runs, a worktree is being made, a background command runs, or a usage limit holds
+    /// it back.
+    InFlight,
+    /// Out of the list until its snooze runs out.
+    Snoozed,
+    /// Put away by the user. Sending a message brings it back.
+    Settled,
 }
 
-/// What [`sidebar_group`] decides from.
+/// What [`placement`] decides from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GroupFacts {
+pub struct PlacementFacts {
     pub status: Status,
     pub approval_pending: bool,
     /// A usage limit refused the thread's provider and has not reset yet.
@@ -960,20 +970,41 @@ pub struct GroupFacts {
     pub background_tasks: usize,
     /// Something happened since the user last had the thread on screen.
     pub unread: bool,
+    pub list: ListState,
+    /// Unix milliseconds, the unit of [`ListState`].
+    pub now_ms: i64,
 }
 
-pub fn sidebar_group(facts: GroupFacts) -> SidebarGroup {
-    let busy = facts.status.is_busy();
-    if facts.approval_pending
-        || facts.status == Status::Waiting
-        || (facts.status == Status::Failed && facts.unread)
-        || (facts.limit_paused && !busy)
-    {
-        SidebarGroup::NeedsYou
-    } else if facts.preparing || busy || facts.background_tasks > 0 {
-        SidebarGroup::Working
+impl PlacementFacts {
+    /// An approval or a question is waiting for an answer.
+    pub fn waits_on_you(&self) -> bool {
+        self.approval_pending || self.status == Status::Waiting
+    }
+}
+
+/// Where a thread belongs. The user's choices come first: pinned, settled, then snoozed while
+/// the snooze lasts. Then what the thread itself is doing: an answer owed to you, work in
+/// flight, a turn you have not looked at, and last a command left running in the background.
+/// An unread turn outranks a lone background command, so a failure is not hidden behind a dev
+/// server.
+pub fn placement(facts: PlacementFacts) -> Placement {
+    let list = facts.list;
+    if list.pinned_at.is_some() {
+        Placement::Pinned
+    } else if list.settled_at.is_some() {
+        Placement::Settled
+    } else if list.snoozed_until.is_some_and(|until| until > facts.now_ms) {
+        Placement::Snoozed
+    } else if facts.waits_on_you() {
+        Placement::Queue
+    } else if facts.preparing || facts.status.is_busy() || facts.limit_paused {
+        Placement::InFlight
+    } else if facts.unread {
+        Placement::Queue
+    } else if facts.background_tasks > 0 {
+        Placement::InFlight
     } else {
-        SidebarGroup::Done
+        Placement::Read
     }
 }
 
@@ -986,42 +1017,51 @@ impl Thread {
         )
     }
 
-    /// Which group of the thread list the thread belongs to at `now` (Unix seconds).
-    pub fn sidebar_group(&self, now: i64) -> SidebarGroup {
-        sidebar_group(GroupFacts {
+    /// Where the thread belongs in the thread list at `now_ms` (Unix milliseconds).
+    pub fn placement(&self, now_ms: i64) -> Placement {
+        placement(PlacementFacts {
             status: self.status(),
             approval_pending: self.transcript().pending_approval().is_some(),
-            limit_paused: self.paused_until(now).is_some(),
+            limit_paused: self.paused_until(now_ms / 1000).is_some(),
             preparing: self.preparing().is_some(),
             background_tasks: self.background_tasks().len(),
             unread: self.is_unread(),
+            list: self.list_state(),
+            now_ms,
         })
+    }
+
+    /// An approval or a question is waiting for an answer.
+    pub fn waits_on_you(&self) -> bool {
+        self.status() == Status::Waiting || self.transcript().pending_approval().is_some()
     }
 
     /// The line under the thread's title at `now` (Unix seconds): what it does right now, or
     /// how it ended. `None` when there is nothing specific to say.
     pub fn activity_line(&self, now: i64) -> Option<String> {
-        match self.sidebar_group(now) {
-            SidebarGroup::NeedsYou => match self.paused_until(now) {
-                Some(reset) if !self.status().is_busy() => Some(format!(
-                    "Usage limit reached · resets {}",
-                    crate::picker::reset_time(reset, now)
-                )),
-                _ => activity_line(self.transcript()),
+        let busy = self.status().is_busy();
+        if let Some(reset) = self.paused_until(now).filter(|_| !busy) {
+            return Some(format!(
+                "Usage limit reached · resets {}",
+                crate::picker::reset_time(reset, now)
+            ));
+        }
+        let failed_unread = self.status() == Status::Failed && self.is_unread();
+        if self.waits_on_you() || failed_unread {
+            return activity_line(self.transcript());
+        }
+        match self.preparing() {
+            Some(Waiting::Copy(_)) => Some("Creating a worktree".to_string()),
+            Some(Waiting::Project(_)) => Some("Preparing the project".to_string()),
+            None if busy => activity_line(self.transcript()),
+            None => match self.background_tasks() {
+                [] => activity_line(self.transcript()),
+                [task] if !task.description.trim().is_empty() => {
+                    Some(clip(&task.description, HEADLINE_CHARS))
+                }
+                [_] => Some("Background task running".to_string()),
+                tasks => Some(format!("{} background tasks running", tasks.len())),
             },
-            SidebarGroup::Working => match self.preparing() {
-                Some(Waiting::Copy(_)) => Some("Creating a worktree".to_string()),
-                Some(Waiting::Project(_)) => Some("Preparing the project".to_string()),
-                None if self.status().is_busy() => activity_line(self.transcript()),
-                None => Some(match self.background_tasks() {
-                    [task] if !task.description.trim().is_empty() => {
-                        clip(&task.description, HEADLINE_CHARS)
-                    }
-                    [_] => "Background task running".to_string(),
-                    tasks => format!("{} background tasks running", tasks.len()),
-                }),
-            },
-            SidebarGroup::Done => activity_line(self.transcript()),
         }
     }
 }
@@ -1670,90 +1710,128 @@ mod tests {
         assert_eq!(activity_line(&transcript), None);
     }
 
-    fn facts(status: Status) -> GroupFacts {
-        GroupFacts {
+    fn facts(status: Status) -> PlacementFacts {
+        PlacementFacts {
             status,
             approval_pending: false,
             limit_paused: false,
             preparing: false,
             background_tasks: 0,
             unread: false,
+            list: ListState::default(),
+            now_ms: 1_000,
         }
     }
 
     #[test]
-    fn threads_sort_into_needs_you_working_and_done() {
-        use SidebarGroup::*;
-        let group = |facts| sidebar_group(facts);
-        assert_eq!(group(facts(Status::Idle)), Done);
-        assert_eq!(group(facts(Status::Done)), Done);
-        assert_eq!(group(facts(Status::Stopped)), Done);
-        assert_eq!(group(facts(Status::Working)), Working);
-        assert_eq!(group(facts(Status::Waiting)), NeedsYou);
+    fn threads_sort_into_the_queue_in_flight_and_read() {
+        use Placement::*;
+        let place = placement;
+        assert_eq!(place(facts(Status::Idle)), Read);
+        assert_eq!(place(facts(Status::Done)), Read);
+        assert_eq!(place(facts(Status::Stopped)), Read);
+        assert_eq!(place(facts(Status::Failed)), Read);
+        assert_eq!(place(facts(Status::Working)), InFlight);
+        assert_eq!(place(facts(Status::Waiting)), Queue);
+        for status in [Status::Done, Status::Failed, Status::Stopped] {
+            assert_eq!(
+                place(PlacementFacts {
+                    unread: true,
+                    ..facts(status)
+                }),
+                Queue,
+                "{status:?}"
+            );
+        }
         assert_eq!(
-            group(GroupFacts {
-                unread: true,
-                ..facts(Status::Failed)
-            }),
-            NeedsYou
-        );
-        assert_eq!(group(facts(Status::Failed)), Done);
-        assert_eq!(
-            group(GroupFacts {
-                unread: true,
-                ..facts(Status::Done)
-            }),
-            Done
-        );
-        assert_eq!(
-            group(GroupFacts {
+            place(PlacementFacts {
                 approval_pending: true,
                 ..facts(Status::Working)
             }),
-            NeedsYou
+            Queue
         );
         assert_eq!(
-            group(GroupFacts {
-                limit_paused: true,
-                ..facts(Status::Done)
-            }),
-            NeedsYou
-        );
-        assert_eq!(
-            group(GroupFacts {
-                limit_paused: true,
-                ..facts(Status::Working)
-            }),
-            Working
-        );
-        assert_eq!(
-            group(GroupFacts {
+            place(PlacementFacts {
                 preparing: true,
                 ..facts(Status::Idle)
             }),
-            Working
+            InFlight
         );
         assert_eq!(
-            group(GroupFacts {
+            place(PlacementFacts {
                 background_tasks: 1,
                 ..facts(Status::Done)
             }),
-            Working
+            InFlight
         );
+    }
+
+    #[test]
+    fn a_usage_limit_holds_a_thread_in_flight_whether_or_not_it_works() {
+        use Placement::*;
+        for status in [Status::Done, Status::Failed, Status::Working] {
+            assert_eq!(
+                placement(PlacementFacts {
+                    limit_paused: true,
+                    unread: true,
+                    ..facts(status)
+                }),
+                InFlight,
+                "{status:?}"
+            );
+        }
         assert_eq!(
-            group(GroupFacts {
-                background_tasks: 1,
+            placement(PlacementFacts {
+                limit_paused: true,
+                approval_pending: true,
+                ..facts(Status::Waiting)
+            }),
+            Queue
+        );
+    }
+
+    #[test]
+    fn an_unread_turn_is_not_hidden_behind_a_background_command() {
+        use Placement::*;
+        let running = PlacementFacts {
+            background_tasks: 1,
+            ..facts(Status::Failed)
+        };
+        assert_eq!(placement(running), InFlight);
+        assert_eq!(
+            placement(PlacementFacts {
                 unread: true,
-                ..facts(Status::Failed)
+                ..running
             }),
-            NeedsYou
+            Queue
         );
-        assert_eq!(
-            group(GroupFacts {
-                background_tasks: 1,
-                ..facts(Status::Failed)
-            }),
-            Working
-        );
+    }
+
+    #[test]
+    fn the_users_choices_outrank_what_the_thread_does() {
+        use Placement::*;
+        let busy = PlacementFacts {
+            approval_pending: true,
+            unread: true,
+            background_tasks: 2,
+            ..facts(Status::Waiting)
+        };
+        let list = |list| PlacementFacts { list, ..busy };
+        let at = |pinned_at, snoozed_until, settled_at| {
+            list(ListState {
+                pinned_at,
+                snoozed_until,
+                settled_at,
+                landed_at: 0,
+            })
+        };
+        assert_eq!(placement(busy), Queue);
+        assert_eq!(placement(at(Some(1), None, None)), Pinned);
+        assert_eq!(placement(at(Some(1), Some(5_000), Some(1))), Pinned);
+        assert_eq!(placement(at(None, Some(5_000), Some(1))), Settled);
+        assert_eq!(placement(at(None, Some(5_000), None)), Snoozed);
+        assert_eq!(placement(at(None, Some(1_001), None)), Snoozed);
+        assert_eq!(placement(at(None, Some(1_000), None)), Queue);
+        assert_eq!(placement(at(None, Some(999), None)), Queue);
     }
 }

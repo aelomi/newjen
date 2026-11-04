@@ -57,8 +57,8 @@ use crate::protocol::{Incoming, ResultMessage};
 use crate::providers::claude::controller::{is_missing_conversation, is_session_in_use};
 use crate::session::{Session, SessionConfig, SessionEvent};
 use crate::store::{
-    Grant, PendingCopy, PendingIntent, PendingState, Project, QUIT_FLUSH_TIMEOUT, Store, ThreadRow,
-    now_ms,
+    Grant, ListState, PendingCopy, PendingIntent, PendingState, Project, QUIT_FLUSH_TIMEOUT, Store,
+    ThreadRow, now_ms,
 };
 use crate::thread_usage::{ThreadUsage, TurnUsageRow};
 use crate::transcript::{Item, Status, Transcript};
@@ -130,6 +130,7 @@ pub struct Thread {
     events: Receiver<ThreadEvent>,
     grants: Vec<Grant>,
     unread: bool,
+    list: ListState,
     /// Whether this is the thread on screen (see [`Thread::set_active`]).
     active: bool,
     stage: Stage,
@@ -496,6 +497,10 @@ impl Thread {
             events,
             grants: Vec::new(),
             unread: false,
+            list: ListState {
+                landed_at: now,
+                ..ListState::default()
+            },
             active: false,
             stage: Stage::Draft,
             copy_job: None,
@@ -640,6 +645,7 @@ impl Thread {
         thread.usage_rows = usage_rows;
         thread.grants = grants;
         thread.unread = row.unread;
+        thread.list = row.list;
         thread.stage = Stage::Saved;
         thread.created_at = row.created_at;
         thread.updated_at = row.updated_at;
@@ -1267,6 +1273,11 @@ impl Thread {
             self.title = title_from_message(text);
         }
         self.transcript.push_user(text);
+        self.set_list(ListState {
+            snoozed_until: None,
+            settled_at: None,
+            ..self.list
+        });
         self.controller.begin_message(text);
         self.turn_started = Some(Instant::now());
         self.last_activity = Instant::now();
@@ -1434,6 +1445,94 @@ impl Thread {
         if active && self.unread {
             self.set_unread(false);
         }
+    }
+
+    pub fn list_state(&self) -> ListState {
+        self.list
+    }
+
+    /// Pins the thread to the top of the list. Pins keep the order they were made in. A
+    /// pinned thread is not snoozed or settled.
+    pub fn pin(&mut self, now_ms: i64) {
+        self.set_list(ListState {
+            pinned_at: self.list.pinned_at.or(Some(now_ms)),
+            snoozed_until: None,
+            settled_at: None,
+            ..self.list
+        });
+    }
+
+    pub fn unpin(&mut self) {
+        self.set_list(ListState {
+            pinned_at: None,
+            ..self.list
+        });
+    }
+
+    /// Takes the thread out of the list until `until_ms`, when it wakes (see
+    /// [`Thread::wake_if_due`]).
+    pub fn snooze(&mut self, until_ms: i64) {
+        self.set_list(ListState {
+            pinned_at: None,
+            snoozed_until: Some(until_ms),
+            settled_at: None,
+            ..self.list
+        });
+    }
+
+    /// Ends a snooze now: the thread lands on top of the Queue, unread unless it is on screen.
+    pub fn wake(&mut self, now_ms: i64) {
+        if self.list.snoozed_until.is_none() {
+            return;
+        }
+        self.set_list(ListState {
+            snoozed_until: None,
+            landed_at: now_ms,
+            ..self.list
+        });
+        if !self.active {
+            self.set_unread(true);
+        }
+    }
+
+    /// Wakes the thread if its snooze has run out at `now_ms`. The app calls this on its clock.
+    /// Returns true if it woke.
+    pub fn wake_if_due(&mut self, now_ms: i64) -> bool {
+        let due = self.list.snoozed_until.is_some_and(|until| until <= now_ms);
+        if due {
+            self.wake(now_ms);
+        }
+        due
+    }
+
+    /// Whether the thread can be put away: it is saved and neither runs a turn, waits on an
+    /// answer nor waits for its worktree.
+    pub fn can_settle(&self) -> bool {
+        !self.is_draft()
+            && !self.status().is_busy()
+            && !self.waits_on_you()
+            && self.preparing().is_none()
+    }
+
+    /// Puts the thread away without deleting anything. Sending a message brings it back. A
+    /// thread that works, waits on you or is being prepared stays where it is.
+    pub fn settle(&mut self, now_ms: i64) {
+        if !self.can_settle() {
+            return;
+        }
+        self.set_list(ListState {
+            pinned_at: None,
+            snoozed_until: None,
+            settled_at: Some(now_ms),
+            ..self.list
+        });
+    }
+
+    pub fn unsettle(&mut self) {
+        self.set_list(ListState {
+            settled_at: None,
+            ..self.list
+        });
     }
 
     /// Stops `claude` if it has been idle for [`IDLE_TIMEOUT`] at `now`: running, no turn, no
@@ -1647,6 +1746,9 @@ impl Thread {
         if !was_busy && self.status().is_busy() {
             self.turn_started = Some(Instant::now());
         }
+        if approval_asked {
+            self.land(true);
+        }
         if approval_asked && becomes_unread(self.active, false, true) {
             self.set_unread(true);
         }
@@ -1784,6 +1886,7 @@ impl Thread {
     /// the message a repair would resend, and a stop that was waiting for the turn to end (see
     /// [`Thread::revoke`]).
     fn after_turn_ended(&mut self) {
+        self.land(false);
         if becomes_unread(self.active, true, false) {
             self.set_unread(true);
         }
@@ -1836,6 +1939,35 @@ impl Thread {
                 context_window: model.context_window,
             }
         }));
+    }
+
+    fn set_list(&mut self, list: ListState) {
+        if self.list == list || self.is_draft() {
+            return;
+        }
+        self.list = list;
+        if self.is_saved() {
+            self.store.set_list(&self.id, list);
+        }
+    }
+
+    /// The thread landed: a turn ended or it asks for an approval. It moves to the front of the
+    /// Queue and the read list. An approval also brings it back from Snoozed or Settled, so a
+    /// thread that is blocked on you is never hidden.
+    fn land(&mut self, needs_you: bool) {
+        let parked = if needs_you {
+            ListState {
+                snoozed_until: None,
+                settled_at: None,
+                ..self.list
+            }
+        } else {
+            self.list
+        };
+        self.set_list(ListState {
+            landed_at: now_ms(),
+            ..parked
+        });
     }
 
     fn set_unread(&mut self, unread: bool) {
@@ -1935,6 +2067,7 @@ impl Thread {
             review_base: self.review_base.clone(),
             landing_resolved: self.landing_resolved,
             snapshot_needed: self.work_pending(),
+            list: self.list,
         }
     }
 }

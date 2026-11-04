@@ -6,29 +6,30 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    Action as _, AnyElement, App, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
     prelude::FluentBuilder as _, px, relative,
 };
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
-use newjen_core::Store;
 use newjen_core::picker::{self, reset_time};
 use newjen_core::providers::{Availability, Billing, Provider, ProviderStatus};
 use newjen_core::store::{DailyTokens, ThreadWindowUsage, local_utc_offset_seconds};
 use newjen_core::usage::{self, Pace, ProviderUsage, UsageCredits, UsageStatus, UsageWindow};
+use newjen_core::{Status, Store};
 
 use crate::format::{as_of, compact_tokens, dollars, model_name, span, thousands};
-use crate::sidebar::compact_time;
+use crate::keys::Settings;
+use crate::sidebar::{OnPress, compact_time};
 use crate::theme::material;
 use crate::ui;
 
 const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
+const WARNING_FRACTION: f32 = 0.9;
 const WEEK_DAYS: u32 = 7;
 const THREAD_ROWS: usize = 8;
 const CHART_HEIGHT: f32 = 130.0;
-const METER_WIDTH: f32 = 56.0;
 const TABLE_BAR: f32 = 64.0;
 const TABLE_AGENT: f32 = 112.0;
 const LIMIT_REACHED: &str = "You choose when to continue; Newjen never resumes on its own.";
@@ -36,7 +37,7 @@ const NOTHING_REPORTED: &str = "They show here after this account's next reply."
 
 /// How a window reads: amber from 90% or when the pace empties it before the reset, red at
 /// the limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tone {
     Normal,
     Warning,
@@ -57,26 +58,32 @@ pub struct WindowModel {
     pub tone: Tone,
 }
 
+/// How a window reads: amber from 90% or when the pace empties it before the reset, red at
+/// the limit, plain once it has reset.
+fn window_tone(window: &UsageWindow, now: i64) -> Tone {
+    if window.expired(now) {
+        return Tone::Normal;
+    }
+    let used = window.used_fraction.unwrap_or(0.0);
+    let runs_out = matches!(
+        window.pace(now),
+        Some(Pace::Ahead {
+            runs_out_at: Some(_)
+        })
+    );
+    match window.status {
+        UsageStatus::Limited => Tone::Limited,
+        UsageStatus::Warning => Tone::Warning,
+        UsageStatus::Ok if used >= WARNING_FRACTION || runs_out => Tone::Warning,
+        UsageStatus::Ok => Tone::Normal,
+    }
+}
+
 pub fn window_model(provider: Provider, window: &UsageWindow, now: i64) -> WindowModel {
     let label = provider.presentation().label;
     let expired = window.expired(now);
     let pace = window.pace(now);
-    let mut tone = Tone::Normal;
-    if !expired {
-        let used = window.used_fraction.unwrap_or(0.0);
-        let runs_out = matches!(
-            pace,
-            Some(Pace::Ahead {
-                runs_out_at: Some(_)
-            })
-        );
-        tone = match window.status {
-            UsageStatus::Limited => Tone::Limited,
-            UsageStatus::Warning => Tone::Warning,
-            UsageStatus::Ok if used >= 0.9 || runs_out => Tone::Warning,
-            UsageStatus::Ok => Tone::Normal,
-        };
-    }
+    let tone = window_tone(window, now);
     let remaining = window
         .resets_at_unix_seconds
         .filter(|_| window.length_seconds.is_some_and(|length| length <= 86_400))
@@ -148,21 +155,117 @@ pub fn credits_line(credits: &UsageCredits) -> (String, Option<String>) {
     }
 }
 
-/// The fullest window still counting, for the little meter on the footer row. A window past
-/// its reset time no longer says anything.
-pub fn worst_meter(usages: &[ProviderUsage], now: i64) -> Option<(f32, UsageStatus)> {
-    usages
-        .iter()
-        .flat_map(|usage| &usage.windows)
-        .filter(|window| !window.expired(now))
-        .filter_map(|window| window.used_fraction.map(|used| (used, window.status)))
-        .max_by(|a, b| a.0.total_cmp(&b.0))
+/// What the footer ring shows: the tightest limit among the providers in use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gauge {
+    pub provider: Provider,
+    /// How full the window is, 0.0 to 1.0.
+    pub fraction: f32,
+    /// Where even spending would be by now, when the pace is known.
+    pub pace: Option<f32>,
+    pub tone: Tone,
+    /// Beside the ring, only when a limit is near: "Limit by 3:40pm" or "Resets 4:10pm".
+    pub label: Option<String>,
 }
 
-/// The meter for the footer row, from what the board holds.
-pub fn footer_meter(now: i64) -> Option<(f32, UsageStatus)> {
-    let usages: Vec<ProviderUsage> = PROVIDERS.into_iter().filter_map(usage::latest).collect();
-    worst_meter(&usages, now)
+/// The tightest live window of the providers in `in_use`: the worst tone first, then the
+/// fullest. A provider that is not in use never raises it, nor does one billed through an API
+/// key, whose plan windows say nothing. A window past its reset says nothing either.
+pub fn gauge(usages: &[ProviderUsage], in_use: &[Provider], now: i64) -> Option<Gauge> {
+    usages
+        .iter()
+        .filter(|usage| in_use.contains(&usage.provider) && usage.billing != Billing::ApiKey)
+        .flat_map(|usage| {
+            usage
+                .windows
+                .iter()
+                .map(move |window| (usage.provider, window))
+        })
+        .filter(|(_, window)| !window.expired(now))
+        .filter_map(|(provider, window)| {
+            let tone = window_tone(window, now);
+            let fraction = match tone {
+                Tone::Limited => 1.0,
+                _ => window
+                    .used_fraction
+                    .or((tone == Tone::Warning).then_some(WARNING_FRACTION))?,
+            };
+            Some((tone, fraction, provider, window))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)))
+        .map(|(tone, fraction, provider, window)| Gauge {
+            provider,
+            fraction,
+            pace: window.pace(now).and(window.elapsed_fraction(now)),
+            tone,
+            label: gauge_label(window, tone, now),
+        })
+}
+
+fn gauge_label(window: &UsageWindow, tone: Tone, now: i64) -> Option<String> {
+    match tone {
+        Tone::Normal => None,
+        Tone::Limited => Some(match window.resets_at_unix_seconds {
+            Some(reset) => format!("Resets {}", reset_time(reset, now)),
+            None => "Limit reached".to_string(),
+        }),
+        Tone::Warning => match window.pace(now) {
+            Some(Pace::Ahead {
+                runs_out_at: Some(out),
+            }) => Some(format!("Limit by {}", reset_time(out, now))),
+            _ => window
+                .used_fraction
+                .map(|used| format!("{}% used", (used * 100.0).round() as i64)),
+        },
+    }
+}
+
+/// The providers whose limits can raise the ring: one with a working thread, the one of the
+/// thread on screen, and one that Newjen's own turns used in its current window. `with_turns`
+/// is given the first two kinds and says which others the turns used.
+pub fn providers_in_use(
+    threads: impl IntoIterator<Item = (Provider, Status)>,
+    on_screen: Option<Provider>,
+    with_turns: impl FnOnce(&[Provider]) -> Vec<Provider>,
+) -> Vec<Provider> {
+    let working = threads
+        .into_iter()
+        .filter(|(_, status)| status.is_busy())
+        .map(|(provider, _)| provider);
+    let mut providers: Vec<Provider> = Vec::new();
+    for provider in working.chain(on_screen) {
+        if !providers.contains(&provider) {
+            providers.push(provider);
+        }
+    }
+    for provider in with_turns(&providers) {
+        if !providers.contains(&provider) {
+            providers.push(provider);
+        }
+    }
+    providers
+}
+
+/// The providers with turn usage in the window the Usage view counts from (`current_window`).
+/// `used_since` says whether Newjen's turns used a provider from a Unix-second instant on.
+pub fn providers_with_turns(
+    usages: &[ProviderUsage],
+    now: i64,
+    used_since: impl Fn(Provider, i64) -> bool,
+) -> Vec<Provider> {
+    usages
+        .iter()
+        .filter(|usage| {
+            current_window(usage, now)
+                .is_some_and(|(_, started)| used_since(usage.provider, started))
+        })
+        .map(|usage| usage.provider)
+        .collect()
+}
+
+/// The reports on the board, for every provider that has one.
+pub fn board_usages() -> Vec<ProviderUsage> {
+    PROVIDERS.into_iter().filter_map(usage::latest).collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -963,24 +1066,75 @@ fn week_card(snapshot: &Snapshot, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// The footer row's meter, a thin bar in the worst window's color.
-pub fn meter_view(meter: (f32, UsageStatus), cx: &App) -> AnyElement {
-    let (used, status) = meter;
+const ICON_BUTTON: f32 = 26.0;
+const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+fn tone_ink(tone: Tone, cx: &App) -> Hsla {
     let colors = cx.theme().colors;
-    let color = match status {
-        UsageStatus::Ok => colors.foreground,
-        UsageStatus::Warning => colors.warning,
-        UsageStatus::Limited => colors.danger,
-    };
+    match tone {
+        Tone::Normal => colors.foreground.opacity(0.72),
+        Tone::Warning => colors.warning,
+        Tone::Limited => colors.danger,
+    }
+}
+
+/// The row at the foot of the sidebar: the settings gear at the left, the usage ring at the
+/// right. The ring opens the Usage view.
+pub fn footer(gauge: Option<&Gauge>, selected: bool, on_usage: OnPress, cx: &App) -> AnyElement {
+    let gear = ui::icon_button("settings", ui::IconName::Settings, "Settings", cx)
+        .tooltip_with_action("Settings", &Settings, None)
+        .tooltip_show_delay(TOOLTIP_DELAY)
+        .debug_selector(|| "settings".to_string())
+        .size(px(ICON_BUTTON))
+        .on_click(|_, window, cx| window.dispatch_action(Settings.boxed_clone(), cx));
     div()
         .flex_none()
-        .w(px(METER_WIDTH))
+        .px_2()
+        .pb_2()
         .child(
-            Progress::new("usage-meter")
-                .value(used * 100.0)
-                .color(color)
-                .with_size(gpui_kit::component::Size::Size(px(4.))),
+            h_flex()
+                .h(px(32.))
+                .px(px(2.))
+                .items_center()
+                .justify_between()
+                .child(gear)
+                .child(cluster(gauge, selected, on_usage, cx)),
         )
+        .into_any_element()
+}
+
+fn cluster(gauge: Option<&Gauge>, selected: bool, on_usage: OnPress, cx: &App) -> AnyElement {
+    let material = material(cx);
+    let colors = cx.theme().colors;
+    let look = ui::GaugeLook {
+        fraction: gauge.map_or(0.0, |gauge| gauge.fraction),
+        tick: gauge.and_then(|gauge| gauge.pace),
+        ink: tone_ink(gauge.map_or(Tone::Normal, |gauge| gauge.tone), cx),
+        track: colors.foreground.opacity(0.12),
+        tick_ink: colors.foreground.opacity(0.55),
+    };
+    let label = gauge.and_then(|gauge| {
+        Some(ui::GaugeLabel {
+            provider: gauge.provider,
+            text: gauge.label.clone()?.into(),
+        })
+    });
+    h_flex()
+        .id("usage-row")
+        .debug_selector(|| "usage-row".to_string())
+        .h(px(ICON_BUTTON))
+        .px(px(5.))
+        .items_center()
+        .rounded(px(6.))
+        .when(selected, |row| row.bg(material.glass_selected))
+        .hover(|row| row.bg(material.glass_hover))
+        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Usage").build(window, cx))
+        .tooltip_show_delay(TOOLTIP_DELAY)
+        .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+            window.prevent_default()
+        })
+        .on_click(move |_, window, cx| on_usage(window, cx))
+        .child(ui::UsageGauge::new("usage-gauge", look, label))
         .into_any_element()
 }
 
@@ -1050,42 +1204,333 @@ mod tests {
         )
     }
 
+    fn codex(windows: Vec<UsageWindow>) -> ProviderUsage {
+        ProviderUsage {
+            provider: Provider::Codex,
+            ..usage(windows)
+        }
+    }
+
+    const BOTH: [Provider; 2] = [Provider::Claude, Provider::Codex];
+
     #[test]
-    fn the_meter_shows_the_fullest_live_window() {
-        let usages = [
-            usage(vec![
-                window("5h", Some(0.38), Some(NOW + 100), None, UsageStatus::Ok),
-                window("week", Some(0.2), Some(NOW + 100), None, UsageStatus::Ok),
-            ]),
-            usage(vec![window(
-                "codex",
-                Some(0.91),
-                None,
-                None,
-                UsageStatus::Warning,
-            )]),
-        ];
+    fn the_ring_is_plain_and_unlabelled_while_a_limit_is_comfortable() {
+        let claude = usage(vec![five_hours(0.32, 12_600, UsageStatus::Ok)]);
+        let ring = gauge(&[claude], &BOTH, NOW).unwrap();
+        assert_eq!(ring.provider, Provider::Claude);
+        assert_eq!(ring.tone, Tone::Normal);
+        assert_eq!(ring.label, None);
+        assert!((ring.fraction - 0.32).abs() < 1e-6);
+        assert!((ring.pace.unwrap() - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_ring_turns_amber_and_says_when_the_pace_hits_the_limit() {
+        let claude = usage(vec![five_hours(0.74, 9_000, UsageStatus::Ok)]);
+        let ring = gauge(&[claude], &BOTH, NOW).unwrap();
+        assert_eq!(ring.tone, Tone::Warning);
+        let out = NOW + 9_000 - 18_000 + (9_000.0_f64 / 0.74).round() as i64;
         assert_eq!(
-            worst_meter(&usages, NOW),
-            Some((0.91, UsageStatus::Warning))
+            ring.label,
+            Some(format!("Limit by {}", reset_time(out, NOW)))
         );
-        let stale = [usage(vec![window(
-            "5h",
-            Some(0.99),
-            Some(NOW - 1),
+        assert!((ring.fraction - 0.74).abs() < 1e-6);
+    }
+
+    #[test]
+    fn near_the_limit_with_no_pace_to_project_the_ring_names_the_share_used() {
+        let codex = codex(vec![window(
+            "codex:primary",
+            Some(0.93),
+            Some(NOW + 600),
             None,
-            UsageStatus::Warning,
-        )])];
-        assert_eq!(worst_meter(&stale, NOW), None);
-        let bare = [usage(vec![window(
-            "5h",
+            UsageStatus::Ok,
+        )]);
+        let ring = gauge(&[codex], &BOTH, NOW).unwrap();
+        assert_eq!(ring.tone, Tone::Warning);
+        assert_eq!(ring.label.as_deref(), Some("93% used"));
+        assert_eq!(ring.pace, None);
+    }
+
+    #[test]
+    fn at_the_limit_the_ring_is_full_red_and_says_when_it_resets() {
+        let claude = usage(vec![five_hours(1.0, 3_600, UsageStatus::Limited)]);
+        let ring = gauge(&[claude], &BOTH, NOW).unwrap();
+        assert_eq!(ring.tone, Tone::Limited);
+        assert_eq!(ring.fraction, 1.0);
+        assert_eq!(
+            ring.label,
+            Some(format!("Resets {}", reset_time(NOW + 3_600, NOW)))
+        );
+        let rejected = usage(vec![window(
+            "usage",
+            None,
+            Some(NOW + 3_600),
+            None,
+            UsageStatus::Limited,
+        )]);
+        let ring = gauge(&[rejected], &BOTH, NOW).unwrap();
+        assert_eq!((ring.tone, ring.fraction), (Tone::Limited, 1.0));
+        let unknown = usage(vec![window(
+            "usage",
             None,
             None,
             None,
             UsageStatus::Limited,
-        )])];
-        assert_eq!(worst_meter(&bare, NOW), None);
-        assert_eq!(worst_meter(&[], NOW), None);
+        )]);
+        assert_eq!(
+            gauge(&[unknown], &BOTH, NOW).unwrap().label.as_deref(),
+            Some("Limit reached")
+        );
+    }
+
+    #[test]
+    fn the_tightest_limit_of_the_providers_in_use_wins() {
+        let claude = usage(vec![five_hours(0.32, 12_600, UsageStatus::Ok)]);
+        let codex = codex(vec![window(
+            "codex:primary",
+            Some(0.97),
+            Some(NOW + 600),
+            Some(18_000),
+            UsageStatus::Warning,
+        )]);
+        let usages = [claude, codex];
+        let both = gauge(&usages, &BOTH, NOW).unwrap();
+        assert_eq!((both.provider, both.tone), (Provider::Codex, Tone::Warning));
+        let calm_but_fuller = usage(vec![
+            five_hours(0.2, 12_600, UsageStatus::Ok),
+            window(
+                "week",
+                Some(0.6),
+                Some(NOW + 300_000),
+                None,
+                UsageStatus::Ok,
+            ),
+        ]);
+        assert!((gauge(&[calm_but_fuller], &BOTH, NOW).unwrap().fraction - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_provider_not_in_use_never_raises_the_ring() {
+        let claude = usage(vec![five_hours(0.32, 12_600, UsageStatus::Ok)]);
+        let codex = codex(vec![window(
+            "codex:primary",
+            Some(1.0),
+            Some(NOW + 600),
+            Some(18_000),
+            UsageStatus::Limited,
+        )]);
+        let usages = [claude, codex];
+        let ring = gauge(&usages, &[Provider::Claude], NOW).unwrap();
+        assert_eq!((ring.provider, ring.tone), (Provider::Claude, Tone::Normal));
+        assert_eq!(gauge(&usages, &[], NOW), None);
+    }
+
+    #[test]
+    fn windows_that_say_nothing_are_left_out() {
+        let past = usage(vec![five_hours(0.99, -1, UsageStatus::Warning)]);
+        assert_eq!(gauge(&[past], &BOTH, NOW), None);
+        let bare = usage(vec![window("5h", None, None, None, UsageStatus::Ok)]);
+        assert_eq!(gauge(&[bare], &BOTH, NOW), None);
+        let paid = ProviderUsage {
+            billing: Billing::ApiKey,
+            ..usage(vec![five_hours(1.0, 600, UsageStatus::Limited)])
+        };
+        assert_eq!(gauge(&[paid], &BOTH, NOW), None);
+        assert_eq!(gauge(&[], &BOTH, NOW), None);
+    }
+
+    #[test]
+    fn a_provider_is_in_use_with_a_working_thread_on_screen_or_with_recent_turns() {
+        use Provider::{Claude, Codex};
+        let threads = [
+            (Claude, Status::Done),
+            (Codex, Status::Working),
+            (Codex, Status::Waiting),
+            (Claude, Status::Idle),
+        ];
+        let none = |_: &[Provider]| Vec::new();
+        assert_eq!(providers_in_use(threads, None, none), vec![Codex]);
+        assert_eq!(providers_in_use([], Some(Claude), none), vec![Claude]);
+        assert_eq!(
+            providers_in_use(threads, Some(Claude), |_| vec![Claude]),
+            vec![Codex, Claude]
+        );
+        assert_eq!(
+            providers_in_use(threads, None, |known| {
+                assert_eq!(known, [Codex]);
+                vec![Claude, Codex]
+            }),
+            vec![Codex, Claude]
+        );
+        assert!(providers_in_use([(Claude, Status::Failed)], None, none).is_empty());
+    }
+
+    #[test]
+    fn turn_usage_counts_from_the_start_of_the_current_window() {
+        let claude = usage(vec![five_hours(0.4, 3_600, UsageStatus::Ok)]);
+        let codex = codex(vec![window(
+            "x",
+            Some(0.1),
+            Some(NOW + 5),
+            None,
+            UsageStatus::Ok,
+        )]);
+        let started = NOW + 3_600 - 18_000;
+        let used =
+            providers_with_turns(&[claude.clone(), codex.clone()], NOW, |provider, since| {
+                provider == Provider::Claude && since == started
+            });
+        assert_eq!(used, vec![Provider::Claude]);
+        let unmeasured = providers_with_turns(&[claude, codex], NOW, |_, _| true);
+        assert_eq!(unmeasured, vec![Provider::Claude]);
+    }
+
+    struct Harness {
+        gauge: Option<Gauge>,
+        opened: Rc<std::cell::Cell<u32>>,
+    }
+
+    impl gpui::Render for Harness {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let opened = self.opened.clone();
+            footer(
+                self.gauge.as_ref(),
+                false,
+                Rc::new(move |_, _| opened.set(opened.get() + 1)),
+                cx,
+            )
+        }
+    }
+
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    }
+
+    #[gpui::test]
+    fn the_footer_has_a_gear_for_settings_and_a_ring_that_opens_usage(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings = Rc::new(std::cell::Cell::new(0));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let settings = settings.clone();
+            cx.on_action(move |_: &Settings, _| settings.set(settings.get() + 1));
+        });
+        let opened = Rc::new(std::cell::Cell::new(0));
+        let (_, cx) = cx.add_window_view(|_, _| Harness {
+            gauge: None,
+            opened: opened.clone(),
+        });
+        assert!(cx.debug_bounds("usage-label").is_none());
+        click(cx, "settings");
+        assert_eq!((settings.get(), opened.get()), (1, 0));
+        click(cx, "usage-row");
+        assert_eq!((settings.get(), opened.get()), (1, 1));
+    }
+
+    #[gpui::test]
+    fn the_footer_names_the_limit_only_when_one_is_near(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let near = gauge(
+            &[usage(vec![five_hours(1.0, 3_600, UsageStatus::Limited)])],
+            &BOTH,
+            NOW,
+        );
+        assert!(near.as_ref().unwrap().label.is_some());
+        let (_, cx) = cx.add_window_view(|_, _| Harness {
+            gauge: near,
+            opened: Rc::default(),
+        });
+        assert!(cx.debug_bounds("usage-label").is_some());
+        let calm = gauge(
+            &[usage(vec![five_hours(0.32, 12_600, UsageStatus::Ok)])],
+            &BOTH,
+            NOW,
+        );
+        let (_, cx) = cx.add_window_view(|_, _| Harness {
+            gauge: calm,
+            opened: Rc::default(),
+        });
+        assert!(cx.debug_bounds("usage-label").is_none());
+    }
+
+    fn show(view: &gpui::Entity<Harness>, gauge: Option<Gauge>, cx: &mut gpui::VisualTestContext) {
+        cx.update(|_, cx| {
+            view.update(cx, |harness, cx| {
+                harness.gauge = gauge;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    fn label_width(cx: &mut gpui::VisualTestContext) -> Option<f32> {
+        cx.debug_bounds("usage-label")
+            .map(|bounds| f32::from(bounds.size.width))
+    }
+
+    fn pass(cx: &mut gpui::VisualTestContext, millis: u64) {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(millis));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+
+    fn near() -> Option<Gauge> {
+        gauge(
+            &[usage(vec![five_hours(1.0, 3_600, UsageStatus::Limited)])],
+            &BOTH,
+            NOW,
+        )
+    }
+
+    #[gpui::test]
+    fn the_label_slides_out_of_the_ring_and_back(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, _| Harness {
+            gauge: None,
+            opened: Rc::default(),
+        });
+        assert_eq!(label_width(cx), None);
+        show(&view, near(), cx);
+        let starting = label_width(cx).unwrap();
+        pass(cx, 100);
+        let sliding = label_width(cx).unwrap();
+        pass(cx, 300);
+        let full = label_width(cx).unwrap();
+        assert!(
+            starting < sliding && sliding < full,
+            "{starting} {sliding} {full}"
+        );
+        show(&view, None, cx);
+        pass(cx, 100);
+        assert!(label_width(cx).unwrap() < full);
+        pass(cx, 300);
+        assert_eq!(label_width(cx), None);
+    }
+
+    #[gpui::test]
+    fn with_reduce_motion_the_label_keeps_its_width_and_only_fades(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (view, cx) = cx.add_window_view(|_, _| Harness {
+            gauge: None,
+            opened: Rc::default(),
+        });
+        show(&view, near(), cx);
+        pass(cx, 100);
+        let full = label_width(cx).unwrap();
+        pass(cx, 300);
+        assert_eq!(label_width(cx), Some(full));
+        show(&view, None, cx);
+        pass(cx, 100);
+        assert_eq!(label_width(cx), Some(full));
+        pass(cx, 300);
+        assert_eq!(label_width(cx), None);
     }
 
     #[test]

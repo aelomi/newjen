@@ -87,15 +87,15 @@ impl NativeAttention {
     pub fn capability_note(&self) -> Option<&'static str> {
         if self.center.is_none() {
             return Some(
-                "Desktop notifications need an app bundle. Check \"Needs you\" in the thread list (⌘J) for requests.",
+                "Desktop notifications need an app bundle. Check the Queue in the thread list (⌘J) for requests.",
             );
         }
         match self.authorization.load(Ordering::Acquire) {
             DENIED => Some(
-                "Desktop notifications are off in macOS settings. Check \"Needs you\" in the thread list (⌘J) for requests.",
+                "Desktop notifications are off in macOS settings. Check the Queue in the thread list (⌘J) for requests.",
             ),
             FAILED => Some(
-                "macOS could not enable desktop notifications. Check \"Needs you\" in the thread list (⌘J) for requests.",
+                "macOS could not enable desktop notifications. Check the Queue in the thread list (⌘J) for requests.",
             ),
             _ => None,
         }

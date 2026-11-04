@@ -315,6 +315,12 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     cx.simulate_click(bounds.center(), gpui::Modifiers::default());
 }
 
+fn let_motion_finish(chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+}
+
 fn finish(chat: &Entity<ChatView>, path: PathBuf, cx: &mut VisualTestContext) {
     cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)))
         .unwrap();
@@ -552,7 +558,14 @@ async fn reply_copy_and_chrome_clicks_preserve_keyboard_behavior(cx: &mut TestAp
     cx.simulate_keystrokes("cmd-b cmd-n");
     assert!(focused(cx));
     assert!(cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
-    click(cx, "thread-row");
+    let_motion_finish(&chat, cx);
+    // The first thread is still finishing in the tray, or already in the list.
+    let first = if cx.debug_bounds("tray-row").is_some() {
+        "tray-row"
+    } else {
+        "thread-row"
+    };
+    click(cx, first);
     assert!(focused(cx));
     assert!(!cx.update(|_, cx| chat.read(cx).thread().read(cx).is_draft()));
     finish(&chat, path, cx);
@@ -990,7 +1003,8 @@ fn a_failed_copy_names_what_failed(cx: &mut TestAppContext) {
     finish(&chat, path, cx);
 }
 
-/// Right click on the thread on screen's row, then "Archive thread".
+/// Right click on the row of a thread that waits on an approval, then "Archive thread". The
+/// menu skips Settle, which is disabled for such a thread.
 fn archive_from_menu(cx: &mut VisualTestContext) {
     let bounds = cx.debug_bounds("thread-row").unwrap();
     for event in [true, false] {
@@ -1008,7 +1022,7 @@ fn archive_from_menu(cx: &mut VisualTestContext) {
             );
         }
     }
-    cx.simulate_keystrokes("down enter");
+    cx.simulate_keystrokes("down down down enter");
 }
 
 #[gpui::test]
@@ -2162,6 +2176,7 @@ async fn review_completion_during_saving_does_not_disable_keep_open(cx: &mut Tes
                 review_base: Some("a".repeat(40)),
                 landing_resolved: false,
                 snapshot_needed: false,
+                list: Default::default(),
             };
             view.store.save_thread(row.clone());
             assert!(view.store.flush(Duration::from_secs(5)));
@@ -2263,33 +2278,42 @@ fn a_dismissed_notification_note_stays_dismissed(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn the_sidebar_groups_threads_and_its_usage_row_opens_the_usage_view(
-    cx: &mut TestAppContext,
-) {
+async fn the_sidebar_lists_threads_and_its_usage_row_opens_the_usage_view(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "sidebar-groups", true);
     cx.run_until_parked();
     for selector in ["switch-project", "new-thread", "usage-row", "thread-row"] {
         assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
     }
-    // The first message starts a thread that waits for an approval: "Needs you".
+    // The first message starts a thread that waits for an approval. It is on screen, so it stays
+    // where it was opened until the user leaves it, then it is in the Queue.
     cx.simulate_input("first thread");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
     cx.update(|_, cx| {
         let view = chat.read(cx);
         assert_eq!(
-            view.sidebar_entries(cx),
-            vec![
-                sidebar::Entry::Header {
-                    group: SidebarGroup::NeedsYou,
-                    count: 1
-                },
-                sidebar::Entry::Thread(0)
-            ]
+            view.sidebar_layout(cx).entries,
+            vec![sidebar::Entry::Thread(0)]
         );
     });
     cx.simulate_keystrokes("cmd-n");
     cx.run_until_parked();
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert_eq!(
+            view.sidebar_layout(cx).entries,
+            vec![
+                sidebar::Entry::Thread(0),
+                sidebar::Entry::Header {
+                    section: sidebar::Section::Queue,
+                    count: 1,
+                    needs: 1
+                },
+                sidebar::Entry::Thread(1)
+            ]
+        );
+    });
+    let_motion_finish(&chat, cx);
     assert!(cx.debug_bounds("thread-row").is_some());
     // The usage row opens the Usage view in place of the thread, and a thread row returns.
     assert!(cx.debug_bounds("usage-view").is_none());
@@ -2299,6 +2323,666 @@ async fn the_sidebar_groups_threads_and_its_usage_row_opens_the_usage_view(
     click(cx, "thread-row");
     cx.run_until_parked();
     assert!(cx.debug_bounds("usage-view").is_none());
+    finish(&chat, path, cx);
+}
+
+/// Adds a saved thread that is idle, with a row of its own in the list, and returns its id.
+/// `unread` puts it in the Queue, otherwise it is read.
+fn add_idle_thread(
+    chat: &Entity<ChatView>,
+    cx: &mut VisualTestContext,
+    title: &str,
+    unread: bool,
+    list: newjen_core::store::ListState,
+) -> String {
+    add_idle_thread_in(chat, cx, title, unread, list, None)
+}
+
+fn add_idle_thread_in(
+    chat: &Entity<ChatView>,
+    cx: &mut VisualTestContext,
+    title: &str,
+    unread: bool,
+    list: newjen_core::store::ListState,
+    copy: Option<newjen_core::worktree::Worktree>,
+) -> String {
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let id = format!("5a0c1f4e-2b1e-4c8e-9a51-{:012}", view.slots.len());
+            let row = newjen_core::store::ThreadRow {
+                id: id.clone(),
+                project_id: view.project.id,
+                workdir: view.project.path.clone(),
+                title: title.into(),
+                provider: "claude".into(),
+                conversation: newjen_core::agent::ConversationState::Established(
+                    "6f1c1f4e-2b1e-4c8e-9a51-0d9a7c2f3b10".into(),
+                ),
+                model: newjen_core::providers::ModelSelection::CliDefault,
+                effort: newjen_core::agent::EffortSelection::CliDefault,
+                speed: newjen_core::agent::Speed::Normal,
+                status: Status::Done,
+                unread,
+                created_at: 1,
+                updated_at: 1,
+                archived_at: None,
+                copy,
+                review_base: None,
+                landing_resolved: false,
+                snapshot_needed: false,
+                list,
+            };
+            view.store.save_thread(row.clone());
+            assert!(view.store.flush(Duration::from_secs(5)));
+            let thread = Thread::load(
+                view.store.clone(),
+                &view.project,
+                row,
+                view.base_config.clone(),
+            )
+            .unwrap();
+            let at = view.slots.len();
+            view.add_slot(thread, at, window, cx);
+            cx.notify();
+            id
+        })
+    })
+}
+
+fn settled_list(at: i64) -> newjen_core::store::ListState {
+    newjen_core::store::ListState {
+        settled_at: Some(at),
+        landed_at: at,
+        ..Default::default()
+    }
+}
+
+fn fox(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> (bool, String) {
+    cx.update(|_, cx| {
+        let fox = chat.read(cx).fox.read(cx);
+        (fox.is_shown(), fox.title().to_string())
+    })
+}
+
+#[gpui::test]
+async fn the_fox_game_fills_a_list_with_nothing_to_read_and_yields_to_the_first_row(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "fox-game", true);
+    cx.run_until_parked();
+    assert_eq!(fox(&chat, cx), (true, "All clear".to_string()));
+    assert!(cx.debug_bounds("fox-playfield").is_some());
+
+    cx.simulate_input("a draft of its own");
+    cx.simulate_keystrokes("cmd-n");
+    let_motion_finish(&chat, cx);
+    cx.update(|_, cx| assert_eq!(chat.read(cx).slots.len(), 2));
+    assert_eq!(
+        fox(&chat, cx),
+        (true, "All clear".to_string()),
+        "drafts are not rows to read"
+    );
+
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let_motion_finish(&chat, cx);
+    assert!(!fox(&chat, cx).0, "the thread on screen is a row");
+    cx.update(|_, cx| {
+        let fox = chat.read(cx).fox.clone();
+        fox.update(cx, |fox, _| fox.advance(1., true));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("fox-playfield").is_none(),
+        "the game has faded away"
+    );
+
+    click(cx, "once");
+    click(cx, "once");
+    wait_answers(cx, &path, 2).await;
+    cx.simulate_keystrokes("cmd-n");
+    let_motion_finish(&chat, cx);
+    cx.update(|_, cx| {
+        let layout = chat.read(cx).sidebar_layout(cx);
+        assert_eq!(layout.in_flight.len(), 1);
+        assert!(layout.entries.iter().all(|entry| matches!(
+            entry,
+            sidebar::Entry::Thread(ix) if chat.read(cx).slots[*ix].thread.read(cx).is_draft()
+        )));
+    });
+    assert_eq!(
+        fox(&chat, cx),
+        (true, sidebar::NOTHING_NEEDS_YOU.to_string()),
+        "a thread in flight leaves the list empty"
+    );
+
+    cx.simulate_input("second thread");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    cx.simulate_keystrokes("cmd-n");
+    let_motion_finish(&chat, cx);
+    cx.update(|_, cx| {
+        let layout = chat.read(cx).sidebar_layout(cx);
+        assert!(layout.entries.iter().any(|entry| matches!(
+            entry,
+            sidebar::Entry::Header {
+                section: sidebar::Section::Queue,
+                ..
+            }
+        )));
+    });
+    assert!(!fox(&chat, cx).0, "a Queue row hides the game");
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn the_fox_game_takes_the_keyboard_only_when_clicked_and_gives_it_back(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "fox-focus", true);
+    cx.run_until_parked();
+    let composer = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window))
+    };
+    let game = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            chat.read(cx)
+                .fox
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        })
+    };
+    assert!(fox(&chat, cx).0);
+    assert!(composer(cx) && !game(cx), "showing the game keeps the keys");
+    cx.simulate_input("two approvals");
+    assert!(composer(cx) && !game(cx));
+
+    click(cx, "fox-playfield");
+    assert!(game(cx) && !composer(cx), "a click gives it the keys");
+
+    let row = sidebar::Listed {
+        draft: false,
+        placement: Placement::Queue,
+        waits: false,
+        list: Default::default(),
+    };
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.sync_fox(&[row], window, cx)));
+    assert!(
+        composer(cx) && !game(cx),
+        "the keys go back as soon as the game yields"
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_settled_thread_waits_in_a_panel_that_esc_closes_and_archive_all_asks_first(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "settled-panel", true);
+    cx.simulate_input("keep waiting");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let id = add_idle_thread(&chat, cx, "park me", false, Default::default());
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
+    cx.run_until_parked();
+    let_motion_finish(&chat, cx);
+    cx.update(|_, cx| {
+        let layout = chat.read(cx).sidebar_layout(cx);
+        assert_eq!(layout.settled, vec![1]);
+        assert_eq!(layout.entries, vec![sidebar::Entry::Thread(0)]);
+    });
+    assert!(cx.debug_bounds("sheet").is_none());
+
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet").is_some());
+    assert!(cx.debug_bounds("sheet-row").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet").is_none());
+    assert!(
+        cx.update(|_, cx| chat
+            .read(cx)
+            .thread()
+            .read(cx)
+            .transcript()
+            .pending_approval()
+            .is_some()),
+        "Esc closed the panel and denied nothing"
+    );
+
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet-archive").is_some());
+    click(cx, "sheet-cancel");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet-archive").is_none());
+    assert!(cx.debug_bounds("sheet").is_some(), "cancel keeps the panel");
+    assert!(cx.debug_bounds("sheet-bulk").is_some());
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    click(cx, "sheet-archive");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet").is_none());
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert_eq!(view.slots.len(), 1);
+        assert!(
+            view.thread()
+                .read(cx)
+                .transcript()
+                .pending_approval()
+                .is_some()
+        );
+        assert!(view.sidebar_layout(cx).settled.is_empty());
+    });
+    let_motion_finish(&chat, cx);
+    assert!(cx.debug_bounds("disclosure-settled").is_none());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_row_offers_settle_only_to_a_thread_that_can_be_put_away(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "settle-offer", true);
+    cx.simulate_input("keep waiting");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    assert!(cx.debug_bounds("row-snooze").is_some());
+    assert!(
+        cx.debug_bounds("row-settle").is_none(),
+        "a thread that waits on you stays in the list"
+    );
+    add_idle_thread(&chat, cx, "quiet", false, Default::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("row-settle").is_some());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn archive_all_leaves_a_thread_that_left_settled_while_the_question_was_open(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "archive-all-race", true);
+    let stays = add_idle_thread(&chat, cx, "comes back", false, settled_list(5));
+    let goes = add_idle_thread(&chat, cx, "still put away", false, settled_list(6));
+    let_motion_finish(&chat, cx);
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet-archive").is_some());
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            let ix = view.index_of(&stays, cx).unwrap();
+            view.slots[ix].thread.update(cx, |thread, cx| {
+                thread.unsettle();
+                cx.notify();
+            });
+        })
+    });
+    cx.run_until_parked();
+    click(cx, "sheet-archive");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert!(view.index_of(&stays, cx).is_some(), "it was not settled");
+        assert!(view.index_of(&goes, cx).is_none());
+    });
+    finish(&chat, path, cx);
+}
+
+fn listed_ids(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        view.thread_order(cx)
+            .into_iter()
+            .map(|ix| view.slots[ix].thread.read(cx).id().to_string())
+            .collect()
+    })
+}
+
+fn read_list(landed_at: i64) -> newjen_core::store::ListState {
+    newjen_core::store::ListState {
+        landed_at,
+        ..Default::default()
+    }
+}
+
+#[gpui::test]
+async fn the_thread_on_screen_keeps_its_exact_place_when_it_lands_and_moves_when_left(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "hold-order", false);
+    let older = add_idle_thread(&chat, cx, "older", false, read_list(100));
+    let mid = add_idle_thread(&chat, cx, "mid", false, read_list(200));
+    let newest = add_idle_thread(&chat, cx, "newest", false, read_list(300));
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| view.show_thread(&mid, window, cx));
+    });
+    let_motion_finish(&chat, cx);
+    let expected = vec![newest.clone(), mid.clone(), older.clone()];
+    assert_eq!(listed_ids(&chat, cx), expected);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            let ix = view.index_of(&mid, cx).unwrap();
+            view.slots[ix].thread.update(cx, |thread, cx| {
+                thread.snooze(i64::MAX);
+                thread.wake(now_ms());
+                cx.notify();
+            });
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        listed_ids(&chat, cx),
+        expected,
+        "landing on screen does not move the row"
+    );
+
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| view.show_thread(&older, window, cx));
+    });
+    let_motion_finish(&chat, cx);
+    assert_eq!(listed_ids(&chat, cx), vec![mid, newest, older]);
+    finish(&chat, path, cx);
+}
+
+fn snoozed_list(until: i64) -> newjen_core::store::ListState {
+    newjen_core::store::ListState {
+        snoozed_until: Some(until),
+        landed_at: until,
+        ..Default::default()
+    }
+}
+
+fn root_focused(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| chat.read(cx).root.is_focused(window))
+}
+
+fn filter_focused(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| {
+        chat.read(cx)
+            .sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.filter.read(cx).focus_handle(cx).is_focused(window))
+    })
+}
+
+#[gpui::test]
+async fn closing_a_panel_over_an_approval_gives_the_keyboard_to_the_dock(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "panel-focus", true);
+    cx.update(|_, cx| cx.set_reduce_motion(false));
+    add_idle_thread(&chat, cx, "later", false, snoozed_list(i64::MAX));
+    cx.simulate_input("keep waiting");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let_motion_finish(&chat, cx);
+    assert!(root_focused(&chat, cx));
+
+    for close in ["escape", "outside"] {
+        click(cx, "disclosure-snoozed");
+        let_motion_finish(&chat, cx);
+        assert!(filter_focused(&chat, cx), "the panel takes the keyboard");
+        if close == "escape" {
+            cx.simulate_keystrokes("escape");
+        } else {
+            let size = cx.update(|window, _| window.viewport_size());
+            cx.simulate_click(
+                gpui::point(size.width * 0.6, size.height * 0.3),
+                gpui::Modifiers::default(),
+            );
+        }
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| chat.read(cx).sheet.is_none()));
+        assert!(
+            cx.update(|_, cx| chat.read(cx).sheet_exit.is_some()),
+            "the panel is still lowering"
+        );
+        assert!(
+            root_focused(&chat, cx),
+            "closing by {close} leaves the keyboard on the dock"
+        );
+        let_motion_finish(&chat, cx);
+    }
+    assert!(
+        cx.update(|_, cx| chat
+            .read(cx)
+            .thread()
+            .read(cx)
+            .transcript()
+            .pending_approval()
+            .is_some()),
+        "nothing was denied"
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn choosing_a_row_in_a_panel_gives_the_keyboard_to_its_thread(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "panel-row-focus", true);
+    cx.simulate_input("keep waiting");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let waiting = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.slots[0].thread.update(cx, |thread, cx| {
+                thread.snooze(i64::MAX);
+                cx.notify();
+            });
+        })
+    });
+    let idle = add_idle_thread(&chat, cx, "quiet", false, snoozed_list(i64::MAX));
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.add_draft(window, cx)));
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.show(0, window, cx);
+        })
+    });
+    let_motion_finish(&chat, cx);
+    assert!(
+        cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window)),
+        "the draft has the keyboard"
+    );
+
+    for (shown, dock) in [(waiting, true), (idle, false)] {
+        click(cx, "disclosure-snoozed");
+        cx.run_until_parked();
+        assert!(filter_focused(&chat, cx));
+        cx.update(|window, cx| {
+            chat.update(cx, |view, cx| view.show_thread(&shown, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(!filter_focused(&chat, cx));
+        let composer =
+            cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window));
+        assert_eq!(root_focused(&chat, cx), dock);
+        assert_eq!(composer, !dock);
+        let_motion_finish(&chat, cx);
+    }
+    finish(&chat, path, cx);
+}
+
+fn panel_words(
+    chat: &Entity<ChatView>,
+    cx: &mut VisualTestContext,
+) -> (Option<usize>, Option<sidebar::Confirm>) {
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let layout = view.sidebar_layout(cx);
+            let sheet = view.sheet.take().unwrap();
+            let panel = view.sheet_panel(&sheet, &layout, window, cx);
+            view.sheet = Some(sheet);
+            (panel.filtered, panel.confirming)
+        })
+    })
+}
+
+#[gpui::test]
+async fn the_panel_names_the_filtered_count_and_the_copies_only_when_there_are_some(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "panel-words", true);
+    let worktree = newjen_core::worktree::Worktree {
+        path: path.join("copy"),
+        workdir: path.join("copy"),
+        source: path.clone(),
+        branch: "newjen/test".into(),
+        base: "0123456789abcdef0123456789abcdef01234567".into(),
+    };
+    add_idle_thread(&chat, cx, "alpha one", false, settled_list(5));
+    add_idle_thread(&chat, cx, "alpha two", false, settled_list(6));
+    add_idle_thread_in(&chat, cx, "beta", false, settled_list(7), Some(worktree));
+    let_motion_finish(&chat, cx);
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    assert_eq!(panel_words(&chat, cx), (None, None));
+
+    cx.update(|window, cx| {
+        let filter = chat.read(cx).sheet.as_ref().unwrap().filter.clone();
+        filter.update(cx, |input, cx| input.set_value("alpha", window, cx));
+    });
+    assert_eq!(panel_words(&chat, cx).0, Some(2));
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    assert_eq!(
+        panel_words(&chat, cx).1,
+        Some(sidebar::Confirm {
+            count: 2,
+            copies: false
+        }),
+        "no worktree goes with these two"
+    );
+
+    click(cx, "sheet-cancel");
+    cx.update(|window, cx| {
+        let filter = chat.read(cx).sheet.as_ref().unwrap().filter.clone();
+        filter.update(cx, |input, cx| input.set_value("", window, cx));
+    });
+    assert_eq!(panel_words(&chat, cx).0, None);
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    assert_eq!(
+        panel_words(&chat, cx).1,
+        Some(sidebar::Confirm {
+            count: 3,
+            copies: true
+        })
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_hidden_list_runs_no_motion_and_shows_where_it_is_when_it_returns(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "hidden-motion", false);
+    add_idle_thread(&chat, cx, "before", true, Default::default());
+    let_motion_finish(&chat, cx);
+    let busy = |cx: &mut VisualTestContext| cx.update(|_, cx| chat.read(cx).frame.borrow().busy);
+    assert!(!busy(cx));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.sidebar_hidden = true;
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    add_idle_thread(&chat, cx, "while hidden", true, Default::default());
+    cx.run_until_parked();
+    assert!(!busy(cx), "nothing animates in a list nobody sees");
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.sidebar_hidden = false;
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    assert!(!busy(cx), "the list comes back as it is");
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "settle-motion", true);
+    let id = add_idle_thread(&chat, cx, "first thread", true, Default::default());
+    let_motion_finish(&chat, cx);
+    let ghosts = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            chat.read(cx)
+                .frame
+                .borrow()
+                .items
+                .iter()
+                .filter(|item| item.ghost)
+                .count()
+        })
+    };
+    assert_eq!(ghosts(cx), 0);
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).sidebar_layout(cx).settled.clone()),
+        vec![1]
+    );
+    assert_eq!(ghosts(cx), 2, "the row and the Queue header are leaving");
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("disclosure-settled").is_none(),
+        "the dock counts it when the row has gone"
+    );
+    let_motion_finish(&chat, cx);
+    assert_eq!(ghosts(cx), 0);
+    assert!(cx.debug_bounds("disclosure-settled").is_some());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn the_settled_panel_rises_and_lowers_instead_of_appearing_and_vanishing(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "panel-motion", true);
+    add_idle_thread(&chat, cx, "park me", false, settled_list(5));
+    cx.run_until_parked();
+    let_motion_finish(&chat, cx);
+    let lift = |cx: &mut VisualTestContext| cx.update(|_, cx| chat.read(cx).frame.borrow().raised);
+
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    assert_eq!(lift(cx), Default::default());
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+    let rising = lift(cx);
+    assert!(rising.panel > 0. && rising.panel < 1. && rising.dim > 0.);
+    let_motion_finish(&chat, cx);
+    let up = lift(cx);
+    assert_eq!((up.panel, up.dim), (1., 1.));
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("sheet").is_some(),
+        "the panel stays while it lowers"
+    );
+    cx.executor().advance_clock(Duration::from_millis(80));
+    cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+    let lowering = lift(cx);
+    assert!(lowering.panel > 0. && lowering.panel < 1.);
+    let_motion_finish(&chat, cx);
+    assert!(cx.debug_bounds("sheet").is_none());
+    assert_eq!(lift(cx), Default::default());
     finish(&chat, path, cx);
 }
 
@@ -2377,6 +3061,7 @@ fn idle_project_thread(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> P
                 review_base: Some(base),
                 landing_resolved: false,
                 snapshot_needed: false,
+                list: Default::default(),
             };
             view.store.save_thread(row.clone());
             assert!(view.store.flush(Duration::from_secs(5)));

@@ -12,7 +12,7 @@ use newjen_core::protocol::Incoming;
 use newjen_core::providers::Provider;
 use newjen_core::providers::claude::events::ClaudeEvents;
 use newjen_core::session::SessionEvent;
-use newjen_core::steps::SidebarGroup;
+use newjen_core::steps::Placement;
 use newjen_core::steps::{WorkState, activity_line, work_blocks};
 use newjen_core::transcript::{Status, ToolState, Transcript};
 use newjen_core::{SessionConfig, Store, Thread};
@@ -229,18 +229,19 @@ fn until(thread: &mut Thread, condition: impl Fn(&Thread) -> bool) {
 }
 
 const NOW: i64 = 1_700_000_000;
+const NOW_MS: i64 = NOW * 1000;
 
 #[test]
-fn a_codex_thread_moves_from_needs_you_to_done() {
+fn a_codex_thread_moves_from_the_queue_to_read() {
     let lab = Lab::codex("command-accept");
     let mut thread = lab.draft();
-    assert_eq!(thread.sidebar_group(NOW), SidebarGroup::Done);
+    assert_eq!(thread.placement(NOW_MS), Placement::Read);
     assert_eq!(thread.activity_line(NOW), None);
     thread.send("Do the command").unwrap();
     until(&mut thread, |thread| {
         thread.transcript().pending_approval().is_some()
     });
-    assert_eq!(thread.sidebar_group(NOW), SidebarGroup::NeedsYou);
+    assert_eq!(thread.placement(NOW_MS), Placement::Queue);
     assert_eq!(thread.activity_line(NOW).as_deref(), Some("Run touch?"));
     let blocks = thread.work_blocks();
     assert_eq!(blocks[0].state, WorkState::WaitingForYou);
@@ -249,7 +250,9 @@ fn a_codex_thread_moves_from_needs_you_to_done() {
     let key = thread.transcript().pending_approval().unwrap().key();
     thread.answer(Some(key), Intent::AllowOnce).unwrap();
     until(&mut thread, |thread| !thread.status().is_busy());
-    assert_eq!(thread.sidebar_group(NOW), SidebarGroup::Done);
+    assert_eq!(thread.placement(NOW_MS), Placement::Queue);
+    thread.set_active(true);
+    assert_eq!(thread.placement(NOW_MS), Placement::Read);
     assert_eq!(thread.activity_line(NOW).as_deref(), Some("Answered"));
     let blocks = thread.work_blocks();
     assert_eq!(blocks.len(), 1);
@@ -268,14 +271,15 @@ fn a_codex_file_change_approval_without_a_preview_still_asks_plainly() {
 }
 
 #[test]
-fn a_refused_thread_needs_you_until_the_limit_resets() {
+fn a_refused_thread_waits_in_flight_until_the_limit_resets() {
     let lab = Lab::codex("limit");
     let mut thread = lab.draft();
     thread.send("Do not retry").unwrap();
     until(&mut thread, |thread| thread.status() == Status::Failed);
-    assert_eq!(thread.sidebar_group(NOW), SidebarGroup::NeedsYou);
+    assert_eq!(thread.placement(NOW_MS), Placement::InFlight);
     let line = thread.activity_line(NOW).unwrap();
     assert!(line.starts_with("Usage limit reached · resets "), "{line}");
+    assert_eq!(thread.placement(1_900_000_000_000), Placement::Queue);
     assert_eq!(
         thread.activity_line(1_900_000_000).as_deref(),
         Some("Failed")

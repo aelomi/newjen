@@ -2,7 +2,7 @@ use gpui::{App, Hsla, Styled as _, rgb};
 use gpui_kit::component::{ActiveTheme as _, Icon};
 use newjen_core::providers::Provider;
 
-use super::IconName;
+use crate::assets::{CLAUDE_MARK, OPENAI_MARK};
 
 /// The provider's mark color: Claude's own orange, Codex in the text color.
 pub fn provider_color(provider: Provider, cx: &App) -> Hsla {
@@ -12,11 +12,13 @@ pub fn provider_color(provider: Provider, cx: &App) -> Hsla {
     }
 }
 
-/// The provider's mark.
+/// The provider's own mark: Claude's for Claude, OpenAI's for Codex.
 pub fn provider_icon(provider: Provider, cx: &App) -> Icon {
-    let name = match provider {
-        Provider::Claude => IconName::Sparkles,
-        Provider::Codex => IconName::Sparkle,
+    let path = match provider {
+        Provider::Claude => CLAUDE_MARK,
+        Provider::Codex => OPENAI_MARK,
     };
-    Icon::new(name).text_color(provider_color(provider, cx))
+    Icon::default()
+        .path(path)
+        .text_color(provider_color(provider, cx))
 }

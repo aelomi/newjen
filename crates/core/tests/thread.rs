@@ -31,7 +31,7 @@
 //!   does (see the `background_task` fixture). The task runs until a `finish_task` file
 //!   appears; then claude reports it finished and starts a turn by itself, with no message.
 //!   With `own_turn_missing`, that turn ends with the "No conversation found" result for this
-//!   session.
+//!   session. With `own_turn_ask`, that turn asks to approve `touch own.txt` and does not end.
 //! - `queued_own_turn`: on reading a message, first run the turn claude starts by itself when
 //!   that task finishes, as if the message arrived just after the task did. That turn's
 //!   result says the message waits for the next turn (`queued_turn_count: 1`).
@@ -152,6 +152,10 @@ while IFS= read -r line; do
       printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
       send_init
       printf '%s\n' '{"type":"assistant","message":{"id":"mc","content":[{"type":"text","text":"The dev server stopped."}]}}'
+      if [ -f "$dir/own_turn_ask" ]; then
+        printf '%s\n' '{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"t2","input":{"command":"touch own.txt"},"permission_suggestions":[]}}'
+        exit 0
+      fi
       if [ -f "$dir/own_turn_missing" ]; then
         printf '%s\n' "$missing"
       else
@@ -632,8 +636,8 @@ fn already_in_use_twice_shows_one_error_with_the_reason() {
 }
 
 #[test]
-fn a_failed_thread_needs_you_only_until_it_has_been_opened() {
-    use newjen_core::steps::SidebarGroup;
+fn a_failed_thread_is_in_the_queue_only_until_it_has_been_opened() {
+    use newjen_core::steps::Placement;
     let fixture = Fixture::new();
     fixture.switch("new_in_use", true);
     fixture.switch("resume_in_use", true);
@@ -642,12 +646,12 @@ fn a_failed_thread_needs_you_only_until_it_has_been_opened() {
     finish_turn(&mut thread);
     assert_eq!(thread.status(), Status::Failed);
     assert!(thread.is_unread());
-    assert_eq!(thread.sidebar_group(0), SidebarGroup::NeedsYou);
+    assert_eq!(thread.placement(0), Placement::Queue);
     assert_eq!(thread.activity_line(0).as_deref(), Some("Failed"));
 
     thread.set_active(true);
     assert_eq!(thread.status(), Status::Failed);
-    assert_eq!(thread.sidebar_group(0), SidebarGroup::Done);
+    assert_eq!(thread.placement(0), Placement::Read);
     assert_eq!(thread.activity_line(0).as_deref(), Some("Failed"));
 }
 
@@ -1126,6 +1130,142 @@ fn unread_is_set_off_screen_and_cleared_on_screen() {
     thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
     finish_turn(&mut thread);
     assert!(!thread.is_unread());
+}
+
+#[test]
+fn pin_snooze_and_settle_are_saved_and_only_a_landing_moves_the_thread() {
+    let fixture = Fixture::new();
+    let mut thread = fixture.draft();
+    thread.send("one").unwrap();
+    finish_turn(&mut thread);
+    thread.set_active(true);
+    thread.set_active(false);
+    let id = thread.id().to_string();
+    let landed = thread.list_state().landed_at;
+    let updated = thread.updated_at();
+    assert!(landed >= thread.created_at());
+
+    std::thread::sleep(Duration::from_millis(5));
+    thread.pin(1_000);
+    thread.pin(2_000);
+    assert_eq!(thread.list_state().pinned_at, Some(1_000));
+    assert_eq!(thread.list_state().landed_at, landed);
+    assert_eq!(thread.updated_at(), updated);
+    let reloaded = fixture.reload(&id);
+    assert_eq!(reloaded.list_state(), thread.list_state());
+    assert_eq!(reloaded.updated_at(), updated);
+
+    thread.snooze(5_000);
+    let state = thread.list_state();
+    assert_eq!(
+        (state.pinned_at, state.snoozed_until, state.settled_at),
+        (None, Some(5_000), None)
+    );
+    assert_eq!(fixture.reload(&id).list_state(), state);
+
+    assert!(!thread.wake_if_due(4_999));
+    assert!(!thread.is_unread());
+    assert!(thread.wake_if_due(5_000));
+    assert!(thread.is_unread());
+    let state = thread.list_state();
+    assert_eq!((state.snoozed_until, state.landed_at), (None, 5_000));
+    assert_eq!(fixture.reload(&id).list_state(), state);
+    assert!(!thread.wake_if_due(9_000));
+
+    thread.settle(7_000);
+    assert_eq!(thread.list_state().settled_at, Some(7_000));
+    assert_eq!(fixture.reload(&id).list_state(), thread.list_state());
+    thread.unsettle();
+    assert_eq!(thread.list_state().settled_at, None);
+    thread.settle(8_000);
+    thread.snooze(9_000);
+    assert_eq!(thread.list_state().settled_at, None);
+    thread.settle(8_000);
+    assert_eq!(thread.list_state().snoozed_until, None);
+
+    thread.send("two").unwrap();
+    assert_eq!(thread.list_state().settled_at, None);
+    finish_turn(&mut thread);
+    assert!(thread.list_state().landed_at > 5_000);
+    assert_eq!(fixture.reload(&id).list_state(), thread.list_state());
+}
+
+#[test]
+fn an_approval_brings_a_settled_or_snoozed_thread_back_and_a_woken_open_thread_stays_read() {
+    let fixture = Fixture::new();
+    fixture.switch("background", true);
+    fixture.switch("own_turn_ask", true);
+    let mut thread = fixture.draft();
+    thread.send("one").unwrap();
+    finish_turn(&mut thread);
+    assert!(thread.can_settle());
+    thread.settle(1_000);
+    assert_eq!(thread.list_state().settled_at, Some(1_000));
+    fixture.switch("finish_task", true);
+    pump_until(&mut thread, "the approval", |thread| {
+        thread.transcript().pending_approval().is_some()
+    });
+    assert_eq!(thread.list_state().settled_at, None);
+    assert!(thread.list_state().landed_at > 1_000);
+
+    let mut snoozed = {
+        let fixture = Fixture::new();
+        fixture.switch("ask", true);
+        let mut thread = fixture.draft();
+        thread.send("one").unwrap();
+        thread.snooze(1_000);
+        pump_until(&mut thread, "the approval", |thread| {
+            thread.transcript().pending_approval().is_some()
+        });
+        assert_eq!(thread.list_state().snoozed_until, None);
+        thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
+        finish_turn(&mut thread);
+        thread
+    };
+    snoozed.set_active(true);
+    snoozed.snooze(10);
+    assert!(snoozed.wake_if_due(10));
+    assert!(!snoozed.is_unread());
+}
+
+#[test]
+fn a_thread_that_works_waits_on_you_or_is_being_prepared_cannot_be_settled() {
+    let fixture = Fixture::new();
+    fixture.switch("ask", true);
+    let mut thread = fixture.draft();
+    assert!(!thread.can_settle());
+    thread.send("one").unwrap();
+    assert!(!thread.can_settle());
+    thread.settle(1_000);
+    assert_eq!(thread.list_state().settled_at, None);
+    pump_until(&mut thread, "the approval", |thread| {
+        thread.transcript().pending_approval().is_some()
+    });
+    assert!(!thread.can_settle());
+    thread.settle(2_000);
+    assert_eq!(thread.list_state().settled_at, None);
+    thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
+    finish_turn(&mut thread);
+    assert!(thread.can_settle());
+    thread.settle(3_000);
+    assert_eq!(thread.list_state().settled_at, Some(3_000));
+
+    let (mut preparing, _job) = fixture.preparing("first");
+    assert!(!preparing.can_settle());
+    preparing.settle(4_000);
+    assert_eq!(preparing.list_state().settled_at, None);
+}
+
+#[test]
+fn a_draft_cannot_be_pinned_snoozed_or_settled() {
+    let fixture = Fixture::new();
+    let mut thread = fixture.draft();
+    thread.pin(1);
+    thread.snooze(2);
+    thread.settle(3);
+    assert_eq!(thread.list_state().pinned_at, None);
+    assert_eq!(thread.list_state().snoozed_until, None);
+    assert_eq!(thread.list_state().settled_at, None);
 }
 
 #[test]
@@ -1715,6 +1855,7 @@ fn a_thread_always_restarts_from_its_own_folder() {
         review_base: None,
         landing_resolved: false,
         snapshot_needed: false,
+        list: Default::default(),
     });
     assert!(store.flush(Duration::from_secs(5)));
 
