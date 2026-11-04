@@ -22,6 +22,7 @@ mod picker;
 mod review;
 mod usage;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -37,7 +38,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use newjen_core::agent::NoteDelivery;
-use newjen_core::steps::SidebarGroup;
+use newjen_core::steps::Placement as ThreadPlacement;
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
 use newjen_core::worktree::{self, CopyError, Tools};
@@ -254,6 +255,7 @@ pub struct ChatView {
     drawer_open: bool,
     drawer_focus: FocusHandle,
     list_scroll: ScrollHandle,
+    hold: RefCell<Option<(String, ThreadPlacement)>>,
     chip: Entity<ChipMenu>,
     /// What the main card shows: the thread on screen, or the Usage view.
     pane: Pane,
@@ -357,6 +359,7 @@ impl ChatView {
             drawer_open: false,
             drawer_focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
+            hold: RefCell::new(None),
             chip: cx.new(|_| ChipMenu::new()),
             pane: Pane::Thread,
             usage_snapshot: None,
@@ -902,6 +905,7 @@ impl ChatView {
         if !self.visible {
             return;
         }
+        self.listed(cx);
         self.sync_replies(self.active, cx);
         // No `notify` on the thread: this view redraws itself below. (It also runs while the
         // view is being built, when nothing can observe the thread yet.)
@@ -924,8 +928,8 @@ impl ChatView {
         } else if self.pane == Pane::Usage {
             self.focus_panel(window, cx);
         }
-        let entries = self.sidebar_entries(cx);
-        if let Some(at) = sidebar::entry_of(&entries, self.active) {
+        let layout = self.sidebar_layout(cx);
+        if let Some(at) = sidebar::entry_of(&layout, self.active) {
             self.list_scroll.scroll_to_item(at);
         }
         cx.notify();
@@ -2707,44 +2711,73 @@ impl ChatView {
         )
     }
 
-    /// Each thread's `(draft, group)`, in the view's thread order.
-    fn sidebar_groups(&self, cx: &App) -> Vec<(bool, SidebarGroup)> {
-        let now = now_ms() / 1000;
+    /// Each thread's place in the list, in the view's thread order. The thread on screen shows
+    /// where it was when it was opened (see `sidebar::held`), so the first call after a thread
+    /// is opened records that place: call it before the thread is marked as seen.
+    fn listed(&self, cx: &App) -> Vec<sidebar::Listed> {
+        let now = now_ms();
         self.slots
             .iter()
-            .map(|slot| {
+            .enumerate()
+            .map(|(ix, slot)| {
                 let thread = slot.thread.read(cx);
-                (thread.is_draft(), thread.sidebar_group(now))
+                let own = thread.placement(now);
+                let placement = if ix == self.active {
+                    self.hold_place(thread.id(), own)
+                } else {
+                    own
+                };
+                sidebar::Listed {
+                    draft: thread.is_draft(),
+                    placement,
+                    waits: !thread.is_draft() && thread.waits_on_you(),
+                    list: thread.list_state(),
+                }
             })
             .collect()
     }
 
-    fn sidebar_entries(&self, cx: &App) -> Vec<sidebar::Entry> {
-        sidebar::display_order(&self.sidebar_groups(cx))
+    fn hold_place(&self, thread_id: &str, own: ThreadPlacement) -> ThreadPlacement {
+        let mut hold = self.hold.borrow_mut();
+        let shown = match hold.as_ref() {
+            Some((held_id, at)) if held_id == thread_id => sidebar::held(*at, own),
+            _ => own,
+        };
+        *hold = Some((thread_id.to_string(), shown));
+        shown
+    }
+
+    fn sidebar_layout(&self, cx: &App) -> sidebar::Layout {
+        sidebar::display_order(&self.listed(cx))
     }
 
     /// The threads in the order the list shows them.
     fn thread_order(&self, cx: &App) -> Vec<usize> {
-        sidebar::thread_order(&self.sidebar_entries(cx))
+        sidebar::thread_order(&self.sidebar_layout(cx))
     }
 
-    /// Whether each thread is in the "Needs you" group.
+    /// Whether each thread has an approval or a question waiting.
     fn needs_you(&self, cx: &App) -> Vec<bool> {
-        self.sidebar_groups(cx)
-            .into_iter()
-            .map(|(_, group)| group == SidebarGroup::NeedsYou)
-            .collect()
+        self.listed(cx).iter().map(|thread| thread.waits).collect()
     }
 
-    /// The list's content: the project row, the threads by group (or, with none yet, a line
+    /// The list's content: the project row, the threads by section (or, with none yet, a line
     /// saying so) and the usage row.
     fn render_list(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let groups = self.sidebar_groups(cx);
-        let drafts: Vec<bool> = groups.iter().map(|(draft, _)| *draft).collect();
-        let entries = sidebar::display_order(&groups);
-        let mut rows = self.render_entries(&entries, &groups, cx);
-        if sidebar::is_empty_list(&drafts) {
-            rows.push(sidebar::empty_caption(cx));
+        let listed = self.listed(cx);
+        let layout = sidebar::display_order(&listed);
+        let mut rows = self.render_entries(&layout.entries, cx);
+        rows.extend(
+            layout
+                .in_flight
+                .iter()
+                .filter_map(|ix| self.render_thread_row(*ix, Instant::now(), cx)),
+        );
+        if sidebar::is_empty_list(&listed) {
+            rows.push(sidebar::empty_caption(
+                sidebar::empty_caption_text(&listed),
+                cx,
+            ));
         }
         let bar = sidebar::ProjectBar {
             name: self.project_name.clone(),
@@ -2775,20 +2808,21 @@ impl ChatView {
     fn render_entries(
         &self,
         entries: &[sidebar::Entry],
-        groups: &[(bool, SidebarGroup)],
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let now = Instant::now();
         entries
             .iter()
             .filter_map(|entry| match *entry {
-                sidebar::Entry::Header { group, count } => {
-                    Some(sidebar::section_header(group, count, cx))
+                sidebar::Entry::Header {
+                    section,
+                    count,
+                    needs,
+                } => Some(sidebar::section_header(section, count, needs, cx)),
+                sidebar::Entry::Gap => {
+                    Some(div().flex_none().h(sidebar::READ_GAP).into_any_element())
                 }
-                sidebar::Entry::Thread(ix) => {
-                    let group = groups.get(ix)?.1;
-                    self.render_thread_row(ix, group, now, cx)
-                }
+                sidebar::Entry::Thread(ix) => self.render_thread_row(ix, now, cx),
             })
             .collect()
     }
@@ -2796,7 +2830,6 @@ impl ChatView {
     fn render_thread_row(
         &self,
         ix: usize,
-        group: SidebarGroup,
         now: Instant,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -2807,18 +2840,18 @@ impl ChatView {
             let id = SharedString::from(thread.id().to_string());
             let draft = thread.is_draft();
             let look = sidebar::row_look(&row_facts(thread, now), now_ms);
+            let dot = match look.dot {
+                sidebar::Dot::Failed if !look.strong => sidebar::Dot::None,
+                dot => dot,
+            };
             let row = sidebar::Row {
                 id: id.clone(),
                 title: thread.title().to_string().into(),
-                mark: sidebar::mark(group, &look, draft),
-                detail: sidebar::detail_line(
-                    thread.activity_line(now_ms / 1000),
-                    &look,
-                    group,
-                    draft,
-                ),
-                attention: group == SidebarGroup::NeedsYou,
-                time: (!draft).then(|| sidebar::compact_time(thread.updated_at(), now_ms)),
+                dot,
+                detail: sidebar::detail_line(thread.activity_line(now_ms / 1000), &look, draft),
+                attention: thread.waits_on_you(),
+                time: (!draft)
+                    .then(|| sidebar::compact_time(thread.list_state().landed_at, now_ms)),
                 in_copy: look.copy,
                 strong: look.strong,
                 selected: ix == self.active && self.pane == Pane::Thread,

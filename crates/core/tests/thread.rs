@@ -632,8 +632,8 @@ fn already_in_use_twice_shows_one_error_with_the_reason() {
 }
 
 #[test]
-fn a_failed_thread_needs_you_only_until_it_has_been_opened() {
-    use newjen_core::steps::SidebarGroup;
+fn a_failed_thread_is_in_the_queue_only_until_it_has_been_opened() {
+    use newjen_core::steps::Placement;
     let fixture = Fixture::new();
     fixture.switch("new_in_use", true);
     fixture.switch("resume_in_use", true);
@@ -642,12 +642,12 @@ fn a_failed_thread_needs_you_only_until_it_has_been_opened() {
     finish_turn(&mut thread);
     assert_eq!(thread.status(), Status::Failed);
     assert!(thread.is_unread());
-    assert_eq!(thread.sidebar_group(0), SidebarGroup::NeedsYou);
+    assert_eq!(thread.placement(0), Placement::Queue);
     assert_eq!(thread.activity_line(0).as_deref(), Some("Failed"));
 
     thread.set_active(true);
     assert_eq!(thread.status(), Status::Failed);
-    assert_eq!(thread.sidebar_group(0), SidebarGroup::Done);
+    assert_eq!(thread.placement(0), Placement::Read);
     assert_eq!(thread.activity_line(0).as_deref(), Some("Failed"));
 }
 

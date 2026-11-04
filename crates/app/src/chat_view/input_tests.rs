@@ -2264,33 +2264,41 @@ fn a_dismissed_notification_note_stays_dismissed(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn the_sidebar_groups_threads_and_its_usage_row_opens_the_usage_view(
-    cx: &mut TestAppContext,
-) {
+async fn the_sidebar_lists_threads_and_its_usage_row_opens_the_usage_view(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "sidebar-groups", true);
     cx.run_until_parked();
     for selector in ["switch-project", "new-thread", "usage-row", "thread-row"] {
         assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
     }
-    // The first message starts a thread that waits for an approval: "Needs you".
+    // The first message starts a thread that waits for an approval. It is on screen, so it stays
+    // where it was opened until the user leaves it, then it is in the Queue.
     cx.simulate_input("first thread");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
     cx.update(|_, cx| {
         let view = chat.read(cx);
         assert_eq!(
-            view.sidebar_entries(cx),
-            vec![
-                sidebar::Entry::Header {
-                    group: SidebarGroup::NeedsYou,
-                    count: 1
-                },
-                sidebar::Entry::Thread(0)
-            ]
+            view.sidebar_layout(cx).entries,
+            vec![sidebar::Entry::Thread(0)]
         );
     });
     cx.simulate_keystrokes("cmd-n");
     cx.run_until_parked();
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert_eq!(
+            view.sidebar_layout(cx).entries,
+            vec![
+                sidebar::Entry::Thread(0),
+                sidebar::Entry::Header {
+                    section: sidebar::Section::Queue,
+                    count: 1,
+                    needs: 1
+                },
+                sidebar::Entry::Thread(1)
+            ]
+        );
+    });
     assert!(cx.debug_bounds("thread-row").is_some());
     // The usage row opens the Usage view in place of the thread, and a thread row returns.
     assert!(cx.debug_bounds("usage-view").is_none());
