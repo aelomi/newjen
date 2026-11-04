@@ -2325,6 +2325,125 @@ async fn the_sidebar_lists_threads_and_its_usage_row_opens_the_usage_view(cx: &m
     finish(&chat, path, cx);
 }
 
+fn fox(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> (bool, String) {
+    cx.update(|_, cx| {
+        let fox = chat.read(cx).fox.read(cx);
+        (fox.is_shown(), fox.title().to_string())
+    })
+}
+
+#[gpui::test]
+async fn the_fox_game_fills_a_list_with_nothing_to_read_and_yields_to_the_first_row(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "fox-game", true);
+    cx.run_until_parked();
+    assert_eq!(fox(&chat, cx), (true, "All clear".to_string()));
+    assert!(cx.debug_bounds("fox-playfield").is_some());
+
+    cx.simulate_input("a draft of its own");
+    cx.simulate_keystrokes("cmd-n");
+    let_motion_finish(&chat, cx);
+    cx.update(|_, cx| assert_eq!(chat.read(cx).slots.len(), 2));
+    assert_eq!(
+        fox(&chat, cx),
+        (true, "All clear".to_string()),
+        "drafts are not rows to read"
+    );
+
+    cx.simulate_input("two approvals");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let_motion_finish(&chat, cx);
+    assert!(!fox(&chat, cx).0, "the thread on screen is a row");
+    cx.update(|_, cx| {
+        let fox = chat.read(cx).fox.clone();
+        fox.update(cx, |fox, _| fox.advance(1., true));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("fox-playfield").is_none(),
+        "the game has faded away"
+    );
+
+    click(cx, "once");
+    click(cx, "once");
+    wait_answers(cx, &path, 2).await;
+    cx.simulate_keystrokes("cmd-n");
+    let_motion_finish(&chat, cx);
+    cx.update(|_, cx| {
+        let layout = chat.read(cx).sidebar_layout(cx);
+        assert_eq!(layout.in_flight.len(), 1);
+        assert!(layout.entries.iter().all(|entry| matches!(
+            entry,
+            sidebar::Entry::Thread(ix) if chat.read(cx).slots[*ix].thread.read(cx).is_draft()
+        )));
+    });
+    assert_eq!(
+        fox(&chat, cx),
+        (true, sidebar::NOTHING_NEEDS_YOU.to_string()),
+        "a thread in flight leaves the list empty"
+    );
+
+    cx.simulate_input("second thread");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    cx.simulate_keystrokes("cmd-n");
+    let_motion_finish(&chat, cx);
+    cx.update(|_, cx| {
+        let layout = chat.read(cx).sidebar_layout(cx);
+        assert!(layout.entries.iter().any(|entry| matches!(
+            entry,
+            sidebar::Entry::Header {
+                section: sidebar::Section::Queue,
+                ..
+            }
+        )));
+    });
+    assert!(!fox(&chat, cx).0, "a Queue row hides the game");
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn the_fox_game_takes_the_keyboard_only_when_clicked_and_gives_it_back(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "fox-focus", true);
+    cx.run_until_parked();
+    let composer = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window))
+    };
+    let game = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            chat.read(cx)
+                .fox
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        })
+    };
+    assert!(fox(&chat, cx).0);
+    assert!(composer(cx) && !game(cx), "showing the game keeps the keys");
+    cx.simulate_input("two approvals");
+    assert!(composer(cx) && !game(cx));
+
+    click(cx, "fox-playfield");
+    assert!(game(cx) && !composer(cx), "a click gives it the keys");
+
+    let row = sidebar::Listed {
+        draft: false,
+        placement: Placement::Queue,
+        waits: false,
+        list: Default::default(),
+    };
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.sync_fox(&[row], window, cx)));
+    assert!(
+        composer(cx) && !game(cx),
+        "the keys go back as soon as the game yields"
+    );
+    finish(&chat, path, cx);
+}
+
 #[gpui::test]
 async fn a_settled_thread_waits_in_a_panel_that_esc_closes_and_archive_all_asks_first(
     cx: &mut TestAppContext,
