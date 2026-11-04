@@ -37,11 +37,14 @@ pub use message::{ErrorNotice, Pending, assistant, user, user_pending};
 pub use motion::Chevron;
 pub use popover::{popover_surface, solid_popover_surface};
 pub use provider::{provider_color, provider_icon};
-pub use ring::ring;
+pub use ring::{Tick, ring, ring_with_tick};
 pub use step::{
     Detail, Mark, Narration, Part, QuietMark, StepState, StepView, WorkBlockView, mark, step_mark,
 };
 pub use tool_card::{ToolBody, ToolCard};
+
+mod gauge;
+pub use gauge::{GaugeLabel, GaugeLook, UsageGauge};
 
 mod message_list;
 pub use message_list::MessageList;

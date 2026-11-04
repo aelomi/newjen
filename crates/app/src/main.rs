@@ -38,7 +38,7 @@ use crate::assets::AppAssets;
 use crate::keys::{
     AboutNewjen, CheckForUpdates, CloseWindow, Hide, HideOthers, JumpToNeedsYou, JumpToThread,
     Minimize, NewThread, NextThread, OpenProject, OpenRecentProject, PreviousThread, Quit,
-    ReleaseNotesOnGithub, ShowProjects, ToggleSidebar, ToggleTerminal, WhatsNewInNewjen,
+    ReleaseNotesOnGithub, Settings, ShowProjects, ToggleSidebar, ToggleTerminal, WhatsNewInNewjen,
 };
 use crate::project_view::ProjectView;
 use gpui_kit::component::ActiveTheme as _;
@@ -221,6 +221,7 @@ fn project_url(value: &str) -> anyhow::Result<PathBuf> {
 fn install_menus(cx: &mut App) {
     cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
     cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
+    cx.on_action(|_: &Settings, _: &mut App| {});
     // A key press is handled while GPUI is busy with the window, which can't be updated from
     // inside that, so these two act on it a moment later (`defer`).
     cx.on_action(|_: &Minimize, cx: &mut App| {
@@ -239,6 +240,8 @@ fn update_menus(recent: &[Project], cx: &mut App) {
         Menu::new("Newjen").items([
             MenuItem::action("About Newjen", AboutNewjen),
             MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::separator(),
+            MenuItem::action("Settings…", Settings),
             MenuItem::separator(),
             MenuItem::action("Hide Newjen", Hide),
             MenuItem::action("Hide Others", HideOthers),

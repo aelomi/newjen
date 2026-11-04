@@ -16,6 +16,12 @@ Every user-visible change adds a line under `## Unreleased`, in one of four grou
 
 - A thread stays where it is while you read it and moves to its new place when you switch away.
 - A thread that ended and was not opened yet waits in the Queue, and a thread held back by a usage limit shows as waiting in the In flight tray.
+- The Usage row at the foot of the sidebar is now a ring. It follows the tightest limit among the providers you are using. Near a limit it names the provider and when you will hit it, and at a limit it says when it resets. Click it to open Usage.
+- Claude and Codex show their own marks.
+
+### Misc
+
+- The sidebar has a settings gear, and the Newjen menu has Settings… (⌘,). They open nothing yet.
 
 ## 0.1.0-alpha.2 · 3 November 2026
 

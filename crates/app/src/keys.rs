@@ -30,6 +30,7 @@ actions!(
         ToggleSidebar,
         JumpToNeedsYou,
         ToggleTerminal,
+        Settings,
         AboutNewjen,
         CheckForUpdates,
         WhatsNewInNewjen,
@@ -66,6 +67,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-,", Settings, None),
         KeyBinding::new("cmd-o", OpenProject, None),
         KeyBinding::new("cmd-shift-o", ShowProjects, None),
         // Works from the text field too: it stops the running turn.
@@ -190,6 +192,22 @@ mod tests {
             is_held,
             prefer_character_input: false,
         }
+    }
+
+    #[gpui::test]
+    fn command_comma_is_settings_from_anywhere(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind(cx);
+        });
+        let bindings =
+            cx.update(|cx| cx.all_bindings_for_input(&[Keystroke::parse("cmd-,").unwrap()]));
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.action().partial_eq(&Settings))
+        );
+        assert!(bindings.iter().all(|binding| binding.predicate().is_none()));
     }
 
     #[test]

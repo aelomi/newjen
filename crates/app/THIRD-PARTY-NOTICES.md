@@ -45,3 +45,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+The Claude and OpenAI marks in `assets/icons/` come from Simple Icons 13.21.0 (https://simpleicons.org), released under CC0 1.0 Universal (public domain dedication). That licence covers the drawings only: Claude is a trademark of Anthropic, PBC, and OpenAI is a trademark of OpenAI, Inc. Newjen shows each mark only to name that provider's CLI and does not imply endorsement.
