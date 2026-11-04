@@ -3318,7 +3318,7 @@ impl ChatView {
                             let Some(row) = motion.row(id).cloned() else {
                                 continue;
                             };
-                            sidebar::thread_row(row, None, Rc::new(|_, _| {}), 1., cx)
+                            sidebar::thread_row(row.leaving(), None, Rc::new(|_, _| {}), 1., cx)
                         }
                     }
                 }
@@ -3369,6 +3369,7 @@ impl ChatView {
                 strong: look.strong,
                 selected: ix == self.active && self.pane == Pane::Thread,
                 archivable: thread.preparing().is_none(),
+                ghost: false,
             };
             (
                 id,

@@ -1069,6 +1069,7 @@ mod tests {
             strong: false,
             selected: false,
             archivable: true,
+            ghost: false,
         };
         motion.step(start, sight(&["a", "b"], &[]), false);
         motion.remember_row(&row);

@@ -830,6 +830,23 @@ pub struct Row {
     /// The thread on screen.
     pub selected: bool,
     pub archivable: bool,
+    /// The row is the memory of one that left, drawn while it fades.
+    pub ghost: bool,
+}
+
+impl Row {
+    /// What a row that has left is drawn as: not selected, and with a hover group of its own so
+    /// that the live row of the same thread, wherever it is now, is not hovered with it.
+    pub fn leaving(mut self) -> Row {
+        self.selected = false;
+        self.ghost = true;
+        self
+    }
+
+    fn hover_group(&self) -> SharedString {
+        let kind = if self.ghost { "ghost" } else { "live" };
+        SharedString::from(format!("thread-row-{kind}-{}", self.id))
+    }
 }
 
 /// The height of a thread row.
@@ -986,6 +1003,7 @@ pub fn thread_row(
         material.glass_muted
     };
     let archivable = row.archivable;
+    let group = row.hover_group();
     let label = format!("{}: {}", row.title, row.detail);
     let full_title = row.title.clone();
     let cut = full_title.chars().count() > TITLE_TOOLTIP_CHARS;
@@ -1021,7 +1039,6 @@ pub fn thread_row(
                 .text_color(material.glass_muted)
                 .child(time)
         }));
-    let group = SharedString::from(format!("thread-row-{}", row.id));
     let hover = actions
         .as_ref()
         .map(|actions| hover_actions(&row.id, actions, group.clone(), cx));
@@ -1504,6 +1521,27 @@ mod tests {
             assert_eq!(held(was, Read), Read);
             assert_eq!(held(was, Queue), Queue);
         }
+    }
+
+    #[test]
+    fn a_row_that_left_is_not_selected_and_shares_no_hover_group_with_the_live_row() {
+        let live = Row {
+            id: "t1".into(),
+            title: "Title".into(),
+            dot: Dot::None,
+            detail: "Done".to_string(),
+            attention: false,
+            time: None,
+            in_copy: false,
+            strong: false,
+            selected: true,
+            archivable: true,
+            ghost: false,
+        };
+        let ghost = live.clone().leaving();
+        assert!(live.selected && !ghost.selected);
+        assert_ne!(live.hover_group(), ghost.hover_group());
+        assert_eq!(ghost.id, live.id);
     }
 
     #[test]
