@@ -221,18 +221,24 @@ fn gauge_label(window: &UsageWindow, tone: Tone, now: i64) -> Option<String> {
 }
 
 /// The providers whose limits can raise the ring: one with a working thread, the one of the
-/// thread on screen, and one that Newjen's own turns used in its current window.
+/// thread on screen, and one that Newjen's own turns used in its current window. `with_turns`
+/// is given the first two kinds and says which others the turns used.
 pub fn providers_in_use(
     threads: impl IntoIterator<Item = (Provider, Status)>,
     on_screen: Option<Provider>,
-    with_turns: &[Provider],
+    with_turns: impl FnOnce(&[Provider]) -> Vec<Provider>,
 ) -> Vec<Provider> {
     let working = threads
         .into_iter()
         .filter(|(_, status)| status.is_busy())
         .map(|(provider, _)| provider);
     let mut providers: Vec<Provider> = Vec::new();
-    for provider in working.chain(on_screen).chain(with_turns.iter().copied()) {
+    for provider in working.chain(on_screen) {
+        if !providers.contains(&provider) {
+            providers.push(provider);
+        }
+    }
+    for provider in with_turns(&providers) {
         if !providers.contains(&provider) {
             providers.push(provider);
         }
@@ -1343,13 +1349,21 @@ mod tests {
             (Codex, Status::Waiting),
             (Claude, Status::Idle),
         ];
-        assert_eq!(providers_in_use(threads, None, &[]), vec![Codex]);
-        assert_eq!(providers_in_use([], Some(Claude), &[]), vec![Claude]);
+        let none = |_: &[Provider]| Vec::new();
+        assert_eq!(providers_in_use(threads, None, none), vec![Codex]);
+        assert_eq!(providers_in_use([], Some(Claude), none), vec![Claude]);
         assert_eq!(
-            providers_in_use(threads, Some(Claude), &[Claude]),
+            providers_in_use(threads, Some(Claude), |_| vec![Claude]),
             vec![Codex, Claude]
         );
-        assert!(providers_in_use([(Claude, Status::Failed)], None, &[]).is_empty());
+        assert_eq!(
+            providers_in_use(threads, None, |known| {
+                assert_eq!(known, [Codex]);
+                vec![Claude, Codex]
+            }),
+            vec![Codex, Claude]
+        );
+        assert!(providers_in_use([(Claude, Status::Failed)], None, none).is_empty());
     }
 
     #[test]

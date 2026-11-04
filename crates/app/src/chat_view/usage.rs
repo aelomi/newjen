@@ -78,11 +78,11 @@ impl ChatView {
                 Some((thread.agent_config()?.provider, thread.status()))
             })
             .collect();
-        let known = usage_view::providers_in_use(threads.iter().copied(), on_screen, &[]);
-        let with_turns = usage_view::providers_with_turns(&usages, now, |provider, since| {
-            known.contains(&provider) || turn_usage_since(&self.store, provider, since)
+        let in_use = usage_view::providers_in_use(threads, on_screen, |known| {
+            usage_view::providers_with_turns(&usages, now, |provider, since| {
+                known.contains(&provider) || turn_usage_since(&self.store, provider, since)
+            })
         });
-        let in_use = usage_view::providers_in_use(threads, on_screen, &with_turns);
         let gauge = usage_view::gauge(&usages, &in_use, now);
         let on_press = self.press(cx, |view, window, cx| view.show_usage(window, cx));
         usage_view::footer(gauge.as_ref(), self.pane == Pane::Usage, on_press, cx)
