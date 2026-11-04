@@ -887,7 +887,7 @@ fn hover_actions(
     group: SharedString,
     cx: &App,
 ) -> AnyElement {
-    let fill = crate::theme::material(cx).popover_glass;
+    let fill = crate::theme::material(cx).popover;
     let on_snooze = actions.on_snooze.clone();
     let on_settle = actions.on_settle.clone();
     h_flex()

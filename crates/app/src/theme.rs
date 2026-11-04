@@ -9,11 +9,6 @@ pub const SIDEBAR: Pixels = px(255.);
 pub const CARD_INSET: Pixels = px(8.);
 pub const CARD_RADIUS: Pixels = px(10.);
 
-/// How opaque menus, popovers and tooltips are. GPUI blurs only what is behind the window, not
-/// the card's own text behind a popover, so anything much more see-through is illegible over
-/// text. This keeps a hint of the glass.
-const POPOVER_ALPHA: f32 = 0.97;
-
 /// The window's materials, chosen by light or dark mode and by Reduce Transparency.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
@@ -27,13 +22,14 @@ pub struct Material {
     /// The solid floating panel: the chat, and the recent projects.
     pub card: Hsla,
     pub card_stroke: Hsla,
-    /// Menus, popovers and tooltips: nearly opaque (see `POPOVER_ALPHA`), fully so under Reduce
-    /// Transparency.
-    pub popover_glass: Hsla,
+    /// Menus, popovers and tooltips: fully opaque. GPUI blurs only what is behind the window,
+    /// never the card's own text behind a popover, so any see-through shows that text through
+    /// it, and a tooltip over text was illegible.
+    pub popover: Hsla,
 }
 
 impl Material {
-    /// Under Reduce Transparency the tint and the popover lose their alpha.
+    /// Under Reduce Transparency the tint loses its alpha.
     pub fn resolve(dark: bool, reduce_transparency: bool) -> Self {
         let shade = |hex: u32, alpha: f32| {
             let mut color = Hsla::from(rgb(hex));
@@ -41,14 +37,14 @@ impl Material {
             color
         };
         let (tint, popover) = if dark {
-            (shade(0x0e0e12, 0.82), shade(0x1b1b21, POPOVER_ALPHA))
+            (shade(0x0e0e12, 0.82), shade(0x1b1b21, 1.0))
         } else {
-            (shade(0xf4f4f7, 0.82), shade(0xfbfbfd, POPOVER_ALPHA))
+            (shade(0xf4f4f7, 0.82), shade(0xfbfbfd, 1.0))
         };
-        let (glass_tint, popover_glass) = if reduce_transparency {
-            (Hsla { a: 1.0, ..tint }, Hsla { a: 1.0, ..popover })
+        let glass_tint = if reduce_transparency {
+            Hsla { a: 1.0, ..tint }
         } else {
-            (tint, popover)
+            tint
         };
         if dark {
             Self {
@@ -59,7 +55,7 @@ impl Material {
                 glass_muted: shade(0xd4d4d4, 1.0),
                 card: shade(0x111114, 1.0),
                 card_stroke: hsla(0., 0., 1., 0.07),
-                popover_glass,
+                popover,
             }
         } else {
             Self {
@@ -70,7 +66,7 @@ impl Material {
                 glass_muted: shade(0x525252, 1.0),
                 card: shade(0xffffff, 1.0),
                 card_stroke: hsla(0., 0., 0., 0.06),
-                popover_glass,
+                popover,
             }
         }
     }
@@ -136,7 +132,7 @@ pub fn apply(cx: &mut App) {
     let material = material(cx);
     Theme::update(cx, |theme| {
         theme.background = material.card;
-        theme.popover = material.popover_glass;
+        theme.popover = material.popover;
         theme.list_active = material.glass_selected;
         theme.list_hover = material.glass_hover;
     });
@@ -202,7 +198,8 @@ mod tests {
         for dark in [true, false] {
             let glass = Material::resolve(dark, false);
             let opaque = Material::resolve(dark, true);
-            assert!(glass.glass_tint.a < 1.0 && glass.popover_glass.a < 1.0);
+            assert!(glass.glass_tint.a < 1.0);
+            assert_eq!(glass.popover.a, 1.0);
             assert_eq!(
                 opaque.glass_tint,
                 Hsla {
@@ -210,7 +207,7 @@ mod tests {
                     ..glass.glass_tint
                 }
             );
-            assert_eq!(opaque.popover_glass.a, 1.0);
+            assert_eq!(opaque.popover.a, 1.0);
             assert_ne!(opaque.glass_tint, opaque.card);
             assert_eq!(opaque.card, glass.card);
         }
@@ -225,7 +222,13 @@ mod tests {
             apply(cx);
             assert_eq!(cx.theme().colors.background, material(cx).card);
             assert_eq!(cx.theme().tokens.background.color, material(cx).glass_tint);
-            assert_eq!(cx.theme().popover, material(cx).popover_glass);
+            assert_eq!(cx.theme().popover, material(cx).popover);
+            assert_eq!(
+                cx.theme().tokens.popover.background,
+                material(cx).popover.into(),
+                "Kit's tooltip and menus paint this token"
+            );
+            assert_eq!(cx.theme().tokens.popover.color.a, 1.0);
 
             cx.set_global(ReduceTransparency(true));
             apply(cx);

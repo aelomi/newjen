@@ -19,6 +19,7 @@ Every user-visible change adds a line under `## Unreleased`, in one of four grou
 - A thread that ended and was not opened yet waits in the Queue, and a thread held back by a usage limit shows as waiting in the In flight tray.
 - The Usage row at the foot of the sidebar is now a ring. It follows the tightest limit among the providers you are using. Near a limit it names the provider and when you will hit it, and at a limit it says when it resets. Click it to open Usage.
 - Claude and Codex show their own marks.
+- Tooltips, menus and popovers are fully opaque, so the text behind them no longer shows through.
 - Rows in the thread list move with some ease. A working thread folds into the In flight tray when you switch away, a finished one lands in the Queue, a read one drops out of it, and a settled or snoozed one slides away. The gap closes after the row fades, and the counts crossfade. The Snoozed and Settled panels rise from their row while everything behind them dims. Reduce Motion keeps the fades and drops the movement.
 
 ### Misc
