@@ -30,7 +30,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, list::ListItem};
 use newjen_core::Status;
 use newjen_core::calendar::SnoozeUntil;
-use newjen_core::steps::Placement as ThreadPlacement;
+use newjen_core::steps::Placement;
 use newjen_core::store::ListState;
 use newjen_core::transcript::STOPPED_ON_QUIT;
 
@@ -224,7 +224,7 @@ pub struct Listed {
     pub draft: bool,
     /// Where the thread shows: its own placement, or the one it is held in while on screen
     /// (see [`held`]).
-    pub placement: ThreadPlacement,
+    pub placement: Placement,
     /// An approval or a question waits for an answer.
     pub waits: bool,
     pub list: ListState,
@@ -273,7 +273,7 @@ pub struct Layout {
 /// changed. A section has a header only while it has rows, and the read list, which has no
 /// header, sits 14px under whatever is above it.
 pub fn display_order(threads: &[Listed]) -> Layout {
-    let members = |placement: ThreadPlacement| -> Vec<usize> {
+    let members = |placement: Placement| -> Vec<usize> {
         threads
             .iter()
             .enumerate()
@@ -288,11 +288,11 @@ pub fn display_order(threads: &[Listed]) -> Layout {
         .map(|(ix, _)| Entry::Thread(ix))
         .collect();
 
-    let mut pinned = members(ThreadPlacement::Pinned);
+    let mut pinned = members(Placement::Pinned);
     pinned.sort_by_key(|ix| threads[*ix].list.pinned_at);
-    let mut queue = members(ThreadPlacement::Queue);
+    let mut queue = members(Placement::Queue);
     queue.sort_by_key(|ix| std::cmp::Reverse(threads[*ix].list.landed_at));
-    let mut read = members(ThreadPlacement::Read);
+    let mut read = members(Placement::Read);
     read.sort_by_key(|ix| std::cmp::Reverse(threads[*ix].list.landed_at));
 
     for (section, rows) in [(Section::Pinned, &pinned), (Section::Queue, &queue)] {
@@ -311,13 +311,13 @@ pub fn display_order(threads: &[Listed]) -> Layout {
     }
     entries.extend(read.into_iter().map(Entry::Thread));
 
-    let mut snoozed = members(ThreadPlacement::Snoozed);
+    let mut snoozed = members(Placement::Snoozed);
     snoozed.sort_by_key(|ix| threads[*ix].list.snoozed_until);
-    let mut settled = members(ThreadPlacement::Settled);
+    let mut settled = members(Placement::Settled);
     settled.sort_by_key(|ix| std::cmp::Reverse(threads[*ix].list.settled_at));
     Layout {
         entries,
-        in_flight: members(ThreadPlacement::InFlight),
+        in_flight: members(Placement::InFlight),
         snoozed,
         settled,
     }
@@ -341,8 +341,8 @@ pub fn thread_order(layout: &Layout) -> Vec<usize> {
 /// it was opened, whatever happens to it there, until the user switches away, so it never moves
 /// under them. The user's own moves (pin, snooze, settle) apply at once. A thread opened from
 /// the tray that lands while on screen moves to the top of the Queue.
-pub fn held(held: ThreadPlacement, now: ThreadPlacement) -> ThreadPlacement {
-    use ThreadPlacement::*;
+pub fn held(held: Placement, now: Placement) -> Placement {
+    use Placement::*;
     match (held, now) {
         (_, Pinned | Snoozed | Settled) => now,
         (Queue | Read, _) => held,
@@ -406,7 +406,7 @@ pub fn detail_line(activity: Option<String>, look: &RowLook, draft: bool) -> Str
 
 /// How the thread list is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Placement {
+pub enum SidebarMode {
     /// A column beside the chat.
     Docked,
     /// Floating over the chat from the left (narrow windows, after ⌘B).
@@ -417,17 +417,17 @@ pub enum Placement {
 
 /// How the list is shown at `window_width`: docked in a wide window unless the user hid it,
 /// hidden in a narrow one unless the user opened the drawer.
-pub fn placement(window_width: f32, hidden_by_user: bool, drawer_open: bool) -> Placement {
+pub fn mode(window_width: f32, hidden_by_user: bool, drawer_open: bool) -> SidebarMode {
     if window_width >= NARROW_WINDOW {
         if hidden_by_user {
-            Placement::Hidden
+            SidebarMode::Hidden
         } else {
-            Placement::Docked
+            SidebarMode::Docked
         }
     } else if drawer_open {
-        Placement::Drawer
+        SidebarMode::Drawer
     } else {
-        Placement::Hidden
+        SidebarMode::Hidden
     }
 }
 
@@ -487,7 +487,7 @@ pub fn is_empty_list(threads: &[Listed]) -> bool {
             thread.draft
                 || matches!(
                     thread.placement,
-                    ThreadPlacement::InFlight | ThreadPlacement::Snoozed | ThreadPlacement::Settled
+                    Placement::InFlight | Placement::Snoozed | Placement::Settled
                 )
         })
 }
@@ -499,7 +499,7 @@ pub fn empty_caption_text(threads: &[Listed]) -> &'static str {
         EMPTY_LIST
     } else if threads
         .iter()
-        .any(|thread| thread.placement == ThreadPlacement::InFlight)
+        .any(|thread| thread.placement == Placement::InFlight)
     {
         NOTHING_NEEDS_YOU
     } else {
@@ -1230,15 +1230,15 @@ mod tests {
 
     #[test]
     fn the_list_hides_below_760_and_toggles_into_a_drawer() {
-        assert_eq!(placement(1200.0, false, false), Placement::Docked);
-        assert_eq!(placement(760.0, false, false), Placement::Docked);
-        assert_eq!(placement(1200.0, true, false), Placement::Hidden);
+        assert_eq!(mode(1200.0, false, false), SidebarMode::Docked);
+        assert_eq!(mode(760.0, false, false), SidebarMode::Docked);
+        assert_eq!(mode(1200.0, true, false), SidebarMode::Hidden);
         // Wide: the drawer never shows, even if it was left open in a narrow window.
-        assert_eq!(placement(1200.0, false, true), Placement::Docked);
-        assert_eq!(placement(759.0, false, false), Placement::Hidden);
-        assert_eq!(placement(640.0, false, true), Placement::Drawer);
+        assert_eq!(mode(1200.0, false, true), SidebarMode::Docked);
+        assert_eq!(mode(759.0, false, false), SidebarMode::Hidden);
+        assert_eq!(mode(640.0, false, true), SidebarMode::Drawer);
         // The user's choice for wide windows does not keep the drawer shut.
-        assert_eq!(placement(640.0, true, true), Placement::Drawer);
+        assert_eq!(mode(640.0, true, true), SidebarMode::Drawer);
 
         // ⌘B in a wide window hides or shows the column.
         assert_eq!(toggled(1200.0, false, false), (true, false));
@@ -1282,7 +1282,7 @@ mod tests {
 
     #[test]
     fn only_a_lone_draft_and_parked_threads_make_an_empty_list() {
-        use ThreadPlacement::*;
+        use Placement::*;
         assert!(is_empty_list(&[]));
         assert!(is_empty_list(&[listed(true, Read)]));
         assert!(!is_empty_list(&[listed(false, Read)]));
@@ -1302,7 +1302,7 @@ mod tests {
 
     #[test]
     fn the_empty_list_says_what_is_going_on() {
-        use ThreadPlacement::*;
+        use Placement::*;
         assert_eq!(empty_caption_text(&[listed(true, Read)]), EMPTY_LIST);
         assert_eq!(
             empty_caption_text(&[listed(true, Read), listed(false, Settled)]),
@@ -1323,7 +1323,7 @@ mod tests {
         assert!(!hidden_needs_you(&[Status::Working, Status::Failed], 0));
     }
 
-    fn listed(draft: bool, placement: ThreadPlacement) -> Listed {
+    fn listed(draft: bool, placement: Placement) -> Listed {
         Listed {
             draft,
             placement,
@@ -1332,7 +1332,7 @@ mod tests {
         }
     }
 
-    fn landed(placement: ThreadPlacement, landed_at: i64) -> Listed {
+    fn landed(placement: Placement, landed_at: i64) -> Listed {
         Listed {
             list: ListState {
                 landed_at,
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn the_list_goes_drafts_pinned_queue_then_the_read_list_newest_landing_first() {
-        use ThreadPlacement::*;
+        use Placement::*;
         let threads = [
             landed(Read, 10),
             listed(true, Read),
@@ -1401,7 +1401,7 @@ mod tests {
 
     #[test]
     fn a_header_shows_only_while_it_has_rows_and_the_read_list_has_none() {
-        use ThreadPlacement::*;
+        use Placement::*;
         assert!(display_order(&[]).entries.is_empty());
         assert_eq!(
             display_order(&[landed(Read, 1), landed(Read, 2)]).entries,
@@ -1419,7 +1419,7 @@ mod tests {
 
     #[test]
     fn a_row_moves_only_when_something_lands() {
-        use ThreadPlacement::*;
+        use Placement::*;
         let before = [landed(Read, 10), landed(Read, 20)];
         assert_eq!(display_order(&before).entries[0], Entry::Thread(1));
         // The older thread lands again: it goes on top.
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn parked_threads_wait_in_their_panels_by_date() {
-        use ThreadPlacement::*;
+        use Placement::*;
         let snoozed = |until| Listed {
             list: ListState {
                 snoozed_until: Some(until),
@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn the_thread_on_screen_stays_where_it_was_opened() {
-        use ThreadPlacement::*;
+        use Placement::*;
         assert_eq!(held(Queue, Read), Queue);
         assert_eq!(held(Read, Queue), Read);
         assert_eq!(held(Read, InFlight), Read);

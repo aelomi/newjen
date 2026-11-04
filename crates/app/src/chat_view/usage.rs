@@ -90,13 +90,13 @@ impl ChatView {
 
     pub(super) fn render_usage_card(
         &mut self,
-        placement: Placement,
+        mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.usage_snapshot.is_none() {
             self.refresh_usage();
         }
-        let show_list = (placement != Placement::Docked).then(|| {
+        let show_list = (mode != SidebarMode::Docked).then(|| {
             let statuses: Vec<Status> = self
                 .slots
                 .iter()
@@ -135,7 +135,7 @@ impl ChatView {
             cx,
         );
         let material = crate::theme::material(cx);
-        let floating = placement == Placement::Docked;
+        let floating = mode == SidebarMode::Docked;
         v_flex()
             .id("usage-card")
             .flex_1()

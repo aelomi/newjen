@@ -18,7 +18,7 @@ use gpui::{
     AnyElement, ElementId, InteractiveElement as _, IntoElement as _, ParentElement as _, Pixels,
     SharedString, Styled as _, div, px,
 };
-use newjen_core::steps::Placement as ThreadPlacement;
+use newjen_core::steps::Placement;
 
 use super::dock::{self, SheetKind, TrayRow};
 use super::{READ_GAP, ROW_HEIGHT, Row, Section};
@@ -53,17 +53,17 @@ pub enum Zone {
 }
 
 impl Zone {
-    pub fn of(draft: bool, placement: ThreadPlacement) -> Self {
+    pub fn of(draft: bool, placement: Placement) -> Self {
         if draft {
             return Self::Draft;
         }
         match placement {
-            ThreadPlacement::Pinned => Self::Pinned,
-            ThreadPlacement::Queue => Self::Queue,
-            ThreadPlacement::Read => Self::Read,
-            ThreadPlacement::InFlight => Self::Tray,
-            ThreadPlacement::Snoozed => Self::Snoozed,
-            ThreadPlacement::Settled => Self::Settled,
+            Placement::Pinned => Self::Pinned,
+            Placement::Queue => Self::Queue,
+            Placement::Read => Self::Read,
+            Placement::InFlight => Self::Tray,
+            Placement::Snoozed => Self::Snoozed,
+            Placement::Settled => Self::Settled,
         }
     }
 

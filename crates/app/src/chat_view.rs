@@ -40,7 +40,7 @@ use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{InputEvent, InputState};
 use newjen_core::agent::NoteDelivery;
 use newjen_core::calendar::{self, SettledAge, WakeDay};
-use newjen_core::steps::Placement as ThreadPlacement;
+use newjen_core::steps::Placement;
 use newjen_core::store::{PendingCopy, PendingIntent, PendingState, now_ms};
 use newjen_core::thread::{self, CopyJob, NotSent, Quitting, Sent, WorksIn, keeps_draft};
 use newjen_core::worktree::{self, CopyError, Tools};
@@ -56,7 +56,7 @@ use crate::keys::{
 };
 use crate::reply;
 use crate::rows::{self, OnRestart};
-use crate::sidebar::{self, OnPress, Placement, RowFacts};
+use crate::sidebar::{self, OnPress, RowFacts, SidebarMode};
 use crate::terminal::TerminalPanel;
 use crate::theme::{CARD_INSET, CARD_RADIUS, SIDEBAR};
 use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
@@ -272,7 +272,7 @@ pub struct ChatView {
     motion: RefCell<sidebar::Motion>,
     /// What the list shows this render, with each ghost and how far along each element is.
     frame: RefCell<sidebar::Frame>,
-    hold: RefCell<Option<(String, ThreadPlacement)>>,
+    hold: RefCell<Option<(String, Placement)>>,
     sheet: Option<Sheet>,
     /// The panel that was just closed, drawn while it lowers.
     sheet_exit: Option<Sheet>,
@@ -2174,12 +2174,12 @@ impl ChatView {
     /// brings it back, with an amber dot if another thread waits for an approval.
     fn render_title_bar(
         &self,
-        placement: Placement,
+        mode: SidebarMode,
         window_width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let show_list = (placement != Placement::Docked).then(|| {
+        let show_list = (mode != SidebarMode::Docked).then(|| {
             let statuses: Vec<Status> = self
                 .slots
                 .iter()
@@ -2229,7 +2229,7 @@ impl ChatView {
             }
         };
         let bar = Bar {
-            changes: self.changes_toggle(placement, window_width, window, cx),
+            changes: self.changes_toggle(mode, window_width, window, cx),
             ..bar
         };
         // claude cannot forget a rule, so core stops it (now, or when the turn ends) and the
@@ -2787,7 +2787,7 @@ impl ChatView {
             .collect()
     }
 
-    fn hold_place(&self, thread_id: &str, own: ThreadPlacement) -> ThreadPlacement {
+    fn hold_place(&self, thread_id: &str, own: Placement) -> Placement {
         let mut hold = self.hold.borrow_mut();
         let shown = match hold.as_ref() {
             Some((held_id, at)) if held_id == thread_id => sidebar::held(*at, own),
@@ -3433,21 +3433,21 @@ impl Render for ChatView {
         if self.thread().read(cx).grant_views().is_empty() {
             self.grants_open = false;
         }
-        let placement = sidebar::placement(width, self.sidebar_hidden, self.drawer_open);
+        let mode = sidebar::mode(width, self.sidebar_hidden, self.drawer_open);
         let sidebar_px = f32::from(SIDEBAR);
         // The drawer floats over the chat, so only the docked list takes width from it.
-        let main_width = match placement {
-            Placement::Docked => width - sidebar_px,
-            Placement::Drawer | Placement::Hidden => width,
+        let main_width = match mode {
+            SidebarMode::Docked => width - sidebar_px,
+            SidebarMode::Drawer | SidebarMode::Hidden => width,
         };
-        let docked = (placement == Placement::Docked).then(|| {
+        let docked = (mode == SidebarMode::Docked).then(|| {
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
             let header = sidebar::header(toggle, window, cx);
             let list = self.render_list(window, cx);
             sidebar::column(header, list, cx)
         });
         use gpui_kit::component::{Placement as SheetPlacement, WindowExt as _};
-        if placement == Placement::Drawer && !window.has_active_sheet(cx) {
+        if mode == SidebarMode::Drawer && !window.has_active_sheet(cx) {
             let drawer_fill = crate::theme::material(cx).card;
             let view = cx.entity().downgrade();
             let closed = view.clone();
@@ -3474,7 +3474,7 @@ impl Render for ChatView {
                     focus.focus(window, cx);
                 }
             });
-        } else if placement != Placement::Drawer && window.has_active_sheet(cx) {
+        } else if mode != SidebarMode::Drawer && window.has_active_sheet(cx) {
             window.close_sheet(cx);
             self.focus_panel(window, cx);
         }
@@ -3483,10 +3483,10 @@ impl Render for ChatView {
             let theme = cx.theme();
             (theme.foreground, theme.font_family.clone())
         };
-        let floating = placement == Placement::Docked;
+        let floating = mode == SidebarMode::Docked;
         let (main, changes) = match self.pane {
-            Pane::Thread => self.render_thread_card(placement, width, main_width, window, cx),
-            Pane::Usage => (self.render_usage_card(placement, cx), None),
+            Pane::Thread => self.render_thread_card(mode, width, main_width, window, cx),
+            Pane::Usage => (self.render_usage_card(mode, cx), None),
         };
 
         // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
@@ -3552,14 +3552,14 @@ impl ChatView {
     /// terminal. The Changes card beside it, when there is one, comes back apart.
     fn render_thread_card(
         &mut self,
-        placement: Placement,
+        mode: SidebarMode,
         width: f32,
         main_width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (AnyElement, Option<AnyElement>) {
         self.sync_changes(window, cx);
-        let changes = self.render_changes_card(placement, width, window, cx);
+        let changes = self.render_changes_card(mode, width, window, cx);
         let main_width = main_width - changes.as_ref().map_or(0.0, |(_, taken)| *taken);
 
         let (thread_id, empty) = {
@@ -3572,7 +3572,7 @@ impl ChatView {
                     && thread.preparing().is_none(),
             )
         };
-        let title_bar = self.render_title_bar(placement, width, window, cx);
+        let title_bar = self.render_title_bar(mode, width, window, cx);
         let body = if self.review_panel.is_some() {
             self.render_review(cx)
         } else if empty {
@@ -3632,7 +3632,7 @@ impl ChatView {
         };
 
         let material = crate::theme::material(cx);
-        let floating = placement == Placement::Docked;
+        let floating = mode == SidebarMode::Docked;
         // Everything that belongs to one thread sits under an id made from the thread's id,
         // so per-element state (a tool card left open, the scroll position, a streaming reply)
         // can never carry over to another thread whose rows have the same numbers.

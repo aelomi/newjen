@@ -401,26 +401,23 @@ impl ChatView {
 
     /// Whether the thread on screen has changes to show, and whether the card fits beside
     /// the chat in a window `width` pixels wide with the list docked.
-    fn changes_facts(&self, placement: Placement, width: f32, cx: &App) -> (bool, bool) {
+    fn changes_facts(&self, mode: SidebarMode, width: f32, cx: &App) -> (bool, bool) {
         let has =
             self.changes.summary(self.thread().read(cx)).is_some() && self.review_panel.is_none();
         let room = width - f32::from(SIDEBAR) - 2.0 * f32::from(CARD_INSET) - CARD_WIDTH;
-        (
-            has,
-            placement == Placement::Docked && room >= MAIN_MIN_WIDTH,
-        )
+        (has, mode == SidebarMode::Docked && room >= MAIN_MIN_WIDTH)
     }
 
     /// The header button that shows and hides the card; where the card cannot fit it opens
     /// the review instead. `None` while there is nothing to show.
     pub(super) fn changes_toggle(
         &self,
-        placement: Placement,
+        mode: SidebarMode,
         width: f32,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<ChangesToggle> {
-        let (has, fits) = self.changes_facts(placement, width, cx);
+        let (has, fits) = self.changes_facts(mode, width, cx);
         if !has {
             return None;
         }
@@ -456,12 +453,12 @@ impl ChatView {
     /// The card, if it is to be on screen, and the width it takes from the chat.
     pub(super) fn render_changes_card(
         &mut self,
-        placement: Placement,
+        mode: SidebarMode,
         width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<(AnyElement, f32)> {
-        let (has, fits) = self.changes_facts(placement, width, cx);
+        let (has, fits) = self.changes_facts(mode, width, cx);
         self.changes.on_screen = false;
         self.changes.has_changes = has;
         if !has || !fits {
