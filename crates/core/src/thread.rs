@@ -1505,8 +1505,21 @@ impl Thread {
         due
     }
 
-    /// Puts the thread away without deleting anything. Sending a message brings it back.
+    /// Whether the thread can be put away: it is saved and neither runs a turn, waits on an
+    /// answer nor waits for its worktree.
+    pub fn can_settle(&self) -> bool {
+        !self.is_draft()
+            && !self.status().is_busy()
+            && !self.waits_on_you()
+            && self.preparing().is_none()
+    }
+
+    /// Puts the thread away without deleting anything. Sending a message brings it back. A
+    /// thread that works, waits on you or is being prepared stays where it is.
     pub fn settle(&mut self, now_ms: i64) {
+        if !self.can_settle() {
+            return;
+        }
         self.set_list(ListState {
             pinned_at: None,
             snoozed_until: None,

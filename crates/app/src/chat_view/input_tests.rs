@@ -1003,7 +1003,8 @@ fn a_failed_copy_names_what_failed(cx: &mut TestAppContext) {
     finish(&chat, path, cx);
 }
 
-/// Right click on the thread on screen's row, then "Archive thread".
+/// Right click on the row of a thread that waits on an approval, then "Archive thread". The
+/// menu skips Settle, which is disabled for such a thread.
 fn archive_from_menu(cx: &mut VisualTestContext) {
     let bounds = cx.debug_bounds("thread-row").unwrap();
     for event in [true, false] {
@@ -1021,7 +1022,7 @@ fn archive_from_menu(cx: &mut VisualTestContext) {
             );
         }
     }
-    cx.simulate_keystrokes("down down down down enter");
+    cx.simulate_keystrokes("down down down enter");
 }
 
 #[gpui::test]
@@ -2325,6 +2326,66 @@ async fn the_sidebar_lists_threads_and_its_usage_row_opens_the_usage_view(cx: &m
     finish(&chat, path, cx);
 }
 
+/// Adds a saved thread that is idle, with a row of its own in the list, and returns its id.
+/// `unread` puts it in the Queue, otherwise it is read.
+fn add_idle_thread(
+    chat: &Entity<ChatView>,
+    cx: &mut VisualTestContext,
+    title: &str,
+    unread: bool,
+    list: newjen_core::store::ListState,
+) -> String {
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let id = format!("5a0c1f4e-2b1e-4c8e-9a51-{:012}", view.slots.len());
+            let row = newjen_core::store::ThreadRow {
+                id: id.clone(),
+                project_id: view.project.id,
+                workdir: view.project.path.clone(),
+                title: title.into(),
+                provider: "claude".into(),
+                conversation: newjen_core::agent::ConversationState::Established(
+                    "6f1c1f4e-2b1e-4c8e-9a51-0d9a7c2f3b10".into(),
+                ),
+                model: newjen_core::providers::ModelSelection::CliDefault,
+                effort: newjen_core::agent::EffortSelection::CliDefault,
+                speed: newjen_core::agent::Speed::Normal,
+                status: Status::Done,
+                unread,
+                created_at: 1,
+                updated_at: 1,
+                archived_at: None,
+                copy: None,
+                review_base: None,
+                landing_resolved: false,
+                snapshot_needed: false,
+                list,
+            };
+            view.store.save_thread(row.clone());
+            assert!(view.store.flush(Duration::from_secs(5)));
+            let thread = Thread::load(
+                view.store.clone(),
+                &view.project,
+                row,
+                view.base_config.clone(),
+            )
+            .unwrap();
+            let at = view.slots.len();
+            view.add_slot(thread, at, window, cx);
+            cx.notify();
+            id
+        })
+    })
+}
+
+fn settled_list(at: i64) -> newjen_core::store::ListState {
+    newjen_core::store::ListState {
+        settled_at: Some(at),
+        landed_at: at,
+        ..Default::default()
+    }
+}
+
 fn fox(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> (bool, String) {
     cx.update(|_, cx| {
         let fox = chat.read(cx).fox.read(cx);
@@ -2449,17 +2510,17 @@ async fn a_settled_thread_waits_in_a_panel_that_esc_closes_and_archive_all_asks_
     cx: &mut TestAppContext,
 ) {
     let (chat, path, cx) = setup(cx, "settled-panel", true);
-    cx.simulate_input("park me");
+    cx.simulate_input("keep waiting");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
-    let id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    let id = add_idle_thread(&chat, cx, "park me", false, Default::default());
     cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
     cx.run_until_parked();
     let_motion_finish(&chat, cx);
     cx.update(|_, cx| {
         let layout = chat.read(cx).sidebar_layout(cx);
-        assert_eq!(layout.settled, vec![0]);
-        assert!(layout.entries.is_empty() && layout.in_flight.is_empty());
+        assert_eq!(layout.settled, vec![1]);
+        assert_eq!(layout.entries, vec![sidebar::Entry::Thread(0)]);
     });
     assert!(cx.debug_bounds("sheet").is_none());
 
@@ -2498,7 +2559,14 @@ async fn a_settled_thread_waits_in_a_panel_that_esc_closes_and_archive_all_asks_
     assert!(cx.debug_bounds("sheet").is_none());
     cx.update(|_, cx| {
         let view = chat.read(cx);
-        assert!(view.thread().read(cx).is_draft());
+        assert_eq!(view.slots.len(), 1);
+        assert!(
+            view.thread()
+                .read(cx)
+                .transcript()
+                .pending_approval()
+                .is_some()
+        );
         assert!(view.sidebar_layout(cx).settled.is_empty());
     });
     let_motion_finish(&chat, cx);
@@ -2507,12 +2575,60 @@ async fn a_settled_thread_waits_in_a_panel_that_esc_closes_and_archive_all_asks_
 }
 
 #[gpui::test]
-async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) {
-    let (chat, path, cx) = setup(cx, "settle-motion", true);
-    cx.simulate_input("first thread");
+async fn a_row_offers_settle_only_to_a_thread_that_can_be_put_away(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "settle-offer", true);
+    cx.simulate_input("keep waiting");
     cx.simulate_keystrokes("enter");
     pending(&chat, cx).await;
-    cx.simulate_keystrokes("cmd-n");
+    assert!(cx.debug_bounds("row-snooze").is_some());
+    assert!(
+        cx.debug_bounds("row-settle").is_none(),
+        "a thread that waits on you stays in the list"
+    );
+    add_idle_thread(&chat, cx, "quiet", false, Default::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("row-settle").is_some());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn archive_all_leaves_a_thread_that_left_settled_while_the_question_was_open(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "archive-all-race", true);
+    let stays = add_idle_thread(&chat, cx, "comes back", false, settled_list(5));
+    let goes = add_idle_thread(&chat, cx, "still put away", false, settled_list(6));
+    let_motion_finish(&chat, cx);
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sheet-archive").is_some());
+
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            let ix = view.index_of(&stays, cx).unwrap();
+            view.slots[ix].thread.update(cx, |thread, cx| {
+                thread.unsettle();
+                cx.notify();
+            });
+        })
+    });
+    cx.run_until_parked();
+    click(cx, "sheet-archive");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let view = chat.read(cx);
+        assert!(view.index_of(&stays, cx).is_some(), "it was not settled");
+        assert!(view.index_of(&goes, cx).is_none());
+    });
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "settle-motion", true);
+    let id = add_idle_thread(&chat, cx, "first thread", true, Default::default());
     let_motion_finish(&chat, cx);
     let ghosts = |cx: &mut VisualTestContext| {
         cx.update(|_, cx| {
@@ -2526,7 +2642,6 @@ async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) 
         })
     };
     assert_eq!(ghosts(cx), 0);
-    let id = cx.update(|_, cx| chat.read(cx).slots[1].thread.read(cx).id().to_string());
     cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
     cx.run_until_parked();
     assert_eq!(
@@ -2552,11 +2667,7 @@ async fn the_settled_panel_rises_and_lowers_instead_of_appearing_and_vanishing(
     cx: &mut TestAppContext,
 ) {
     let (chat, path, cx) = setup(cx, "panel-motion", true);
-    cx.simulate_input("park me");
-    cx.simulate_keystrokes("enter");
-    pending(&chat, cx).await;
-    let id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
-    cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
+    add_idle_thread(&chat, cx, "park me", false, settled_list(5));
     cx.run_until_parked();
     let_motion_finish(&chat, cx);
     let lift = |cx: &mut VisualTestContext| cx.update(|_, cx| chat.read(cx).frame.borrow().raised);

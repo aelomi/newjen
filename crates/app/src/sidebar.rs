@@ -812,6 +812,8 @@ pub const ROW_HEIGHT: Pixels = px(48.);
 /// What a row can do beyond opening: the buttons that show on hover and the right-click menu.
 pub struct RowActions {
     pub pinned: bool,
+    /// The thread can be put away: not while it works, waits on you or is being prepared.
+    pub settlable: bool,
     pub on_pin: OnPress,
     pub on_snooze: OnSnooze,
     pub on_settle: OnPress,
@@ -869,16 +871,18 @@ fn hover_actions(
             .debug_selector(|| "row-snooze".to_string())
             .dropdown_menu(move |menu, _, _| snooze_menu(menu, &on_snooze)),
         )
-        .child(
-            ui::icon_button(
-                (ElementId::from("settle"), id.clone()),
-                IconName::Check,
-                "Settle",
-                cx,
+        .when(actions.settlable, |actions| {
+            actions.child(
+                ui::icon_button(
+                    (ElementId::from("settle"), id.clone()),
+                    IconName::Check,
+                    "Settle",
+                    cx,
+                )
+                .debug_selector(|| "row-settle".to_string())
+                .on_click(move |_, window, cx| on_settle(window, cx)),
             )
-            .debug_selector(|| "row-settle".to_string())
-            .on_click(move |_, window, cx| on_settle(window, cx)),
-        )
+        })
         .into_any_element()
 }
 
@@ -1035,6 +1039,7 @@ pub fn thread_row(
                 actions.on_archive.clone(),
             );
             let on_snooze = actions.on_snooze.clone();
+            let settlable = actions.settlable;
             menu.min_w(MENU_WIDTH)
                 .item(
                     PopupMenuItem::new(if actions.pinned { "Unpin" } else { "Pin" })
@@ -1045,6 +1050,7 @@ pub fn thread_row(
                 })
                 .item(
                     PopupMenuItem::new("Settle")
+                        .disabled(!settlable)
                         .on_click(move |_, window, cx| on_settle(window, cx)),
                 )
                 .separator()

@@ -31,7 +31,7 @@
 //!   does (see the `background_task` fixture). The task runs until a `finish_task` file
 //!   appears; then claude reports it finished and starts a turn by itself, with no message.
 //!   With `own_turn_missing`, that turn ends with the "No conversation found" result for this
-//!   session.
+//!   session. With `own_turn_ask`, that turn asks to approve `touch own.txt` and does not end.
 //! - `queued_own_turn`: on reading a message, first run the turn claude starts by itself when
 //!   that task finishes, as if the message arrived just after the task did. That turn's
 //!   result says the message waits for the next turn (`queued_turn_count: 1`).
@@ -152,6 +152,10 @@ while IFS= read -r line; do
       printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
       send_init
       printf '%s\n' '{"type":"assistant","message":{"id":"mc","content":[{"type":"text","text":"The dev server stopped."}]}}'
+      if [ -f "$dir/own_turn_ask" ]; then
+        printf '%s\n' '{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"t2","input":{"command":"touch own.txt"},"permission_suggestions":[]}}'
+        exit 0
+      fi
       if [ -f "$dir/own_turn_missing" ]; then
         printf '%s\n' "$missing"
       else
@@ -1189,22 +1193,67 @@ fn pin_snooze_and_settle_are_saved_and_only_a_landing_moves_the_thread() {
 #[test]
 fn an_approval_brings_a_settled_or_snoozed_thread_back_and_a_woken_open_thread_stays_read() {
     let fixture = Fixture::new();
-    fixture.switch("ask", true);
+    fixture.switch("background", true);
+    fixture.switch("own_turn_ask", true);
     let mut thread = fixture.draft();
     thread.send("one").unwrap();
+    finish_turn(&mut thread);
+    assert!(thread.can_settle());
     thread.settle(1_000);
+    assert_eq!(thread.list_state().settled_at, Some(1_000));
+    fixture.switch("finish_task", true);
     pump_until(&mut thread, "the approval", |thread| {
         thread.transcript().pending_approval().is_some()
     });
     assert_eq!(thread.list_state().settled_at, None);
     assert!(thread.list_state().landed_at > 1_000);
+
+    let mut snoozed = {
+        let fixture = Fixture::new();
+        fixture.switch("ask", true);
+        let mut thread = fixture.draft();
+        thread.send("one").unwrap();
+        thread.snooze(1_000);
+        pump_until(&mut thread, "the approval", |thread| {
+            thread.transcript().pending_approval().is_some()
+        });
+        assert_eq!(thread.list_state().snoozed_until, None);
+        thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
+        finish_turn(&mut thread);
+        thread
+    };
+    snoozed.set_active(true);
+    snoozed.snooze(10);
+    assert!(snoozed.wake_if_due(10));
+    assert!(!snoozed.is_unread());
+}
+
+#[test]
+fn a_thread_that_works_waits_on_you_or_is_being_prepared_cannot_be_settled() {
+    let fixture = Fixture::new();
+    fixture.switch("ask", true);
+    let mut thread = fixture.draft();
+    assert!(!thread.can_settle());
+    thread.send("one").unwrap();
+    assert!(!thread.can_settle());
+    thread.settle(1_000);
+    assert_eq!(thread.list_state().settled_at, None);
+    pump_until(&mut thread, "the approval", |thread| {
+        thread.transcript().pending_approval().is_some()
+    });
+    assert!(!thread.can_settle());
+    thread.settle(2_000);
+    assert_eq!(thread.list_state().settled_at, None);
     thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
     finish_turn(&mut thread);
+    assert!(thread.can_settle());
+    thread.settle(3_000);
+    assert_eq!(thread.list_state().settled_at, Some(3_000));
 
-    thread.set_active(true);
-    thread.snooze(10);
-    assert!(thread.wake_if_due(10));
-    assert!(!thread.is_unread());
+    let (mut preparing, _job) = fixture.preparing("first");
+    assert!(!preparing.can_settle());
+    preparing.settle(4_000);
+    assert_eq!(preparing.list_state().settled_at, None);
 }
 
 #[test]

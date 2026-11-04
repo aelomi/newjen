@@ -3078,11 +3078,12 @@ impl ChatView {
             }
         });
         let on_confirm = self.press(cx, |view, window, cx| {
-            let ids = view
+            let asked = view
                 .sheet
                 .as_mut()
                 .and_then(|sheet| sheet.confirming.take())
                 .unwrap_or_default();
+            let ids = view.still_settled(&asked, cx);
             view.close_sheet(window, cx);
             for id in ids {
                 view.archive(&id, window, cx);
@@ -3096,7 +3097,10 @@ impl ChatView {
                 .into_iter()
                 .map(|(label, rows)| sidebar::PanelGroup { label, rows })
                 .collect(),
-            confirming: sheet.confirming.as_ref().map(Vec::len),
+            confirming: sheet
+                .confirming
+                .as_ref()
+                .map(|asked| self.still_settled(asked, cx).len()),
             on_bulk,
             on_cancel,
             on_confirm,
@@ -3106,6 +3110,21 @@ impl ChatView {
             live: self.sheet.is_some(),
             measured: self.sheet_height.clone(),
         }
+    }
+
+    /// The threads among `ids` that are still settled. A thread can leave Settled while a
+    /// question about it is open, say when an approval brings it back, and then it is not
+    /// archived.
+    fn still_settled(&self, ids: &[String], cx: &App) -> Vec<String> {
+        let now = now_ms();
+        ids.iter()
+            .filter(|id| {
+                self.index_of(id, cx).is_some_and(|ix| {
+                    self.slots[ix].thread.read(cx).placement(now) == Placement::Settled
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     /// Clicking the Snoozed or Settled row: opens its panel, or closes it when it is the one
@@ -3326,7 +3345,7 @@ impl ChatView {
     ) -> Option<(sidebar::Row, AnyElement)> {
         let now_ms = now_ms();
         let slot = self.slots.get(ix)?;
-        let (id, row, draft_row, pinned) = {
+        let (id, row, draft_row, pinned, settlable) = {
             let thread = slot.thread.read(cx);
             let id = SharedString::from(thread.id().to_string());
             let draft = thread.is_draft();
@@ -3348,13 +3367,19 @@ impl ChatView {
                 selected: ix == self.active && self.pane == Pane::Thread,
                 archivable: thread.preparing().is_none(),
             };
-            (id, row, draft, thread.list_state().pinned_at.is_some())
+            (
+                id,
+                row,
+                draft,
+                thread.list_state().pinned_at.is_some(),
+                thread.can_settle(),
+            )
         };
         let shown = id.clone();
         let on_press = self.press(cx, move |view, window, cx| {
             view.show_thread(&shown, window, cx)
         });
-        let actions = (!draft_row).then(|| self.row_actions(&id, pinned, cx));
+        let actions = (!draft_row).then(|| self.row_actions(&id, pinned, settlable, cx));
         let element = sidebar::thread_row(row.clone(), actions, on_press, grown, cx);
         Some((row, element))
     }
@@ -3363,6 +3388,7 @@ impl ChatView {
         &self,
         id: &SharedString,
         pinned: bool,
+        settlable: bool,
         cx: &mut Context<Self>,
     ) -> sidebar::RowActions {
         let (pin, settle, archive) = (id.clone(), id.clone(), id.clone());
@@ -3370,6 +3396,7 @@ impl ChatView {
         let view = cx.weak_entity();
         sidebar::RowActions {
             pinned,
+            settlable,
             on_pin: self.press(cx, move |view, _, cx| view.toggle_pin(&pin, cx)),
             on_snooze: Rc::new(move |until, _, cx| {
                 let _ = view.update(cx, |view, cx| view.snooze_thread(&snooze, until, cx));
