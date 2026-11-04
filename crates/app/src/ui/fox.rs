@@ -2002,12 +2002,13 @@ use gpui::{
     AnyElement, Bounds, Context, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseUpEvent,
     ParentElement as _, PathBuilder, Pixels, Render, Rgba, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, canvas, div, fill, point,
-    px, size,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, canvas, div, fill,
+    point, px, size,
 };
 use model::{HEIGHT, Phase, Runner, WIDTH};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const HIDE_RESET: Duration = Duration::from_millis(140);
 const FADE_IN: f32 = 0.2;
 const FADE_OUT: f32 = 0.14;
 const HINT_FADE: f32 = 0.15;
@@ -2044,6 +2045,7 @@ pub struct FoxGame {
     hint_alpha: f32,
     focus: FocusHandle,
     pub(crate) frame: Option<Instant>,
+    settling: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -2071,6 +2073,7 @@ impl FoxGame {
             hint_alpha: 1.0,
             focus,
             frame: None,
+            settling: None,
             _subscriptions: subscriptions,
         }
     }
@@ -2088,12 +2091,25 @@ impl FoxGame {
             return;
         }
         self.shown = shown;
+        self.settling = None;
         if !shown {
             self.runner.pause();
             self.runner.release();
             self.fx.set_hover(false);
+            self.settling = Some(cx.spawn(async move |game, cx| {
+                cx.background_executor().timer(HIDE_RESET).await;
+                game.update(cx, |game, cx| game.settle_hidden(cx)).ok();
+            }));
         }
         cx.notify();
+    }
+
+    fn settle_hidden(&mut self, cx: &mut Context<Self>) {
+        if !self.shown && self.runner.phase() != Phase::Idle {
+            self.runner.rest();
+            self.hint = hint_for(Phase::Idle);
+            cx.notify();
+        }
     }
 
     fn pause(&mut self, cx: &mut Context<Self>) {
@@ -2114,10 +2130,6 @@ impl FoxGame {
         self.hint_alpha = approach(self.hint_alpha, self.hint_target(), dt / HINT_FADE);
         if phase != Phase::Running {
             self.hint = hint_for(phase);
-        }
-        if !self.shown && self.fade <= 0.0 && phase != Phase::Idle {
-            self.runner.rest();
-            self.hint = hint_for(Phase::Idle);
         }
     }
 
@@ -2594,7 +2606,11 @@ mod view_tests {
         assert_eq!(phase(&game, cx), Phase::Paused);
         game.update(cx, |game, _| game.advance(0.05, false));
         assert_eq!(game.read_with(cx, |game, _| game.runner.score()), score);
-        game.update(cx, |game, _| game.advance(1.0, false));
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert_eq!(phase(&game, cx), Phase::Paused, "the fade is not over yet");
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
         assert_eq!(phase(&game, cx), Phase::Idle);
         assert_eq!(game.read_with(cx, |game, _| game.runner.best()), score);
         game.update(cx, |game, cx| game.set_shown(true, cx));
@@ -2608,8 +2624,37 @@ mod view_tests {
         click_playfield(cx);
         game.update(cx, |game, cx| game.set_shown(false, cx));
         game.update(cx, |game, cx| game.set_shown(true, cx));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
         game.update(cx, |game, _| game.advance(30.0, false));
         assert_eq!(phase(&game, cx), Phase::Paused);
+    }
+
+    #[gpui::test]
+    fn a_hidden_game_resets_even_if_its_host_stops_rendering_it(cx: &mut TestAppContext) {
+        struct Gone {
+            game: Entity<FoxGame>,
+        }
+        impl Render for Gone {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| Gone {
+            game: cx.new(|cx| FoxGame::new(window, cx)),
+        });
+        let game = host.read_with(cx, |host, _| host.game.clone());
+        game.update(cx, |game, cx| {
+            game.set_shown(true, cx);
+            game.runner.press();
+            game.advance(1.0, false);
+        });
+        assert_eq!(phase(&game, cx), Phase::Running);
+        game.update(cx, |game, cx| game.set_shown(false, cx));
+        assert_eq!(phase(&game, cx), Phase::Paused);
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(phase(&game, cx), Phase::Idle);
     }
 
     #[gpui::test]
