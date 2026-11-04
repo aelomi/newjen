@@ -38,9 +38,19 @@ gpui_kit::assets::icon_assets!(
     ]
 );
 gpui_kit::assets::icon_assets!(ApprovalIcons, [Trash, FilePen, Terminal, Plug]);
+pub const CLAUDE_MARK: &str = "icons/claude.svg";
+pub const OPENAI_MARK: &str = "icons/openai.svg";
+const MARKS: [(&str, &[u8]); 2] = [
+    (CLAUDE_MARK, include_bytes!("../assets/icons/claude.svg")),
+    (OPENAI_MARK, include_bytes!("../assets/icons/openai.svg")),
+];
+
 pub struct AppAssets<T>(pub T);
 impl<T: AssetSource> AssetSource for AppAssets<T> {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some((_, data)) = MARKS.iter().find(|(name, _)| *name == path) {
+            return Ok(Some(Cow::Borrowed(data)));
+        }
         if let Some(data) = AppIcons.load(path)? {
             return Ok(Some(data));
         }
@@ -51,6 +61,12 @@ impl<T: AssetSource> AssetSource for AppAssets<T> {
     }
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut names = AppIcons.list(path)?;
+        names.extend(
+            MARKS
+                .iter()
+                .filter(|(name, _)| name.starts_with(path))
+                .map(|(name, _)| SharedString::from(*name)),
+        );
         names.extend(ApprovalIcons.list(path)?);
         names.extend(self.0.list(path)?);
         names.sort();
@@ -63,6 +79,25 @@ impl<T: AssetSource> AssetSource for AppAssets<T> {
 mod tests {
     use super::*;
     use crate::ui::IconName;
+
+    #[test]
+    fn provider_marks_are_served_from_the_binary() {
+        let assets = AppAssets(gpui_kit::assets::Assets);
+        for path in [CLAUDE_MARK, OPENAI_MARK] {
+            let bytes = assets.load(path).unwrap().unwrap();
+            assert!(
+                std::str::from_utf8(&bytes).unwrap().contains("<path"),
+                "{path}"
+            );
+            assert!(
+                assets
+                    .list("icons/")
+                    .unwrap()
+                    .iter()
+                    .any(|name| name == path)
+            );
+        }
+    }
 
     #[test]
     fn embedded_icons_resolve_through_kit() {
@@ -115,6 +150,7 @@ mod tests {
             IconName::ShieldAlert,
             IconName::RotateCcwClock,
             IconName::ArrowUpRight,
+            IconName::Settings,
         ] {
             let path = icon.path();
             let bytes = assets.load(&path).unwrap().unwrap();
