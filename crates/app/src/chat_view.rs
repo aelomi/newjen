@@ -20,6 +20,7 @@ mod lifecycle;
 mod limits;
 mod picker;
 mod review;
+mod settings;
 mod usage;
 
 use std::cell::{Cell, RefCell};
@@ -58,7 +59,7 @@ use crate::reply;
 use crate::rows::{self, OnRestart};
 use crate::sidebar::{self, OnPress, RowFacts, SidebarMode};
 use crate::terminal::TerminalPanel;
-use crate::theme::{CARD_INSET, CARD_RADIUS, SIDEBAR};
+use crate::theme::{self, CARD_INSET, CARD_RADIUS, SIDEBAR};
 use crate::title_bar::{self, Bar, Grants, OnGrantsOpen, OnRevoke};
 use crate::ui;
 use crate::ui::DOCK_METRICS;
@@ -74,10 +75,8 @@ use gpui_kit::component::message_scroller::MessageScrollerState;
 enum Pane {
     Thread,
     Usage,
+    Settings,
 }
-
-/// The conversation column is capped at this width and centered, as in the mocks.
-const COLUMN_WIDTH: Pixels = px(720.0);
 
 /// The answered approval card kept on screen while it fades (`ui::EXIT_FADE`).
 struct DockGhost {
@@ -1145,6 +1144,7 @@ impl ChatView {
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_jump_to_needs_you))
             .on_action(cx.listener(Self::on_toggle_terminal))
+            .on_action(cx.listener(Self::on_open_settings))
             .children(list)
             .into_any_element()
     }
@@ -1760,7 +1760,7 @@ impl ChatView {
             event,
             self.drawer_open,
             overlay_focused(window),
-            self.pane == Pane::Usage,
+            self.pane != Pane::Thread,
             pending,
         )
     }
@@ -1819,12 +1819,24 @@ impl ChatView {
                 cx.stop_propagation();
                 self.run_primary_action(window, cx);
             }
-            KeyRoute::LeaveUsage => {
+            KeyRoute::LeavePane => {
                 cx.stop_propagation();
                 self.show(self.active, window, cx);
             }
             KeyRoute::CloseDrawer | KeyRoute::Pass => {}
         }
+    }
+
+    fn on_open_settings(
+        &mut self,
+        _: &keys::OpenSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.quit_saving {
+            return;
+        }
+        self.toggle_settings(window, cx);
     }
 
     fn on_stop(&mut self, _: &Stop, window: &mut Window, cx: &mut Context<Self>) {
@@ -1937,7 +1949,7 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.quit_saving || self.pane == Pane::Usage {
+        if self.quit_saving || self.pane != Pane::Thread {
             return;
         }
         self.toggle_terminal(window, cx);
@@ -2166,7 +2178,13 @@ impl ChatView {
             .when(notice_row, |row| {
                 row.debug_selector(|| "chat-notice".to_string())
             })
-            .child(div().w_full().max_w(COLUMN_WIDTH).py_2().child(row))
+            .child(
+                div()
+                    .w_full()
+                    .when_some(theme::column_width(cx), |column, width| column.max_w(width))
+                    .py_2()
+                    .child(row),
+            )
             .into_any_element()
     }
 
@@ -2287,7 +2305,7 @@ impl ChatView {
             ))
             .when(no_agent, |column| {
                 column.child(
-                    div().max_w(COLUMN_WIDTH).text_center().child(
+                    div().when_some(theme::column_width(cx), |notice, width| notice.max_w(width)).text_center().child(
                         ui::caption(
                             "Newjen drives the Claude or Codex CLI installed and signed in on this Mac with your own account. Install one, then Refresh.",
                             cx,
@@ -2413,7 +2431,8 @@ impl ChatView {
             .unwrap_or(f32::from(font_size) * 0.6)
             .max(1.0);
         let viewport = window.viewport_size();
-        let dock_width = (main_width - m.page_padding * 2.).min(f32::from(COLUMN_WIDTH));
+        let room = main_width - m.page_padding * 2.;
+        let dock_width = theme::column_width(cx).map_or(room, |width| room.min(f32::from(width)));
         // One column spare: real wrapping is a little less tidy than the estimate.
         let cols = ((dock_width - m.detail_inset()) / char_width).max(0.0) as usize;
         let cols = cols.saturating_sub(1);
@@ -3545,6 +3564,7 @@ impl Render for ChatView {
         let (main, changes) = match self.pane {
             Pane::Thread => self.render_thread_card(mode, width, main_width, window, cx),
             Pane::Usage => (self.render_usage_card(mode, cx), None),
+            Pane::Settings => (self.render_settings_card(mode, cx), None),
         };
 
         // Our key context and shortcut handlers. Tab is the window root's (Kit); focus that
@@ -3572,6 +3592,7 @@ impl Render for ChatView {
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_jump_to_needs_you))
             .on_action(cx.listener(Self::on_toggle_terminal))
+            .on_action(cx.listener(Self::on_open_settings))
             .flex()
             .text_color(fg)
             .font_family(font)
@@ -3652,7 +3673,7 @@ impl ChatView {
         let column = v_flex()
             .relative()
             .w_full()
-            .max_w(COLUMN_WIDTH)
+            .when_some(theme::column_width(cx), |column, width| column.max_w(width))
             .gap(px(DOCK_METRICS.scope_gap))
             .children(problem)
             .children(limit_notice)

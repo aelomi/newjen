@@ -12,6 +12,7 @@ Every user-visible change adds a line under `## Unreleased`, in one of four grou
 - Snooze a thread until later today, tomorrow or next Monday, settle it when you are done, or pin it to the top. Hover a row for Snooze and Settle, or right-click it.
 - Archive all in the Settled panel removes every settled thread after one confirmation.
 - When the list is empty, a spirit fox runner game fills the space while you wait. Click it to play and press Space to jump. It steps aside when a thread lands.
+- Settings opens with ⌘, from the Newjen menu or the gear at the foot of the sidebar. Its Appearance page sets light or dark, the accent color, how much glass shows through, the interface and code fonts and sizes, how wide the chat is, and blue and orange for added and removed lines. Each choice applies at once and is kept.
 
 ### Improvements
 
@@ -21,10 +22,7 @@ Every user-visible change adds a line under `## Unreleased`, in one of four grou
 - Claude and Codex show their own marks.
 - Tooltips, menus and popovers are fully opaque, so the text behind them no longer shows through.
 - Rows in the thread list move with some ease. A working thread folds into the In flight tray when you switch away, a finished one lands in the Queue, a read one drops out of it, and a settled or snoozed one slides away. The gap closes after the row fades, and the counts crossfade. The Snoozed and Settled panels rise from their row while everything behind them dims. Reduce Motion keeps the fades and drops the movement.
-
-### Misc
-
-- The sidebar has a settings gear, and the Newjen menu has Settings… (⌘,). They open nothing yet.
+- Text is smaller and calmer: a 14 pt base instead of 16, quieter secondary lines in the thread list, your messages in a soft gray bubble instead of a white one, and a lighter composer border.
 
 ## 0.1.0-alpha.2 · 3 November 2026
 

@@ -5,9 +5,11 @@ use rusqlite::OptionalExtension;
 use semver::Version;
 
 use super::{Store, Write};
+use crate::appearance::Appearance;
 
 const LAST_SEEN_VERSION: &str = "last_seen_version";
 const FAILED_UPDATE_VERSION: &str = "failed_update_version";
+const APPEARANCE: &str = "appearance";
 
 impl Store {
     /// The newest version whose release notes the user has been shown, or `None` before the
@@ -50,6 +52,27 @@ impl Store {
             })
             .optional()?;
         Ok(text.and_then(|text| text.parse().ok()))
+    }
+
+    /// The saved look. A missing or unreadable value gives the defaults, so a preference never
+    /// stops a launch.
+    pub fn appearance(&self) -> Result<Appearance> {
+        let text: Option<String> = self
+            .reader()
+            .query_row(
+                "SELECT value FROM app_state WHERE key = ?1",
+                [APPEARANCE],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(text.map_or_else(Appearance::default, |text| Appearance::parse(&text)))
+    }
+
+    pub fn set_appearance(&self, appearance: &Appearance) {
+        self.queue(Write::AppState {
+            key: APPEARANCE,
+            value: appearance.to_json(),
+        });
     }
 
     pub fn set_last_seen_version(&self, version: &Version) {

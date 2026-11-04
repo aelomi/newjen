@@ -34,7 +34,8 @@ gpui_kit::assets::icon_assets!(
         FolderInput,
         ShieldAlert,
         RotateCcwClock,
-        ArrowUpRight
+        ArrowUpRight,
+        RotateCcw
     ]
 );
 gpui_kit::assets::icon_assets!(ApprovalIcons, [Trash, FilePen, Terminal, Plug]);

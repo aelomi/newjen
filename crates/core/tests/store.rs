@@ -414,3 +414,35 @@ fn review_state_survives_reopen() {
     let store = Store::open_in(home.path()).unwrap();
     assert_eq!(store.thread("landing").unwrap(), Some(row));
 }
+
+#[test]
+fn appearance_is_saved_and_a_missing_or_garbled_one_gives_the_defaults() {
+    use newjen_core::appearance::{Accent, Appearance, ChatWidth, Font, Glass, TextSize};
+
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).unwrap();
+    assert_eq!(store.appearance().unwrap(), Appearance::default());
+
+    let chosen = Appearance {
+        accent: Accent::Blue,
+        glass: Glass::Solid,
+        interface_font: Font::Named("Menlo".into()),
+        interface_size: TextSize::new(15),
+        chat_width: ChatWidth::Wide,
+        ..Appearance::default()
+    };
+    store.set_appearance(&chosen);
+    assert!(store.flush(FLUSH));
+    drop(store);
+    let store = Store::open_in(home.path()).unwrap();
+    assert_eq!(store.appearance().unwrap(), chosen);
+
+    rusqlite::Connection::open(store.path())
+        .unwrap()
+        .execute(
+            "UPDATE app_state SET value = 'not json' WHERE key = 'appearance'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(store.appearance().unwrap(), Appearance::default());
+}

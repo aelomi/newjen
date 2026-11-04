@@ -20,9 +20,9 @@ pub fn assistant(body: impl IntoElement, _: &App) -> Div {
 }
 
 pub fn user(text: String, _: &App) -> Message {
-    Message::new()
-        .alignment(MessageAlignment::End)
-        .content(MessageContent::new().bubble(Bubble::new().child(text)))
+    Message::new().alignment(MessageAlignment::End).content(
+        MessageContent::new().bubble(Bubble::new().with_variant(BubbleVariant::Muted).child(text)),
+    )
 }
 
 /// What sits beside a message of the user's that has not gone through yet.
@@ -69,7 +69,7 @@ pub fn user_pending(id: ElementId, text: String, pending: Pending, cx: &App) -> 
         .alignment(MessageAlignment::End)
         .content(
             MessageContent::new().bubble(
-                Bubble::new().child(
+                Bubble::new().with_variant(BubbleVariant::Muted).child(
                     div()
                         .debug_selector(|| "not-sent-text".to_string())
                         .child(text),

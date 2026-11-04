@@ -6,11 +6,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    Action as _, AnyElement, App, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    AnyElement, App, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
     prelude::FluentBuilder as _, px, relative,
 };
-use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::base::{Selectable as _, h_flex, v_flex};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use newjen_core::picker::{self, reset_time};
@@ -20,7 +20,7 @@ use newjen_core::usage::{self, Pace, ProviderUsage, UsageCredits, UsageStatus, U
 use newjen_core::{Status, Store};
 
 use crate::format::{as_of, compact_tokens, dollars, model_name, span, thousands};
-use crate::keys::Settings;
+use crate::keys::OpenSettings;
 use crate::sidebar::{OnPress, compact_time};
 use crate::theme::material;
 use crate::ui;
@@ -1079,14 +1079,21 @@ fn tone_ink(tone: Tone, cx: &App) -> Hsla {
 }
 
 /// The row at the foot of the sidebar: the settings gear at the left, the usage ring at the
-/// right. The ring opens the Usage view.
-pub fn footer(gauge: Option<&Gauge>, selected: bool, on_usage: OnPress, cx: &App) -> AnyElement {
+/// right. The gear opens Settings and the ring the Usage view.
+pub fn footer(
+    gauge: Option<&Gauge>,
+    selected: bool,
+    on_usage: OnPress,
+    (settings_open, on_settings): (bool, OnPress),
+    cx: &App,
+) -> AnyElement {
     let gear = ui::icon_button("settings", ui::IconName::Settings, "Settings", cx)
-        .tooltip_with_action("Settings", &Settings, None)
+        .tooltip_with_action("Settings", &OpenSettings, Some(crate::keys::CONTEXT))
         .tooltip_show_delay(TOOLTIP_DELAY)
         .debug_selector(|| "settings".to_string())
         .size(px(ICON_BUTTON))
-        .on_click(|_, window, cx| window.dispatch_action(Settings.boxed_clone(), cx));
+        .selected(settings_open)
+        .on_click(move |_, window, cx| on_settings(window, cx));
     div()
         .flex_none()
         .px_2()
@@ -1389,15 +1396,18 @@ mod tests {
     struct Harness {
         gauge: Option<Gauge>,
         opened: Rc<std::cell::Cell<u32>>,
+        settings: Rc<std::cell::Cell<u32>>,
     }
 
     impl gpui::Render for Harness {
         fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
             let opened = self.opened.clone();
+            let settings = self.settings.clone();
             footer(
                 self.gauge.as_ref(),
                 false,
                 Rc::new(move |_, _| opened.set(opened.get() + 1)),
+                (false, Rc::new(move |_, _| settings.set(settings.get() + 1))),
                 cx,
             )
         }
@@ -1413,15 +1423,12 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let settings = Rc::new(std::cell::Cell::new(0));
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            let settings = settings.clone();
-            cx.on_action(move |_: &Settings, _| settings.set(settings.get() + 1));
-        });
+        cx.update(gpui_kit::init);
         let opened = Rc::new(std::cell::Cell::new(0));
         let (_, cx) = cx.add_window_view(|_, _| Harness {
             gauge: None,
             opened: opened.clone(),
+            settings: settings.clone(),
         });
         assert!(cx.debug_bounds("usage-label").is_none());
         click(cx, "settings");
@@ -1442,6 +1449,7 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, _| Harness {
             gauge: near,
             opened: Rc::default(),
+            settings: Rc::default(),
         });
         assert!(cx.debug_bounds("usage-label").is_some());
         let calm = gauge(
@@ -1452,6 +1460,7 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, _| Harness {
             gauge: calm,
             opened: Rc::default(),
+            settings: Rc::default(),
         });
         assert!(cx.debug_bounds("usage-label").is_none());
     }
@@ -1492,6 +1501,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, _| Harness {
             gauge: None,
             opened: Rc::default(),
+            settings: Rc::default(),
         });
         assert_eq!(label_width(cx), None);
         show(&view, near(), cx);
@@ -1520,6 +1530,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, _| Harness {
             gauge: None,
             opened: Rc::default(),
+            settings: Rc::default(),
         });
         show(&view, near(), cx);
         pass(cx, 100);

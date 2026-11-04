@@ -85,18 +85,23 @@ impl ChatView {
         });
         let gauge = usage_view::gauge(&usages, &in_use, now);
         let on_press = self.press(cx, |view, window, cx| view.show_usage(window, cx));
-        usage_view::footer(gauge.as_ref(), self.pane == Pane::Usage, on_press, cx)
+        let on_settings = self.press(cx, |view, window, cx| view.toggle_settings(window, cx));
+        usage_view::footer(
+            gauge.as_ref(),
+            self.pane == Pane::Usage,
+            on_press,
+            (self.pane == Pane::Settings, on_settings),
+            cx,
+        )
     }
 
-    pub(super) fn render_usage_card(
-        &mut self,
+    /// The button that brings the thread list back, when it is out of sight.
+    pub(super) fn pane_list_toggle(
+        &self,
         mode: SidebarMode,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if self.usage_snapshot.is_none() {
-            self.refresh_usage();
-        }
-        let show_list = (mode != SidebarMode::Docked).then(|| {
+    ) -> Option<(OnPress, sidebar::ListBadge)> {
+        (mode != SidebarMode::Docked).then(|| {
             let statuses: Vec<Status> = self
                 .slots
                 .iter()
@@ -108,8 +113,51 @@ impl ChatView {
             };
             let toggle = self.press(cx, |view, window, cx| view.toggle_sidebar(window, cx));
             (toggle, badge)
-        });
-        let header = title_bar::usage_header(show_list, cx);
+        })
+    }
+
+    /// The main card of the Usage or Settings view: its header over its body.
+    pub(super) fn pane_card(
+        id: &'static str,
+        header: AnyElement,
+        body: AnyElement,
+        mode: SidebarMode,
+        cx: &App,
+    ) -> AnyElement {
+        let material = crate::theme::material(cx);
+        let floating = mode == SidebarMode::Docked;
+        v_flex()
+            .id(id)
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(material.card)
+            .when(floating, |main| {
+                main.border_1()
+                    .border_color(material.card_stroke)
+                    .rounded(CARD_RADIUS)
+                    .shadow(material.card_shadow())
+                    .overflow_hidden()
+            })
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    pub(super) fn render_usage_card(
+        &mut self,
+        mode: SidebarMode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.usage_snapshot.is_none() {
+            self.refresh_usage();
+        }
+        let header = title_bar::pane_header(
+            "Usage",
+            "From each CLI's own reports",
+            self.pane_list_toggle(mode, cx),
+            cx,
+        );
         let snapshot = self.usage_snapshot.clone().unwrap_or_default();
         let openable: Vec<String> = snapshot
             .threads
@@ -134,23 +182,6 @@ impl ChatView {
             },
             cx,
         );
-        let material = crate::theme::material(cx);
-        let floating = mode == SidebarMode::Docked;
-        v_flex()
-            .id("usage-card")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .bg(material.card)
-            .when(floating, |main| {
-                main.border_1()
-                    .border_color(material.card_stroke)
-                    .rounded(CARD_RADIUS)
-                    .shadow(material.card_shadow())
-                    .overflow_hidden()
-            })
-            .child(header)
-            .child(body)
-            .into_any_element()
+        Self::pane_card("usage-card", header, body, mode, cx)
     }
 }

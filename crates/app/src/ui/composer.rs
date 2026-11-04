@@ -1,6 +1,5 @@
 use std::rc::Rc;
 
-use gpui::Focusable as _;
 use std::cell::Cell;
 
 use gpui::{
@@ -77,7 +76,7 @@ impl Composer {
 }
 
 impl RenderOnce for Composer {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let ready = !self.field.read(cx).value().trim().is_empty();
         let name = self.field.read(cx).presentation().placeholder().clone();
         let send = match &self.footer {
@@ -85,11 +84,6 @@ impl RenderOnce for Composer {
             Footer::Stop(_) | Footer::Cancel(_) | Footer::Wait(_) | Footer::Disabled(_) => None,
         };
         let waiting = matches!(self.footer, Footer::Wait(_) | Footer::Disabled(_));
-        let focused = self
-            .field
-            .read(cx)
-            .focus_handle(cx)
-            .contains_focused(window, cx);
         let (status, button) = match self.footer {
             Footer::Cancel(cancel) => (
                 None,
@@ -186,11 +180,7 @@ impl RenderOnce for Composer {
             .py_2()
             .rounded_xl()
             .border_1()
-            .border_color(if focused {
-                cx.theme().ring
-            } else {
-                material.card_stroke
-            })
+            .border_color(cx.theme().input)
             .bg(material.glass_hover)
             .child(
                 div()
@@ -227,7 +217,9 @@ impl RenderOnce for Composer {
 mod tests {
     use super::*;
     use crate::keys;
-    use gpui::{AppContext, FocusHandle, Render, TestAppContext, VisualTestContext};
+    use gpui::{
+        AppContext, FocusHandle, Focusable as _, Render, TestAppContext, VisualTestContext,
+    };
     use gpui_kit::base::Root;
 
     struct Example {

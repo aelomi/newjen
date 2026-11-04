@@ -1,5 +1,6 @@
 //! Newjen's core: everything except the UI.
 //!
+//! - [`appearance`]: the user's look choices: mode, accent, glass, fonts, sizes, widths.
 //! - [`env`]: login-shell PATH and installed CLI lookup.
 //! - [`providers`]: usage-free sign-in, account, model and limit detection.
 //! - [`protocol`]: the Claude Code CLI's stream-json wire format.
@@ -18,6 +19,7 @@
 //! the core can be tested headlessly.
 
 pub mod agent;
+pub mod appearance;
 mod approval_text;
 pub mod calendar;
 pub mod changelog;
