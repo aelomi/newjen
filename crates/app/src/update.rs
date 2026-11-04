@@ -196,7 +196,12 @@ impl UpdateModel {
                 store.set_failed_update_version(&failure.version);
             }
             let news = changelog::whats_new_on_launch(&store, &current, launched_at);
-            let failed = store.failed_update_version().ok().flatten();
+            // The store writes on its own thread, so a failure recorded just now may not be
+            // readable yet: it is the answer, and the store only fills in an earlier one.
+            let failed = failure
+                .as_ref()
+                .map(|failure| failure.version.clone())
+                .or_else(|| store.failed_update_version().ok().flatten());
             (failure, news, failed)
         });
         self._quiet_checks = Some(cx.spawn(async move |this, cx| {
