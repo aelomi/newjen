@@ -24,6 +24,7 @@ pub fn icon(name: IconName, size: gpui_kit::component::Size, color: Hsla) -> Ico
 
 mod code;
 mod copy;
+mod fox;
 mod message;
 mod motion;
 mod popover;
