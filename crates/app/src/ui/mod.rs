@@ -34,6 +34,7 @@ mod step;
 mod tool_card;
 pub use code::CodeBlock;
 pub use copy::CopyButton;
+pub use fox::FoxGame;
 pub use message::{ErrorNotice, Pending, assistant, user, user_pending};
 pub use motion::Chevron;
 pub use popover::{popover_surface, solid_popover_surface};

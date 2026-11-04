@@ -11,6 +11,7 @@ Every user-visible change adds a line under `## Unreleased`, in one of four grou
 - The thread list is an inbox. A Queue holds what waits on you, finished threads you have read sit below it, working threads tuck into an In flight tray, and Snoozed and Settled open as panels at the bottom.
 - Snooze a thread until later today, tomorrow or next Monday, settle it when you are done, or pin it to the top. Hover a row for Snooze and Settle, or right-click it.
 - Archive all in the Settled panel removes every settled thread after one confirmation.
+- When the list is empty, a spirit fox runner game fills the space while you wait. Click it to play and press Space to jump. It steps aside when a thread lands.
 
 ### Improvements
 

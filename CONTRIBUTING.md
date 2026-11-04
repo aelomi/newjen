@@ -47,7 +47,7 @@ crates/
           #   src/sidebar.rs (+ sidebar/dock.rs, sidebar/motion.rs): the thread list (Pinned, a Queue of what waits on you, then the read list) with the In flight, Snoozed and Settled dock under it, and a settings gear and a usage ring at its foot (the ring opens the Usage view). `motion.rs` keeps a row that changes place on screen while it fades out and eases the arrival in.
           #   src/context_chip.rs: the composer's context chip and its "This thread" popover. src/usage_view.rs: the Usage view (plan windows with pace, threads in the current windows, a week of tokens).
           #   src/terminal.rs: the per-thread terminal panel. src/attention.rs: AppKit badge and notification adapters.
-          #   src/theme.rs: the sidebar width, the card inset and radius, and the material tokens. src/ui/: approval card, tool card, thin Kit helpers and style wrappers (`card`, `glass_title_bar`, `card_title_bar`).
+          #   src/theme.rs: the sidebar width, the card inset and radius, and the material tokens. src/ui/: approval card, tool card, thin Kit helpers and style wrappers (`card`, `glass_title_bar`, `card_title_bar`). `ui/fox.rs` is the spirit fox runner game (`FoxGame`) that `chat_view.rs` shows under the thread list while it holds no Pinned, Queue or read thread.
           #   src/assets.rs: extra Kit icons. THIRD-PARTY-NOTICES.md: embedded Lucide icon licenses.
 design/   # newjen.pen: pen.dev mocks of every UI state. Mock UI changes here first.
 docs/     # PLAN.md, git.md (checkpoints, changes and the git button) and research memos.

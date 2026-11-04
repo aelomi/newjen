@@ -54,14 +54,14 @@ pub const NEEDS_APPROVAL: &str = "Needs approval";
 
 pub const MAKING_COPY_DETAIL: &str = "Creating a worktree…";
 
-/// What the list says when it has no thread yet (screen 12, "Empty").
-pub const EMPTY_LIST: &str = "No threads yet. Your first message starts one.";
-
-/// What the empty list says while threads work in the tray.
+/// What the game's title says while threads work in the tray.
 pub const NOTHING_NEEDS_YOU: &str = "Nothing needs you";
 
-/// What the empty list says when nothing is in flight either.
+/// What the game's title says when nothing is in flight either.
 pub const ALL_CLEAR: &str = "All clear";
+
+/// How far the game sits above the foot of the list, which is the top of the dock.
+pub const GAME_LIFT: Pixels = px(30.);
 
 /// Secondary text on the glass: a row's detail line.
 pub fn muted(cx: &App) -> gpui::Hsla {
@@ -478,28 +478,24 @@ pub fn shifted(ix: usize, removed: usize) -> usize {
     if removed < ix { ix - 1 } else { ix }
 }
 
-/// Whether the list counts as empty: no thread in the scrolling list, and no draft but the one
-/// on screen. Threads in the tray or a panel do not count, so the empty element shows whenever
-/// the list has nothing to read.
-pub fn is_empty_list(threads: &[Listed]) -> bool {
-    threads.iter().filter(|thread| thread.draft).count() <= 1
-        && threads.iter().all(|thread| {
-            thread.draft
-                || matches!(
-                    thread.placement,
-                    Placement::InFlight | Placement::Snoozed | Placement::Settled
-                )
-        })
+/// Whether the spirit fox game fills the list: no thread in Pinned, the Queue or the read
+/// list. Drafts do not count, so a lone "New thread" draft row still has the game below it, and
+/// neither do the In flight tray, Snoozed or Settled.
+pub fn shows_game(threads: &[Listed]) -> bool {
+    threads.iter().all(|thread| {
+        thread.draft
+            || matches!(
+                thread.placement,
+                Placement::InFlight | Placement::Snoozed | Placement::Settled
+            )
+    })
 }
 
-/// What the empty list says: the first-run line while there is no thread at all, else that
-/// nothing waits, or that all is clear when nothing is in flight either.
-pub fn empty_caption_text(threads: &[Listed]) -> &'static str {
-    if threads.iter().all(|thread| thread.draft) {
-        EMPTY_LIST
-    } else if threads
+/// The game's title: that nothing needs you while a thread works in the tray, else all clear.
+pub fn game_title(threads: &[Listed]) -> &'static str {
+    if threads
         .iter()
-        .any(|thread| thread.placement == Placement::InFlight)
+        .any(|thread| !thread.draft && thread.placement == Placement::InFlight)
     {
         NOTHING_NEEDS_YOU
     } else {
@@ -685,15 +681,23 @@ pub fn column(header: AnyElement, list: Vec<AnyElement>, cx: &App) -> gpui::Div 
         .child(v_flex().flex_1().min_h_0().px_2().children(list))
 }
 
-/// What the empty list says (see [`empty_caption_text`]).
-pub fn empty_caption(text: &'static str, cx: &App) -> AnyElement {
+/// The scrolling list with the game anchored over its foot, just above the dock.
+pub fn list_area(list: impl IntoElement, game: impl IntoElement) -> gpui::Div {
     div()
-        .px_2p5()
-        .py_2()
-        .text_sm()
-        .text_color(crate::theme::material(cx).glass_muted)
-        .child(text)
-        .into_any_element()
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(list)
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(GAME_LIFT)
+                .child(game),
+        )
 }
 
 /// Which edge the old value of a crossfading count lines up with.
@@ -1281,18 +1285,16 @@ mod tests {
     }
 
     #[test]
-    fn only_a_lone_draft_and_parked_threads_make_an_empty_list() {
+    fn the_game_shows_until_a_thread_sits_in_the_list() {
         use Placement::*;
-        assert!(is_empty_list(&[]));
-        assert!(is_empty_list(&[listed(true, Read)]));
-        assert!(!is_empty_list(&[listed(false, Read)]));
-        assert!(!is_empty_list(&[listed(false, Queue)]));
-        assert!(!is_empty_list(&[listed(false, Pinned)]));
-        // A draft beside a read thread, or two drafts, are rows of their own.
-        assert!(!is_empty_list(&[listed(true, Read), listed(false, Read)]));
-        assert!(!is_empty_list(&[listed(true, Read), listed(true, Read)]));
-        // Threads in the tray or a panel leave the list empty.
-        assert!(is_empty_list(&[
+        assert!(shows_game(&[]));
+        assert!(shows_game(&[listed(true, Read)]));
+        assert!(shows_game(&[listed(true, Read), listed(true, Read)]));
+        assert!(!shows_game(&[listed(false, Read)]));
+        assert!(!shows_game(&[listed(false, Queue)]));
+        assert!(!shows_game(&[listed(false, Pinned)]));
+        assert!(!shows_game(&[listed(true, Read), listed(false, Read)]));
+        assert!(shows_game(&[
             listed(true, Read),
             listed(false, InFlight),
             listed(false, Snoozed),
@@ -1301,15 +1303,15 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_list_says_what_is_going_on() {
+    fn the_games_title_says_whether_anything_is_in_flight() {
         use Placement::*;
-        assert_eq!(empty_caption_text(&[listed(true, Read)]), EMPTY_LIST);
+        assert_eq!(game_title(&[listed(true, Read)]), ALL_CLEAR);
         assert_eq!(
-            empty_caption_text(&[listed(true, Read), listed(false, Settled)]),
+            game_title(&[listed(true, Read), listed(false, Settled)]),
             ALL_CLEAR
         );
         assert_eq!(
-            empty_caption_text(&[listed(true, Read), listed(false, InFlight)]),
+            game_title(&[listed(true, Read), listed(false, InFlight)]),
             NOTHING_NEEDS_YOU
         );
     }

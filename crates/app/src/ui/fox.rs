@@ -1,4 +1,7 @@
-#![expect(dead_code, reason = "the sidebar mounts the fox in a later slice")]
+#![expect(
+    dead_code,
+    reason = "the tests and the PNG example read parts of the game that the sidebar does not"
+)]
 
 pub(crate) mod model {
     pub const WIDTH: f32 = 239.0;
@@ -1999,11 +2002,11 @@ mod art {
 
 use art::{Fx, Hud, Prim, Pt, Shape};
 use gpui::{
-    AnyElement, Bounds, Context, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseUpEvent,
-    ParentElement as _, PathBuilder, Pixels, Render, Rgba, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, canvas, div, fill,
-    point, px, size,
+    AnyElement, App, Bounds, Context, FocusHandle, Focusable, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render, Rgba,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, canvas,
+    div, fill, point, px, size,
 };
 use model::{HEIGHT, Phase, Runner, WIDTH};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2104,6 +2107,16 @@ impl FoxGame {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_shown(&self) -> bool {
+        self.shown
+    }
+
+    #[cfg(test)]
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
     fn settle_hidden(&mut self, cx: &mut Context<Self>) {
         if !self.shown && self.runner.phase() != Phase::Idle {
             self.runner.rest();
@@ -2181,6 +2194,12 @@ impl FoxGame {
     fn on_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
         self.fx.set_hover(*hovered && self.shown);
         cx.notify();
+    }
+}
+
+impl Focusable for FoxGame {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 

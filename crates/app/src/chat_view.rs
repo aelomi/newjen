@@ -266,6 +266,9 @@ pub struct ChatView {
     drawer_open: bool,
     drawer_focus: FocusHandle,
     list_scroll: ScrollHandle,
+    /// The spirit fox game under the list. It lives as long as the view and is only shown while
+    /// the list has no thread to read (see `sidebar::shows_game`).
+    fox: Entity<ui::FoxGame>,
     /// The list scrolls to the thread on screen the next time it is drawn.
     reveal_active: Cell<bool>,
     /// Rows that change place stay on screen while they leave (see `sidebar::Motion`).
@@ -381,6 +384,7 @@ impl ChatView {
             drawer_open: false,
             drawer_focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
+            fox: cx.new(|cx| ui::FoxGame::new(window, cx)),
             reveal_active: Cell::new(false),
             motion: RefCell::new(sidebar::Motion::default()),
             frame: RefCell::new(sidebar::Frame::default()),
@@ -2816,13 +2820,8 @@ impl ChatView {
     fn render_list(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let listed = self.listed(cx);
         let layout = sidebar::display_order(&listed);
-        let mut rows = self.render_entries(&layout, cx);
-        if sidebar::is_empty_list(&listed) {
-            rows.push(sidebar::empty_caption(
-                sidebar::empty_caption_text(&listed),
-                cx,
-            ));
-        }
+        let rows = self.render_entries(&layout, cx);
+        self.sync_fox(&listed, window, cx);
         let bar = sidebar::ProjectBar {
             name: self.project_name.clone(),
             on_switch: self.project_chooser.clone(),
@@ -2840,8 +2839,11 @@ impl ChatView {
         });
         let dim = self.frame.borrow().raised.dim;
         let dimmed = dim > 0.;
-        let list = sidebar::list_panel(&self.list_scroll, rows)
-            .when(dimmed, |list| list.opacity(1. - 0.5 * dim));
+        let list = sidebar::list_area(
+            sidebar::list_panel(&self.list_scroll, rows),
+            self.fox.clone(),
+        )
+        .when(dimmed, |list| list.opacity(1. - 0.5 * dim));
         let dock = self.render_thread_dock(&layout, window, cx);
         let usage = self.render_usage_row(cx);
         let usage = if dimmed {
@@ -2859,6 +2861,20 @@ impl ChatView {
             .chain(self.render_update_row(cx))
             .chain([usage])
             .collect()
+    }
+
+    /// Shows the game while the list has nothing to read and hides it the moment a row lands. A
+    /// game that held the keyboard gives it back to the composer when it goes.
+    fn sync_fox(&self, listed: &[sidebar::Listed], window: &Window, cx: &mut Context<Self>) {
+        let shown = sidebar::shows_game(listed);
+        let title = sidebar::game_title(listed);
+        self.fox.update(cx, |fox, cx| {
+            fox.set_title(title, cx);
+            fox.set_shown(shown, cx);
+        });
+        if !shown && self.fox.focus_handle(cx).is_focused(window) {
+            cx.defer_in(window, |view, window, cx| view.focus_panel(window, cx));
+        }
     }
 
     fn render_thread_dock(
