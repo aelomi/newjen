@@ -10,8 +10,8 @@ mod dock;
 mod motion;
 
 pub use dock::{
-    Clock, Dock, Flight, Fold, Panel, PanelGroup, PanelRow, SheetKind, TRAY_ROWS, TrayItem,
-    TrayRow, dock,
+    Clock, Confirm, Dock, Flight, Fold, Panel, PanelGroup, PanelRow, SheetKind, TRAY_ROWS,
+    TrayItem, TrayRow, dock,
 };
 pub use motion::{
     Counted, Counter, Frame, HEADER_HEIGHT, Key, Lane, Look, Motion, Sight, Zone, slot,

@@ -51,10 +51,15 @@ impl SheetKind {
         }
     }
 
-    pub fn bulk_label(self) -> &'static str {
-        match self {
-            Self::Snoozed => "Wake all",
-            Self::Settled => "Archive all",
+    /// The button over the rows: "Archive all", or "Archive 3" while a filter leaves 3 of them.
+    pub fn bulk_label(self, filtered: Option<usize>) -> String {
+        let verb = match self {
+            Self::Snoozed => "Wake",
+            Self::Settled => "Archive",
+        };
+        match filtered {
+            Some(count) => format!("{verb} {count}"),
+            None => format!("{verb} all"),
         }
     }
 }
@@ -140,12 +145,22 @@ pub struct PanelGroup {
     pub rows: Vec<PanelRow>,
 }
 
+/// The question "Archive N threads?" and what it needs to be worded right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Confirm {
+    pub count: usize,
+    /// At least one of the threads works in a worktree of its own.
+    pub copies: bool,
+}
+
 pub struct Panel {
     pub kind: SheetKind,
     pub filter: Entity<InputState>,
     pub groups: Vec<PanelGroup>,
-    /// "Archive N threads?" is asked: the number of threads.
-    pub confirming: Option<usize>,
+    /// The number of rows the filter leaves, while a filter is typed.
+    pub filtered: Option<usize>,
+    /// "Archive N threads?" is asked.
+    pub confirming: Option<Confirm>,
     pub on_bulk: OnPress,
     pub on_cancel: OnPress,
     pub on_confirm: OnPress,
@@ -164,12 +179,19 @@ pub fn more_label(total: usize) -> Option<String> {
     (total > TRAY_ROWS).then(|| format!("+{} more", total - TRAY_ROWS))
 }
 
-/// "Archive 3 threads? Their copies are removed for good."
-pub fn archive_question(count: usize) -> String {
-    format!(
-        "Archive {count} {}? Their copies are removed for good.",
+/// "Archive 3 threads?", and "Their copies are removed for good." when a worktree goes with
+/// them.
+pub fn archive_question(confirm: Confirm) -> String {
+    let Confirm { count, copies } = confirm;
+    let question = format!(
+        "Archive {count} {}?",
         if count == 1 { "thread" } else { "threads" }
-    )
+    );
+    if copies {
+        format!("{question} Their copies are removed for good.")
+    } else {
+        question
+    }
 }
 
 fn separator(cx: &App) -> AnyElement {
@@ -423,7 +445,7 @@ fn sheet(
     };
     let on_dismiss = panel.on_dismiss.clone();
     let bar = match panel.confirming {
-        Some(count) => confirm_bar(count, &panel, cx),
+        Some(confirm) => confirm_bar(confirm, &panel, cx),
         None => filter_bar(&panel, cx),
     };
     let body = v_flex()
@@ -560,12 +582,12 @@ fn filter_bar(panel: &Panel, cx: &App) -> AnyElement {
                         .on_click(move |_, window, cx| on_bulk(window, cx))
                 })
                 .when(!enabled, |label| label.opacity(0.4))
-                .child(panel.kind.bulk_label()),
+                .child(panel.kind.bulk_label(panel.filtered)),
         )
         .into_any_element()
 }
 
-fn confirm_bar(count: usize, panel: &Panel, cx: &App) -> AnyElement {
+fn confirm_bar(confirm: Confirm, panel: &Panel, cx: &App) -> AnyElement {
     let on_cancel = panel.on_cancel.clone();
     let on_confirm = panel.on_confirm.clone();
     let pill = |id: &'static str, label: &'static str| {
@@ -597,7 +619,7 @@ fn confirm_bar(count: usize, panel: &Panel, cx: &App) -> AnyElement {
                 .text_size(px(11.5))
                 .line_height(px(15.))
                 .text_color(muted(cx))
-                .child(archive_question(count)),
+                .child(archive_question(confirm)),
         )
         .child(
             pill("sheet-cancel", "Cancel")
@@ -696,14 +718,25 @@ mod tests {
     }
 
     #[test]
-    fn the_archive_question_counts_threads() {
+    fn the_archive_question_counts_threads_and_names_copies_only_when_there_are_some() {
+        let ask = |count, copies| archive_question(Confirm { count, copies });
         assert_eq!(
-            archive_question(28),
+            ask(28, true),
             "Archive 28 threads? Their copies are removed for good."
         );
         assert_eq!(
-            archive_question(1),
+            ask(1, true),
             "Archive 1 thread? Their copies are removed for good."
         );
+        assert_eq!(ask(28, false), "Archive 28 threads?");
+        assert_eq!(ask(1, false), "Archive 1 thread?");
+    }
+
+    #[test]
+    fn the_bulk_button_says_all_until_a_filter_narrows_it() {
+        assert_eq!(SheetKind::Settled.bulk_label(None), "Archive all");
+        assert_eq!(SheetKind::Snoozed.bulk_label(None), "Wake all");
+        assert_eq!(SheetKind::Settled.bulk_label(Some(3)), "Archive 3");
+        assert_eq!(SheetKind::Snoozed.bulk_label(Some(1)), "Wake 1");
     }
 }

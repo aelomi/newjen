@@ -3092,10 +3092,14 @@ impl ChatView {
                 .into_iter()
                 .map(|(label, rows)| sidebar::PanelGroup { label, rows })
                 .collect(),
-            confirming: sheet
-                .confirming
-                .as_ref()
-                .map(|asked| self.still_settled(asked, cx).len()),
+            filtered: (!query.is_empty()).then_some(shown.len()),
+            confirming: sheet.confirming.as_ref().map(|asked| {
+                let ids = self.still_settled(asked, cx);
+                sidebar::Confirm {
+                    count: ids.len(),
+                    copies: self.any_copy(&ids, cx),
+                }
+            }),
             on_bulk,
             on_cancel,
             on_confirm,
@@ -3105,6 +3109,14 @@ impl ChatView {
             live: self.sheet.is_some(),
             measured: self.sheet_height.clone(),
         }
+    }
+
+    /// Whether any of the threads works in a worktree of its own.
+    fn any_copy(&self, ids: &[String], cx: &App) -> bool {
+        ids.iter().any(|id| {
+            self.index_of(id, cx)
+                .is_some_and(|ix| self.slots[ix].thread.read(cx).copy().is_some())
+        })
     }
 
     /// The threads among `ids` that are still settled. A thread can leave Settled while a

@@ -2335,6 +2335,17 @@ fn add_idle_thread(
     unread: bool,
     list: newjen_core::store::ListState,
 ) -> String {
+    add_idle_thread_in(chat, cx, title, unread, list, None)
+}
+
+fn add_idle_thread_in(
+    chat: &Entity<ChatView>,
+    cx: &mut VisualTestContext,
+    title: &str,
+    unread: bool,
+    list: newjen_core::store::ListState,
+    copy: Option<newjen_core::worktree::Worktree>,
+) -> String {
     cx.update(|window, cx| {
         chat.update(cx, |view, cx| {
             let id = format!("5a0c1f4e-2b1e-4c8e-9a51-{:012}", view.slots.len());
@@ -2355,7 +2366,7 @@ fn add_idle_thread(
                 created_at: 1,
                 updated_at: 1,
                 archived_at: None,
-                copy: None,
+                copy,
                 review_base: None,
                 landing_resolved: false,
                 snapshot_needed: false,
@@ -2795,6 +2806,75 @@ async fn choosing_a_row_in_a_panel_gives_the_keyboard_to_its_thread(cx: &mut Tes
         assert_eq!(composer, !dock);
         let_motion_finish(&chat, cx);
     }
+    finish(&chat, path, cx);
+}
+
+fn panel_words(
+    chat: &Entity<ChatView>,
+    cx: &mut VisualTestContext,
+) -> (Option<usize>, Option<sidebar::Confirm>) {
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            let layout = view.sidebar_layout(cx);
+            let sheet = view.sheet.take().unwrap();
+            let panel = view.sheet_panel(&sheet, &layout, window, cx);
+            view.sheet = Some(sheet);
+            (panel.filtered, panel.confirming)
+        })
+    })
+}
+
+#[gpui::test]
+async fn the_panel_names_the_filtered_count_and_the_copies_only_when_there_are_some(
+    cx: &mut TestAppContext,
+) {
+    let (chat, path, cx) = setup(cx, "panel-words", true);
+    let worktree = newjen_core::worktree::Worktree {
+        path: path.join("copy"),
+        workdir: path.join("copy"),
+        source: path.clone(),
+        branch: "newjen/test".into(),
+        base: "0123456789abcdef0123456789abcdef01234567".into(),
+    };
+    add_idle_thread(&chat, cx, "alpha one", false, settled_list(5));
+    add_idle_thread(&chat, cx, "alpha two", false, settled_list(6));
+    add_idle_thread_in(&chat, cx, "beta", false, settled_list(7), Some(worktree));
+    let_motion_finish(&chat, cx);
+    click(cx, "disclosure-settled");
+    cx.run_until_parked();
+    assert_eq!(panel_words(&chat, cx), (None, None));
+
+    cx.update(|window, cx| {
+        let filter = chat.read(cx).sheet.as_ref().unwrap().filter.clone();
+        filter.update(cx, |input, cx| input.set_value("alpha", window, cx));
+    });
+    assert_eq!(panel_words(&chat, cx).0, Some(2));
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    assert_eq!(
+        panel_words(&chat, cx).1,
+        Some(sidebar::Confirm {
+            count: 2,
+            copies: false
+        }),
+        "no worktree goes with these two"
+    );
+
+    click(cx, "sheet-cancel");
+    cx.update(|window, cx| {
+        let filter = chat.read(cx).sheet.as_ref().unwrap().filter.clone();
+        filter.update(cx, |input, cx| input.set_value("", window, cx));
+    });
+    assert_eq!(panel_words(&chat, cx).0, None);
+    click(cx, "sheet-bulk");
+    cx.run_until_parked();
+    assert_eq!(
+        panel_words(&chat, cx).1,
+        Some(sidebar::Confirm {
+            count: 3,
+            copies: true
+        })
+    );
     finish(&chat, path, cx);
 }
 
