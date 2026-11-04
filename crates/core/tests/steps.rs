@@ -250,6 +250,8 @@ fn a_codex_thread_moves_from_the_queue_to_read() {
     let key = thread.transcript().pending_approval().unwrap().key();
     thread.answer(Some(key), Intent::AllowOnce).unwrap();
     until(&mut thread, |thread| !thread.status().is_busy());
+    assert_eq!(thread.placement(NOW_MS), Placement::Queue);
+    thread.set_active(true);
     assert_eq!(thread.placement(NOW_MS), Placement::Read);
     assert_eq!(thread.activity_line(NOW).as_deref(), Some("Answered"));
     let blocks = thread.work_blocks();

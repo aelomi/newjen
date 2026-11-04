@@ -19,6 +19,7 @@
 
 pub mod agent;
 mod approval_text;
+pub mod calendar;
 pub mod changelog;
 pub mod changes;
 pub mod commit_message;
