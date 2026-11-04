@@ -46,6 +46,9 @@ pub use tool_card::{ToolBody, ToolCard};
 mod gauge;
 pub use gauge::{GaugeLabel, GaugeLook, UsageGauge};
 
+mod tween;
+pub use tween::Tween;
+
 mod message_list;
 pub use message_list::MessageList;
 

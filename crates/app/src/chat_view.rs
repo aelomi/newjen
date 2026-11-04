@@ -266,6 +266,12 @@ pub struct ChatView {
     drawer_open: bool,
     drawer_focus: FocusHandle,
     list_scroll: ScrollHandle,
+    /// The list scrolls to the thread on screen the next time it is drawn.
+    reveal_active: Cell<bool>,
+    /// Rows that change place stay on screen while they leave (see `sidebar::Motion`).
+    motion: RefCell<sidebar::Motion>,
+    /// What the list shows this render, with each ghost and how far along each element is.
+    frame: RefCell<sidebar::Frame>,
     hold: RefCell<Option<(String, ThreadPlacement)>>,
     sheet: Option<Sheet>,
     dock_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
@@ -372,6 +378,9 @@ impl ChatView {
             drawer_open: false,
             drawer_focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
+            reveal_active: Cell::new(false),
+            motion: RefCell::new(sidebar::Motion::default()),
+            frame: RefCell::new(sidebar::Frame::default()),
             hold: RefCell::new(None),
             sheet: None,
             dock_bounds: Rc::default(),
@@ -504,6 +513,7 @@ impl ChatView {
 
     pub fn set_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = visible;
+        self.motion.get_mut().snap();
         if visible {
             self.enter(window, cx);
         } else {
@@ -944,10 +954,7 @@ impl ChatView {
         } else if self.pane == Pane::Usage {
             self.focus_panel(window, cx);
         }
-        let layout = self.sidebar_layout(cx);
-        if let Some(at) = sidebar::entry_of(&layout, self.active) {
-            self.list_scroll.scroll_to_item(at);
-        }
+        self.reveal_active.set(true);
         cx.notify();
     }
 
@@ -1851,6 +1858,7 @@ impl ChatView {
         }
         let order = self.thread_order(cx);
         if let Some(place) = sidebar::jump(jump.0, order.len()) {
+            self.motion.get_mut().snap();
             self.show(order[place], window, cx);
         }
     }
@@ -1862,6 +1870,7 @@ impl ChatView {
             return;
         };
         if let Some(place) = sidebar::step(at, order.len(), forward) {
+            self.motion.get_mut().snap();
             self.show(order[place], window, cx);
         }
     }
@@ -1880,6 +1889,7 @@ impl ChatView {
         let order = self.thread_order(cx);
         let needs = self.needs_you(cx);
         if let Some(target) = sidebar::next_needs_you(&order, self.active, &needs) {
+            self.motion.get_mut().snap();
             self.show(target, window, cx);
             return;
         }
@@ -2801,7 +2811,7 @@ impl ChatView {
     fn render_list(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let listed = self.listed(cx);
         let layout = sidebar::display_order(&listed);
-        let mut rows = self.render_entries(&layout.entries, cx);
+        let mut rows = self.render_entries(&layout, cx);
         if sidebar::is_empty_list(&listed) {
             rows.push(sidebar::empty_caption(
                 sidebar::empty_caption_text(&listed),
@@ -2864,11 +2874,20 @@ impl ChatView {
             .sheet
             .as_ref()
             .map(|sheet| self.sheet_panel(sheet, layout, window, cx));
+        let frame = self.frame.borrow();
+        let fold = |kind: sidebar::SheetKind, counter: sidebar::Counter| {
+            frame
+                .item(&sidebar::Key::Disclosure(kind))
+                .map(|item| sidebar::Fold {
+                    count: frame.counted(counter),
+                    look: item.look,
+                })
+        };
         sidebar::dock(
             sidebar::Dock {
                 tray,
-                snoozed: layout.snoozed.len(),
-                settled: layout.settled.len(),
+                snoozed: fold(sidebar::SheetKind::Snoozed, sidebar::Counter::Snoozed),
+                settled: fold(sidebar::SheetKind::Settled, sidebar::Counter::Settled),
                 open: self.sheet.as_ref().map(|sheet| sheet.kind),
                 on_open,
                 panel,
@@ -3082,26 +3101,132 @@ impl ChatView {
         cx.notify();
     }
 
-    fn render_entries(
-        &self,
-        entries: &[sidebar::Entry],
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let now = Instant::now();
-        entries
+    /// Compares what the list shows with the render before, and keeps the rows that are
+    /// leaving on screen until they have faded.
+    fn step_motion(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let listed = self.listed(cx);
+        let layout = sidebar::display_order(&listed);
+        let ids: Vec<SharedString> = self
+            .slots
             .iter()
-            .filter_map(|entry| match *entry {
+            .map(|slot| SharedString::from(slot.thread.read(cx).id().to_string()))
+            .collect();
+        let zone = |ix: usize| sidebar::Zone::of(listed[ix].draft, listed[ix].placement);
+        let mut sight = sidebar::Sight::default();
+        for entry in &layout.entries {
+            match *entry {
                 sidebar::Entry::Header {
                     section,
                     count,
                     needs,
-                } => Some(sidebar::section_header(section, count, needs, cx)),
-                sidebar::Entry::Gap => {
-                    Some(div().flex_none().h(sidebar::READ_GAP).into_any_element())
+                } => {
+                    sight.keys.push(sidebar::Key::Header(section));
+                    match section {
+                        sidebar::Section::Pinned => {
+                            sight.counts.push((sidebar::Counter::Pinned, count));
+                        }
+                        sidebar::Section::Queue => {
+                            sight.counts.push((sidebar::Counter::Queue, count));
+                            sight.counts.push((sidebar::Counter::Need, needs));
+                        }
+                    }
                 }
-                sidebar::Entry::Thread(ix) => self.render_thread_row(ix, now, cx),
-            })
-            .collect()
+                sidebar::Entry::Gap => sight.keys.push(sidebar::Key::Gap),
+                sidebar::Entry::Thread(ix) => {
+                    sight
+                        .keys
+                        .push(sidebar::Key::Row(zone(ix), ids[ix].clone()));
+                }
+            }
+        }
+        sight.zones = ids
+            .iter()
+            .enumerate()
+            .map(|(ix, id)| (id.clone(), zone(ix)))
+            .collect();
+        sight.snoozed = layout.snoozed.len();
+        sight.settled = layout.settled.len();
+        let now = cx.background_executor().now();
+        let frame = self
+            .motion
+            .borrow_mut()
+            .step(now, sight, cx.reduce_motion());
+        if frame.busy {
+            window.request_animation_frame();
+        }
+        *self.frame.borrow_mut() = frame;
+    }
+
+    fn render_entries(&self, layout: &sidebar::Layout, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let frame = self.frame.borrow();
+        let now = Instant::now();
+        let mut motion = self.motion.borrow_mut();
+        let active = self
+            .slots
+            .get(self.active)
+            .map(|slot| slot.thread.read(cx).id().to_string());
+        let mut elements = Vec::new();
+        for item in frame.lane(sidebar::Lane::List) {
+            let content = match &item.key {
+                sidebar::Key::Header(section) => {
+                    let live = layout.entries.iter().find_map(|entry| match *entry {
+                        sidebar::Entry::Header {
+                            section: found,
+                            count,
+                            needs,
+                        } if found == *section => Some((count, needs)),
+                        _ => None,
+                    });
+                    let (count, needs) = match live.filter(|_| !item.ghost) {
+                        Some((count, needs)) => {
+                            motion.remember_header(*section, count, needs);
+                            let shown = match section {
+                                sidebar::Section::Pinned => sidebar::Counter::Pinned,
+                                sidebar::Section::Queue => sidebar::Counter::Queue,
+                            };
+                            (frame.counted(shown), frame.counted(sidebar::Counter::Need))
+                        }
+                        None => {
+                            let (count, needs) = motion.header(*section);
+                            (
+                                sidebar::Counted::steady(count),
+                                sidebar::Counted::steady(needs),
+                            )
+                        }
+                    };
+                    sidebar::section_header(*section, count, needs, cx)
+                }
+                sidebar::Key::Gap => div().flex_none().h(sidebar::READ_GAP).into_any_element(),
+                sidebar::Key::Row(_, id) => {
+                    let live = (!item.ghost).then(|| self.index_of(id, cx)).flatten();
+                    match live {
+                        Some(ix) => {
+                            let Some((row, element)) = self.render_thread_row(ix, now, cx) else {
+                                continue;
+                            };
+                            motion.remember_row(&row);
+                            element
+                        }
+                        None => {
+                            let Some(row) = motion.row(id).cloned() else {
+                                continue;
+                            };
+                            sidebar::thread_row(row, None, Rc::new(|_, _| {}), cx)
+                        }
+                    }
+                }
+                sidebar::Key::Disclosure(_) => continue,
+            };
+            if !item.ghost
+                && matches!(&item.key, sidebar::Key::Row(_, id) if active.as_deref() == Some(id.as_ref()))
+                && self.reveal_active.take()
+            {
+                self.list_scroll.scroll_to_item(elements.len());
+            }
+            elements.push(sidebar::slot(&item.key, item.look, content));
+        }
+        self.reveal_active.set(false);
+        elements
     }
 
     fn render_thread_row(
@@ -3109,7 +3234,7 @@ impl ChatView {
         ix: usize,
         now: Instant,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Option<(sidebar::Row, AnyElement)> {
         let now_ms = now_ms();
         let slot = self.slots.get(ix)?;
         let (id, row, draft_row, pinned) = {
@@ -3141,7 +3266,8 @@ impl ChatView {
             view.show_thread(&shown, window, cx)
         });
         let actions = (!draft_row).then(|| self.row_actions(&id, pinned, cx));
-        Some(sidebar::thread_row(row, actions, on_press, cx))
+        let element = sidebar::thread_row(row.clone(), actions, on_press, cx);
+        Some((row, element))
     }
 
     fn row_actions(
@@ -3214,6 +3340,7 @@ impl ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.step_motion(window, cx);
         if self.terminal_open {
             if self.terminal_focused(window, cx) {
                 self.terminal_wanted = true;

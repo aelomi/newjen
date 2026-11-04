@@ -13,7 +13,9 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 
-use super::{OnOpen, OnPress, count_label, faint, muted, pulse};
+use super::{
+    Counted, Edge, Key, Look, OnOpen, OnPress, count_label, faint, muted, number, pulse, slot,
+};
 use crate::ui::{self, IconName};
 
 /// Rows the tray shows before a quiet "+N more".
@@ -31,7 +33,7 @@ const LIFT: Pixels = px(4.);
 /// A panel row.
 const PANEL_ROW: Pixels = px(32.);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SheetKind {
     Snoozed,
     Settled,
@@ -82,11 +84,18 @@ pub struct TrayRow {
     pub on_press: OnPress,
 }
 
+/// The Snoozed or Settled row while it shows: its count, and how far it has grown or faded.
+#[derive(Clone, Copy)]
+pub struct Fold {
+    pub count: Counted,
+    pub look: Look,
+}
+
 pub struct Dock {
     /// Every thread in flight; the tray shows the first [`TRAY_ROWS`].
     pub tray: Vec<TrayRow>,
-    pub snoozed: usize,
-    pub settled: usize,
+    pub snoozed: Option<Fold>,
+    pub settled: Option<Fold>,
     pub open: Option<SheetKind>,
     pub on_open: OnOpen,
     pub panel: Option<Panel>,
@@ -227,7 +236,7 @@ fn tray_row(row: &TrayRow, dimmed: bool, cx: &App) -> AnyElement {
 
 fn disclosure(
     kind: SheetKind,
-    count: usize,
+    count: Counted,
     open: Option<SheetKind>,
     on_open: &OnOpen,
     cx: &App,
@@ -279,7 +288,7 @@ fn disclosure(
             div()
                 .text_size(px(11.5))
                 .text_color(faint(cx))
-                .child(count_label(count)),
+                .child(number(count, Edge::Right)),
         )
         .into_any_element()
 }
@@ -296,13 +305,13 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
         panel,
         bounds,
     } = dock;
-    if tray.is_empty() && snoozed == 0 && settled == 0 {
+    if tray.is_empty() && snoozed.is_none() && settled.is_none() {
         return None;
     }
     let dimmed = open.is_some();
     let rows_below = |kind: SheetKind| match kind {
-        SheetKind::Snoozed => 1 + usize::from(settled > 0),
-        SheetKind::Settled => 1,
+        SheetKind::Snoozed => 1. + settled.map_or(0., |fold| fold.look.size),
+        SheetKind::Settled => 1.,
     };
     let record = bounds.clone();
     let mut root = v_flex().id("dock").relative().flex_none().pt_0p5().pb(FOOT);
@@ -324,15 +333,18 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
                     .child(more),
             );
         }
-        if snoozed > 0 || settled > 0 {
+        if snoozed.is_some() || settled.is_some() {
             root = root.child(separator(cx));
         }
     }
-    if snoozed > 0 {
-        root = root.child(disclosure(SheetKind::Snoozed, snoozed, open, &on_open, cx));
-    }
-    if settled > 0 {
-        root = root.child(disclosure(SheetKind::Settled, settled, open, &on_open, cx));
+    for (kind, fold) in [(SheetKind::Snoozed, snoozed), (SheetKind::Settled, settled)] {
+        if let Some(fold) = fold {
+            root = root.child(slot(
+                &Key::Disclosure(kind),
+                fold.look,
+                disclosure(kind, fold.count, open, &on_open, cx),
+            ));
+        }
     }
     root = root.child(
         canvas(|_, _, _| {}, move |area, _, _, _| record.set(area))
@@ -340,7 +352,7 @@ pub fn dock(dock: Dock, window: &Window, cx: &App) -> Option<AnyElement> {
             .inset_0(),
     );
     if let Some(panel) = panel {
-        let bottom = FOOT + ROW * rows_below(panel.kind) as f32 + LIFT;
+        let bottom = FOOT + ROW * rows_below(panel.kind) + LIFT;
         root = root.child(sheet(panel, bottom, bounds, window, cx));
     }
     Some(root.into_any_element())

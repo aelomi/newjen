@@ -315,6 +315,12 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     cx.simulate_click(bounds.center(), gpui::Modifiers::default());
 }
 
+fn let_motion_finish(chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+}
+
 fn finish(chat: &Entity<ChatView>, path: PathBuf, cx: &mut VisualTestContext) {
     cx.update(|_, cx| chat.update(cx, |view, cx| view.quit(cx)))
         .unwrap();
@@ -2328,6 +2334,7 @@ async fn a_settled_thread_waits_in_a_panel_that_esc_closes_and_archive_all_asks_
     let id = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
     cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
     cx.run_until_parked();
+    let_motion_finish(&chat, cx);
     cx.update(|_, cx| {
         let layout = chat.read(cx).sidebar_layout(cx);
         assert_eq!(layout.settled, vec![0]);
@@ -2373,7 +2380,49 @@ async fn a_settled_thread_waits_in_a_panel_that_esc_closes_and_archive_all_asks_
         assert!(view.thread().read(cx).is_draft());
         assert!(view.sidebar_layout(cx).settled.is_empty());
     });
+    let_motion_finish(&chat, cx);
     assert!(cx.debug_bounds("disclosure-settled").is_none());
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "settle-motion", true);
+    cx.simulate_input("first thread");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    cx.simulate_keystrokes("cmd-n");
+    cx.run_until_parked();
+    let ghosts = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            chat.read(cx)
+                .frame
+                .borrow()
+                .items
+                .iter()
+                .filter(|item| item.ghost)
+                .count()
+        })
+    };
+    assert_eq!(ghosts(cx), 0);
+    let id = cx.update(|_, cx| chat.read(cx).slots[1].thread.read(cx).id().to_string());
+    cx.update(|_, cx| chat.update(cx, |view, cx| view.settle_thread(&id, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).sidebar_layout(cx).settled.clone()),
+        vec![1]
+    );
+    assert_eq!(ghosts(cx), 2, "the row and the Queue header are leaving");
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.update(|_, cx| chat.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("disclosure-settled").is_none(),
+        "the dock counts it when the row has gone"
+    );
+    let_motion_finish(&chat, cx);
+    assert_eq!(ghosts(cx), 0);
+    assert!(cx.debug_bounds("disclosure-settled").is_some());
     finish(&chat, path, cx);
 }
 

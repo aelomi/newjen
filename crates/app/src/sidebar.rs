@@ -7,8 +7,12 @@
 //! threads.
 
 mod dock;
+mod motion;
 
-pub use dock::{Clock, Dock, Panel, PanelGroup, PanelRow, SheetKind, TrayRow, dock};
+pub use dock::{Clock, Dock, Fold, Panel, PanelGroup, PanelRow, SheetKind, TrayRow, dock};
+pub use motion::{
+    Counted, Counter, Frame, HEADER_HEIGHT, Key, Lane, Look, Motion, Sight, Zone, slot,
+};
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -224,7 +228,7 @@ pub struct Listed {
 }
 
 /// A section of the scrolling list that has a header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Section {
     Pinned,
     Queue,
@@ -328,15 +332,6 @@ pub fn thread_order(layout: &Layout) -> Vec<usize> {
         })
         .chain(layout.in_flight.iter().copied())
         .collect()
-}
-
-/// Where thread `ix` sits among the scrolling list's entries, to scroll to it. A thread in the
-/// tray or a panel has no place there.
-pub fn entry_of(layout: &Layout, ix: usize) -> Option<usize> {
-    layout
-        .entries
-        .iter()
-        .position(|entry| *entry == Entry::Thread(ix))
 }
 
 /// Where the thread on screen shows. It stays in the Queue or the read list where it was when
@@ -698,17 +693,61 @@ pub fn empty_caption(text: &'static str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// Which edge the old value of a crossfading count lines up with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+}
+
+/// A count. While it changes, the old value fades out under the new one fading in.
+pub fn number(count: Counted, edge: Edge) -> AnyElement {
+    let Some(was) = count.was else {
+        return div().child(count_label(count.value)).into_any_element();
+    };
+    let old = div()
+        .absolute()
+        .top_0()
+        .opacity(1. - count.mix)
+        .child(count_label(was));
+    let old = match edge {
+        Edge::Left => old.left_0(),
+        Edge::Right => old.right_0(),
+    };
+    div()
+        .relative()
+        .child(div().opacity(count.mix).child(count_label(count.value)))
+        .child(old)
+        .into_any_element()
+}
+
+/// How much of the "need you" group shows: it fades in when the first row starts to wait and out
+/// when the last one is answered.
+fn need_group(needs: Counted) -> Option<(Counted, f32)> {
+    match (needs.value, needs.was) {
+        (0, Some(was)) if was > 0 => Some((Counted::steady(was), 1. - needs.mix)),
+        (0, _) => None,
+        (value, Some(0)) => Some((Counted::steady(value), needs.mix)),
+        _ => Some((needs, 1.)),
+    }
+}
+
 /// A section's header: a small muted label and its count. The Queue's also says how many rows
 /// wait for an answer, in amber, with the key that jumps to them.
-pub fn section_header(section: Section, count: usize, needs: usize, cx: &App) -> AnyElement {
+pub fn section_header(section: Section, count: Counted, needs: Counted, cx: &App) -> AnyElement {
     let material = crate::theme::material(cx);
     let warning = cx.theme().colors.warning;
     let label = match section {
         Section::Pinned => "Pinned",
         Section::Queue => "Queue",
     };
+    let need = (section == Section::Queue)
+        .then(|| need_group(needs))
+        .flatten();
     h_flex()
+        .debug_selector(|| "section-header".to_string())
         .flex_none()
+        .h(HEADER_HEIGHT)
         .items_center()
         .gap_2()
         .px_2()
@@ -718,15 +757,21 @@ pub fn section_header(section: Section, count: usize, needs: usize, cx: &App) ->
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(material.glass_muted)
         .child(label)
-        .child(count_label(count))
-        .when(section == Section::Queue && needs > 0, |header| {
+        .child(number(count, Edge::Left))
+        .when_some(need, |header, (needs, opacity)| {
             header.child(div().flex_1()).child(
                 h_flex()
                     .items_center()
                     .gap(px(5.))
                     .text_color(warning)
+                    .opacity(opacity)
                     .child(div().size(px(6.)).rounded_full().bg(warning))
-                    .child(format!("{} need you", count_label(needs)))
+                    .child(
+                        h_flex()
+                            .gap(px(3.))
+                            .child(number(needs, Edge::Left))
+                            .child("need you"),
+                    )
                     .child(ui::key_caps("cmd-j", cx)),
             )
         })
@@ -734,6 +779,7 @@ pub fn section_header(section: Section, count: usize, needs: usize, cx: &App) ->
 }
 
 /// What one thread row shows.
+#[derive(Clone)]
 pub struct Row {
     /// The thread's id, which keys the row's state (its menu).
     pub id: SharedString,
@@ -1330,8 +1376,6 @@ mod tests {
         );
         assert_eq!(layout.in_flight, vec![7]);
         assert_eq!(thread_order(&layout), vec![1, 6, 5, 4, 3, 2, 0, 7]);
-        assert_eq!(entry_of(&layout, 4), Some(5));
-        assert_eq!(entry_of(&layout, 7), None);
     }
 
     #[test]
