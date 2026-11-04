@@ -1129,6 +1129,97 @@ fn unread_is_set_off_screen_and_cleared_on_screen() {
 }
 
 #[test]
+fn pin_snooze_and_settle_are_saved_and_only_a_landing_moves_the_thread() {
+    let fixture = Fixture::new();
+    let mut thread = fixture.draft();
+    thread.send("one").unwrap();
+    finish_turn(&mut thread);
+    thread.set_active(true);
+    thread.set_active(false);
+    let id = thread.id().to_string();
+    let landed = thread.list_state().landed_at;
+    let updated = thread.updated_at();
+    assert!(landed >= thread.created_at());
+
+    std::thread::sleep(Duration::from_millis(5));
+    thread.pin(1_000);
+    thread.pin(2_000);
+    assert_eq!(thread.list_state().pinned_at, Some(1_000));
+    assert_eq!(thread.list_state().landed_at, landed);
+    assert_eq!(thread.updated_at(), updated);
+    let reloaded = fixture.reload(&id);
+    assert_eq!(reloaded.list_state(), thread.list_state());
+    assert_eq!(reloaded.updated_at(), updated);
+
+    thread.snooze(5_000);
+    let state = thread.list_state();
+    assert_eq!(
+        (state.pinned_at, state.snoozed_until, state.settled_at),
+        (None, Some(5_000), None)
+    );
+    assert_eq!(fixture.reload(&id).list_state(), state);
+
+    assert!(!thread.wake_if_due(4_999));
+    assert!(!thread.is_unread());
+    assert!(thread.wake_if_due(5_000));
+    assert!(thread.is_unread());
+    let state = thread.list_state();
+    assert_eq!((state.snoozed_until, state.landed_at), (None, 5_000));
+    assert_eq!(fixture.reload(&id).list_state(), state);
+    assert!(!thread.wake_if_due(9_000));
+
+    thread.settle(7_000);
+    assert_eq!(thread.list_state().settled_at, Some(7_000));
+    assert_eq!(fixture.reload(&id).list_state(), thread.list_state());
+    thread.unsettle();
+    assert_eq!(thread.list_state().settled_at, None);
+    thread.settle(8_000);
+    thread.snooze(9_000);
+    assert_eq!(thread.list_state().settled_at, None);
+    thread.settle(8_000);
+    assert_eq!(thread.list_state().snoozed_until, None);
+
+    thread.send("two").unwrap();
+    assert_eq!(thread.list_state().settled_at, None);
+    finish_turn(&mut thread);
+    assert!(thread.list_state().landed_at > 5_000);
+    assert_eq!(fixture.reload(&id).list_state(), thread.list_state());
+}
+
+#[test]
+fn an_approval_brings_a_settled_or_snoozed_thread_back_and_a_woken_open_thread_stays_read() {
+    let fixture = Fixture::new();
+    fixture.switch("ask", true);
+    let mut thread = fixture.draft();
+    thread.send("one").unwrap();
+    thread.settle(1_000);
+    pump_until(&mut thread, "the approval", |thread| {
+        thread.transcript().pending_approval().is_some()
+    });
+    assert_eq!(thread.list_state().settled_at, None);
+    assert!(thread.list_state().landed_at > 1_000);
+    thread.answer(None, ApprovalIntent::AllowOnce).unwrap();
+    finish_turn(&mut thread);
+
+    thread.set_active(true);
+    thread.snooze(10);
+    assert!(thread.wake_if_due(10));
+    assert!(!thread.is_unread());
+}
+
+#[test]
+fn a_draft_cannot_be_pinned_snoozed_or_settled() {
+    let fixture = Fixture::new();
+    let mut thread = fixture.draft();
+    thread.pin(1);
+    thread.snooze(2);
+    thread.settle(3);
+    assert_eq!(thread.list_state().pinned_at, None);
+    assert_eq!(thread.list_state().snoozed_until, None);
+    assert_eq!(thread.list_state().settled_at, None);
+}
+
+#[test]
 fn a_thread_left_waiting_by_a_crash_is_stopped_with_its_approval_expired() {
     let fixture = Fixture::new();
     fixture.switch("ask", true);
@@ -1715,6 +1806,7 @@ fn a_thread_always_restarts_from_its_own_folder() {
         review_base: None,
         landing_resolved: false,
         snapshot_needed: false,
+        list: Default::default(),
     });
     assert!(store.flush(Duration::from_secs(5)));
 

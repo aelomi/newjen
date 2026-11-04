@@ -183,6 +183,14 @@ const MIGRATIONS: &[&str] = &[
          key TEXT PRIMARY KEY,
          value TEXT NOT NULL
      );",
+    // Version 10: where a thread sits in the list. Pinned, snoozed and settled are the user's
+    // choices; `landed_at` is when the thread last landed (a turn ended, an approval was asked,
+    // a snooze ran out), which orders the Queue and the read list.
+    "ALTER TABLE threads ADD COLUMN pinned_at INTEGER;
+     ALTER TABLE threads ADD COLUMN snoozed_until INTEGER;
+     ALTER TABLE threads ADD COLUMN settled_at INTEGER;
+     ALTER TABLE threads ADD COLUMN landed_at INTEGER NOT NULL DEFAULT 0;
+     UPDATE threads SET landed_at = updated_at;",
 ];
 
 /// The `user_version` of a database at the current schema.
@@ -221,6 +229,21 @@ pub struct Project {
     pub last_opened_at: i64,
 }
 
+/// What decides where a thread sits in the list beyond what it is doing (Unix milliseconds
+/// throughout). A thread is at most one of pinned, snoozed and settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ListState {
+    /// When the thread was pinned; pinned threads keep this order.
+    pub pinned_at: Option<i64>,
+    /// The thread is out of the list until this time.
+    pub snoozed_until: Option<i64>,
+    /// When the thread was settled.
+    pub settled_at: Option<i64>,
+    /// When the thread last landed. Orders the Queue and the read list, newest first, and moves
+    /// only when something lands, never when a flag or a snapshot changes the row.
+    pub landed_at: i64,
+}
+
 /// One saved thread (the `threads` table).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadRow {
@@ -249,6 +272,7 @@ pub struct ThreadRow {
     pub review_base: Option<String>,
     pub landing_resolved: bool,
     pub snapshot_needed: bool,
+    pub list: ListState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,6 +478,10 @@ enum Write {
     SetUnread {
         thread_id: String,
         unread: bool,
+    },
+    SetList {
+        thread_id: String,
+        list: ListState,
     },
     Archive {
         thread_id: String,
@@ -928,6 +956,14 @@ impl Store {
         });
     }
 
+    /// Sets where the thread sits in the list (without touching `updated_at`).
+    pub fn set_list(&self, thread_id: &str, list: ListState) {
+        self.queue(Write::SetList {
+            thread_id: thread_id.to_string(),
+            list,
+        });
+    }
+
     /// Hides the thread from the list. Its rows stay in the database.
     pub fn archive(&self, thread_id: &str, at: i64) {
         self.queue(Write::Archive {
@@ -1003,7 +1039,7 @@ fn path_text(path: &Path) -> String {
 const THREAD_COLUMNS: &str = "SELECT id, project_id, title, provider, conversation_id, conversation_state,
         status, unread, threads.created_at, updated_at, archived_at, threads.workdir,
         copies.path, copies.workdir, source, branch, base, threads.model, threads.effort, threads.speed,
-        review_base, landing_resolved, snapshot_needed
+        review_base, landing_resolved, snapshot_needed, pinned_at, snoozed_until, settled_at, landed_at
      FROM threads LEFT JOIN copies ON copies.thread_id = threads.id";
 
 fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
@@ -1043,6 +1079,12 @@ fn thread_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         review_base: row.get(20)?,
         landing_resolved: row.get(21)?,
         snapshot_needed: row.get(22)?,
+        list: ListState {
+            pinned_at: row.get(23)?,
+            snoozed_until: row.get(24)?,
+            settled_at: row.get(25)?,
+            landed_at: row.get(26)?,
+        },
     })
 }
 
@@ -1164,8 +1206,8 @@ fn lost_by(write: &Write) -> Option<(String, Unsaved)> {
                 ..Unsaved::default()
             },
         ),
-        // The unread flag is part of the row.
-        Write::SetUnread { thread_id, .. } => (
+        // The unread flag and the list state are part of the row.
+        Write::SetUnread { thread_id, .. } | Write::SetList { thread_id, .. } => (
             thread_id,
             Unsaved {
                 row: true,
@@ -1363,6 +1405,19 @@ fn run_write(connection: &mut Connection, write: Write) -> rusqlite::Result<()> 
                 params![thread_id, unread],
             )?;
         }
+        Write::SetList { thread_id, list } => {
+            connection.execute(
+                "UPDATE threads SET pinned_at = ?2, snoozed_until = ?3, settled_at = ?4, landed_at = ?5
+                 WHERE id = ?1",
+                params![
+                    thread_id,
+                    list.pinned_at,
+                    list.snoozed_until,
+                    list.settled_at,
+                    list.landed_at
+                ],
+            )?;
+        }
         Write::Archive { thread_id, at } => {
             connection.execute(
                 "UPDATE threads SET archived_at = ?2 WHERE id = ?1",
@@ -1420,8 +1475,10 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
     connection.execute(
         "INSERT INTO threads (id, project_id, title, provider, session_id, session_started,
                               status, unread, created_at, updated_at, archived_at, workdir, conversation_id, conversation_state, model, effort, speed,
-                              review_base, landing_resolved, snapshot_needed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                              review_base, landing_resolved, snapshot_needed,
+                              pinned_at, snoozed_until, settled_at, landed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                 ?21, ?22, ?23, ?24)
          ON CONFLICT (id) DO UPDATE SET
              title = excluded.title,
              provider = excluded.provider,
@@ -1437,7 +1494,11 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
              updated_at = excluded.updated_at,
              review_base = excluded.review_base,
              landing_resolved = excluded.landing_resolved,
-             snapshot_needed = excluded.snapshot_needed",
+             snapshot_needed = excluded.snapshot_needed,
+             pinned_at = excluded.pinned_at,
+             snoozed_until = excluded.snoozed_until,
+             settled_at = excluded.settled_at,
+             landed_at = excluded.landed_at",
         params![
             row.id,
             row.project_id,
@@ -1459,6 +1520,10 @@ fn save_thread_row(connection: &Connection, row: &ThreadRow) -> rusqlite::Result
             row.review_base,
             row.landing_resolved,
             row.snapshot_needed,
+            row.list.pinned_at,
+            row.list.snoozed_until,
+            row.list.settled_at,
+            row.list.landed_at,
         ],
     )?;
     if let Some(copy) = &row.copy {
@@ -1627,6 +1692,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn existing_threads_land_where_they_were_last_active() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &MIGRATIONS[..9]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, path, created_at, last_opened_at) VALUES (1, '/tmp/project', 1, 1);
+                 INSERT INTO threads (id, project_id, workdir, title, session_id, status, created_at, updated_at)
+                 VALUES ('old', 1, '/tmp/project', 'Old', 's', 'done', 10, 77);",
+            )
+            .unwrap();
+        migrate(&mut connection, MIGRATIONS).unwrap();
+        let row = connection
+            .query_row(
+                &format!("{THREAD_COLUMNS} WHERE id = 'old'"),
+                [],
+                thread_row,
+            )
+            .unwrap();
+        assert_eq!(
+            row.list,
+            ListState {
+                landed_at: 77,
+                ..ListState::default()
+            }
+        );
+    }
+
     fn row(id: &str, project_id: i64) -> ThreadRow {
         ThreadRow {
             id: id.to_string(),
@@ -1647,6 +1740,7 @@ mod tests {
             review_base: None,
             landing_resolved: false,
             snapshot_needed: false,
+            list: ListState::default(),
         }
     }
 

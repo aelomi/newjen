@@ -30,6 +30,7 @@ fn thread_row(id: &str, project_id: i64, created_at: i64) -> ThreadRow {
         review_base: None,
         landing_resolved: false,
         snapshot_needed: false,
+        list: Default::default(),
     }
 }
 

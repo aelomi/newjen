@@ -383,6 +383,7 @@ mod tests {
             review_base: None,
             landing_resolved: false,
             snapshot_needed: false,
+            list: Default::default(),
         }
     }
 
@@ -450,7 +451,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!((SCHEMA_VERSION, version), (9, 9));
+        assert_eq!((SCHEMA_VERSION, version), (10, 10));
         assert_eq!(store.thread("t1").unwrap().unwrap().title, "Old");
         assert!(store.turn_usage("t1").unwrap().is_empty());
         save(

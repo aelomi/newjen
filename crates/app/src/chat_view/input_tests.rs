@@ -2162,6 +2162,7 @@ async fn review_completion_during_saving_does_not_disable_keep_open(cx: &mut Tes
                 review_base: Some("a".repeat(40)),
                 landing_resolved: false,
                 snapshot_needed: false,
+                list: Default::default(),
             };
             view.store.save_thread(row.clone());
             assert!(view.store.flush(Duration::from_secs(5)));
@@ -2377,6 +2378,7 @@ fn idle_project_thread(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> P
                 review_base: Some(base),
                 landing_resolved: false,
                 snapshot_needed: false,
+                list: Default::default(),
             };
             view.store.save_thread(row.clone());
             assert!(view.store.flush(Duration::from_secs(5)));
