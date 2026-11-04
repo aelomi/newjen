@@ -2682,6 +2682,122 @@ async fn the_thread_on_screen_keeps_its_exact_place_when_it_lands_and_moves_when
     finish(&chat, path, cx);
 }
 
+fn snoozed_list(until: i64) -> newjen_core::store::ListState {
+    newjen_core::store::ListState {
+        snoozed_until: Some(until),
+        landed_at: until,
+        ..Default::default()
+    }
+}
+
+fn root_focused(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| chat.read(cx).root.is_focused(window))
+}
+
+fn filter_focused(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| {
+        chat.read(cx)
+            .sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.filter.read(cx).focus_handle(cx).is_focused(window))
+    })
+}
+
+#[gpui::test]
+async fn closing_a_panel_over_an_approval_gives_the_keyboard_to_the_dock(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "panel-focus", true);
+    cx.update(|_, cx| cx.set_reduce_motion(false));
+    add_idle_thread(&chat, cx, "later", false, snoozed_list(i64::MAX));
+    cx.simulate_input("keep waiting");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let_motion_finish(&chat, cx);
+    assert!(root_focused(&chat, cx));
+
+    for close in ["escape", "outside"] {
+        click(cx, "disclosure-snoozed");
+        let_motion_finish(&chat, cx);
+        assert!(filter_focused(&chat, cx), "the panel takes the keyboard");
+        if close == "escape" {
+            cx.simulate_keystrokes("escape");
+        } else {
+            let size = cx.update(|window, _| window.viewport_size());
+            cx.simulate_click(
+                gpui::point(size.width * 0.6, size.height * 0.3),
+                gpui::Modifiers::default(),
+            );
+        }
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| chat.read(cx).sheet.is_none()));
+        assert!(
+            cx.update(|_, cx| chat.read(cx).sheet_exit.is_some()),
+            "the panel is still lowering"
+        );
+        assert!(
+            root_focused(&chat, cx),
+            "closing by {close} leaves the keyboard on the dock"
+        );
+        let_motion_finish(&chat, cx);
+    }
+    assert!(
+        cx.update(|_, cx| chat
+            .read(cx)
+            .thread()
+            .read(cx)
+            .transcript()
+            .pending_approval()
+            .is_some()),
+        "nothing was denied"
+    );
+    finish(&chat, path, cx);
+}
+
+#[gpui::test]
+async fn choosing_a_row_in_a_panel_gives_the_keyboard_to_its_thread(cx: &mut TestAppContext) {
+    let (chat, path, cx) = setup(cx, "panel-row-focus", true);
+    cx.simulate_input("keep waiting");
+    cx.simulate_keystrokes("enter");
+    pending(&chat, cx).await;
+    let waiting = cx.update(|_, cx| chat.read(cx).thread().read(cx).id().to_string());
+    cx.update(|_, cx| {
+        chat.update(cx, |view, cx| {
+            view.slots[0].thread.update(cx, |thread, cx| {
+                thread.snooze(i64::MAX);
+                cx.notify();
+            });
+        })
+    });
+    let idle = add_idle_thread(&chat, cx, "quiet", false, snoozed_list(i64::MAX));
+    cx.update(|window, cx| chat.update(cx, |view, cx| view.add_draft(window, cx)));
+    cx.update(|window, cx| {
+        chat.update(cx, |view, cx| {
+            view.show(0, window, cx);
+        })
+    });
+    let_motion_finish(&chat, cx);
+    assert!(
+        cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window)),
+        "the draft has the keyboard"
+    );
+
+    for (shown, dock) in [(waiting, true), (idle, false)] {
+        click(cx, "disclosure-snoozed");
+        cx.run_until_parked();
+        assert!(filter_focused(&chat, cx));
+        cx.update(|window, cx| {
+            chat.update(cx, |view, cx| view.show_thread(&shown, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(!filter_focused(&chat, cx));
+        let composer =
+            cx.update(|window, cx| chat.read(cx).field_focus(cx).unwrap().is_focused(window));
+        assert_eq!(root_focused(&chat, cx), dock);
+        assert_eq!(composer, !dock);
+        let_motion_finish(&chat, cx);
+    }
+    finish(&chat, path, cx);
+}
+
 #[gpui::test]
 async fn a_settled_row_stays_on_screen_while_it_leaves(cx: &mut TestAppContext) {
     let (chat, path, cx) = setup(cx, "settle-motion", true);

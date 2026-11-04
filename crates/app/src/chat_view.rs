@@ -954,15 +954,7 @@ impl ChatView {
         self.dock_request = None;
         self.making_copy_shown = false;
         self.sync_field(window, cx);
-        if self.terminal_open && self.terminal_wanted {
-            self.focus_panel(window, cx);
-        } else if self.composer_has_keys() {
-            let field = self.ensure_field(window, cx);
-            let handle = field.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
-        } else if self.pane == Pane::Usage {
-            self.focus_panel(window, cx);
-        }
+        self.focus_panel(window, cx);
         self.reveal_active.set(true);
         cx.notify();
     }
@@ -3172,11 +3164,7 @@ impl ChatView {
             return;
         }
         self.lower_sheet();
-        if self.composer_has_keys() {
-            let field = self.ensure_field(window, cx);
-            let handle = field.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
-        }
+        self.focus_panel(window, cx);
         cx.notify();
     }
 
