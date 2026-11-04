@@ -1,6 +1,6 @@
 #![expect(dead_code, reason = "the sidebar mounts the fox in a later slice")]
 
-mod model {
+pub(crate) mod model {
     pub const WIDTH: f32 = 239.0;
     pub const HEIGHT: f32 = 112.0;
     pub const GROUND: f32 = 98.0;
@@ -385,7 +385,6 @@ mod model {
             });
         }
 
-        #[cfg(test)]
         pub fn clear_obstacles(&mut self) {
             self.obstacles.clear();
         }
@@ -1397,16 +1396,12 @@ mod art {
             hazard(&mut canvas, obstacle, fx, still);
         }
         fox(&mut canvas, runner, fx);
+        canvas.xf = Xf::IDENTITY;
         for age in &fx.rings {
             let progress = age / 0.5;
-            let around = arc_points(
-                FOX_X + 3.0,
-                GROUND - runner.height() - 12.0,
-                6.0 + 22.0 * ease(progress),
-                0.0,
-                TAU,
-                32,
-            );
+            let radius = 6.0 + 22.0 * ease(progress);
+            let around =
+                ellipse_points(FOX_X + 3.0, GROUND - runner.height() - 12.0, radius, radius);
             canvas.stroke(
                 &around,
                 1.5,
@@ -1856,6 +1851,28 @@ mod art {
                 runner.clear_obstacles();
             }
             assert_eq!(fx.rings(), 1);
+            let ring = scene(&runner, &fx)
+                .into_iter()
+                .find_map(|prim| match prim.shape {
+                    Shape::Line {
+                        pts,
+                        closed: true,
+                        width: 1.5,
+                        ..
+                    } => Some(pts),
+                    _ => None,
+                })
+                .expect("the ring is drawn");
+            let n = ring.len() as f32;
+            let centre = (
+                ring.iter().map(|p| p.x).sum::<f32>() / n,
+                ring.iter().map(|p| p.y).sum::<f32>() / n,
+            );
+            assert!((centre.0 - (FOX_X + 3.0)).abs() < 0.5, "{centre:?}");
+            assert!(
+                (centre.1 - (GROUND - runner.height() - 12.0)).abs() < 0.5,
+                "{centre:?}"
+            );
             assert_eq!(
                 fx.particles()
                     .iter()
@@ -2018,15 +2035,15 @@ fn is_jump_key(keystroke: &Keystroke) -> bool {
 }
 
 pub struct FoxGame {
-    runner: Runner,
-    fx: Fx,
+    pub(crate) runner: Runner,
+    pub(crate) fx: Fx,
     title: SharedString,
     shown: bool,
     fade: f32,
     hint: &'static str,
     hint_alpha: f32,
     focus: FocusHandle,
-    frame: Option<Instant>,
+    pub(crate) frame: Option<Instant>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -2087,7 +2104,7 @@ impl FoxGame {
         }
     }
 
-    fn advance(&mut self, dt: f32, reduce_motion: bool) {
+    pub(crate) fn advance(&mut self, dt: f32, reduce_motion: bool) {
         self.fx.set_reduce_motion(reduce_motion);
         self.runner.step(dt);
         self.fx.step(dt, &self.runner);
